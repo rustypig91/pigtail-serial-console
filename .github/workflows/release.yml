@@ -1,0 +1,107 @@
+name: "release"
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  verify-version:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read workspace version
+        id: version
+        run: |
+          VERSION="$(grep -m1 '^version = "' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          echo "Workspace version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Verify tag matches workspace version
+        # Only meaningful on tag builds; manual/branch runs have no version to check.
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          echo "Workspace version: ${{ steps.version.outputs.version }}"
+          echo "Tag version:       $TAG_VERSION"
+          if [ "${{ steps.version.outputs.version }}" != "$TAG_VERSION" ]; then
+            echo "::error::Release tag '$GITHUB_REF_NAME' does not match workspace version '${{ steps.version.outputs.version }}'"
+            exit 1
+          fi
+
+  release:
+    needs: verify-version
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # - platform: 'macos-latest' # for Arm based macs (M1 and above).
+          #   target: 'aarch64-apple-darwin'
+          # - platform: 'macos-latest' # for Intel based macs.
+          #   target: 'x86_64-apple-darwin'
+          - platform: "ubuntu-22.04"
+            target: "x86_64-unknown-linux-gnu"
+          # - platform: 'ubuntu-22.04-arm' # Only available in public repos.
+          #   target: 'aarch64-unknown-linux-gnu'
+          - platform: "windows-latest"
+            target: "x86_64-pc-windows-msvc"
+
+    runs-on: ${{ matrix.platform }}
+    env:
+      VERSION: ${{ needs.verify-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: install dependencies (ubuntu only)
+        if: startsWith(matrix.platform, 'ubuntu') # This must match the platform value defined above.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev libgtk-3-dev
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release -p pigtail --target ${{ matrix.target }}
+
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN_DIR="target/${{ matrix.target }}/release"
+          OUT="pigtail-v${VERSION}-${{ matrix.target }}"
+          mkdir "$OUT"
+          if [ "${{ matrix.platform }}" = "windows-latest" ]; then
+            cp "$BIN_DIR/pigtail.exe" "$OUT/"
+          else
+            cp "$BIN_DIR/pigtail" "$OUT/"
+          fi
+          cp README.md LICENSE "$OUT/"
+          if [ "${{ matrix.platform }}" = "windows-latest" ]; then
+            7z a "$OUT.zip" "$OUT" >/dev/null
+            echo "ASSET=$OUT.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "$OUT.tar.gz" "$OUT"
+            echo "ASSET=$OUT.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: "Pigtail v${{ env.VERSION }}"
+          body: "See the assets to download this version."
+          # Publish the release (with its assets) when building from a release
+          # tag; keep branch/manual builds as drafts so they don't publish.
+          draft: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          prerelease: false
+          files: ${{ env.ASSET }}

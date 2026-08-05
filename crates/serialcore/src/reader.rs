@@ -1,0 +1,599 @@
+//! The reader thread: one blocking reader per port, batching, and the reconnect
+//! state machine (spec §5, §7.6).
+//!
+//! Non-negotiable rules honoured here:
+//! 1. Batch before sending (~16ms or a few thousand lines).
+//! 2. Never block on the UI: the channel is bounded; if it is full we keep the
+//!    batch in a local backlog and keep reading — reading always takes priority.
+//! 3. The raw session log is written before any parsing.
+//! 4. The UI owns the store; data flows only through channels.
+
+use crate::clock::{SessionClock, Timestamp};
+use crate::config::{PortConfig, PortIdentity};
+use crate::enumerate::{enumerate_ports, match_identity, MatchResult};
+use crate::framer::{FramedLine, Framer};
+use crate::session::{SessionMeta, SessionWriter};
+use crate::source::{ByteSource, SerialSource, SourceError};
+use crate::store::{LineFlags, PortId};
+use crate::wake::Wake;
+use crossbeam_channel::{Receiver, Sender, TrySendError};
+use std::path::PathBuf;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+const READ_BUF: usize = 64 * 1024;
+const BATCH_INTERVAL: Duration = Duration::from_millis(16);
+const BATCH_MAX_LINES: usize = 4000;
+// Kept short so an interactive prompt's echo (characters the device sends back
+// with no trailing newline) appears promptly instead of feeling laggy.
+const PROVISIONAL_AFTER: Duration = Duration::from_millis(20);
+const CHANNEL_CAPACITY: usize = 1024;
+
+/// Connection state machine (spec §7.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnState {
+    Disconnected,
+    Connecting,
+    Connected,
+    Lost,
+    Reconnecting,
+    Closed,
+}
+
+impl std::fmt::Display for ConnState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            ConnState::Disconnected => "disconnected",
+            ConnState::Connecting => "connecting",
+            ConnState::Connected => "connected",
+            ConnState::Lost => "lost",
+            ConnState::Reconnecting => "reconnecting",
+            ConnState::Closed => "closed",
+        };
+        f.write_str(s)
+    }
+}
+
+/// A batch of framed lines plus the raw bytes that produced them.
+#[derive(Clone, Debug, Default)]
+pub struct Batch {
+    pub lines: Vec<FramedLine>,
+    /// Raw bytes exactly as read, for the live hex view.
+    pub raw: Vec<u8>,
+}
+
+/// An event from a reader thread to the UI.
+#[derive(Clone, Debug)]
+pub enum ReaderEvent {
+    State(ConnState),
+    Batch(Batch),
+    Error(String),
+}
+
+/// Commands from the UI to a reader thread.
+#[derive(Clone, Debug)]
+enum ReaderCommand {
+    Transmit(Vec<u8>),
+    SetDtr(bool),
+    SetRts(bool),
+    SendBreak,
+    Shutdown,
+}
+
+/// What to read from, and whether to reconnect.
+pub enum SourceSpec {
+    /// A live serial device, resolved by identity (reconnectable).
+    Serial {
+        identity: PortIdentity,
+        config: PortConfig,
+        /// Path the user selected for the first open (disambiguates identical
+        /// no-serial devices). Reconnects resolve by identity.
+        initial_path: Option<String>,
+    },
+    /// A prebuilt one-shot source (e.g. a scripted test fixture); no reconnect.
+    OneShot(Box<dyn ByteSource>),
+}
+
+/// Configuration for spawning a reader.
+pub struct ReaderConfig {
+    pub port_id: PortId,
+    pub clock: SessionClock,
+    /// Directory for the session log, or `None` to skip logging (tests).
+    pub session_dir: Option<PathBuf>,
+    pub meta: SessionMeta,
+    /// How incoming carriage returns are framed into lines.
+    pub terminal: crate::config::TerminalMode,
+    /// Signalled after every event, so a sleeping UI comes back to drain the
+    /// channel. Without it the events sit there unseen (spec §5, rule 4).
+    pub wake: Wake,
+}
+
+/// Handle to a running reader thread.
+pub struct ReaderHandle {
+    pub port_id: PortId,
+    pub events: Receiver<ReaderEvent>,
+    cmd: Sender<ReaderCommand>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl ReaderHandle {
+    pub fn transmit(&self, bytes: Vec<u8>) {
+        let _ = self.cmd.send(ReaderCommand::Transmit(bytes));
+    }
+    pub fn set_dtr(&self, on: bool) {
+        let _ = self.cmd.send(ReaderCommand::SetDtr(on));
+    }
+    pub fn set_rts(&self, on: bool) {
+        let _ = self.cmd.send(ReaderCommand::SetRts(on));
+    }
+    pub fn send_break(&self) {
+        let _ = self.cmd.send(ReaderCommand::SendBreak);
+    }
+
+    /// Signal shutdown and join the thread.
+    pub fn shutdown(mut self) {
+        let _ = self.cmd.send(ReaderCommand::Shutdown);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for ReaderHandle {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            let _ = self.cmd.send(ReaderCommand::Shutdown);
+            let _ = join.join();
+        }
+    }
+}
+
+/// Spawn a reader thread for the given source.
+pub fn spawn(config: ReaderConfig, spec: SourceSpec) -> ReaderHandle {
+    let (event_tx, event_rx) = crossbeam_channel::bounded(CHANNEL_CAPACITY);
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let port_id = config.port_id;
+    let name = format!("reader-{}", port_id.0);
+    let join = std::thread::Builder::new()
+        .name(name)
+        .spawn(move || run(config, spec, event_tx, cmd_rx))
+        .expect("spawn reader thread");
+    ReaderHandle {
+        port_id,
+        events: event_rx,
+        cmd: cmd_tx,
+        join: Some(join),
+    }
+}
+
+/// A factory that (re)opens the underlying source.
+type Opener = Box<dyn FnMut() -> Result<Box<dyn ByteSource>, SourceError> + Send>;
+
+/// The event channel paired with the UI wake signal.
+///
+/// Every send goes through here so that "the UI finds out" is structural rather
+/// than something each of the dozen send sites has to remember: one missed wake
+/// means that event sits in the channel until some unrelated input happens to
+/// redraw the app.
+struct EventTx {
+    tx: Sender<ReaderEvent>,
+    wake: Wake,
+}
+
+impl EventTx {
+    /// Send, blocking if the channel is full. Used for state and error events,
+    /// which are rare and must not be dropped.
+    fn send(&self, ev: ReaderEvent) {
+        if self.tx.send(ev).is_ok() {
+            self.wake.signal();
+        }
+    }
+
+    /// Send without blocking. Used for batches, which must never stall the read
+    /// loop (rule 2); a full channel leaves them in the backlog to retry.
+    fn try_send(&self, ev: ReaderEvent) -> Result<(), TrySendError<ReaderEvent>> {
+        let result = self.tx.try_send(ev);
+        if result.is_ok() {
+            self.wake.signal();
+        }
+        result
+    }
+}
+
+fn run(
+    config: ReaderConfig,
+    spec: SourceSpec,
+    event_tx: Sender<ReaderEvent>,
+    cmd_rx: Receiver<ReaderCommand>,
+) {
+    let clock = config.clock.clone();
+    let event_tx = EventTx {
+        tx: event_tx,
+        wake: config.wake.clone(),
+    };
+
+    // Build the opener and whether we reconnect.
+    let (mut opener, reconnect): (Opener, bool) = match spec {
+        SourceSpec::Serial {
+            identity,
+            config: pcfg,
+            initial_path,
+        } => {
+            let mut first = true;
+            let opener: Opener = Box::new(move || {
+                let path = resolve_path(&identity, &pcfg, &mut first, &initial_path)?;
+                Ok(Box::new(SerialSource::open(&path, &pcfg)?) as Box<dyn ByteSource>)
+            });
+            (opener, true)
+        }
+        SourceSpec::OneShot(src) => {
+            let mut slot = Some(src);
+            let opener: Opener = Box::new(move || {
+                slot.take()
+                    .ok_or_else(|| SourceError::Disconnected("source exhausted".into()))
+            });
+            (opener, false)
+        }
+    };
+
+    // Session writer: created once, survives reconnects (spec §7.6).
+    let mut writer: Option<SessionWriter> = match &config.session_dir {
+        Some(dir) => match SessionWriter::create(dir, &config.meta) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                event_tx.send(ReaderEvent::Error(format!("session log: {e}")));
+                None
+            }
+        },
+        None => None,
+    };
+
+    let mut framer = Framer::with_mode(config.terminal);
+    let mut backlog: Vec<Batch> = Vec::new();
+    let mut backoff = Duration::from_millis(100);
+    let mut lost_at: Option<Instant> = None;
+    let mut first_connect = true;
+
+    'outer: loop {
+        // (Re)connect phase.
+        let state = if first_connect {
+            ConnState::Connecting
+        } else {
+            ConnState::Reconnecting
+        };
+        event_tx.send(ReaderEvent::State(state));
+
+        let mut source = loop {
+            match opener() {
+                Ok(s) => break s,
+                Err(e) => {
+                    if !reconnect {
+                        event_tx.send(ReaderEvent::Error(e.to_string()));
+                        event_tx.send(ReaderEvent::State(ConnState::Closed));
+                        return;
+                    }
+                    // Wait out the backoff while remaining responsive to Shutdown.
+                    if wait_or_shutdown(&cmd_rx, backoff) {
+                        event_tx.send(ReaderEvent::State(ConnState::Closed));
+                        return;
+                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(2));
+                }
+            }
+        };
+
+        // Connected. Emit a reconnect marker if this was a reconnect.
+        if let Some(lost) = lost_at.take() {
+            let outage = lost.elapsed();
+            let marker = reconnect_marker(&clock, outage);
+            backlog.push(Batch {
+                lines: vec![marker],
+                raw: Vec::new(),
+            });
+        }
+        backoff = Duration::from_millis(100);
+        first_connect = false;
+        event_tx.send(ReaderEvent::State(ConnState::Connected));
+
+        // Read loop.
+        let mut buf = vec![0u8; READ_BUF];
+        let mut pending = Batch::default();
+        let mut last_send = Instant::now();
+        let mut last_byte = Instant::now();
+        let mut provisional_flushed = false;
+
+        loop {
+            // Handle any queued commands.
+            match drain_commands(&cmd_rx, source.as_mut(), &event_tx) {
+                CommandOutcome::Shutdown => {
+                    // Flush and exit.
+                    framer.flush_final(&mut pending.lines);
+                    flush_batch(&mut pending, &mut backlog, &event_tx);
+                    drain_backlog(&mut backlog, &event_tx);
+                    if let Some(w) = &mut writer {
+                        let _ = w.flush();
+                    }
+                    event_tx.send(ReaderEvent::State(ConnState::Closed));
+                    break 'outer;
+                }
+                CommandOutcome::Continue => {}
+            }
+
+            match source.read(&mut buf) {
+                Ok(0) => {
+                    // Timeout: consider a provisional flush after silence.
+                    if !provisional_flushed && last_byte.elapsed() >= PROVISIONAL_AFTER {
+                        if let Some(line) = framer.flush_provisional() {
+                            pending.lines.push(line);
+                        }
+                        provisional_flushed = true;
+                    }
+                }
+                Ok(n) => {
+                    let ts = clock.now();
+                    last_byte = Instant::now();
+                    provisional_flushed = false;
+                    if let Some(w) = &mut writer {
+                        if let Err(e) = w.write_record(ts.micros, &buf[..n]) {
+                            event_tx.send(ReaderEvent::Error(format!("log write: {e}")));
+                        }
+                    }
+                    pending.raw.extend_from_slice(&buf[..n]);
+                    framer.push(&buf[..n], ts, &mut pending.lines);
+                }
+                Err(SourceError::Disconnected(msg)) => {
+                    event_tx.send(ReaderEvent::Error(msg));
+                    break;
+                }
+                Err(e) => {
+                    // Treat any read error as a loss; reconnect will retry.
+                    event_tx.send(ReaderEvent::Error(e.to_string()));
+                    break;
+                }
+            }
+
+            // Batch flush (rule 1).
+            let full = pending.lines.len() >= BATCH_MAX_LINES;
+            if (!pending.lines.is_empty() || !pending.raw.is_empty())
+                && (full || last_send.elapsed() >= BATCH_INTERVAL)
+            {
+                flush_batch(&mut pending, &mut backlog, &event_tx);
+                last_send = Instant::now();
+            }
+            // Try to drain any backlog that built up while the channel was full.
+            drain_backlog(&mut backlog, &event_tx);
+        }
+
+        // Left the read loop due to disconnect.
+        flush_batch(&mut pending, &mut backlog, &event_tx);
+        drain_backlog(&mut backlog, &event_tx);
+        if let Some(w) = &mut writer {
+            let _ = w.flush();
+        }
+
+        if !reconnect {
+            event_tx.send(ReaderEvent::State(ConnState::Closed));
+            break 'outer;
+        }
+
+        // Enter Lost/Reconnecting.
+        lost_at = Some(Instant::now());
+        event_tx.send(ReaderEvent::State(ConnState::Lost));
+    }
+}
+
+/// Resolve the OS path for a serial identity. On the first open we honour a
+/// user-selected path (to disambiguate identical no-serial devices); afterwards
+/// we resolve strictly by identity so a re-enumerated device is found on its new
+/// path (spec §7.6).
+fn resolve_path(
+    identity: &PortIdentity,
+    _config: &PortConfig,
+    first: &mut bool,
+    initial_path: &Option<String>,
+) -> Result<String, SourceError> {
+    let discovered = enumerate_ports();
+
+    if *first {
+        if let Some(path) = initial_path {
+            if discovered.iter().any(|d| &d.path == path) {
+                *first = false;
+                return Ok(path.clone());
+            }
+        }
+    }
+    *first = false;
+
+    match match_identity(identity, &discovered) {
+        MatchResult::Definite(i) => Ok(discovered[i].path.clone()),
+        MatchResult::Ambiguous(_) => Err(SourceError::Open(
+            "multiple identical devices present; cannot disambiguate".into(),
+        )),
+        MatchResult::None => {
+            if !identity.has_usb() && !identity.path_fallback.is_empty() {
+                Ok(identity.path_fallback.clone())
+            } else {
+                Err(SourceError::Disconnected("device not present".into()))
+            }
+        }
+    }
+}
+
+enum CommandOutcome {
+    Continue,
+    Shutdown,
+}
+
+fn drain_commands(
+    cmd_rx: &Receiver<ReaderCommand>,
+    source: &mut dyn ByteSource,
+    event_tx: &EventTx,
+) -> CommandOutcome {
+    while let Ok(cmd) = cmd_rx.try_recv() {
+        match cmd {
+            ReaderCommand::Shutdown => return CommandOutcome::Shutdown,
+            ReaderCommand::Transmit(bytes) => {
+                if let Err(e) = source.write(&bytes) {
+                    event_tx.send(ReaderEvent::Error(format!("transmit: {e}")));
+                }
+            }
+            ReaderCommand::SetDtr(on) => {
+                if let Err(e) = source.set_dtr(on) {
+                    event_tx.send(ReaderEvent::Error(format!("dtr: {e}")));
+                }
+            }
+            ReaderCommand::SetRts(on) => {
+                if let Err(e) = source.set_rts(on) {
+                    event_tx.send(ReaderEvent::Error(format!("rts: {e}")));
+                }
+            }
+            ReaderCommand::SendBreak => {
+                if let Err(e) = source.send_break() {
+                    event_tx.send(ReaderEvent::Error(format!("break: {e}")));
+                }
+            }
+        }
+    }
+    CommandOutcome::Continue
+}
+
+/// Move `pending` into the backlog, then try to push backlog entries onto the
+/// channel. If the channel is full we keep them in the backlog and keep reading
+/// (rule 2: never block on the UI).
+fn flush_batch(pending: &mut Batch, backlog: &mut Vec<Batch>, event_tx: &EventTx) {
+    if pending.lines.is_empty() && pending.raw.is_empty() {
+        return;
+    }
+    backlog.push(std::mem::take(pending));
+    drain_backlog(backlog, event_tx);
+}
+
+fn drain_backlog(backlog: &mut Vec<Batch>, event_tx: &EventTx) {
+    while let Some(batch) = backlog.first() {
+        match event_tx.try_send(ReaderEvent::Batch(batch.clone())) {
+            Ok(()) => {
+                backlog.remove(0);
+            }
+            Err(TrySendError::Full(_)) => break, // keep accumulating; retry later
+            Err(TrySendError::Disconnected(_)) => {
+                backlog.clear();
+                break;
+            }
+        }
+    }
+}
+
+/// Sleep for `dur`, returning `true` if a Shutdown arrived meanwhile.
+fn wait_or_shutdown(cmd_rx: &Receiver<ReaderCommand>, dur: Duration) -> bool {
+    match cmd_rx.recv_timeout(dur) {
+        Ok(ReaderCommand::Shutdown) => true,
+        Ok(_) => false, // ignore control commands while disconnected
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => false,
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => true,
+    }
+}
+
+fn reconnect_marker(clock: &SessionClock, outage: Duration) -> FramedLine {
+    let ts: Timestamp = clock.now();
+    FramedLine {
+        text: format!("reconnected after {:.1}s", outage.as_secs_f64()),
+        ts,
+        flags: LineFlags::RECONNECT_MARKER,
+        cursor: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PortConfig;
+    use crate::source::ScriptedSource;
+
+    fn test_meta() -> SessionMeta {
+        SessionMeta {
+            identity: PortIdentity::default(),
+            config: PortConfig::default(),
+            start_wall: chrono::Utc::now(),
+            app_version: "test".into(),
+            port_label: "test".into(),
+        }
+    }
+
+    fn collect_lines(handle: &ReaderHandle, timeout: Duration) -> (Vec<String>, Vec<ConnState>) {
+        let deadline = Instant::now() + timeout;
+        let mut lines = Vec::new();
+        let mut states = Vec::new();
+        while Instant::now() < deadline {
+            match handle.events.recv_timeout(Duration::from_millis(50)) {
+                Ok(ReaderEvent::Batch(b)) => {
+                    lines.extend(b.lines.into_iter().map(|l| l.text));
+                }
+                Ok(ReaderEvent::State(s)) => {
+                    states.push(s);
+                    if s == ConnState::Closed {
+                        break;
+                    }
+                }
+                Ok(ReaderEvent::Error(_)) => {}
+                Err(_) => {}
+            }
+        }
+        (lines, states)
+    }
+
+    #[test]
+    fn oneshot_delivers_lines_and_closes() {
+        let src = ScriptedSource::new(vec![
+            (b"hello\nwor".to_vec(), Duration::ZERO),
+            (b"ld\n".to_vec(), Duration::ZERO),
+        ])
+        .no_delays()
+        .eof_when_done();
+
+        let config = ReaderConfig {
+            port_id: PortId(0),
+            clock: SessionClock::new(),
+            session_dir: None,
+            meta: test_meta(),
+            terminal: crate::config::TerminalMode::Classic,
+            wake: Wake::none(),
+        };
+        let handle = spawn(config, SourceSpec::OneShot(Box::new(src)));
+        let (lines, states) = collect_lines(&handle, Duration::from_secs(2));
+        assert_eq!(lines, vec!["hello", "world"]);
+        assert!(states.contains(&ConnState::Connected));
+        assert!(states.contains(&ConnState::Closed));
+    }
+
+    #[test]
+    fn provisional_prompt_is_flushed() {
+        // A prompt with no newline must appear as a provisional line.
+        let src = ScriptedSource::new(vec![(b"> ".to_vec(), Duration::ZERO)]);
+        // Do NOT mark eof_when_done: returns Ok(0) forever, so the provisional
+        // path triggers. We shut down explicitly after collecting.
+        let config = ReaderConfig {
+            port_id: PortId(0),
+            clock: SessionClock::new(),
+            session_dir: None,
+            meta: test_meta(),
+            terminal: crate::config::TerminalMode::Classic,
+            wake: Wake::none(),
+        };
+        let handle = spawn(config, SourceSpec::OneShot(Box::new(src)));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut got_provisional = false;
+        while Instant::now() < deadline && !got_provisional {
+            if let Ok(ReaderEvent::Batch(b)) = handle.events.recv_timeout(Duration::from_millis(50))
+            {
+                for l in &b.lines {
+                    if l.text == "> " && l.flags.contains(LineFlags::PROVISIONAL) {
+                        got_provisional = true;
+                    }
+                }
+            }
+        }
+        assert!(got_provisional, "expected a provisional prompt line");
+        handle.shutdown();
+    }
+}
