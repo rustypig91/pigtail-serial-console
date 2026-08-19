@@ -1,4 +1,4 @@
-//! Settings window (spec §7.14, §5 M5): max lines, retention, theme.
+//! Settings window (spec §7.14, §5 M5): max lines, retention, theme, updates.
 
 use crate::app::App;
 
@@ -6,6 +6,8 @@ impl App {
     pub(crate) fn show_settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_settings;
         let mut changed = false;
+        // Started after the window closes its borrow on `self`.
+        let mut check_now = false;
         egui::Window::new("Settings")
             .open(&mut open)
             .resizable(false)
@@ -51,17 +53,45 @@ impl App {
                             changed = true;
                         }
                         ui.end_row();
+
+                        ui.label("Updates");
+                        changed |= ui
+                            .checkbox(
+                                &mut self.config.settings.check_updates,
+                                "check at startup",
+                            )
+                            .on_hover_text(
+                                "Asks GitHub for the newest release. \
+                                 The only network request pigtail makes.",
+                            )
+                            .changed();
+                        ui.end_row();
                     });
 
                 ui.separator();
                 ui.label(format!("Config: {}", self.paths.config_file.display()));
                 ui.label(format!("Sessions: {}", self.paths.sessions.display()));
-                ui.weak(concat!("pigtail v", env!("CARGO_PKG_VERSION")));
+                ui.horizontal(|ui| {
+                    ui.weak(concat!("pigtail v", env!("CARGO_PKG_VERSION")));
+                    let checking = self.update_rx.is_some();
+                    if ui
+                        .add_enabled(!checking, egui::Button::new("Check for updates"))
+                        .clicked()
+                    {
+                        check_now = true;
+                    }
+                    if checking {
+                        ui.spinner();
+                    }
+                });
             });
 
         self.show_settings = open;
         if changed {
             self.write_config();
+        }
+        if check_now {
+            self.start_update_check(true);
         }
     }
 }
