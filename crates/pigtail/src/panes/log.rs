@@ -1027,7 +1027,7 @@ fn draw_search_ticks(
         let y = rect.top() + frac * rect.height();
         painter.line_segment(
             [egui::pos2(x, y), egui::pos2(rect.right(), y)],
-            egui::Stroke::new(2.0, color),
+            egui::Stroke::new(2.0_f32, color),
         );
     }
 }

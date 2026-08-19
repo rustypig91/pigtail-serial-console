@@ -15,6 +15,7 @@ use serialcore::reader::{self, ConnState, ReaderEvent, SourceSpec};
 use serialcore::series::{Series, DEFAULT_CAPACITY};
 use serialcore::session::{self, SessionMeta};
 use serialcore::store::{IncomingLine, LineFlags, LineStore, PortId};
+use serialcore::update;
 use serialcore::wake::Wake;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -346,6 +347,17 @@ pub struct ConfigDialog {
     pub editing: Option<PortId>,
 }
 
+/// The update notice: what it says, and what its buttons do.
+pub struct UpdateDialog {
+    pub title: String,
+    pub message: String,
+    /// Release page the "Download" button opens. `None` when there is nothing to
+    /// download and the dialog is a plain acknowledgement.
+    pub download_url: Option<String>,
+    /// Version the "Skip this version" button records. `None` hides that button.
+    pub skip_version: Option<String>,
+}
+
 pub struct App {
     pub clock: SessionClock,
     pub config: Config,
@@ -381,6 +393,14 @@ pub struct App {
     pub show_search: bool,
     /// Set when search should grab keyboard focus next frame (e.g. after Ctrl+F).
     pub search_focus_request: bool,
+    /// `Some` while an update check is in flight.
+    pub update_rx: Option<Receiver<update::CheckResult>>,
+    /// True when the in-flight check came from Settings → "Check for updates".
+    /// A manual check always reports a result and ignores a previous skip; the
+    /// startup check stays silent unless there is a new version to announce.
+    pub update_manual: bool,
+    /// `Some` while the update notice is showing.
+    pub update_dialog: Option<UpdateDialog>,
 }
 
 impl App {
@@ -427,7 +447,17 @@ impl App {
             show_extract_win: false,
             show_search: false,
             search_focus_request: false,
+            update_rx: None,
+            update_manual: false,
+            update_dialog: None,
         };
+
+        // Silent startup check for a newer release. Debug builds are skipped: a
+        // working copy is routinely at the same version as — or ahead of — the
+        // published tag, so there is nothing useful to say about it.
+        if !cfg!(debug_assertions) && app.config.settings.check_updates {
+            app.start_update_check(false);
+        }
 
         // Snapshot the captures already on disk *before* opening anything, so a
         // tab is preloaded from its previous run, not the empty file its own
@@ -691,6 +721,63 @@ impl App {
             }
             Err(e) => tracing::warn!("serializing config: {e}"),
         }
+    }
+
+    /// Start a background check for a newer release. `manual` marks the explicit
+    /// Settings → "Check for updates" action, which reports a result either way;
+    /// the startup check only speaks up when there is a new version.
+    pub fn start_update_check(&mut self, manual: bool) {
+        if self.update_rx.is_some() {
+            return; // one already in flight
+        }
+        self.update_manual = manual;
+        self.update_rx = Some(update::spawn_check(self.wake.clone()));
+    }
+
+    /// Turn a finished update check into a dialog — or into silence. What to say
+    /// is decided in `serialcore::update`; this only words it.
+    fn poll_update_check(&mut self) {
+        // `try_recv` inside the `let` so the borrow of `update_rx` ends before we
+        // clear it below.
+        let Some(result) = self.update_rx.as_ref().and_then(|rx| rx.try_recv().ok()) else {
+            return;
+        };
+        self.update_rx = None;
+        if let Err(e) = &result {
+            tracing::warn!("update check: {e}");
+        }
+
+        let current = env!("CARGO_PKG_VERSION");
+        let notice = update::notice_for(
+            result,
+            current,
+            self.config.settings.skipped_version.as_deref(),
+            self.update_manual,
+        );
+
+        self.update_dialog = notice.map(|notice| match notice {
+            update::Notice::Available { version, url } => UpdateDialog {
+                title: "Update available".into(),
+                message: format!(
+                    "v{} is available — you're on v{current}.",
+                    version.trim_start_matches('v')
+                ),
+                download_url: Some(url),
+                skip_version: Some(version),
+            },
+            update::Notice::UpToDate => UpdateDialog {
+                title: "Up to date".into(),
+                message: format!("You're running the latest version (v{current})."),
+                download_url: None,
+                skip_version: None,
+            },
+            update::Notice::Failed(why) => UpdateDialog {
+                title: "Update check failed".into(),
+                message: why,
+                download_url: None,
+                skip_version: None,
+            },
+        });
     }
 
     /// Auto-connect any profile marked `auto_connect` whose device is present and
@@ -963,6 +1050,7 @@ pub fn parse_hex_color(s: &str) -> Option<egui::Color32> {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_enumerator();
+        self.poll_update_check();
 
         let max_lines = self.config.settings.max_lines;
         let mut any_data = false;
@@ -992,6 +1080,7 @@ impl eframe::App for App {
         self.show_config_dialog(ctx);
         self.show_tool_windows(ctx);
         self.show_settings_window(ctx);
+        self.show_update_dialog(ctx);
 
         // egui only draws when something asks it to, and nothing here animates on
         // its own clock, so an *open but silent* connection must not schedule
