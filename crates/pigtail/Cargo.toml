@@ -26,3 +26,35 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
+
+# `cargo deb -p pigtail` builds the Debian/Ubuntu package. Source paths are
+# relative to this manifest; cargo-deb rewrites "target/release" to the
+# per-target directory automatically when --target is passed.
+[package.metadata.deb]
+maintainer = "Christoffer Zakrisson <rustypig91@gmail.com>"
+copyright = "Christoffer Zakrisson"
+# The workspace LICENSE, used to generate /usr/share/doc/pigtail/copyright.
+license-file = ["../../LICENSE", "0"]
+section = "electronics"
+priority = "optional"
+extended-description = """\
+Pigtail is a serial terminal built around the parts of firmware debugging that \
+cause pain: reconnecting to a target by USB device identity rather than port \
+path, filtering that applies retroactively to captured scrollback, live \
+plotting of numeric values linked back to the log lines that produced them, \
+and continuous capture of raw bytes to disk."""
+# $auto reads the binary's ELF dependencies (libudev, libc, ...). The X11 and
+# xkb libraries are appended by hand because winit and glutin dlopen them, so
+# they never appear in the needed-list for $auto to find.
+depends = "$auto, libx11-6, libxcursor1, libxi6, libxrandr2, libxkbcommon0, libxkbcommon-x11-0"
+assets = [
+    ["target/release/pigtail", "usr/bin/", "755"],
+    ["packaging/linux/pigtail.desktop", "usr/share/applications/", "644"],
+    ["packaging/icons/hicolor/16x16/apps/pigtail.png", "usr/share/icons/hicolor/16x16/apps/", "644"],
+    ["packaging/icons/hicolor/32x32/apps/pigtail.png", "usr/share/icons/hicolor/32x32/apps/", "644"],
+    ["packaging/icons/hicolor/48x48/apps/pigtail.png", "usr/share/icons/hicolor/48x48/apps/", "644"],
+    ["packaging/icons/hicolor/64x64/apps/pigtail.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["packaging/icons/hicolor/128x128/apps/pigtail.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
+    ["packaging/icons/hicolor/256x256/apps/pigtail.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["packaging/icons/hicolor/512x512/apps/pigtail.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+]
