@@ -15,4 +15,5 @@ pub mod series;
 pub mod session;
 pub mod source;
 pub mod store;
+pub mod update;
 pub mod wake;
