@@ -6,4 +6,5 @@ mod log;
 mod plot;
 mod settings;
 mod transmit;
+mod update;
 mod windows;

@@ -1,0 +1,65 @@
+//! The update notice. Nothing here installs anything — "Download" opens the
+//! release page in the browser.
+
+use crate::app::App;
+
+impl App {
+    pub(crate) fn show_update_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &self.update_dialog else {
+            return;
+        };
+        // Decided inside the closure, acted on after it, so the handlers can
+        // touch `self` (config, dialog state) without borrowing it twice.
+        let mut open_url: Option<String> = None;
+        let mut skip: Option<String> = None;
+        let mut close = false;
+
+        egui::Window::new(&dialog.title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(&dialog.message);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if let Some(url) = &dialog.download_url {
+                        if ui.button("Download").clicked() {
+                            open_url = Some(url.clone());
+                        }
+                    }
+                    if let Some(version) = &dialog.skip_version {
+                        if ui
+                            .button("Skip this version")
+                            .on_hover_text("Don't mention this release again at startup")
+                            .clicked()
+                        {
+                            skip = Some(version.clone());
+                        }
+                    }
+                    // With nothing to download the dialog is only an
+                    // acknowledgement, and "Later" would imply a pending action.
+                    let dismiss = if dialog.download_url.is_some() {
+                        "Later"
+                    } else {
+                        "Ok"
+                    };
+                    if ui.button(dismiss).clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        if let Some(url) = open_url {
+            ctx.open_url(egui::OpenUrl::new_tab(url));
+            close = true;
+        }
+        if let Some(version) = skip {
+            self.config.settings.skipped_version = Some(version);
+            self.write_config();
+            close = true;
+        }
+        if close {
+            self.update_dialog = None;
+        }
+    }
+}

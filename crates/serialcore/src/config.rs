@@ -354,6 +354,14 @@ pub struct Settings {
     pub session_retention_days: u32,
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Ask GitHub for a newer release at startup. This is pigtail's only
+    /// outbound network request; off means it makes none.
+    #[serde(default = "default_check_updates")]
+    pub check_updates: bool,
+    /// A release the user chose to skip, which silences the startup notice until
+    /// something newer than this is published.
+    #[serde(default)]
+    pub skipped_version: Option<String>,
 }
 
 impl Default for Settings {
@@ -363,6 +371,8 @@ impl Default for Settings {
             timestamp_format: TimestampFormat::default(),
             session_retention_days: default_retention(),
             theme: default_theme(),
+            check_updates: default_check_updates(),
+            skipped_version: None,
         }
     }
 }
@@ -472,6 +482,9 @@ fn default_retention() -> u32 {
 fn default_theme() -> String {
     "dark".to_string()
 }
+fn default_check_updates() -> bool {
+    true
+}
 
 #[cfg(test)]
 mod tests {
@@ -518,6 +531,25 @@ mod tests {
         let s = cfg.to_toml().unwrap();
         let back = Config::from_toml(&s).unwrap();
         assert!(back.highlight.is_empty());
+    }
+
+    #[test]
+    fn update_keys_absent_means_checking_is_on() {
+        // A config written before these keys existed must still get the startup
+        // check, and must not look like it has already skipped a version.
+        let settings: Settings = toml::from_str("max_lines = 1000").unwrap();
+        assert!(settings.check_updates);
+        assert_eq!(settings.skipped_version, None);
+    }
+
+    #[test]
+    fn skipped_version_and_opt_out_round_trip() {
+        let mut cfg = Config::default();
+        cfg.settings.check_updates = false;
+        cfg.settings.skipped_version = Some("v0.2.0".into());
+        let back = Config::from_toml(&cfg.to_toml().unwrap()).unwrap();
+        assert!(!back.settings.check_updates);
+        assert_eq!(back.settings.skipped_version.as_deref(), Some("v0.2.0"));
     }
 
     #[test]
