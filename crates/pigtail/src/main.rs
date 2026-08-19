@@ -32,7 +32,7 @@ fn main() -> anyhow::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1100.0, 720.0])
         .with_min_inner_size([700.0, 400.0])
-        .with_title("Pigtail");
+        .with_title(concat!("Pigtail v", env!("CARGO_PKG_VERSION")));
     // Application/window icon, embedded at build time.
     match eframe::icon_data::from_png_bytes(include_bytes!("icon.png")) {
         Ok(icon) => viewport = viewport.with_icon(icon),
