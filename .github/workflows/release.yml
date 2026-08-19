@@ -60,7 +60,14 @@ jobs:
         if: startsWith(matrix.platform, 'ubuntu') # This must match the platform value defined above.
         run: |
           sudo apt-get update
-          sudo apt-get install -y libudev-dev libgtk-3-dev
+          # libudev-dev is the only build-time system dependency (serialport ->
+          # libudev-sys, found via pkg-config). The rest are runtime libraries
+          # that build-appimage.sh bundles into the AppImage by path; installing
+          # them explicitly keeps that lookup from silently coming up empty.
+          sudo apt-get install -y \
+            libudev-dev \
+            libx11-6 libxcursor1 libxi6 libxrandr2 \
+            libxkbcommon0 libxkbcommon-x11-0
 
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -94,6 +101,66 @@ jobs:
             echo "ASSET=$OUT.tar.gz" >> "$GITHUB_ENV"
           fi
 
+      # --- Windows installer -------------------------------------------------
+      # WiX v3 is not guaranteed to be present on the runner image, so fetch a
+      # pinned copy and drive candle/light directly. The same crates/pigtail/
+      # wix/main.wxs also works locally via `cargo wix -p pigtail`.
+      - name: Install WiX toolset (windows only)
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSfLo wix.zip \
+            https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip
+          7z x wix.zip -owix-bin >/dev/null
+          echo "$PWD/wix-bin" >> "$GITHUB_PATH"
+
+      - name: Build MSI installer (windows only)
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          MSI="pigtail-v${VERSION}-${{ matrix.target }}.msi"
+          # candle.exe is a native tool, so it needs Windows paths — bash's $PWD
+          # is an MSYS path here. GITHUB_WORKSPACE is already Windows-style.
+          WS="$GITHUB_WORKSPACE"
+          candle.exe \
+            -nologo -arch x64 \
+            -dVersion="$VERSION" \
+            -dPlatform=x64 \
+            -dCargoTargetBinDir="$WS/target/${{ matrix.target }}/release" \
+            -out obj/ \
+            "$WS/crates/pigtail/wix/main.wxs"
+          light.exe \
+            -nologo \
+            -ext WixUIExtension \
+            -cultures:en-us \
+            -out "$MSI" \
+            obj/main.wixobj
+          echo "MSI_ASSET=$MSI" >> "$GITHUB_ENV"
+
+      # --- Linux packages ----------------------------------------------------
+      - name: Build .deb package (ubuntu only)
+        if: startsWith(matrix.platform, 'ubuntu')
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-deb --locked
+          # --no-build reuses the release binary built above. cargo-deb prints
+          # the path of the package it wrote as its last line of stdout.
+          DEB="$(cargo deb -p pigtail --target ${{ matrix.target }} --no-build | tail -n1)"
+          echo "Built $DEB"
+          echo "DEB_ASSET=$DEB" >> "$GITHUB_ENV"
+
+      - name: Build AppImage (ubuntu only)
+        if: startsWith(matrix.platform, 'ubuntu')
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash crates/pigtail/packaging/linux/build-appimage.sh \
+            "target/${{ matrix.target }}/release/pigtail" "$VERSION" .
+          echo "APPIMAGE_ASSET=pigtail-v${VERSION}-x86_64.AppImage" >> "$GITHUB_ENV"
+
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
@@ -104,4 +171,10 @@ jobs:
           # tag; keep branch/manual builds as drafts so they don't publish.
           draft: ${{ !startsWith(github.ref, 'refs/tags/v') }}
           prerelease: false
-          files: ${{ env.ASSET }}
+          # Unset variables expand to nothing, so each platform uploads only the
+          # assets it actually produced.
+          files: |
+            ${{ env.ASSET }}
+            ${{ env.MSI_ASSET }}
+            ${{ env.DEB_ASSET }}
+            ${{ env.APPIMAGE_ASSET }}

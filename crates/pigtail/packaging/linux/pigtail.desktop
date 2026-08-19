@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Pigtail
+GenericName=Serial Terminal
+Comment=Desktop serial terminal for embedded firmware development
+Exec=pigtail
+Icon=pigtail
+Terminal=false
+Categories=Development;Electronics;
+Keywords=serial;uart;usb;terminal;embedded;firmware;console;
+StartupWMClass=pigtail

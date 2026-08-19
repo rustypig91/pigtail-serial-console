@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="windows-1252"?>
+<!--
+  WiX v3 source for the Pigtail MSI.
+
+  Built in CI by calling candle/light directly (see .github/workflows/release.yml),
+  and locally by `cargo wix -p pigtail`, which looks for this file at this path.
+  Both define the same preprocessor variables:
+
+    Version           the workspace version, e.g. 0.0.1
+    Platform          x64
+    CargoTargetBinDir directory holding the freshly built pigtail.exe
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+
+    <?if $(var.Platform) = x64 ?>
+        <?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
+    <?else ?>
+        <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
+    <?endif ?>
+
+    <Product
+        Id="*"
+        Name="Pigtail"
+        UpgradeCode="2A228B4C-BDDD-4A49-837E-0F43B737EBFA"
+        Manufacturer="Christoffer Zakrisson"
+        Language="1033"
+        Codepage="1252"
+        Version="$(var.Version)">
+
+        <Package Id="*"
+            Keywords="Installer"
+            Description="Pigtail — desktop serial terminal for embedded firmware development"
+            Manufacturer="Christoffer Zakrisson"
+            InstallerVersion="450"
+            Languages="1033"
+            Compressed="yes"
+            InstallScope="perMachine"
+            SummaryCodepage="1252" />
+
+        <!-- Installing a new version uninstalls the old one in place, so users
+             never end up with two entries in Add/Remove Programs. -->
+        <MajorUpgrade
+            Schedule="afterInstallInitialize"
+            DowngradeErrorMessage="A newer version of [ProductName] is already installed. Setup will now exit." />
+
+        <Media Id="1" Cabinet="media1.cab" EmbedCab="yes" DiskPrompt="CD-ROM #1" />
+        <Property Id="DiskPrompt" Value="Pigtail Installation" />
+
+        <Directory Id="TARGETDIR" Name="SourceDir">
+            <Directory Id="$(var.PlatformProgramFilesFolder)" Name="PFiles">
+                <Directory Id="APPLICATIONFOLDER" Name="Pigtail">
+
+                    <Component Id="MainExecutable" Guid="*">
+                        <File
+                            Id="PigtailExe"
+                            Name="pigtail.exe"
+                            DiskId="1"
+                            Source="$(var.CargoTargetBinDir)\pigtail.exe"
+                            KeyPath="yes">
+                            <Shortcut
+                                Id="StartMenuShortcut"
+                                Directory="ProgramMenuFolder"
+                                Name="Pigtail"
+                                Description="Desktop serial terminal for embedded firmware development"
+                                WorkingDirectory="APPLICATIONFOLDER"
+                                Icon="ProductIcon.ico"
+                                IconIndex="0"
+                                Advertise="yes" />
+                        </File>
+                    </Component>
+
+                    <Component Id="LicenseFile" Guid="*">
+                        <File
+                            Id="License"
+                            Name="License.rtf"
+                            DiskId="1"
+                            Source="$(sys.SOURCEFILEDIR)..\packaging\windows\License.rtf"
+                            KeyPath="yes" />
+                    </Component>
+
+                </Directory>
+            </Directory>
+
+            <!-- Target of the advertised Start Menu shortcut above. -->
+            <Directory Id="ProgramMenuFolder" Name="Programs" />
+        </Directory>
+
+        <Feature
+            Id="Complete"
+            Title="Pigtail"
+            Description="The Pigtail application."
+            Level="1"
+            ConfigurableDirectory="APPLICATIONFOLDER"
+            AllowAdvertise="no"
+            Display="expand"
+            Absent="disallow">
+            <ComponentRef Id="MainExecutable" />
+            <ComponentRef Id="LicenseFile" />
+        </Feature>
+
+        <!-- Icon shown in Add/Remove Programs and on the Start Menu shortcut. -->
+        <Icon Id="ProductIcon.ico" SourceFile="$(sys.SOURCEFILEDIR)..\packaging\windows\pigtail.ico" />
+        <Property Id="ARPPRODUCTICON" Value="ProductIcon.ico" />
+        <Property Id="ARPHELPLINK" Value="https://github.com/rustypig91/pigtail-serial-console" />
+        <Property Id="ARPURLINFOABOUT" Value="https://github.com/rustypig91/pigtail-serial-console" />
+
+        <!-- Welcome → license → install directory → progress → finish. -->
+        <UIRef Id="WixUI_InstallDir" />
+        <Property Id="WIXUI_INSTALLDIR" Value="APPLICATIONFOLDER" />
+        <WixVariable Id="WixUILicenseRtf" Value="$(sys.SOURCEFILEDIR)..\packaging\windows\License.rtf" />
+
+    </Product>
+</Wix>
