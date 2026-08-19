@@ -32,6 +32,7 @@ struct MenuAction {
     set_mark: bool,
     bookmark_line: Option<u64>,
     clear_selection: bool,
+    clear_console: bool,
     export: Option<bool>,
     toggle_dtr: bool,
     toggle_rts: bool,
@@ -531,6 +532,9 @@ impl App {
         if let Some(as_csv) = menu.export {
             self.export_active_view(active, as_csv);
         }
+        if menu.clear_console {
+            self.clear_console();
+        }
         if let Some(line) = menu.bookmark_line {
             if let Some(conn) = self.connections.get_mut(active) {
                 conn.selected = Some(line);
@@ -593,17 +597,20 @@ impl App {
             if as_csv {
                 out.push_str(&format!(
                     "{},{},{},{}\n",
-                    line.meta.ts.wall.format("%Y-%m-%dT%H:%M:%S%.6f"),
+                    // Local time like the console shows, but with the UTC offset
+                    // appended so the exported column stays unambiguous to
+                    // whatever reads it.
+                    line.meta
+                        .ts
+                        .wall
+                        .with_timezone(&chrono::Local)
+                        .format("%Y-%m-%dT%H:%M:%S%.6f%:z"),
                     line.meta.ts.micros,
                     line.meta.flags.0,
                     csv_escape(line.text),
                 ));
             } else {
-                out.push_str(&format!(
-                    "{}  {}\n",
-                    line.meta.ts.wall.format("%H:%M:%S%.3f"),
-                    line.text
-                ));
+                out.push_str(&format!("{}  {}\n", wall_clock(line.meta.ts), line.text));
             }
         }
 
@@ -713,6 +720,15 @@ fn console_menu(
             ui.close_menu();
         }
     });
+    ui.separator();
+    if ui
+        .button("Clear console")
+        .on_hover_text("Discards every line here and in the session capture on disk")
+        .clicked()
+    {
+        menu.clear_console = true;
+        ui.close_menu();
+    }
 }
 
 /// Re-engage `follow` once the user's own scrolling (wheel or scrollbar drag)
@@ -1069,16 +1085,26 @@ pub fn format_timestamp(
 ) -> String {
     match format {
         TimestampFormat::None => String::new(),
-        TimestampFormat::Absolute => ts.wall.format("%H:%M:%S%.3f").to_string(),
+        TimestampFormat::Absolute => wall_clock(ts),
         TimestampFormat::Delta => match prev_micros {
             Some(p) => format!("+{}", fmt_delta(ts.micros.saturating_sub(p))),
             None => format!(" {}", fmt_delta(0)),
         },
         TimestampFormat::Mark => match mark {
             Some(m) => format!("@{}", fmt_delta(ts.micros.saturating_sub(m))),
-            None => ts.wall.format("%H:%M:%S%.3f").to_string(),
+            None => wall_clock(ts),
         },
     }
+}
+
+/// A line's wall-clock time as the user's own clock reads it. Stamps are stored
+/// in UTC (a clock that can't jump backwards over a DST change); the conversion
+/// to local belongs at the point of display, and nowhere else.
+fn wall_clock(ts: Timestamp) -> String {
+    ts.wall
+        .with_timezone(&chrono::Local)
+        .format("%H:%M:%S%.3f")
+        .to_string()
 }
 
 fn fmt_delta(micros: u64) -> String {

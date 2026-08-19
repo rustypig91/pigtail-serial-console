@@ -13,7 +13,7 @@ use crate::config::{PortConfig, PortIdentity};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -79,6 +79,23 @@ impl SessionWriter {
 
     pub fn flush(&mut self) -> std::io::Result<()> {
         self.file.flush()?;
+        self.last_flush = Instant::now();
+        Ok(())
+    }
+
+    /// Discard every record written so far, leaving the header — the on-disk
+    /// half of "clear console". The session keeps writing to the same file, so
+    /// subsequent records carry their original micros-since-session-start and
+    /// still line up with the start time in the meta sidecar.
+    ///
+    /// The buffered writes are flushed first and the file position moved back
+    /// with the truncation: a `BufWriter` position left past the new end would
+    /// otherwise reopen the hole as a run of zero bytes.
+    pub fn truncate(&mut self) -> std::io::Result<()> {
+        self.file.flush()?;
+        let file = self.file.get_mut();
+        file.set_len(HEADER_LEN)?;
+        file.seek(SeekFrom::Start(HEADER_LEN))?;
         self.last_flush = Instant::now();
         Ok(())
     }
@@ -253,6 +270,27 @@ mod tests {
         assert_eq!(
             records,
             vec![(0, b"hello ".to_vec()), (1000, b"world\n".to_vec())]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn truncate_drops_records_and_keeps_writing() {
+        let dir = std::env::temp_dir().join(format!("smon-truncate-{}", std::process::id()));
+        let mut w = SessionWriter::create(&dir, &sample_meta()).unwrap();
+        w.write_record(0, b"cleared away\n").unwrap();
+        w.truncate().unwrap();
+        // The file is a valid, empty capture...
+        let bin = w.bin_path().to_path_buf();
+        assert!(read_tail_records(&bin, 1024).unwrap().is_empty());
+        // ...and the same session keeps appending to it, with no zero-filled
+        // hole left where the discarded record used to be.
+        w.write_record(2000, b"after\n").unwrap();
+        w.flush().unwrap();
+        assert_eq!(
+            read_tail_records(&bin, 1024).unwrap(),
+            vec![(2000, b"after\n".to_vec())]
         );
 
         std::fs::remove_dir_all(&dir).ok();

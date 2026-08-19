@@ -233,6 +233,40 @@ impl LineStore {
         }
     }
 
+    /// Close off a still-open last line, if there is one: the stream feeding it
+    /// has ended (the connection dropped), so it can never be continued. The
+    /// live edit cursor goes with the `PROVISIONAL` flag, or a caret keeps being
+    /// drawn on a line that is now history.
+    ///
+    /// The text is kept as it stands. The framer normally finalizes its tail
+    /// itself on disconnect ([`crate::framer::Framer::flush_final`]); this is
+    /// for the case where that tail is *empty* — a bare `\r` rewound the line
+    /// after its provisional was already shown — where the last thing displayed
+    /// is still the truest picture of what the device had on screen.
+    pub fn finalize_last_provisional(&mut self) {
+        if let Some(last) = self.lines.last_mut() {
+            if last.flags.contains(LineFlags::PROVISIONAL) {
+                last.flags.remove(LineFlags::PROVISIONAL);
+                last.cursor = None;
+            }
+        }
+    }
+
+    /// Drop every resident line (the user clearing the console).
+    ///
+    /// Absolute indices keep advancing rather than restarting at zero, exactly
+    /// as they do for eviction: anything holding an index (a bookmark, a search
+    /// hit, a merged-view entry, a plot point) then resolves to "gone" instead
+    /// of silently pointing at some unrelated later line.
+    pub fn clear(&mut self) {
+        self.arena_base += self.arena.len() as u64;
+        self.arena.clear();
+        self.line_base += self.lines.len() as u64;
+        self.lines.clear();
+        // Not `evicted_any`: nothing was dropped for want of capacity, so the
+        // "lines evicted" notice in the header stays quiet.
+    }
+
     /// Evict from the front in a ~10% chunk when over capacity. Never one line
     /// at a time (that would be O(n) per line, spec §7.7).
     fn maybe_evict(&mut self) {
@@ -333,6 +367,63 @@ mod tests {
         assert_eq!(line.text, "> ready");
         assert!(!line.meta.flags.contains(LineFlags::PROVISIONAL));
         assert!(!line.meta.flags.contains(LineFlags::CONTINUATION));
+    }
+
+    #[test]
+    fn finalize_last_provisional_keeps_the_text_but_drops_the_caret() {
+        let clock = SessionClock::new();
+        let mut s = LineStore::new(1000);
+        let mut prov = incoming("50%", &clock);
+        prov.flags = LineFlags::PROVISIONAL;
+        prov.cursor = Some(3);
+        let idx = s.append(prov);
+
+        // Connection lost with the line still open.
+        s.finalize_last_provisional();
+        let line = s.get(idx).unwrap();
+        assert_eq!(line.text, "50%", "what the device last showed is kept");
+        assert!(!line.meta.flags.contains(LineFlags::PROVISIONAL));
+        assert_eq!(line.meta.cursor, None, "no caret on a line that is history");
+
+        // And it is no longer a target for continuation: output from the
+        // reconnected stream starts its own line.
+        let mut cont = incoming("later", &clock);
+        cont.flags = LineFlags::CONTINUATION;
+        let idx2 = s.append(cont);
+        assert_eq!(idx2, idx + 1);
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn finalize_last_provisional_is_a_no_op_on_a_settled_line() {
+        let clock = SessionClock::new();
+        let mut s = LineStore::new(1000);
+        let idx = s.append(incoming("done", &clock));
+        s.finalize_last_provisional();
+        assert_eq!(s.get(idx).unwrap().text, "done");
+        assert_eq!(s.len(), 1);
+        // Empty store: nothing to finalize, and no panic.
+        LineStore::new(10).finalize_last_provisional();
+    }
+
+    #[test]
+    fn clear_empties_store_without_reusing_indices() {
+        let clock = SessionClock::new();
+        let mut s = LineStore::new(1000);
+        s.append(incoming("before", &clock));
+        s.append(incoming("also before", &clock));
+        s.clear();
+
+        assert!(s.is_empty());
+        assert_eq!(s.len(), 0);
+        assert!(!s.evicted_any(), "clearing is not eviction");
+        // Old indices read as gone, and the next line gets a fresh index rather
+        // than inheriting index 0's identity (and its bookmarks/search hits).
+        assert!(s.get(0).is_none());
+        let idx = s.append(incoming("after", &clock));
+        assert_eq!(idx, 2);
+        assert_eq!(s.get(2).unwrap().text, "after");
+        assert_eq!(s.first_abs_index(), 2);
     }
 
     #[test]

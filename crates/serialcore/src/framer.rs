@@ -116,6 +116,14 @@ impl Framer {
         }
     }
 
+    /// Forget the partially-framed line and any escape sequence in flight.
+    /// Used when the console is cleared: the bytes of the open line are gone
+    /// from the view and from the capture, so completing that line later would
+    /// resurrect text the user just deleted.
+    pub fn reset(&mut self) {
+        *self = Framer::with_mode(self.mode);
+    }
+
     /// Feed a chunk stamped at arrival. Completed lines are pushed onto `out`.
     pub fn push(&mut self, chunk: &[u8], ts: Timestamp, out: &mut Vec<FramedLine>) {
         let mut i = 0;
@@ -447,14 +455,21 @@ impl Framer {
         })
     }
 
-    /// Flush any pending tail as a final (terminated) line. Called at EOF, e.g.
-    /// when a one-shot source is exhausted, so the last unterminated line is
-    /// not lost.
+    /// Flush any pending tail as a final (terminated) line and reset the framer.
+    /// Called whenever the byte stream ends — a one-shot source exhausted, or a
+    /// connection lost — so the last unterminated line is neither lost nor left
+    /// open. Closing it matters beyond the bytes: an open line is emitted
+    /// `PROVISIONAL` and renders a caret, which would otherwise sit blinking on
+    /// a line that can no longer grow. The rest of the per-line state goes with
+    /// it (a half-parsed escape, an ambiguous trailing `\r`, the
+    /// already-emitted-provisional bookkeeping), so a stream that starts again
+    /// afterwards — a reconnect — begins a fresh line instead of continuing one
+    /// that belonged to the stream that ended.
     pub fn flush_final(&mut self, out: &mut Vec<FramedLine>) {
         if !self.tail.is_empty() {
             self.emit_line(out);
         }
-        self.pending_cr = false;
+        self.reset();
     }
 
     fn append_to_tail(&mut self, bytes: &[u8], ts: Timestamp, out: &mut Vec<FramedLine>) {
@@ -1018,6 +1033,60 @@ mod tests {
         assert!(out.is_empty());
         f.flush_final(&mut out);
         assert_eq!(texts(&out), vec!["no newline"]);
+    }
+
+    #[test]
+    fn flush_final_closes_the_open_line_and_starts_the_next_one_fresh() {
+        // A connection dropping mid-prompt. The prompt was already shown as a
+        // provisional line (caret and all), so its final form must arrive as a
+        // CONTINUATION that replaces it in place — not as a second copy — and
+        // must carry no cursor, since nothing more can be typed into a line
+        // whose connection is gone.
+        let mut f = Framer::with_mode(TerminalMode::Vt100);
+        let mut out = Vec::new();
+        f.push(b"usr:~$ ", ts(0), &mut out);
+        let prov = f.flush_provisional().unwrap();
+        assert!(prov.flags.contains(LineFlags::PROVISIONAL));
+        assert_eq!(prov.cursor, Some(7));
+
+        f.flush_final(&mut out);
+        assert_eq!(texts(&out), vec!["usr:~$ "]);
+        assert!(out[0].flags.contains(LineFlags::CONTINUATION));
+        assert!(!out[0].flags.contains(LineFlags::PROVISIONAL));
+        assert_eq!(out[0].cursor, None);
+
+        // Reconnected: the fresh prompt is its own line, not a continuation of
+        // the one that ended with the previous connection.
+        out.clear();
+        f.push(b"usr:~$ \n", ts(1), &mut out);
+        assert_eq!(texts(&out), vec!["usr:~$ "]);
+        assert!(!out[0].flags.contains(LineFlags::CONTINUATION));
+    }
+
+    #[test]
+    fn flush_final_drops_a_half_parsed_escape_and_pending_cr() {
+        // Bytes cut off mid-sequence belong to the stream that ended; the next
+        // connection's first byte must not be read as their continuation.
+        let mut f = Framer::with_mode(TerminalMode::Vt100);
+        let mut out = Vec::new();
+        f.push(b"a\x1b[2", ts(0), &mut out); // truncated CSI
+        f.flush_final(&mut out);
+        assert_eq!(texts(&out), vec!["a"]);
+
+        out.clear();
+        f.push(b"Db\n", ts(1), &mut out); // no longer a cursor-left command
+        assert_eq!(texts(&out), vec!["Db"]);
+
+        // Same for an ambiguous trailing CR: it must not swallow the LF that
+        // opens the reconnected stream.
+        let mut f = Framer::with_mode(TerminalMode::Vt100);
+        let mut out = Vec::new();
+        f.push(b"x\r", ts(0), &mut out);
+        f.flush_final(&mut out);
+        assert_eq!(texts(&out), vec!["x"]);
+        out.clear();
+        f.push(b"\ny\n", ts(1), &mut out);
+        assert_eq!(texts(&out), vec!["", "y"]);
     }
 
     #[test]

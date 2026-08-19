@@ -153,7 +153,11 @@ fn preload_last_session(
     conn.store.append(IncomingLine {
         text: format!(
             "previous session · {}",
-            meta.start_wall.format("%Y-%m-%d %H:%M")
+            // Local time, like every other wall-clock stamp on screen; only
+            // storage is UTC.
+            meta.start_wall
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
         ),
         ts: last_ts,
         port: conn.id,
@@ -239,7 +243,17 @@ impl Connection {
         while let Ok(ev) = self.handle.events.try_recv() {
             changed = true;
             match ev {
-                ReaderEvent::State(s) => self.state = s,
+                ReaderEvent::State(s) => {
+                    // Leaving Connected ends whatever line was still open. The
+                    // reader finalizes it for us when it had bytes in hand; this
+                    // catches the line it had already rewound (a bare `\r`), for
+                    // which it has nothing left to send and whose caret would
+                    // otherwise stay lit across the outage and beyond it.
+                    if s != ConnState::Connected {
+                        self.store.finalize_last_provisional();
+                    }
+                    self.state = s;
+                }
                 ReaderEvent::Error(e) => {
                     tracing::warn!(port = self.id.0, "{e}");
                     self.last_error = Some(e);
@@ -587,7 +601,10 @@ impl App {
             conn.rts = rts;
             conn.last_error = None;
             // Console (store, raw_ring, filters, search, plot series, marks,
-            // selection, scroll position) is intentionally left untouched.
+            // selection, scroll position) is intentionally left untouched —
+            // except for closing any line the old reader left open, since the
+            // reader that would have completed it is being replaced.
+            conn.store.finalize_last_provisional();
             conn.store.append(IncomingLine {
                 text: marker_text,
                 ts: marker_ts,
@@ -966,6 +983,47 @@ impl App {
             self.merged.extend(fresh);
             self.merged.sort_by_key(|e| e.micros);
         }
+    }
+
+    /// Clear the console: drop every line on screen *and* the capture on disk.
+    ///
+    /// Deliberately destructive — the point is that cleared output is gone, not
+    /// merely scrolled away, so it also can't come back as preloaded history on
+    /// the next launch. From the merged view every port is cleared, since that
+    /// is what the window is showing; otherwise just the active tab.
+    ///
+    /// Bytes already in flight (read but not yet drained from the reader
+    /// channel) still land afterwards. That's a line or two at most, and they
+    /// are output that arrived after the click.
+    pub fn clear_console(&mut self) {
+        let targets: Vec<usize> = if self.merged_selected {
+            (0..self.connections.len()).collect()
+        } else {
+            self.active_index().into_iter().collect()
+        };
+        for i in targets {
+            let conn = &mut self.connections[i];
+            conn.handle.clear_log();
+            conn.store.clear();
+            conn.raw_ring.clear();
+            // Everything derived from the lines that just went away. The dirty
+            // flags make the next frame rebuild both indices against the now
+            // empty store rather than leaving stale absolute indices behind.
+            conn.filter_dirty = true;
+            conn.search_dirty = true;
+            conn.search_matches.clear();
+            conn.search_pos = None;
+            conn.search_tested_upto = conn.store.next_abs_index();
+            conn.series.clear();
+            conn.series_index.clear();
+            conn.selected = None;
+            conn.scroll_to = None;
+            conn.mark_micros = None;
+            conn.new_since_scroll = 0;
+            // An empty console has nothing to scroll back to, so resume live.
+            conn.follow = true;
+        }
+        self.merged_dirty = true;
     }
 
     /// Toggle a bookmark on the active connection's selected line.

@@ -12,6 +12,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// A moment stamped on chunk arrival.
+///
+/// `wall` is kept in UTC everywhere it is stored or written to disk; the UI
+/// converts to the local zone at the moment it formats a timestamp, so a
+/// capture stays readable across a DST change or a machine in another zone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timestamp {
     /// Wall-clock, for display only.
