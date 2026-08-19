@@ -22,7 +22,6 @@ Most serial terminals just show you text. Pigtail is built around the parts of f
 - Export the current (filtered) view to `.txt` or `.csv`
 - Startup notice when a newer release is published, with "skip this version"; the
   only network request pigtail makes, and switchable off in Settings
-<<<<<<< HEAD
 
 ## Installing
 
@@ -38,8 +37,6 @@ Every release publishes installers alongside the plain binaries on the
 
 The MSI is not code-signed, so Windows SmartScreen shows an "unrecognized app"
 warning on first run; choose "More info" → "Run anyway".
-=======
->>>>>>> add-update-check
 
 ## Building
 
