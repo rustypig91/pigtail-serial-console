@@ -60,7 +60,14 @@ jobs:
         if: startsWith(matrix.platform, 'ubuntu') # This must match the platform value defined above.
         run: |
           sudo apt-get update
-          sudo apt-get install -y libudev-dev libgtk-3-dev
+          # libudev-dev is the only build-time system dependency (serialport ->
+          # libudev-sys, found via pkg-config). The rest are runtime libraries
+          # that build-appimage.sh bundles into the AppImage by path; installing
+          # them explicitly keeps that lookup from silently coming up empty.
+          sudo apt-get install -y \
+            libudev-dev \
+            libx11-6 libxcursor1 libxi6 libxrandr2 \
+            libxkbcommon0 libxkbcommon-x11-0
 
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
