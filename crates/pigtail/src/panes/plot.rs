@@ -116,7 +116,7 @@ impl App {
                     pui.vline(
                         VLine::new(t)
                             .color(egui::Color32::from_gray(180))
-                            .width(1.0),
+                            .width(1.0_f32),
                     );
                 }
 
