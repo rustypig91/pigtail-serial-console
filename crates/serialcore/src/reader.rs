@@ -77,6 +77,9 @@ enum ReaderCommand {
     SetDtr(bool),
     SetRts(bool),
     SendBreak,
+    /// Throw away the capture written so far and the partly-framed line, so
+    /// clearing the console clears the log on disk too.
+    ClearLog,
     Shutdown,
 }
 
@@ -128,6 +131,13 @@ impl ReaderHandle {
     }
     pub fn send_break(&self) {
         let _ = self.cmd.send(ReaderCommand::SendBreak);
+    }
+    /// Truncate this port's session capture back to its header and drop
+    /// whatever the reader still holds unsent, so output the user cleared from
+    /// the console doesn't survive on disk (or come back as preloaded history
+    /// next launch).
+    pub fn clear_log(&self) {
+        let _ = self.cmd.send(ReaderCommand::ClearLog);
     }
 
     /// Signal shutdown and join the thread.
@@ -250,6 +260,10 @@ fn run(
 
     let mut framer = Framer::with_mode(config.terminal);
     let mut backlog: Vec<Batch> = Vec::new();
+    // Lives outside the connect loop only so a `ClearLog` arriving during a
+    // reconnect backoff can empty it too; it is always drained before a
+    // disconnect, so each connection still starts with an empty batch.
+    let mut pending = Batch::default();
     let mut backoff = Duration::from_millis(100);
     let mut lost_at: Option<Instant> = None;
     let mut first_connect = true;
@@ -273,7 +287,13 @@ fn run(
                         return;
                     }
                     // Wait out the backoff while remaining responsive to Shutdown.
-                    if wait_or_shutdown(&cmd_rx, backoff) {
+                    let targets = ClearTargets {
+                        writer: &mut writer,
+                        framer: &mut framer,
+                        pending: &mut pending,
+                        backlog: &mut backlog,
+                    };
+                    if wait_or_shutdown(&cmd_rx, backoff, targets, &event_tx) {
                         event_tx.send(ReaderEvent::State(ConnState::Closed));
                         return;
                     }
@@ -297,14 +317,19 @@ fn run(
 
         // Read loop.
         let mut buf = vec![0u8; READ_BUF];
-        let mut pending = Batch::default();
         let mut last_send = Instant::now();
         let mut last_byte = Instant::now();
         let mut provisional_flushed = false;
 
         loop {
             // Handle any queued commands.
-            match drain_commands(&cmd_rx, source.as_mut(), &event_tx) {
+            let targets = ClearTargets {
+                writer: &mut writer,
+                framer: &mut framer,
+                pending: &mut pending,
+                backlog: &mut backlog,
+            };
+            match drain_commands(&cmd_rx, source.as_mut(), targets, &event_tx) {
                 CommandOutcome::Shutdown => {
                     // Flush and exit.
                     framer.flush_final(&mut pending.lines);
@@ -364,7 +389,12 @@ fn run(
             drain_backlog(&mut backlog, &event_tx);
         }
 
-        // Left the read loop due to disconnect.
+        // Left the read loop due to disconnect. The line being framed will never
+        // receive its terminator, so close it here rather than carrying it into
+        // the next connection: its provisional form is already on screen wearing
+        // a caret, and the reconnect marker would otherwise land *below* a line
+        // still presenting itself as the live one.
+        framer.flush_final(&mut pending.lines);
         flush_batch(&mut pending, &mut backlog, &event_tx);
         drain_backlog(&mut backlog, &event_tx);
         if let Some(w) = &mut writer {
@@ -424,14 +454,54 @@ enum CommandOutcome {
     Shutdown,
 }
 
+/// State a `ClearLog` command has to reach into: everything holding bytes that
+/// the user just deleted from the console.
+struct ClearTargets<'a> {
+    writer: &'a mut Option<SessionWriter>,
+    framer: &'a mut Framer,
+    pending: &'a mut Batch,
+    backlog: &'a mut Vec<Batch>,
+}
+
+/// Discard the capture written so far plus everything still queued here. Data
+/// already handed to the channel is the UI's, and is dropped on its side.
+fn clear_log(targets: ClearTargets<'_>, event_tx: &EventTx) {
+    targets.pending.lines.clear();
+    targets.pending.raw.clear();
+    targets.backlog.clear();
+    targets.framer.reset();
+    if let Some(w) = targets.writer {
+        if let Err(e) = w.truncate() {
+            event_tx.send(ReaderEvent::Error(format!("clear log: {e}")));
+        }
+    }
+}
+
 fn drain_commands(
     cmd_rx: &Receiver<ReaderCommand>,
     source: &mut dyn ByteSource,
+    targets: ClearTargets<'_>,
     event_tx: &EventTx,
 ) -> CommandOutcome {
+    let ClearTargets {
+        writer,
+        framer,
+        pending,
+        backlog,
+    } = targets;
     while let Ok(cmd) = cmd_rx.try_recv() {
         match cmd {
             ReaderCommand::Shutdown => return CommandOutcome::Shutdown,
+            // Reborrowed rather than moved: another command may follow it.
+            ReaderCommand::ClearLog => clear_log(
+                ClearTargets {
+                    writer: &mut *writer,
+                    framer: &mut *framer,
+                    pending: &mut *pending,
+                    backlog: &mut *backlog,
+                },
+                event_tx,
+            ),
             ReaderCommand::Transmit(bytes) => {
                 if let Err(e) = source.write(&bytes) {
                     event_tx.send(ReaderEvent::Error(format!("transmit: {e}")));
@@ -484,9 +554,21 @@ fn drain_backlog(backlog: &mut Vec<Batch>, event_tx: &EventTx) {
 }
 
 /// Sleep for `dur`, returning `true` if a Shutdown arrived meanwhile.
-fn wait_or_shutdown(cmd_rx: &Receiver<ReaderCommand>, dur: Duration) -> bool {
+fn wait_or_shutdown(
+    cmd_rx: &Receiver<ReaderCommand>,
+    dur: Duration,
+    targets: ClearTargets<'_>,
+    event_tx: &EventTx,
+) -> bool {
     match cmd_rx.recv_timeout(dur) {
         Ok(ReaderCommand::Shutdown) => true,
+        // Handled even while disconnected: the capture is still on disk, and a
+        // console cleared during an outage must not have its history reappear
+        // as preloaded output on the next launch.
+        Ok(ReaderCommand::ClearLog) => {
+            clear_log(targets, event_tx);
+            false
+        }
         Ok(_) => false, // ignore control commands while disconnected
         Err(crossbeam_channel::RecvTimeoutError::Timeout) => false,
         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => true,
@@ -563,6 +645,42 @@ mod tests {
         assert_eq!(lines, vec!["hello", "world"]);
         assert!(states.contains(&ConnState::Connected));
         assert!(states.contains(&ConnState::Closed));
+    }
+
+    #[test]
+    fn losing_the_connection_closes_the_open_line() {
+        // A prompt with no terminator, then the device goes away. The line can
+        // never be completed by the device, so the reader must close it itself:
+        // left open it would keep its PROVISIONAL flag and its caret, which the
+        // console draws — a live-looking cursor on a dead connection, sitting
+        // above the "reconnected" marker once the device comes back.
+        let src = ScriptedSource::new(vec![(b"usr:~$ ".to_vec(), Duration::ZERO)])
+            .no_delays()
+            .eof_when_done();
+        let config = ReaderConfig {
+            port_id: PortId(0),
+            clock: SessionClock::new(),
+            session_dir: None,
+            meta: test_meta(),
+            terminal: crate::config::TerminalMode::Vt100,
+            wake: Wake::none(),
+        };
+        let handle = spawn(config, SourceSpec::OneShot(Box::new(src)));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut lines: Vec<FramedLine> = Vec::new();
+        while Instant::now() < deadline {
+            match handle.events.recv_timeout(Duration::from_millis(50)) {
+                Ok(ReaderEvent::Batch(b)) => lines.extend(b.lines),
+                Ok(ReaderEvent::State(ConnState::Closed)) => break,
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        let last = lines.last().expect("the prompt must not be lost");
+        assert_eq!(last.text, "usr:~$ ");
+        assert!(!last.flags.contains(LineFlags::PROVISIONAL));
+        assert_eq!(last.cursor, None);
     }
 
     #[test]
