@@ -139,6 +139,29 @@ jobs:
             obj/main.wixobj
           echo "MSI_ASSET=$MSI" >> "$GITHUB_ENV"
 
+      # The click-through setup.exe that sits alongside the MSI. Runs under
+      # PowerShell rather than bash because ISCC's /D and /O switches would be
+      # mangled by MSYS path conversion.
+      - name: Build setup.exe installer (windows only)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe'
+          Invoke-WebRequest -Uri $url -OutFile innosetup.exe
+          # /PORTABLE=1 unpacks the toolset instead of installing it.
+          $p = Start-Process -FilePath .\innosetup.exe -Wait -PassThru -NoNewWindow `
+            -ArgumentList '/PORTABLE=1', '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$env:GITHUB_WORKSPACE\inno"
+          if ($p.ExitCode -ne 0) { throw "unpacking Inno Setup failed with exit code $($p.ExitCode)" }
+          & "$env:GITHUB_WORKSPACE\inno\ISCC.exe" `
+            "/DAppVersion=$($env:VERSION)" `
+            "/DSourceBinDir=$env:GITHUB_WORKSPACE\target\${{ matrix.target }}\release" `
+            "/O$env:GITHUB_WORKSPACE" `
+            "$env:GITHUB_WORKSPACE\crates\pigtail\packaging\windows\pigtail.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          "SETUP_ASSET=pigtail-v$($env:VERSION)-x86_64-setup.exe" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       # --- Linux packages ----------------------------------------------------
       - name: Build .deb package (ubuntu only)
         if: startsWith(matrix.platform, 'ubuntu')
@@ -175,6 +198,7 @@ jobs:
           # assets it actually produced.
           files: |
             ${{ env.ASSET }}
+            ${{ env.SETUP_ASSET }}
             ${{ env.MSI_ASSET }}
             ${{ env.DEB_ASSET }}
             ${{ env.APPIMAGE_ASSET }}

@@ -30,13 +30,16 @@ Every release publishes installers alongside the plain binaries on the
 
 | Platform | Asset | Notes |
 | --- | --- | --- |
-| Windows | `pigtail-v<version>-x86_64-pc-windows-msvc.msi` | Install wizard; adds a Start Menu entry and an Add/Remove Programs entry. Installing a newer version replaces the old one in place. |
+| Windows | `pigtail-v<version>-x86_64-setup.exe` | The one most people want. Install wizard with an optional desktop shortcut; installs for all users, or into your own profile if you lack admin rights. |
+| Windows | `pigtail-v<version>-x86_64-pc-windows-msvc.msi` | Same application, for scripted or managed deployment (`msiexec /i ... /qn`, Group Policy). Adds a Start Menu entry and an Add/Remove Programs entry. |
 | Debian/Ubuntu | `pigtail_<version>-1_amd64.deb` | `sudo apt install ./pigtail_<version>-1_amd64.deb` — pulls in its own dependencies and registers a desktop entry. |
 | Any Linux | `pigtail-v<version>-x86_64.AppImage` | `chmod +x` and run; no installation, bundles its libraries. Needs the host's GPU drivers for OpenGL. |
 | Portable | `.zip` / `.tar.gz` | Just the binary, no installation. |
 
-The MSI is not code-signed, so Windows SmartScreen shows an "unrecognized app"
-warning on first run; choose "More info" → "Run anyway".
+Neither Windows installer is code-signed, so SmartScreen shows an
+"unrecognized app" warning on first run; choose "More info" → "Run anyway".
+Install one or the other, not both — Windows treats them as separate products
+and each keeps its own Add/Remove Programs entry.
 
 ## Building
 
@@ -55,6 +58,8 @@ Run in development with `cargo run -p pigtail`.
 CI does this on every tag, but each one can be built by hand:
 
 ```sh
+ISCC /DAppVersion=0.2.0 /DSourceBinDir=target\release \
+    crates\pigtail\packaging\windows\pigtail.iss        # setup.exe (needs Inno Setup 6)
 cargo wix -p pigtail                                    # Windows .msi (needs cargo-wix + WiX v3)
 cargo deb -p pigtail                                    # .deb (needs cargo-deb)
 crates/pigtail/packaging/linux/build-appimage.sh \
@@ -65,8 +70,8 @@ crates/pigtail/packaging/linux/build-appimage.sh \
 
 - `crates/serialcore` — UI-agnostic engine: port enumeration, framing, storage, filtering, extraction. No GUI dependency.
 - `crates/pigtail` — the egui application.
-- `crates/pigtail/wix` — WiX source for the Windows installer.
-- `crates/pigtail/packaging` — icons, desktop entry, and the AppImage build script.
+- `crates/pigtail/wix` — WiX source for the Windows MSI.
+- `crates/pigtail/packaging` — icons, desktop entry, the Inno Setup script for `setup.exe`, and the AppImage build script.
 
 ## License
 
