@@ -95,59 +95,124 @@ fn snapshot_captures(sessions_dir: &std::path::Path) -> Vec<(PathBuf, SessionMet
     out
 }
 
-/// Preload the most recent prior capture for `identity` into `conn.store`, then
-/// append a boundary marker, so a reopened tab shows the output it had before
-/// the app was last closed with new live output continuing below.
+/// Order this device's captures oldest-first.
+///
+/// Sorting on `start_wall` alone is not enough: it is the app's clock anchor,
+/// so every capture written in one run of the app carries the same value. The
+/// micros stamp on the first record breaks those ties, being measured from that
+/// same anchor.
+fn captures_for<'a>(
+    captures: &'a [(PathBuf, SessionMeta)],
+    identity: &PortIdentity,
+) -> Vec<(&'a PathBuf, &'a SessionMeta)> {
+    let mut mine: Vec<(&PathBuf, &SessionMeta, u64)> = captures
+        .iter()
+        .filter(|(_, m)| &m.identity == identity)
+        .map(|(path, m)| {
+            let first = session::read_first_micros(path).ok().flatten().unwrap_or(0);
+            (path, m, first)
+        })
+        .collect();
+    mine.sort_by_key(|(_, m, first)| (m.start_wall, *first));
+    mine.into_iter().map(|(p, m, _)| (p, m)).collect()
+}
+
+/// Stored history ready to replay: one entry per capture, oldest first, each
+/// pairing the capture's metadata with the tail of its raw records.
+type RestoredHistory<'a> = Vec<(&'a SessionMeta, Vec<(u64, Vec<u8>)>)>;
+
+/// Collect this device's stored history, walking back from the newest capture
+/// until `budget` bytes of raw records are covered. Returns the captures
+/// oldest-first, each with the tail of its records, ready to replay.
+fn gather_history<'a>(
+    captures: &'a [(PathBuf, SessionMeta)],
+    identity: &PortIdentity,
+    mut budget: usize,
+) -> RestoredHistory<'a> {
+    let mine = captures_for(captures, identity);
+    let mut restored: RestoredHistory<'a> = Vec::new();
+    for (path, meta) in mine.iter().rev() {
+        if budget == 0 {
+            break;
+        }
+        if let Ok(records) = session::read_tail_records(path, budget) {
+            let used: usize = records.iter().map(|(_, b)| b.len()).sum();
+            budget = budget.saturating_sub(used);
+            if !records.is_empty() {
+                restored.push((*meta, records));
+            }
+        }
+        // A capture the user cleared mid-session holds only what arrived after
+        // the clear, and everything older was discarded on purpose: stop here
+        // rather than putting it back.
+        if meta.cleared {
+            break;
+        }
+    }
+    restored.reverse();
+    restored
+}
+
+/// Preload the prior captures for `identity` into `conn.store`, then append a
+/// boundary marker, so a reopened tab shows the output it had before the app
+/// was last closed with new live output continuing below.
+///
+/// History is gathered from the newest capture backwards until
+/// `PRELOAD_TAIL_BYTES` is filled, rather than from the newest one alone. A
+/// single run can leave several captures behind — applying new port options
+/// respawns the reader onto a fresh one — and what the console showed at exit
+/// was itself part restored, part live, so stopping at the newest capture
+/// throws away output that was on screen when the app closed.
 fn preload_last_session(
     conn: &mut Connection,
     captures: &[(PathBuf, SessionMeta)],
     identity: &PortIdentity,
 ) {
-    let Some((path, meta)) = captures
-        .iter()
-        .filter(|(_, m)| &m.identity == identity)
-        .max_by_key(|(_, m)| m.start_wall)
-    else {
+    let restored = gather_history(captures, identity, PRELOAD_TAIL_BYTES);
+    let Some((newest, _)) = restored.last() else {
         return;
     };
-    let Ok(records) = session::read_tail_records(path, PRELOAD_TAIL_BYTES) else {
-        return;
-    };
-    if records.is_empty() {
-        return;
-    }
+    let newest = *newest;
 
     // Re-frame the raw bytes exactly as the reader did, stamping each line with
     // the *original* wall-clock time (start of that capture plus its offset) so
-    // absolute timestamps read as when the data actually arrived.
-    let mut framer = Framer::with_mode(conn.port_config.terminal);
-    let mut framed = Vec::new();
-    for (micros, bytes) in &records {
-        let ts = Timestamp {
-            wall: meta.start_wall + chrono::Duration::microseconds(*micros as i64),
-            micros: *micros,
-        };
-        framer.push(bytes, ts, &mut framed);
-    }
-    framer.flush_final(&mut framed);
-    if framed.is_empty() {
-        return;
-    }
-
-    let last_ts = framed.last().map(|l| l.ts).unwrap_or(Timestamp {
-        wall: meta.start_wall,
+    // absolute timestamps read as when the data actually arrived. Each capture
+    // is framed on its own: they are separate streams, and the last line of one
+    // must not swallow the first line of the next.
+    let mut last_ts = Timestamp {
+        wall: newest.start_wall,
         micros: 0,
-    });
-    for line in framed {
-        let styled = serialcore::ansi::parse_line(&line.text, line.cursor);
-        conn.store.append(IncomingLine {
-            text: styled.text,
-            ts: line.ts,
-            port: conn.id,
-            flags: line.flags,
-            spans: styled.spans,
-            cursor: styled.cursor.map(|c| c as u32),
-        });
+    };
+    let mut any = false;
+    for (meta, records) in &restored {
+        let mut framer = Framer::with_mode(conn.port_config.terminal);
+        let mut framed = Vec::new();
+        for (micros, bytes) in records {
+            let ts = Timestamp {
+                wall: meta.start_wall + chrono::Duration::microseconds(*micros as i64),
+                micros: *micros,
+            };
+            framer.push(bytes, ts, &mut framed);
+        }
+        framer.flush_final(&mut framed);
+        if let Some(line) = framed.last() {
+            last_ts = line.ts;
+            any = true;
+        }
+        for line in framed {
+            let styled = serialcore::ansi::parse_line(&line.text, line.cursor);
+            conn.store.append(IncomingLine {
+                text: styled.text,
+                ts: line.ts,
+                port: conn.id,
+                flags: line.flags,
+                spans: styled.spans,
+                cursor: styled.cursor.map(|c| c as u32),
+            });
+        }
+    }
+    if !any {
+        return;
     }
 
     // Boundary between restored history (above) and live output (below).
@@ -156,7 +221,8 @@ fn preload_last_session(
             "previous session · {}",
             // Local time, like every other wall-clock stamp on screen; only
             // storage is UTC.
-            meta.start_wall
+            newest
+                .start_wall
                 .with_timezone(&chrono::Local)
                 .format("%Y-%m-%d %H:%M")
         ),
@@ -603,6 +669,7 @@ impl App {
             start_wall: self.clock.start_wall(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             port_label: identity.label(),
+            cleared: false,
         };
         let reader_config = reader::ReaderConfig {
             port_id: id,
@@ -1188,5 +1255,121 @@ impl eframe::App for App {
         if any_data {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serialcore::session::SessionWriter;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pigtail-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        dir
+    }
+
+    fn identity(serial: &str) -> PortIdentity {
+        PortIdentity {
+            vid: Some(0x0483),
+            pid: Some(0x374B),
+            serial_number: Some(serial.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Write a capture holding `records`, returning what `snapshot_captures`
+    /// would have produced for it.
+    fn capture(
+        dir: &std::path::Path,
+        identity: &PortIdentity,
+        start: chrono::DateTime<chrono::Utc>,
+        records: &[(u64, &[u8])],
+    ) -> (PathBuf, SessionMeta) {
+        let meta = SessionMeta {
+            identity: identity.clone(),
+            config: PortConfig::default(),
+            start_wall: start,
+            app_version: "test".into(),
+            port_label: identity.label(),
+            cleared: false,
+        };
+        let mut w = SessionWriter::create(dir, &meta).unwrap();
+        for (micros, bytes) in records {
+            w.write_record(*micros, bytes).unwrap();
+        }
+        w.flush().unwrap();
+        (w.bin_path().to_path_buf(), meta)
+    }
+
+    fn texts(restored: &RestoredHistory<'_>) -> Vec<String> {
+        restored
+            .iter()
+            .flat_map(|(_, records)| records.iter())
+            .map(|(_, bytes)| String::from_utf8_lossy(bytes).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn history_spans_every_capture_of_the_device() {
+        let dir = scratch("history");
+        let dev = identity("A1");
+        // One run of the app leaves several captures behind — applying new port
+        // options respawns the reader onto a fresh one — and they all carry the
+        // app clock's `start_wall`, so only the record stamps order them.
+        let run = chrono::Utc::now();
+        let older = capture(&dir, &dev, run, &[(1_000, b"before the reconnect\n")]);
+        let newer = capture(&dir, &dev, run, &[(9_000, b"after it\n")]);
+        // A second device's capture must not leak into this one's history.
+        let other = capture(&dir, &identity("B2"), run, &[(2_000, b"other device\n")]);
+
+        let captures = vec![newer, older, other];
+        let restored = gather_history(&captures, &dev, 1 << 20);
+        assert_eq!(
+            texts(&restored),
+            vec!["before the reconnect\n", "after it\n"],
+            "both captures restore, oldest first"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn history_stops_at_a_cleared_capture() {
+        let dir = scratch("cleared");
+        let dev = identity("A1");
+        let run = chrono::Utc::now();
+        let older = capture(&dir, &dev, run, &[(1_000, b"cleared away\n")]);
+        let mut newer = capture(&dir, &dev, run, &[(9_000, b"kept\n")]);
+        newer.1.cleared = true;
+
+        let captures = vec![older, newer];
+        let restored = gather_history(&captures, &dev, 1 << 20);
+        assert_eq!(
+            texts(&restored),
+            vec!["kept\n"],
+            "output discarded by Clear console does not come back"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn history_is_bounded_by_the_byte_budget() {
+        let dir = scratch("budget");
+        let dev = identity("A1");
+        let run = chrono::Utc::now();
+        let older = capture(&dir, &dev, run, &[(1_000, b"0123456789")]);
+        let newer = capture(&dir, &dev, run, &[(9_000, b"0123456789")]);
+
+        let captures = vec![older, newer];
+        let restored = gather_history(&captures, &dev, 10);
+        assert_eq!(
+            texts(&restored).len(),
+            1,
+            "the budget stops the walk at the newest capture"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
