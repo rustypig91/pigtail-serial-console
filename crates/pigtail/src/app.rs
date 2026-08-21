@@ -2,6 +2,7 @@
 //! `panes` modules; holds no IO — data arrives from reader threads via channels.
 
 use crate::paths::AppPaths;
+use crate::wrap::WrapIndex;
 use crossbeam_channel::Receiver;
 use serialcore::clock::{SessionClock, Timestamp};
 use serialcore::config::{Config, ExtractRule, PortConfig, PortIdentity, SavedConnection};
@@ -192,6 +193,20 @@ pub struct Connection {
     /// height is computed directly (no measured-content feedback, which would
     /// chase noise and jitter). Stable frame-to-frame; a stale value is harmless.
     pub pin_view_h: f32,
+    /// Running visual-row totals for the console, which stop matching line
+    /// counts as soon as one long line wraps onto several rows.
+    pub wrap_index: WrapIndex,
+    /// Bumped whenever the set of displayed lines is rebuilt wholesale (a
+    /// filter edit), which is the one change `wrap_index` cannot follow
+    /// incrementally.
+    pub filter_generation: u64,
+    /// Absolute index of the line at the top of the view last frame. Re-pinning
+    /// to it is what keeps the reader's place when the rows underneath change
+    /// height — a text-size change, a window resize.
+    pub top_line: Option<u64>,
+    /// Console columns and text size the view was last laid out with; `None`
+    /// until it has been drawn once. A change means every row moved.
+    pub console_layout: Option<(usize, u8)>,
     /// Bounded ring of raw bytes for hex view.
     pub raw_ring: VecDeque<u8>,
     pub last_error: Option<String>,
@@ -211,7 +226,9 @@ pub struct Connection {
     pub search_pos: Option<usize>,
     pub search_dirty: bool,
     pub search_tested_upto: u64,
-    /// The line the user selected (for bookmarks and plot↔log linking).
+    /// The line last jumped to — a search hit, or the line behind a plot point
+    /// that was clicked. Not drawn in the log itself; it is what puts the
+    /// log→plot marker on the plot.
     pub selected: Option<u64>,
     /// Scroll request: centre this absolute line on the next frame.
     pub scroll_to: Option<u64>,
@@ -305,6 +322,43 @@ impl Connection {
         changed
     }
 
+    /// Bring the console's visual-row index up to date for a view `cols`
+    /// characters wide (0 when wrapping is off). Cheap on a normal frame: only
+    /// lines appended since the last call are counted.
+    pub fn sync_wrap(&mut self, cols: usize) {
+        // Destructured so the index can be updated while the store it reads
+        // stays borrowed — they are disjoint fields, but only field access
+        // proves that to the borrow checker.
+        let Connection {
+            store,
+            filter_index,
+            filter_rules,
+            filter_generation,
+            wrap_index,
+            ..
+        } = self;
+        let filter_active = !filter_rules
+            .iter()
+            .all(|r| !r.enabled || r.pattern.is_empty());
+        let matching = filter_index.matching();
+        let first_abs = store.first_abs_index();
+        let entries = if filter_active {
+            matching.len()
+        } else {
+            store.len()
+        };
+        let abs_of = |i: usize| {
+            if filter_active {
+                matching[i]
+            } else {
+                first_abs + i as u64
+            }
+        };
+        wrap_index.sync(cols, *filter_generation, entries, abs_of, |i| {
+            crate::panes::wrap_len(store, abs_of(i))
+        });
+    }
+
     /// True if at least one filter rule is enabled and non-empty.
     pub fn filter_index_active(&self) -> bool {
         !self
@@ -393,11 +447,14 @@ pub struct App {
     /// Timestamp-interleaved merged view across all ports (spec §7.12).
     pub merged: Vec<MergedEntry>,
     pub merged_dirty: bool,
+    /// Visual-row totals for the merged view, as `Connection::wrap_index` is
+    /// for a single tab.
+    pub merged_wrap: WrapIndex,
+    /// Bumped whenever `merged` is rebuilt or reordered rather than appended
+    /// to, which is the one change `merged_wrap` cannot follow incrementally.
+    pub merged_generation: u64,
     /// True when the merged pseudo-tab is active.
     pub merged_selected: bool,
-    /// Deferred bookmark actions from the context menu (applied after drawing).
-    pub pending_bookmark_toggle: bool,
-    pub pending_bookmark_nav: Option<i64>,
     // Floating tool windows, toggled from the console right-click menu, so the
     // main window stays uncluttered.
     pub show_settings: bool,
@@ -415,6 +472,10 @@ pub struct App {
     pub update_manual: bool,
     /// `Some` while the update notice is showing.
     pub update_dialog: Option<UpdateDialog>,
+    /// Console text size to flash over the middle of the window, and the time
+    /// it was set. Ctrl+wheel has nothing else to show for itself: the change
+    /// it makes is legible only if you already know what you are looking for.
+    pub font_toast: Option<(u8, f64)>,
 }
 
 impl App {
@@ -452,9 +513,9 @@ impl App {
             highlight_dirty: true,
             merged: Vec::new(),
             merged_dirty: false,
+            merged_wrap: WrapIndex::new(),
+            merged_generation: 0,
             merged_selected: false,
-            pending_bookmark_toggle: false,
-            pending_bookmark_nav: None,
             show_settings: false,
             show_filters_win: false,
             show_highlight_win: false,
@@ -464,6 +525,7 @@ impl App {
             update_rx: None,
             update_manual: false,
             update_dialog: None,
+            font_toast: None,
         };
 
         // Silent startup check for a newer release. Debug builds are skipped: a
@@ -691,6 +753,10 @@ impl App {
             follow: true,
             new_since_scroll: 0,
             pin_view_h: 0.0,
+            wrap_index: WrapIndex::new(),
+            filter_generation: 0,
+            top_line: None,
+            console_layout: None,
             raw_ring: VecDeque::new(),
             last_error: None,
             mark_micros: None,
@@ -886,6 +952,8 @@ impl App {
             if conn.filter_dirty {
                 conn.filter_dirty = false;
                 conn.filter_index.rebuild(&conn.store, &set);
+                // The displayed set just changed out from under the row index.
+                conn.filter_generation += 1;
             } else {
                 conn.filter_index.prune_evicted(&conn.store);
                 conn.filter_index.extend(&conn.store, &set);
@@ -950,6 +1018,7 @@ impl App {
         if self.merged_dirty {
             self.merged_dirty = false;
             self.merged.clear();
+            self.merged_generation += 1;
             for conn in &mut self.connections {
                 conn.merged_upto = conn.store.first_abs_index();
             }
@@ -979,9 +1048,12 @@ impl App {
         if fresh[0].micros >= last_micros {
             self.merged.extend(fresh);
         } else {
-            // Rare: a slow port produced an earlier timestamp. Merge properly.
+            // Rare: a slow port produced an earlier timestamp. Merge properly —
+            // and since that reorders entries the row index already counted,
+            // make it count them again.
             self.merged.extend(fresh);
             self.merged.sort_by_key(|e| e.micros);
+            self.merged_generation += 1;
         }
     }
 
@@ -1024,46 +1096,6 @@ impl App {
             conn.follow = true;
         }
         self.merged_dirty = true;
-    }
-
-    /// Toggle a bookmark on the active connection's selected line.
-    pub fn toggle_bookmark(&mut self) {
-        let Some(conn) = self.connections.get_mut(self.active) else {
-            return;
-        };
-        let Some(sel) = conn.selected else {
-            return;
-        };
-        let on = conn
-            .store
-            .get(sel)
-            .map(|l| l.meta.flags.contains(LineFlags::BOOKMARK))
-            .unwrap_or(false);
-        conn.store.set_flag(sel, LineFlags::BOOKMARK, !on);
-    }
-
-    /// Move selection to the next/previous bookmarked line (`dir` = +1/-1).
-    pub fn goto_bookmark(&mut self, dir: i64) {
-        let Some(conn) = self.connections.get_mut(self.active) else {
-            return;
-        };
-        let first = conn.store.first_abs_index();
-        let end = conn.store.next_abs_index();
-        let from = conn.selected.unwrap_or(if dir > 0 { first } else { end });
-        let range: Vec<u64> = if dir > 0 {
-            (from + 1..end).collect()
-        } else {
-            (first..from).rev().collect()
-        };
-        for abs in range {
-            if let Some(l) = conn.store.get(abs) {
-                if l.meta.flags.contains(LineFlags::BOOKMARK) {
-                    conn.selected = Some(abs);
-                    conn.scroll_to = Some(abs);
-                    return;
-                }
-            }
-        }
     }
 
     /// Index of the active connection, clamped, or `None` if there are none.
@@ -1139,6 +1171,7 @@ impl eframe::App for App {
         self.show_tool_windows(ctx);
         self.show_settings_window(ctx);
         self.show_update_dialog(ctx);
+        self.show_font_toast(ctx);
 
         // egui only draws when something asks it to, and nothing here animates on
         // its own clock, so an *open but silent* connection must not schedule

@@ -24,8 +24,6 @@ impl LineFlags {
     /// Not stored on a line; signals the store to extend the previous
     /// provisional line rather than append a new one (spec §7.4).
     pub const CONTINUATION: LineFlags = LineFlags(1 << 5);
-    /// A user bookmark.
-    pub const BOOKMARK: LineFlags = LineFlags(1 << 6);
 
     pub fn contains(self, other: LineFlags) -> bool {
         (self.0 & other.0) == other.0
@@ -101,8 +99,8 @@ pub struct LineRef<'a> {
 /// Line arena with front eviction.
 ///
 /// External references to lines use *absolute* indices (`line_base + local`),
-/// so eviction never invalidates a bookmark — it just makes it resolve to
-/// "evicted" (spec §7.7).
+/// so eviction never invalidates a held reference — it just makes it resolve
+/// to "evicted" (spec §7.7).
 pub struct LineStore {
     arena: Vec<u8>,
     lines: Vec<LineMeta>,
@@ -218,21 +216,6 @@ impl LineStore {
         (lo..hi).filter_map(move |i| self.get(i))
     }
 
-    /// Set or clear a flag on a line by absolute index (e.g. bookmarks).
-    pub fn set_flag(&mut self, abs_index: u64, flag: LineFlags, on: bool) {
-        if abs_index < self.line_base {
-            return;
-        }
-        let local = (abs_index - self.line_base) as usize;
-        if let Some(meta) = self.lines.get_mut(local) {
-            if on {
-                meta.flags.insert(flag);
-            } else {
-                meta.flags.remove(flag);
-            }
-        }
-    }
-
     /// Close off a still-open last line, if there is one: the stream feeding it
     /// has ended (the connection dropped), so it can never be continued. The
     /// live edit cursor goes with the `PROVISIONAL` flag, or a caret keeps being
@@ -255,8 +238,8 @@ impl LineStore {
     /// Drop every resident line (the user clearing the console).
     ///
     /// Absolute indices keep advancing rather than restarting at zero, exactly
-    /// as they do for eviction: anything holding an index (a bookmark, a search
-    /// hit, a merged-view entry, a plot point) then resolves to "gone" instead
+    /// as they do for eviction: anything holding an index (a search hit, a
+    /// merged-view entry, a plot point) then resolves to "gone" instead
     /// of silently pointing at some unrelated later line.
     pub fn clear(&mut self) {
         self.arena_base += self.arena.len() as u64;
@@ -418,22 +401,11 @@ mod tests {
         assert_eq!(s.len(), 0);
         assert!(!s.evicted_any(), "clearing is not eviction");
         // Old indices read as gone, and the next line gets a fresh index rather
-        // than inheriting index 0's identity (and its bookmarks/search hits).
+        // than inheriting index 0's identity (and its search hits).
         assert!(s.get(0).is_none());
         let idx = s.append(incoming("after", &clock));
         assert_eq!(idx, 2);
         assert_eq!(s.get(2).unwrap().text, "after");
         assert_eq!(s.first_abs_index(), 2);
-    }
-
-    #[test]
-    fn bookmark_flag_roundtrip() {
-        let clock = SessionClock::new();
-        let mut s = LineStore::new(1000);
-        let idx = s.append(incoming("mark me", &clock));
-        s.set_flag(idx, LineFlags::BOOKMARK, true);
-        assert!(s.get(idx).unwrap().meta.flags.contains(LineFlags::BOOKMARK));
-        s.set_flag(idx, LineFlags::BOOKMARK, false);
-        assert!(!s.get(idx).unwrap().meta.flags.contains(LineFlags::BOOKMARK));
     }
 }

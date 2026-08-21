@@ -3,6 +3,8 @@
 
 mod connect;
 mod log;
+pub use log::wrap_len;
+
 mod plot;
 mod settings;
 mod transmit;
