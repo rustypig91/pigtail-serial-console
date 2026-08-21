@@ -119,9 +119,15 @@ impl SessionWriter {
         // Note the clear in the sidecar, so restoring history on a later launch
         // stops here instead of reaching past it into older captures.
         if !self.meta.cleared {
-            self.meta.cleared = true;
-            if let Ok(json) = serde_json::to_string_pretty(&self.meta) {
+            let mut meta = self.meta.clone();
+            meta.cleared = true;
+            if let Ok(json) = serde_json::to_string_pretty(&meta) {
                 std::fs::write(&self.meta_path, json)?;
+                // Marked as done only once it is actually on disk: setting the
+                // flag first would make every later clear skip this block, and a
+                // single failed write would leave `cleared: false` on disk for
+                // good — which is the one thing this guards against.
+                self.meta = meta;
             }
         }
         Ok(())
@@ -386,6 +392,43 @@ mod tests {
         assert_eq!(
             read_tail_records(&bin, 1024).unwrap(),
             vec![(2000, b"after\n".to_vec())]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_sidecar_write_leaves_the_clear_to_be_recorded_again() {
+        // The flag is the whole clear-safety guarantee: if it never reaches the
+        // sidecar, the next launch restores what the clear discarded. So a
+        // failed write has to leave the writer ready to try again, not
+        // remembering a clear that was never recorded.
+        let dir = std::env::temp_dir().join(format!("smon-clearfail-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let mut w = SessionWriter::create(&dir, &sample_meta()).unwrap();
+        w.write_record(0, b"cleared away\n").unwrap();
+
+        // Make the sidecar unwritable by standing a directory in its place, so
+        // noting the clear in it fails.
+        let meta_path = w.meta_path().to_path_buf();
+        let sidecar = std::fs::read_to_string(&meta_path).unwrap();
+        std::fs::remove_file(&meta_path).unwrap();
+        std::fs::create_dir(&meta_path).unwrap();
+        assert!(w.truncate().is_err(), "the sidecar write failed");
+
+        // Put the original sidecar back, untouched: the clear got nowhere.
+        std::fs::remove_dir(&meta_path).unwrap();
+        std::fs::write(&meta_path, &sidecar).unwrap();
+        assert!(
+            !read_meta(w.bin_path()).unwrap().cleared,
+            "nothing was recorded, which is what the retry has to make up for"
+        );
+
+        // Clearing again — or any later clear in this session — records it.
+        w.truncate().unwrap();
+        assert!(
+            read_meta(w.bin_path()).unwrap().cleared,
+            "the clear reached the sidecar on the retry"
         );
 
         std::fs::remove_dir_all(&dir).ok();

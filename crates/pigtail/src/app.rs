@@ -101,6 +101,12 @@ fn snapshot_captures(sessions_dir: &std::path::Path) -> Vec<(PathBuf, SessionMet
 /// so every capture written in one run of the app carries the same value. The
 /// micros stamp on the first record breaks those ties, being measured from that
 /// same anchor.
+///
+/// A capture holding no records at all has no such stamp, and sorts *last*
+/// within its run rather than first. It is either the one still being written
+/// to or one just emptied by a clear, and both are the newest thing in the run;
+/// placing an emptied capture first would let history restore walk past it into
+/// the older captures whose output the clear discarded.
 fn captures_for<'a>(
     captures: &'a [(PathBuf, SessionMeta)],
     identity: &PortIdentity,
@@ -109,7 +115,10 @@ fn captures_for<'a>(
         .iter()
         .filter(|(_, m)| &m.identity == identity)
         .map(|(path, m)| {
-            let first = session::read_first_micros(path).ok().flatten().unwrap_or(0);
+            let first = session::read_first_micros(path)
+                .ok()
+                .flatten()
+                .unwrap_or(u64::MAX);
             (path, m, first)
         })
         .collect();
@@ -1349,6 +1358,29 @@ mod tests {
             texts(&restored),
             vec!["kept\n"],
             "output discarded by Clear console does not come back"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn history_stops_at_a_capture_cleared_with_nothing_after_it() {
+        // Clear console empties the capture, so until new output arrives it has
+        // no records — and so no first stamp to order it by. It is still the
+        // newest capture of the run, and the walk back has to stop at it rather
+        // than treat it as the oldest and reach past it.
+        let dir = scratch("cleared-empty");
+        let dev = identity("A1");
+        let run = chrono::Utc::now();
+        let older = capture(&dir, &dev, run, &[(1_000, b"cleared away\n")]);
+        let mut newer = capture(&dir, &dev, run, &[]);
+        newer.1.cleared = true;
+
+        let captures = vec![older, newer];
+        let restored = gather_history(&captures, &dev, 1 << 20);
+        assert!(
+            texts(&restored).is_empty(),
+            "a clear with no output after it still holds back the older captures"
         );
 
         std::fs::remove_dir_all(&dir).ok();

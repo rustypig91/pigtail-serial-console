@@ -40,7 +40,11 @@ impl Wake {
 
 impl std::fmt::Debug for Wake {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.is_some() { "Wake(set)" } else { "Wake(none)" })
+        f.write_str(if self.0.is_some() {
+            "Wake(set)"
+        } else {
+            "Wake(none)"
+        })
     }
 }
 

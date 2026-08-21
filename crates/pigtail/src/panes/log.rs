@@ -111,8 +111,8 @@ impl Metrics {
         }
         // One column for the ">" that marks a line you sent, reserved on every
         // row so a sent line's text does not sit further right than the device
-        // output around it — and only for a port that echoes what you send at
-        // all, since otherwise no row will ever carry one.
+        // output around it — and only where such a line can actually appear,
+        // since otherwise this is a column of dead space on every row.
         if tx_marker {
             prefix_w += char_w + ROW_GAP;
         }
@@ -153,6 +153,15 @@ impl Metrics {
             self.cols as f32 * self.char_w + self.char_w * 0.25
         }
     }
+}
+
+/// Whether this console needs the ">" marker column reserved. Not simply
+/// "local echo is on": lines echoed earlier keep their marker for as long as
+/// they are on screen, and they outlive the setting — turning local echo off in
+/// the port options keeps the console, and a restored session brings back what
+/// was sent in it. Without the column those markers paint over the text.
+fn tx_marker(conn: &Connection) -> bool {
+    conn.port_config.local_echo || conn.store.tx_echo_any()
 }
 
 struct RowCtx<'a> {
@@ -412,7 +421,7 @@ impl App {
             ts_format,
             self.config.settings.wrap_lines,
             false,
-            self.connections[active].port_config.local_echo,
+            tx_marker(&self.connections[active]),
         );
         // Bring the row index up to date before anything asks how tall the
         // content is or which line a row belongs to.
@@ -619,7 +628,7 @@ impl App {
             ts_format,
             self.config.settings.wrap_lines,
             true,
-            self.connections.iter().any(|c| c.port_config.local_echo),
+            self.connections.iter().any(tx_marker),
         );
         let App {
             connections,

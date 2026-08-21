@@ -111,6 +111,11 @@ pub struct LineStore {
     max_lines: usize,
     /// Set once eviction has occurred, for the UI banner.
     evicted_any: bool,
+    /// Set once a line you sent has been stored. Sticky, because those lines
+    /// keep their ">" marker long after the setting that echoed them was turned
+    /// off, and the column that marker sits in has to stay reserved for as long
+    /// as any line here can carry one.
+    tx_echo_any: bool,
 }
 
 impl LineStore {
@@ -122,6 +127,7 @@ impl LineStore {
             line_base: 0,
             max_lines: max_lines.max(1),
             evicted_any: false,
+            tx_echo_any: false,
         }
     }
 
@@ -148,11 +154,17 @@ impl LineStore {
         self.evicted_any
     }
 
+    /// True if any line held here is one you sent (and so is drawn with a ">").
+    pub fn tx_echo_any(&self) -> bool {
+        self.tx_echo_any
+    }
+
     /// Append a line. If `flags` contains `CONTINUATION`, the previous line
     /// (which must be `PROVISIONAL`) is replaced in place instead — its bytes
     /// are re-appended to the arena and the metadata updated, keeping the
     /// original absolute index. Returns the absolute index of the affected line.
     pub fn append(&mut self, line: IncomingLine) -> u64 {
+        self.tx_echo_any |= line.flags.contains(LineFlags::TX_ECHO);
         if line.flags.contains(LineFlags::CONTINUATION) {
             if let Some(last) = self.lines.last_mut() {
                 if last.flags.contains(LineFlags::PROVISIONAL) {
@@ -246,6 +258,9 @@ impl LineStore {
         self.arena.clear();
         self.line_base += self.lines.len() as u64;
         self.lines.clear();
+        // No line is left to wear a ">", so the column it needed goes back to
+        // the text.
+        self.tx_echo_any = false;
         // Not `evicted_any`: nothing was dropped for want of capacity, so the
         // "lines evicted" notice in the header stays quiet.
     }
@@ -387,6 +402,26 @@ mod tests {
         assert_eq!(s.len(), 1);
         // Empty store: nothing to finalize, and no panic.
         LineStore::new(10).finalize_last_provisional();
+    }
+
+    #[test]
+    fn tracks_whether_any_line_was_sent() {
+        // The console reserves a column for the ">" on sent lines from this,
+        // and those lines outlive the local-echo setting that produced them —
+        // an unreserved column would paint the marker over the text.
+        let clock = SessionClock::new();
+        let mut s = LineStore::new(1000);
+        s.append(incoming("device output", &clock));
+        assert!(!s.tx_echo_any());
+
+        let mut sent = incoming("typed", &clock);
+        sent.flags = LineFlags::TX_ECHO;
+        s.append(sent);
+        assert!(s.tx_echo_any());
+
+        // Nothing is left to wear a marker after a clear.
+        s.clear();
+        assert!(!s.tx_echo_any());
     }
 
     #[test]

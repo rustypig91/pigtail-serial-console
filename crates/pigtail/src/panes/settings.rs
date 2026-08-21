@@ -78,10 +78,7 @@ impl App {
 
                         ui.label("Updates");
                         changed |= ui
-                            .checkbox(
-                                &mut self.config.settings.check_updates,
-                                "check at startup",
-                            )
+                            .checkbox(&mut self.config.settings.check_updates, "check at startup")
                             .on_hover_text(
                                 "Asks GitHub for the newest release. \
                                  The only network request pigtail makes.",

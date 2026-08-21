@@ -35,8 +35,11 @@ pub struct WrapIndex {
     /// relative to `starts[0]`, so evicting from the front stays a `pop_front`
     /// rather than a rebase of every element.
     starts: VecDeque<u64>,
-    /// Absolute line index of entry 0, used to recognize front eviction.
-    front_abs: u64,
+    /// Each indexed entry's absolute line index, in the same order as `starts`
+    /// (and so one element shorter, having no sentinel). Front eviction is both
+    /// recognized and *measured* here: the view's new first line is still in
+    /// this deque, and where it sits is how many entries went with the drop.
+    keys: VecDeque<u64>,
     cols: usize,
     generation: u64,
 }
@@ -45,7 +48,7 @@ impl WrapIndex {
     pub fn new() -> WrapIndex {
         WrapIndex {
             starts: VecDeque::from(vec![0]),
-            front_abs: 0,
+            keys: VecDeque::new(),
             cols: 0,
             generation: 0,
         }
@@ -54,12 +57,14 @@ impl WrapIndex {
     /// Bring the index up to date for a view of `entries` lines.
     ///
     /// `abs_of` gives an entry's absolute line index — strictly increasing over
-    /// the view, whether or not a filter is narrowing it — and `len_of` its
-    /// byte length. Both are called only for the entries actually being
-    /// (re)counted: appended lines in the common case, all of them when the
-    /// column count or `generation` changed. `generation` is the caller's own
-    /// counter for "the set of displayed lines was rebuilt wholesale", which a
-    /// filter edit does.
+    /// the view, whether or not a filter is narrowing it — and `len_of` its byte
+    /// length. `len_of` is called only for the entries actually being
+    /// (re)counted: the newest line and whatever was appended after it in the
+    /// common case, all of them when the column count or `generation` changed.
+    /// `abs_of` is called for those too, plus a handful more when lines have
+    /// been evicted, to find where the surviving front now sits. `generation` is
+    /// the caller's own counter for "the set of displayed lines was rebuilt
+    /// wholesale", which a filter edit does.
     pub fn sync(
         &mut self,
         cols: usize,
@@ -74,18 +79,28 @@ impl WrapIndex {
         }
 
         // Front eviction: the store dropped lines off the start of the view.
-        // Absolute indices only ever increase across the view, so the surviving
-        // front's new position is a binary search away.
-        if entries > 0 && abs_of(0) != self.front_abs {
-            let dropped = partition_point(entries, |i| abs_of(i) < self.front_abs);
-            if dropped >= self.len() {
+        // Absolute indices only ever increase, so where the surviving front sits
+        // among the ones already indexed is a binary search away, and that
+        // position is the number of entries the drop took with it.
+        if entries > 0 && self.len() > 0 && self.keys.front() != Some(&abs_of(0)) {
+            let front = abs_of(0);
+            let dropped = self.keys.partition_point(|&key| key < front);
+            // Both ends of what should have survived have to still line up with
+            // the view; anything else is a reshuffle no eviction explains, and
+            // salvaging it would silently pair entries with other lines' rows.
+            let survivors = self.len() - dropped;
+            let aligned = survivors > 0
+                && entries >= survivors
+                && self.keys[dropped] == front
+                && self.keys[self.len() - 1] == abs_of(survivors - 1);
+            if !aligned {
                 self.rebuild(cols, generation, entries, &abs_of, &len_of);
                 return;
             }
             for _ in 0..dropped {
                 self.starts.pop_front();
+                self.keys.pop_front();
             }
-            self.front_abs = abs_of(0);
         }
 
         if entries < self.len() {
@@ -96,13 +111,17 @@ impl WrapIndex {
         }
 
         // The newest line can grow in place while it is still open (a device
-        // mid-prompt), so its count is always recomputed rather than trusted.
-        if self.len() > 0 && self.len() == entries {
+        // mid-prompt), so the entry that was last is always recounted rather
+        // than trusted — including when this same frame appended after it, which
+        // is exactly when a line that was still open got completed.
+        if self.len() > 0 {
+            let last = self.len() - 1;
             self.starts.pop_back();
-            self.push(len_of(entries - 1), cols);
+            self.keys.pop_back();
+            self.push(abs_of(last), len_of(last), cols);
         }
         for i in self.len()..entries {
-            self.push(len_of(i), cols);
+            self.push(abs_of(i), len_of(i), cols);
         }
     }
 
@@ -116,17 +135,18 @@ impl WrapIndex {
     ) {
         self.cols = cols;
         self.generation = generation;
-        self.front_abs = if entries > 0 { abs_of(0) } else { 0 };
         self.starts.clear();
         self.starts.push_back(0);
+        self.keys.clear();
         for i in 0..entries {
-            self.push(len_of(i), cols);
+            self.push(abs_of(i), len_of(i), cols);
         }
     }
 
-    fn push(&mut self, len: u32, cols: usize) {
+    fn push(&mut self, key: u64, len: u32, cols: usize) {
         let end = self.starts.back().copied().unwrap_or(0) + u64::from(rows_for(len, cols));
         self.starts.push_back(end);
+        self.keys.push_back(key);
     }
 
     /// Number of entries (lines) indexed.
@@ -167,21 +187,6 @@ impl WrapIndex {
             .saturating_sub(1)
             .min(self.len().saturating_sub(1))
     }
-}
-
-/// `slice::partition_point` over an index range, for a view whose entries are
-/// reached through a closure rather than laid out in memory.
-fn partition_point(len: usize, pred: impl Fn(usize) -> bool) -> usize {
-    let (mut lo, mut hi) = (0usize, len);
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if pred(mid) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
 }
 
 #[cfg(test)]
@@ -251,6 +256,44 @@ mod tests {
         assert_eq!(idx.len(), 2);
         assert_eq!(idx.start_row(0), 0);
         assert_eq!(idx.total_rows(), 3);
+    }
+
+    #[test]
+    fn eviction_and_appending_in_one_frame_keeps_lines_paired_with_their_rows() {
+        // At the line cap every frame both drops from the front and appends, so
+        // the two have to be recognized together: counting the drop as zero
+        // would leave every entry wearing an older line's row count.
+        let mut idx = WrapIndex::new();
+        sync(&mut idx, 8, 0, 0, &[5, 25, 5]);
+        assert_eq!(idx.rows(1), 4);
+        // One line evicted, one appended: same entry count, different lines.
+        sync(&mut idx, 8, 0, 1, &[25, 5, 5]);
+        assert_eq!(idx.rows(0), 4);
+        assert_eq!(idx.total_rows(), 6);
+    }
+
+    #[test]
+    fn an_open_line_is_recounted_even_when_lines_arrive_after_it() {
+        // The line that was last grew *and* was completed in the same frame.
+        // Trusting its old count would leave it a row short for good.
+        let mut idx = WrapIndex::new();
+        sync(&mut idx, 8, 0, 0, &[5]);
+        assert_eq!(idx.rows(0), 1);
+        sync(&mut idx, 8, 0, 0, &[11, 3]);
+        assert_eq!(idx.rows(0), 2);
+        assert_eq!(idx.total_rows(), 3);
+    }
+
+    #[test]
+    fn entries_vanishing_from_the_middle_rebuild() {
+        // Only front eviction is salvageable; anything else has to be recounted
+        // rather than paired up by position.
+        let mut idx = WrapIndex::new();
+        sync(&mut idx, 8, 0, 0, &[5, 25, 5]);
+        // Same first line, but the middle one is gone.
+        idx.sync(8, 0, 2, |i| [0u64, 2][i], |i| [5u32, 5][i]);
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx.total_rows(), 2);
     }
 
     #[test]
