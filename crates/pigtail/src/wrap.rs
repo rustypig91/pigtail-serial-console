@@ -144,6 +144,18 @@ impl WrapIndex {
     }
 
     fn push(&mut self, key: u64, len: u32, cols: usize) {
+        // The whole eviction path is derived from keys that strictly increase:
+        // equal ones make `partition_point` under-count the drop, and every
+        // entry after it then wears another line's row count. Checked here
+        // because a key that merely *looks* monotonic — a timestamp shared by
+        // every line framed out of one read — costs nothing at the call site
+        // and goes wrong only later, and subtly.
+        if let Some(&prev) = self.keys.back() {
+            debug_assert!(
+                key > prev,
+                "row-index keys must increase: {key} after {prev}"
+            );
+        }
         let end = self.starts.back().copied().unwrap_or(0) + u64::from(rows_for(len, cols));
         self.starts.push_back(end);
         self.keys.push_back(key);
@@ -352,6 +364,17 @@ mod tests {
                 });
             }
         }
+    }
+
+    /// The guard on the key contract, which exists because the one caller
+    /// that got it wrong passed a timestamp — monotonic-looking, and shared by
+    /// every line framed out of a single read.
+    #[test]
+    #[should_panic(expected = "row-index keys must increase")]
+    #[cfg(debug_assertions)]
+    fn repeated_keys_are_rejected() {
+        let mut idx = WrapIndex::new();
+        idx.sync(10, 0, 2, |_| 7, |_| 5);
     }
 
     #[test]

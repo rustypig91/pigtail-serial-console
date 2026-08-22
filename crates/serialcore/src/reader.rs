@@ -27,7 +27,15 @@ const BATCH_MAX_LINES: usize = 4000;
 // Kept short so an interactive prompt's echo (characters the device sends back
 // with no trailing newline) appears promptly instead of feeling laggy.
 const PROVISIONAL_AFTER: Duration = Duration::from_millis(20);
+#[cfg(not(test))]
 const CHANNEL_CAPACITY: usize = 1024;
+/// Small under test so a full channel — the state the blocking sends have to
+/// survive — is reachable in a few milliseconds rather than the sixteen
+/// seconds of output it takes at the real size. Nothing here depends on the
+/// number itself; integration tests link the lib built without `cfg(test)`
+/// and so still run at the real capacity.
+#[cfg(test)]
+const CHANNEL_CAPACITY: usize = 4;
 
 /// Connection state machine (spec §7.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,18 +150,39 @@ impl ReaderHandle {
 
     /// Signal shutdown and join the thread.
     pub fn shutdown(mut self) {
+        self.shutdown_in_place();
+    }
+
+    /// [`ReaderHandle::shutdown`] without consuming the handle, which is left
+    /// inert: its thread is gone, so every command sent from here on is
+    /// dropped. For the caller holding the handle by reference — reconnecting
+    /// a tab replaces one in place, and has to close the old reader before the
+    /// new one opens the same device.
+    pub fn shutdown_in_place(&mut self) {
         let _ = self.cmd.send(ReaderCommand::Shutdown);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
+        let Some(join) = self.join.take() else {
+            return;
+        };
+        // Drain while it winds down. The reader *blocks* to send state and
+        // error events (they are rare, and must not be dropped), and we are
+        // the only one who empties that channel — so joining without draining
+        // deadlocks the two of us, with the UI thread the one held. The events
+        // are of no further use: this connection is going away.
+        while !join.is_finished() {
+            while self.events.try_recv().is_ok() {}
+            // The reader can be inside a blocking read for as long as the
+            // port's read timeout, so this waits rather than spins.
+            std::thread::sleep(Duration::from_millis(1));
         }
+        while self.events.try_recv().is_ok() {}
+        let _ = join.join();
     }
 }
 
 impl Drop for ReaderHandle {
     fn drop(&mut self) {
-        if let Some(join) = self.join.take() {
-            let _ = self.cmd.send(ReaderCommand::Shutdown);
-            let _ = join.join();
+        if self.join.is_some() {
+            self.shutdown_in_place();
         }
     }
 }
@@ -622,6 +651,47 @@ mod tests {
             }
         }
         (lines, states)
+    }
+
+    /// The reader *blocks* to send state and error events, and the UI is the
+    /// only thing that empties that channel — so a shutdown that joins the
+    /// thread without draining first is two parties waiting on each other,
+    /// with the UI thread the one held. That is a frozen window, and closing
+    /// a tab or applying port options is where it would happen.
+    #[test]
+    fn shutdown_does_not_deadlock_on_a_full_event_channel() {
+        let src = ScriptedSource::new(vec![(b"x\n".to_vec(), Duration::from_millis(5)); 40])
+            .eof_when_done();
+        let config = ReaderConfig {
+            port_id: PortId(0),
+            clock: SessionClock::new(),
+            session_dir: None,
+            meta: test_meta(),
+            terminal: crate::config::TerminalMode::Classic,
+            wake: Wake::none(),
+        };
+        let handle = spawn(config, SourceSpec::OneShot(Box::new(src)));
+
+        // Deliberately never drained: the channel fills, and the reader parks
+        // on the next state or error it has to get out.
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(
+            handle.events.is_full(),
+            "the channel has to be full to test"
+        );
+
+        // Off-thread, so a shutdown that never returns fails the test instead
+        // of hanging the suite.
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            handle.shutdown();
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "shutdown never returned: it is waiting for a reader that is \
+             waiting for it"
+        );
     }
 
     #[test]

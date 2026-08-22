@@ -644,14 +644,15 @@ impl App {
         // Entries are in timestamp order, so the first is the zero everything
         // else counts from in the "from mark" format.
         let earliest = merged.first().map(|e| e.micros);
-        // Entries are ordered by timestamp, and only ever appended to or thrown
-        // away wholesale (which bumps the generation), so the micros of an entry
-        // stand in for the monotonic key the index needs.
+        // Keyed by `seq`, not by the timestamp the view is ordered on: the
+        // index needs a key that strictly increases to tell entries dropped
+        // off the front from a reshuffle, and a burst of output shares one
+        // timestamp across every line framed out of the same read.
         merged_wrap.sync(
             m.cols,
             *merged_generation,
             entries,
-            |i| merged[i].micros,
+            |i| merged[i].seq,
             |i| {
                 let MergedEntry { port, abs, .. } = merged[i];
                 match index_of(port) {

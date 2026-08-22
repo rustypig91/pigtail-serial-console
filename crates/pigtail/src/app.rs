@@ -60,6 +60,15 @@ pub struct MergedEntry {
     pub micros: u64,
     pub port: PortId,
     pub abs: u64,
+    /// Position in the view, as a number that only ever increases along it.
+    ///
+    /// This is what the row index keys entries by, and it needs a key that is
+    /// *strictly* increasing to tell an eviction from a reshuffle. `micros`
+    /// looks like one and is not: every line framed out of a single read
+    /// carries that read's timestamp, so a burst of output shares one to the
+    /// microsecond. Renumbered whenever the view is reordered rather than
+    /// appended to — which already forces the index to rebuild.
+    pub seq: u64,
 }
 
 /// Load config from disk, falling back to defaults on any error.
@@ -533,6 +542,9 @@ pub struct App {
     /// Visual-row totals for the merged view, as `Connection::wrap_index` is
     /// for a single tab.
     pub merged_wrap: WrapIndex,
+    /// Hands out `MergedEntry::seq`. Only ever counts up while the view is
+    /// appended to; a reorder renumbers the whole view and resets it.
+    pub merged_seq: u64,
     /// Bumped whenever `merged` is rebuilt or reordered rather than appended
     /// to, which is the one change `merged_wrap` cannot follow incrementally.
     pub merged_generation: u64,
@@ -595,6 +607,7 @@ impl App {
             highlight_cache: Vec::new(),
             highlight_dirty: true,
             merged: Vec::new(),
+            merged_seq: 0,
             merged_dirty: false,
             merged_wrap: WrapIndex::new(),
             merged_generation: 0,
@@ -724,6 +737,14 @@ impl App {
             .map(|d| d.identity.clone())
             .unwrap_or_else(|| self.connections[index].identity.clone());
 
+        // Close the old reader *before* opening the new one. Both address the
+        // same device, and a serial port is opened exclusively — with the old
+        // reader still holding it the new one's first open fails, and it goes
+        // away into its reconnect backoff for up to two seconds before trying
+        // again. The wait is no new cost: this join already happened, just
+        // after the spawn rather than before it.
+        self.connections[index].handle.shutdown_in_place();
+
         // Keep the same port id so the preserved lines still map to this tab in
         // the merged view; only the reader (and its capture file) is replaced.
         let handle = self.spawn_serial_reader(port_id, &identity, &config, initial_path.clone());
@@ -736,9 +757,10 @@ impl App {
         let marker_text = format!("reconnected · {}", config.summary());
         let marker_ts = self.clock.now();
 
-        let old_handle = {
+        {
             let conn = &mut self.connections[index];
-            let old = std::mem::replace(&mut conn.handle, handle);
+            // Drops the spent handle, whose thread is already joined.
+            conn.handle = handle;
             conn.identity = identity;
             conn.port_config = config;
             conn.label = label;
@@ -759,9 +781,7 @@ impl App {
                 spans: Default::default(),
                 cursor: None,
             });
-            old
-        };
-        old_handle.shutdown();
+        }
 
         self.active = index;
         self.merged_selected = false;
@@ -1102,6 +1122,7 @@ impl App {
         if self.merged_dirty {
             self.merged_dirty = false;
             self.merged.clear();
+            self.merged_seq = 0;
             self.merged_generation += 1;
             for conn in &mut self.connections {
                 conn.merged_upto = conn.store.first_abs_index();
@@ -1118,6 +1139,8 @@ impl App {
                         micros: line.meta.ts.micros,
                         port: conn.id,
                         abs,
+                        // Stamped below, once the batch is in view order.
+                        seq: 0,
                     });
                 }
             }
@@ -1128,6 +1151,10 @@ impl App {
             return;
         }
         fresh.sort_by_key(|e| e.micros);
+        for e in &mut fresh {
+            e.seq = self.merged_seq;
+            self.merged_seq += 1;
+        }
         // Fast path: the new tail is entirely after what we already have.
         let last_micros = self.merged.last().map(|e| e.micros).unwrap_or(0);
         if fresh[0].micros >= last_micros {
@@ -1138,6 +1165,13 @@ impl App {
             // make it count them again.
             self.merged.extend(fresh);
             self.merged.sort_by_key(|e| e.micros);
+            // The sort interleaved the new entries among the old, so the
+            // numbering no longer runs along the view. Lay it down again — the
+            // index is rebuilding this frame regardless.
+            for (i, e) in self.merged.iter_mut().enumerate() {
+                e.seq = i as u64;
+            }
+            self.merged_seq = self.merged.len() as u64;
             self.merged_generation += 1;
         }
     }
