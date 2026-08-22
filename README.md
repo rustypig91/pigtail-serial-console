@@ -45,11 +45,17 @@ and each keeps its own Add/Remove Programs entry.
 
 Requires stable Rust.
 
+On Linux, install the development headers for udev (serial port access) and GTK 3 (file dialogs) first:
+
+```sh
+sudo apt install libudev-dev libgtk-3-dev
+```
+
+Then build:
+
 ```sh
 cargo build --release
 ```
-
-On Linux, install `libudev-dev` (serial port access) and `libgtk-3-dev` (file dialogs) first.
 
 Run in development with `cargo run -p pigtail`.
 

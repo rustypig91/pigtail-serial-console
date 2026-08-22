@@ -27,6 +27,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 
+[build-dependencies]
+winresource = "0.1.31"
+
 # `cargo deb -p pigtail` builds the Debian/Ubuntu package. Source paths are
 # relative to this manifest; cargo-deb rewrites "target/release" to the
 # per-target directory automatically when --target is passed.
