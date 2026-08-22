@@ -138,9 +138,23 @@ impl FilterIndex {
 
     /// Test only new lines and extend the index (the hot path). Safe to call
     /// every frame.
+    ///
+    /// The newest line is re-tested rather than trusted. A line the device is
+    /// still writing is shown provisionally and then *replaced in place* when
+    /// it grows, keeping its absolute index — so "tested already" is not the
+    /// same as "settled", and a half-written line that didn't match yet would
+    /// otherwise stay hidden for good once it did.
     pub fn extend(&mut self, store: &LineStore, set: &FilterSet) {
         let end = store.next_abs_index();
-        let start = self.next_to_test.max(store.first_abs_index());
+        let first = store.first_abs_index();
+        // The last resident line, which is the one that can still change.
+        let newest = end.saturating_sub(1).max(first);
+        let start = self.next_to_test.max(first).min(newest);
+        // Its verdict from last time goes with it: it may have matched then
+        // and not now. `matching` is ascending, so that is a suffix trim.
+        while self.matching.last().is_some_and(|&abs| abs >= start) {
+            self.matching.pop();
+        }
         for abs in start..end {
             if let Some(line) = store.get(abs) {
                 if set.matches(line.text) {
@@ -192,6 +206,60 @@ mod tests {
             });
         }
         s
+    }
+
+    /// Append `text` to `store` with `flags`, as the reader would.
+    fn append(store: &mut LineStore, text: &str, flags: LineFlags) {
+        store.append(IncomingLine {
+            text: text.to_string(),
+            ts: SessionClock::new().now(),
+            port: PortId(0),
+            flags,
+            spans: Default::default(),
+            cursor: None,
+        });
+    }
+
+    /// A line the device is still writing is shown provisionally and then
+    /// replaced in place as it grows, keeping its absolute index. Testing it
+    /// once and never again left a line that only matched after it was
+    /// finished hidden until the filter was next edited.
+    #[test]
+    fn a_line_still_being_written_is_re_tested_as_it_grows() {
+        let (set, _) = FilterSet::compile(&[rule("ERROR")], Combine::Or);
+        let mut store = LineStore::new(10_000);
+        let mut idx = FilterIndex::new();
+
+        // The device has emitted the start of a line; it doesn't match yet.
+        append(&mut store, "boot: ", LineFlags::PROVISIONAL);
+        idx.extend(&store, &set);
+        assert!(idx.matching().is_empty());
+
+        // The rest of it arrives and replaces the line in place.
+        append(
+            &mut store,
+            "boot: ERROR bad",
+            LineFlags::PROVISIONAL | LineFlags::CONTINUATION,
+        );
+        idx.extend(&store, &set);
+        assert_eq!(idx.matching(), &[0], "the completed line is found");
+
+        // And the verdict is withdrawn if the line stops matching — a bare
+        // `\r` rewinds the tail, and what replaces it may be anything.
+        append(
+            &mut store,
+            "boot: ok",
+            LineFlags::PROVISIONAL | LineFlags::CONTINUATION,
+        );
+        idx.extend(&store, &set);
+        assert!(idx.matching().is_empty(), "and not left behind if it stops");
+
+        // A settled line keeps its verdict once later lines arrive past it.
+        append(&mut store, "ERROR again", LineFlags::default());
+        idx.extend(&store, &set);
+        append(&mut store, "done", LineFlags::default());
+        idx.extend(&store, &set);
+        assert_eq!(idx.matching(), &[1]);
     }
 
     fn rule(pattern: &str) -> FilterRule {

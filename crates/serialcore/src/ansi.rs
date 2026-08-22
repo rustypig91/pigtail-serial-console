@@ -107,8 +107,17 @@ pub fn parse_line(input: &str, cursor: Option<usize>) -> Styled {
                     break;
                 }
             } else {
-                // Non-CSI escape (e.g. `ESC c`): skip ESC and the next byte.
-                i += 2;
+                // Non-CSI escape (e.g. `ESC c`): skip ESC and the character
+                // after it. A whole character, not a byte: the byte following
+                // an ESC is not always ASCII — a device emitting garbage (the
+                // wrong baud rate) has its invalid bytes sanitized to a
+                // two-byte `·` by the framer — and stepping two bytes would
+                // leave `i` inside that character, so the copy below would
+                // slice `input` off a char boundary and panic.
+                i += 1;
+                if i < bytes.len() {
+                    i += utf8_char_len(bytes[i]);
+                }
                 continue;
             }
         }
@@ -294,5 +303,27 @@ mod tests {
         let s = parse_line("\x1b[32mabc\x1b[0m", Some(999));
         assert_eq!(s.text, "abc");
         assert_eq!(s.cursor, Some(3));
+    }
+
+    /// A two-byte escape whose second byte belongs to a multi-byte character —
+    /// which is what a line of garbage looks like once the framer has replaced
+    /// its invalid bytes with `·` — used to step the parser into the middle of
+    /// that character, and the next slice of `input` then panicked on a
+    /// non-boundary index, taking the whole app down with it.
+    #[test]
+    fn a_two_byte_escape_over_a_multibyte_char_does_not_split_it() {
+        let s = parse_line("a\x1b\u{b7}b", None);
+        assert_eq!(s.text, "ab", "the escape swallows the whole character");
+
+        // The same shape at the very end of the line, and with the widest
+        // character UTF-8 has, in case the step runs off the end instead.
+        assert_eq!(parse_line("a\x1b\u{b7}", None).text, "a");
+        assert_eq!(parse_line("a\x1b\u{1f600}b", None).text, "ab");
+
+        // A whole line of garbage, framed the way the reader frames it: every
+        // invalid byte became `·`, and the ESCs among them land against one.
+        let garbage: Vec<u8> = (0u8..=255).rev().collect();
+        let (text, _) = crate::framer::sanitize_utf8(&garbage);
+        let _ = parse_line(&text, Some(text.len() / 2));
     }
 }

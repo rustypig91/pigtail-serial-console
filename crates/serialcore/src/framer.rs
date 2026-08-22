@@ -88,6 +88,11 @@ pub struct Framer {
     /// We already emitted the current tail as PROVISIONAL, so the next emission
     /// for this line is a CONTINUATION that replaces it.
     emitted_provisional: bool,
+    /// Arrival stamp of the most recent chunk. Stands in for `tail_ts` on a
+    /// line with no content bytes of its own — a blank line, or one a bare
+    /// CR wiped — whose only byte is the terminator, and which therefore
+    /// never reached `append_to_tail` to be stamped.
+    last_ts: Option<Timestamp>,
 }
 
 impl Default for Framer {
@@ -113,6 +118,7 @@ impl Framer {
             esc: EscState::None,
             esc_raw: Vec::new(),
             emitted_provisional: false,
+            last_ts: None,
         }
     }
 
@@ -127,6 +133,7 @@ impl Framer {
     /// Feed a chunk stamped at arrival. Completed lines are pushed onto `out`.
     pub fn push(&mut self, chunk: &[u8], ts: Timestamp, out: &mut Vec<FramedLine>) {
         let mut i = 0;
+        self.last_ts = Some(ts);
 
         if self.pending_cr {
             self.pending_cr = false;
@@ -507,20 +514,23 @@ impl Framer {
         self.cursor += remaining.len();
     }
 
+    /// The stamp for a line about to be emitted: the arrival of its first
+    /// content byte, or — for a line that has none, a blank one or one a
+    /// bare CR wiped — the arrival of the chunk carrying its terminator.
+    /// Neither is only possible on a framer nothing was ever pushed to, which
+    /// no emit path can reach. A zero `micros` is the wrong answer for a real
+    /// line: it places it at the session start, so its delta and its distance
+    /// from a mark read as wildly off while its wall clock reads correctly.
+    fn stamp(&self) -> Timestamp {
+        self.tail_ts.or(self.last_ts).unwrap_or(Timestamp {
+            wall: chrono::Utc::now(),
+            micros: 0,
+        })
+    }
+
     /// Emit the tail as a completed line and reset per-line state.
     fn emit_line(&mut self, out: &mut Vec<FramedLine>) {
-        // A tail may legitimately be empty (blank line). tail_ts is set on the
-        // arrival of the terminator's chunk if no content preceded it.
-        let ts = self.tail_ts.unwrap_or_else(|| {
-            // Empty line whose terminator arrived without any preceding content
-            // this chunk. Fall back to a zero micros stamp is wrong; instead we
-            // require callers to have a ts. Use the last known via tail_ts only.
-            // In practice emit_line is only reached with a known ts from push.
-            Timestamp {
-                wall: chrono::Utc::now(),
-                micros: 0,
-            }
-        });
+        let ts = self.stamp();
         let (text, invalid) = sanitize_utf8(&self.tail);
         let mut flags = LineFlags::default();
         if invalid {
@@ -540,10 +550,7 @@ impl Framer {
 
     /// Emit a forced break for an over-length line and keep accumulating the rest.
     fn emit_truncated(&mut self, out: &mut Vec<FramedLine>) {
-        let ts = self.tail_ts.unwrap_or(Timestamp {
-            wall: chrono::Utc::now(),
-            micros: 0,
-        });
+        let ts = self.stamp();
         let (text, invalid) = sanitize_utf8(&self.tail);
         let mut flags = LineFlags::TRUNCATED;
         if invalid {
@@ -752,7 +759,7 @@ mod tests {
     use super::*;
     use crate::clock::SessionClock;
 
-    fn ts(micros: u64) -> Timestamp {
+    fn ts(micros: i64) -> Timestamp {
         Timestamp {
             wall: chrono::Utc::now(),
             micros,
@@ -963,6 +970,35 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text, "partial");
         assert_eq!(out[0].ts.micros, 100, "carries first-byte arrival time");
+    }
+
+    #[test]
+    fn blank_line_carries_terminator_arrival() {
+        // A line with no content bytes never reaches `append_to_tail`, so it
+        // has no first-byte stamp to carry. It must still be stamped from the
+        // chunk that terminated it: a zero `micros` puts it at session start,
+        // which shows up as a wild negative in the from-mark column and a wild
+        // positive in the delta one, while its wall clock reads correctly.
+        let mut f = Framer::new();
+        let mut out = Vec::new();
+        f.push(b"a\n", ts(100), &mut out);
+        f.push(b"\n", ts(200), &mut out);
+        f.push(b"\r\n", ts(300), &mut out);
+        assert_eq!(texts(&out), vec!["a", "", ""]);
+        assert_eq!(out[1].ts.micros, 200, "blank line stamped on its LF");
+        assert_eq!(out[2].ts.micros, 300, "blank CRLF line stamped on its CR");
+    }
+
+    #[test]
+    fn cr_wiped_line_carries_terminator_arrival() {
+        // A bare CR discards the content bytes framed so far, and with them
+        // their stamp; what the CR leaves behind is stamped like a blank line.
+        let mut f = Framer::with_mode(TerminalMode::Vt100);
+        let mut out = Vec::new();
+        f.push(b"typed\r", ts(100), &mut out);
+        f.push(b"\r\n", ts(200), &mut out);
+        assert_eq!(texts(&out), vec![""]);
+        assert_eq!(out[0].ts.micros, 200);
     }
 
     #[test]

@@ -20,6 +20,7 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let dirs = paths::AppPaths::resolve().context("resolving app directories")?;
+    install_panic_hook(dirs.crash_log.clone());
 
     // Best-effort retention cleanup at startup (spec §7.5).
     let cfg = app::load_config(&dirs);
@@ -51,4 +52,36 @@ fn main() -> anyhow::Result<()> {
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, dirs, cfg)))),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
+}
+
+/// Append every panic to a file, then let the default hook run.
+///
+/// A release build is a `windows` subsystem binary with no console attached
+/// and no log file, so a panic on the UI thread takes the window down leaving
+/// the user with nothing to report but "it crashed". This is the whole record
+/// of what happened, and it survives the process — which is why it is written
+/// straight through rather than buffered.
+fn install_panic_hook(path: std::path::PathBuf) {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        let entry = format!(
+            "{} v{} thread {:?}\n{info}\n{}\n\n",
+            chrono::Utc::now().to_rfc3339(),
+            env!("CARGO_PKG_VERSION"),
+            std::thread::current().name().unwrap_or("unnamed"),
+            std::backtrace::Backtrace::force_capture(),
+        );
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = f.write_all(entry.as_bytes());
+        }
+        default(info);
+    }));
 }

@@ -57,9 +57,18 @@ pub struct CompiledHighlight {
 /// One entry in the timestamp-interleaved merged view.
 #[derive(Clone, Copy)]
 pub struct MergedEntry {
-    pub micros: u64,
+    pub micros: i64,
     pub port: PortId,
     pub abs: u64,
+    /// Position in the view, as a number that only ever increases along it.
+    ///
+    /// This is what the row index keys entries by, and it needs a key that is
+    /// *strictly* increasing to tell an eviction from a reshuffle. `micros`
+    /// looks like one and is not: every line framed out of a single read
+    /// carries that read's timestamp, so a burst of output shares one to the
+    /// microsecond. Renumbered whenever the view is reordered rather than
+    /// appended to — which already forces the index to rebuild.
+    pub seq: u64,
 }
 
 /// Load config from disk, falling back to defaults on any error.
@@ -162,9 +171,9 @@ fn gather_history<'a>(
     restored
 }
 
-/// Preload the prior captures for `identity` into `conn.store`, then append a
-/// boundary marker, so a reopened tab shows the output it had before the app
-/// was last closed with new live output continuing below.
+/// Preload the prior captures for `identity` into `conn.store`, each closed by
+/// a boundary marker, so a reopened tab shows the output it had before the app
+/// was last closed with new live output continuing below the last marker.
 ///
 /// History is gathered from the newest capture backwards until
 /// `PRELOAD_TAIL_BYTES` is filled, rather than from the newest one alone. A
@@ -176,38 +185,45 @@ fn preload_last_session(
     conn: &mut Connection,
     captures: &[(PathBuf, SessionMeta)],
     identity: &PortIdentity,
+    clock: &SessionClock,
 ) {
     let restored = gather_history(captures, identity, PRELOAD_TAIL_BYTES);
-    let Some((newest, _)) = restored.last() else {
-        return;
-    };
-    let newest = *newest;
 
     // Re-frame the raw bytes exactly as the reader did, stamping each line with
     // the *original* wall-clock time (start of that capture plus its offset) so
     // absolute timestamps read as when the data actually arrived. Each capture
     // is framed on its own: they are separate streams, and the last line of one
     // must not swallow the first line of the next.
-    let mut last_ts = Timestamp {
-        wall: newest.start_wall,
-        micros: 0,
-    };
-    let mut any = false;
     for (meta, records) in &restored {
         let mut framer = Framer::with_mode(conn.port_config.terminal);
         let mut framed = Vec::new();
         for (micros, bytes) in records {
+            // Checked: the offset comes off disk, and a capture torn by a
+            // crash (or an older one damaged since) can name one that runs
+            // the date past what chrono represents — which `+` answers with
+            // a panic, before the window has even opened.
+            let wall = meta
+                .start_wall
+                .checked_add_signed(chrono::Duration::microseconds(*micros as i64))
+                .unwrap_or(meta.start_wall);
+            // Not the offset off disk: that counts from *that* run's start, and
+            // this line is about to share a store — and every interval drawn
+            // from it — with output stamped against this run's clock. Projected
+            // through the wall clock instead, the only reference the two runs
+            // share, which puts it on the negative side of the axis where a
+            // line recorded before this run began belongs.
             let ts = Timestamp {
-                wall: meta.start_wall + chrono::Duration::microseconds(*micros as i64),
-                micros: *micros,
+                wall,
+                micros: clock.micros_at(wall),
             };
             framer.push(bytes, ts, &mut framed);
         }
         framer.flush_final(&mut framed);
-        if let Some(line) = framed.last() {
-            last_ts = line.ts;
-            any = true;
-        }
+        // A capture that framed to nothing gets no marker: a boundary with no
+        // output above it is just noise.
+        let Some(last_ts) = framed.last().map(|line| line.ts) else {
+            continue;
+        };
         for line in framed {
             let styled = serialcore::ansi::parse_line(&line.text, line.cursor);
             conn.store.append(IncomingLine {
@@ -219,28 +235,24 @@ fn preload_last_session(
                 cursor: styled.cursor.map(|c| c as u32),
             });
         }
+        // Boundary closing this capture. Below it is either the next restored
+        // session or, after the last one, the live output.
+        conn.store.append(IncomingLine {
+            text: format!(
+                "previous session · {}",
+                // Local time, like every other wall-clock stamp on screen; only
+                // storage is UTC.
+                meta.start_wall
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M")
+            ),
+            ts: last_ts,
+            port: conn.id,
+            flags: LineFlags::RECONNECT_MARKER,
+            spans: Default::default(),
+            cursor: None,
+        });
     }
-    if !any {
-        return;
-    }
-
-    // Boundary between restored history (above) and live output (below).
-    conn.store.append(IncomingLine {
-        text: format!(
-            "previous session · {}",
-            // Local time, like every other wall-clock stamp on screen; only
-            // storage is UTC.
-            newest
-                .start_wall
-                .with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M")
-        ),
-        ts: last_ts,
-        port: conn.id,
-        flags: LineFlags::RECONNECT_MARKER,
-        spans: Default::default(),
-        cursor: None,
-    });
 }
 
 /// Maximum raw bytes kept per connection for the live hex view.
@@ -285,8 +297,11 @@ pub struct Connection {
     /// Bounded ring of raw bytes for hex view.
     pub raw_ring: VecDeque<u8>,
     pub last_error: Option<String>,
-    /// User-set time mark for delta-from-mark display.
-    pub mark_micros: Option<u64>,
+    /// User-set time mark for delta-from-mark display, on the session axis, so
+    /// a mark set on a restored line is negative. Deliberately not persisted:
+    /// a mark is a "measure from here" gesture on the console in front of you,
+    /// and the next run counts from its own start until you set one again.
+    pub mark_micros: Option<i64>,
     /// Show the raw-byte hex view instead of decoded lines (spec §7.11).
     pub hex_view: bool,
     // Filtering (spec §7.8).
@@ -525,6 +540,9 @@ pub struct App {
     /// Visual-row totals for the merged view, as `Connection::wrap_index` is
     /// for a single tab.
     pub merged_wrap: WrapIndex,
+    /// Hands out `MergedEntry::seq`. Only ever counts up while the view is
+    /// appended to; a reorder renumbers the whole view and resets it.
+    pub merged_seq: u64,
     /// Bumped whenever `merged` is rebuilt or reordered rather than appended
     /// to, which is the one change `merged_wrap` cannot follow incrementally.
     pub merged_generation: u64,
@@ -587,6 +605,7 @@ impl App {
             highlight_cache: Vec::new(),
             highlight_dirty: true,
             merged: Vec::new(),
+            merged_seq: 0,
             merged_dirty: false,
             merged_wrap: WrapIndex::new(),
             merged_generation: 0,
@@ -620,10 +639,13 @@ impl App {
         // before enumeration has produced its first snapshot; a device that is
         // not present simply sits reconnecting until it appears. Each reopened
         // tab is preloaded with the output it had before the app was closed.
+        // Cloning is an `Arc` bump, and it keeps the loop below from holding a
+        // shared borrow of `app` across the `connections.last_mut()`.
+        let clock = app.clock.clone();
         for saved in app.config.last_open.clone() {
             app.open_connection(saved.identity.clone(), None, saved.config);
             if let Some(conn) = app.connections.last_mut() {
-                preload_last_session(conn, &prior_captures, &saved.identity);
+                preload_last_session(conn, &prior_captures, &saved.identity, &clock);
             }
         }
         app.active = 0;
@@ -716,6 +738,14 @@ impl App {
             .map(|d| d.identity.clone())
             .unwrap_or_else(|| self.connections[index].identity.clone());
 
+        // Close the old reader *before* opening the new one. Both address the
+        // same device, and a serial port is opened exclusively — with the old
+        // reader still holding it the new one's first open fails, and it goes
+        // away into its reconnect backoff for up to two seconds before trying
+        // again. The wait is no new cost: this join already happened, just
+        // after the spawn rather than before it.
+        self.connections[index].handle.shutdown_in_place();
+
         // Keep the same port id so the preserved lines still map to this tab in
         // the merged view; only the reader (and its capture file) is replaced.
         let handle = self.spawn_serial_reader(port_id, &identity, &config, initial_path.clone());
@@ -728,9 +758,10 @@ impl App {
         let marker_text = format!("reconnected · {}", config.summary());
         let marker_ts = self.clock.now();
 
-        let old_handle = {
+        {
             let conn = &mut self.connections[index];
-            let old = std::mem::replace(&mut conn.handle, handle);
+            // Drops the spent handle, whose thread is already joined.
+            conn.handle = handle;
             conn.identity = identity;
             conn.port_config = config;
             conn.label = label;
@@ -751,9 +782,7 @@ impl App {
                 spans: Default::default(),
                 cursor: None,
             });
-            old
-        };
-        old_handle.shutdown();
+        }
 
         self.active = index;
         self.merged_selected = false;
@@ -1094,6 +1123,7 @@ impl App {
         if self.merged_dirty {
             self.merged_dirty = false;
             self.merged.clear();
+            self.merged_seq = 0;
             self.merged_generation += 1;
             for conn in &mut self.connections {
                 conn.merged_upto = conn.store.first_abs_index();
@@ -1110,17 +1140,26 @@ impl App {
                         micros: line.meta.ts.micros,
                         port: conn.id,
                         abs,
+                        // Stamped below, once the batch is in view order.
+                        seq: 0,
                     });
                 }
             }
             conn.merged_upto = end;
         }
+        self.prune_merged();
         if fresh.is_empty() {
             return;
         }
         fresh.sort_by_key(|e| e.micros);
-        // Fast path: the new tail is entirely after what we already have.
-        let last_micros = self.merged.last().map(|e| e.micros).unwrap_or(0);
+        for e in &mut fresh {
+            e.seq = self.merged_seq;
+            self.merged_seq += 1;
+        }
+        // Fast path: the new tail is entirely after what we already have. An
+        // empty view always qualifies — hence `MIN` and not `0`, which restored
+        // history (stamped before this run's start, so negative) would fail.
+        let last_micros = self.merged.last().map(|e| e.micros).unwrap_or(i64::MIN);
         if fresh[0].micros >= last_micros {
             self.merged.extend(fresh);
         } else {
@@ -1129,7 +1168,44 @@ impl App {
             // make it count them again.
             self.merged.extend(fresh);
             self.merged.sort_by_key(|e| e.micros);
+            // The sort interleaved the new entries among the old, so the
+            // numbering no longer runs along the view. Lay it down again — the
+            // index is rebuilding this frame regardless.
+            for (i, e) in self.merged.iter_mut().enumerate() {
+                e.seq = i as u64;
+            }
+            self.merged_seq = self.merged.len() as u64;
             self.merged_generation += 1;
+        }
+    }
+
+    /// Drop merged entries whose line has been evicted from its port's store.
+    ///
+    /// Without this the merged view is the one place in the app that grows
+    /// without bound: every port's store evicts at `max_lines`, but an entry
+    /// here outlives the line it points at, and is then a row that can only
+    /// ever draw as blank space. It is also built on every frame that carries
+    /// data, whether or not the merged tab is the one on screen, so a long
+    /// session at speed leaks it steadily.
+    ///
+    /// Only the front is walked. Entries are in timestamp order and each port
+    /// evicts its own oldest first, so that is where the dead ones collect —
+    /// and stopping at the first live entry keeps this proportional to what is
+    /// actually dropped rather than to the length of the view.
+    fn prune_merged(&mut self) {
+        let dead = self
+            .merged
+            .iter()
+            .take_while(|e| {
+                match self.connections.iter().find(|c| c.id == e.port) {
+                    Some(conn) => e.abs < conn.store.first_abs_index(),
+                    // The port is gone; closing one rebuilds the view anyway.
+                    None => true,
+                }
+            })
+            .count();
+        if dead > 0 {
+            self.merged.drain(..dead);
         }
     }
 

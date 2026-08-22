@@ -101,8 +101,13 @@ impl Metrics {
         }
         let ts_cols = match ts {
             TimestampFormat::None => 0,
-            // Exactly "12:34:56.789"; the from-mark form is shorter.
-            TimestampFormat::Absolute | TimestampFormat::Mark => 12,
+            // Exactly "2026-08-22 12:34:56.789".
+            TimestampFormat::Absolute => 23,
+            // Exactly "12:34:56.789".
+            TimestampFormat::Time => 12,
+            // The widest from-mark form ("-1234.567s", "-364.123d") still fits
+            // inside a clock's columns.
+            TimestampFormat::Mark => 12,
             // "+1234.567s" and friends, with a column to spare.
             TimestampFormat::Delta => 11,
         };
@@ -171,8 +176,8 @@ struct RowCtx<'a> {
     /// is capped to it, so a mispredicted line loses its overflow instead of
     /// spilling into its neighbour.
     rows: u32,
-    prev_micros: Option<u64>,
-    mark: Option<u64>,
+    prev_micros: Option<i64>,
+    mark: Option<i64>,
     highlight: &'a [CompiledHighlight],
     search_re: Option<&'a regex::Regex>,
     is_search_current: bool,
@@ -444,15 +449,13 @@ impl App {
         let follow = conn.follow;
         // Whether the *user* set a mark, which is what the menu offers to clear.
         let has_mark = conn.mark_micros.is_some();
-        // With none set, the console counts from its own first line rather than
-        // falling back to a wall clock: "from mark" should always read as an
-        // offset. That reference follows the scrollback, so once the oldest
-        // lines are evicted it becomes the oldest line still held.
-        let mark = conn.mark_micros.or_else(|| {
-            conn.store
-                .get(conn.store.first_abs_index())
-                .map(|l| l.meta.ts.micros)
-        });
+        // With none set, the console counts from the start of this run, which is
+        // the axis' own zero: live output reads as time since launch, and
+        // restored history above it reads negative — how long *before* this run
+        // each line landed. Counting from the oldest line held instead would
+        // hang every live reading off whenever the restored capture happened to
+        // begin, which can be days back and moves as the scrollback is evicted.
+        let mark = Some(conn.mark_micros.unwrap_or(0));
         let filter_active = !conn
             .filter_rules
             .iter()
@@ -641,17 +644,19 @@ impl App {
         let row_height = m.row_height;
         let index_of = |id: PortId| connections.iter().position(|c| c.id == id);
         let entries = merged.len();
-        // Entries are in timestamp order, so the first is the zero everything
-        // else counts from in the "from mark" format.
-        let earliest = merged.first().map(|e| e.micros);
-        // Entries are ordered by timestamp, and only ever appended to or thrown
-        // away wholesale (which bumps the generation), so the micros of an entry
-        // stand in for the monotonic key the index needs.
+        // The merged view carries no mark of its own — a mark belongs to one
+        // port's console — so "from mark" counts from this run's start here,
+        // the same zero a single tab falls back to.
+        let session_start = Some(0);
+        // Keyed by `seq`, not by the timestamp the view is ordered on: the
+        // index needs a key that strictly increases to tell entries dropped
+        // off the front from a reshuffle, and a burst of output shares one
+        // timestamp across every line framed out of the same read.
         merged_wrap.sync(
             m.cols,
             *merged_generation,
             entries,
-            |i| merged[i].micros,
+            |i| merged[i].seq,
             |i| {
                 let MergedEntry { port, abs, .. } = merged[i];
                 match index_of(port) {
@@ -703,7 +708,7 @@ impl App {
                             m: &m,
                             rows,
                             prev_micros: None,
-                            mark: earliest,
+                            mark: session_start,
                             highlight: highlight_cache,
                             search_re: None,
                             is_search_current: false,
@@ -952,6 +957,7 @@ fn console_menu(
     ui.menu_button("Timestamps", |ui| {
         for f in [
             TimestampFormat::Absolute,
+            TimestampFormat::Time,
             TimestampFormat::Delta,
             TimestampFormat::Mark,
             TimestampFormat::None,
@@ -1073,7 +1079,7 @@ fn prev_micros_for(
     matching: &[u64],
     row: usize,
     abs: u64,
-) -> Option<u64> {
+) -> Option<i64> {
     let prev_abs = if filter_active {
         row.checked_sub(1).map(|r| matching[r])
     } else {
@@ -1492,7 +1498,8 @@ fn short_tag(label: &str) -> String {
 
 fn ts_format_label(f: TimestampFormat) -> &'static str {
     match f {
-        TimestampFormat::Absolute => "absolute",
+        TimestampFormat::Absolute => "absolute (with date)",
+        TimestampFormat::Time => "absolute (time only)",
         TimestampFormat::Delta => "delta",
         TimestampFormat::Mark => "from mark",
         TimestampFormat::None => "none",
@@ -1503,43 +1510,67 @@ fn ts_format_label(f: TimestampFormat) -> &'static str {
 pub fn format_timestamp(
     ts: Timestamp,
     format: TimestampFormat,
-    prev_micros: Option<u64>,
-    mark: Option<u64>,
+    prev_micros: Option<i64>,
+    mark: Option<i64>,
 ) -> String {
     match format {
         TimestampFormat::None => String::new(),
         TimestampFormat::Absolute => wall_clock(ts),
+        TimestampFormat::Time => clock_time(ts),
         TimestampFormat::Delta => match prev_micros {
-            Some(p) => format!("+{}", fmt_delta(ts.micros.saturating_sub(p))),
+            // A store only grows forward in time, so the gap is never negative;
+            // clamped rather than signed because a "-" in the delta column
+            // would read as a defect, not as information.
+            Some(p) => format!("+{}", fmt_delta(ts.micros.saturating_sub(p).max(0))),
             None => format!(" {}", fmt_delta(0)),
         },
         TimestampFormat::Mark => match mark {
-            // Signed: a line above the mark is *before* it. Saturating the
-            // subtraction instead would render the whole scrollback above the
-            // mark as a column of zeroes.
-            Some(m) if ts.micros >= m => format!("+{}", fmt_delta(ts.micros - m)),
-            Some(m) => format!("-{}", fmt_delta(m - ts.micros)),
-            // Only reachable with an empty console, which has no rows to
-            // stamp: callers pass the view's own first line when the user has
-            // not marked one.
+            // Signed: a line above the mark is *before* it. That now covers a
+            // whole restored session sitting above a mark set in this one.
+            Some(m) if ts.micros >= m => format!("+{}", fmt_delta(ts.micros.saturating_sub(m))),
+            Some(m) => format!("-{}", fmt_delta(m.saturating_sub(ts.micros))),
+            // Unreachable: with no mark set, callers fall back to the axis'
+            // zero — the start of this run — rather than to nothing.
             None => String::new(),
         },
     }
 }
 
-/// A line's wall-clock time as the user's own clock reads it. Stamps are stored
-/// in UTC (a clock that can't jump backwards over a DST change); the conversion
-/// to local belongs at the point of display, and nowhere else.
+/// A line's wall-clock time as the user's own clock reads it, dated: a console
+/// can hold days of output, and a bare time of day says nothing about which day
+/// a line landed on. Stamps are stored in UTC (a clock that can't jump backwards
+/// over a DST change); the conversion to local belongs at the point of display,
+/// and nowhere else.
+///
+/// This is the form an export writes, whatever the console is set to: a file
+/// outlives the session that produced it, and its reader has no other way to
+/// know which day a line belongs to.
 fn wall_clock(ts: Timestamp) -> String {
+    ts.wall
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S%.3f")
+        .to_string()
+}
+
+/// The same clock without the date, for a console watching something happen
+/// now: the date is the same on every visible line, and dropping it gives 11
+/// columns back to the text.
+fn clock_time(ts: Timestamp) -> String {
     ts.wall
         .with_timezone(&chrono::Local)
         .format("%H:%M:%S%.3f")
         .to_string()
 }
 
-fn fmt_delta(micros: u64) -> String {
+/// A magnitude, unsigned: the sign is the caller's, since only it knows which
+/// side of a mark the line fell on.
+fn fmt_delta(micros: i64) -> String {
     let secs = micros as f64 / 1_000_000.0;
-    if secs >= 3600.0 {
+    if secs >= 86_400.0 {
+        // Restored history can be days above a mark set in this session, and
+        // "-61.234h" is arithmetic the reader shouldn't have to do.
+        format!("{:.3}d", secs / 86_400.0)
+    } else if secs >= 3600.0 {
         // A device can sit silent overnight. In seconds that reads as a wall of
         // digits, and is wider than the columns the gutter reserves.
         format!("{:.3}h", secs / 3600.0)
@@ -1554,7 +1585,7 @@ fn fmt_delta(micros: u64) -> String {
 mod tests {
     use super::*;
 
-    fn ts(micros: u64) -> Timestamp {
+    fn ts(micros: i64) -> Timestamp {
         Timestamp {
             wall: chrono::Utc::now(),
             micros,
@@ -1586,13 +1617,54 @@ mod tests {
         );
     }
 
-    /// Callers hand "from mark" the view's own first line when the user has not
-    /// marked one, so it never falls back to a wall clock — the format is an
-    /// offset or it is nothing.
+    /// Restored history is stamped on the same axis as live output, below its
+    /// zero, so "from mark" measures across a session boundary the way it
+    /// measures anywhere else — which is the whole reason the axis is signed.
+    #[test]
+    fn from_mark_reaches_back_into_the_previous_session() {
+        // A line from a session that ran 30h before this one started, in a
+        // console marked 5s into this one.
+        let restored = ts(-30 * 3_600 * 1_000_000);
+        assert_eq!(
+            format_timestamp(restored, TimestampFormat::Mark, None, Some(5_000_000)),
+            "-1.250d"
+        );
+        // With no mark set the reference is this run's start, so history reads
+        // as how long before launch it landed and live output as time since.
+        assert_eq!(
+            format_timestamp(restored, TimestampFormat::Mark, None, Some(0)),
+            "-1.250d"
+        );
+        assert_eq!(
+            format_timestamp(ts(2_500_000), TimestampFormat::Mark, None, Some(0)),
+            "+2.500s"
+        );
+    }
+
+    /// The delta column measures against the line above, and the line above can
+    /// belong to the previous session. That gap is real elapsed time, not a
+    /// number to run backwards through the subtraction.
+    #[test]
+    fn delta_across_a_session_boundary_stays_forward() {
+        let last_restored = -90 * 1_000_000;
+        assert_eq!(
+            format_timestamp(
+                ts(1_000_000),
+                TimestampFormat::Delta,
+                Some(last_restored),
+                None
+            ),
+            "+91.000s"
+        );
+    }
+
+    /// Callers hand "from mark" this run's start when the user has not marked a
+    /// line, so it never falls back to a wall clock — the format is an offset or
+    /// it is nothing.
     #[test]
     fn from_mark_never_renders_a_wall_clock() {
-        let from_first_line = format_timestamp(ts(1_000), TimestampFormat::Mark, None, Some(0));
-        assert_eq!(from_first_line, "+1.000ms");
+        let from_session_start = format_timestamp(ts(1_000), TimestampFormat::Mark, None, Some(0));
+        assert_eq!(from_session_start, "+1.000ms");
         // Only an empty console reaches this, and it has no rows to stamp.
         assert_eq!(
             format_timestamp(ts(1), TimestampFormat::Mark, None, None),
@@ -1613,6 +1685,25 @@ mod tests {
         );
     }
 
+    /// The two absolute forms are one clock, and differ only in the date: the
+    /// time-only one is for a session where every visible line shares a date
+    /// and the eleven columns are worth more to the text.
+    #[test]
+    fn the_absolute_forms_differ_only_in_the_date() {
+        let line = Timestamp {
+            wall: chrono::Utc::now(),
+            micros: 0,
+        };
+        let dated = format_timestamp(line, TimestampFormat::Absolute, None, None);
+        let time_only = format_timestamp(line, TimestampFormat::Time, None, None);
+        assert_eq!(dated.chars().count(), 23);
+        assert_eq!(time_only.chars().count(), 12);
+        assert!(
+            dated.ends_with(&time_only),
+            "{dated:?} should be {time_only:?} with a date in front"
+        );
+    }
+
     /// The gutter is reserved a fixed number of columns per format, and text
     /// wraps against what is left; a stamp wider than its reserve would push
     /// into the text column.
@@ -1621,7 +1712,8 @@ mod tests {
         // A session running for over a day, marked at the far end of it.
         let long = 100_000 * 1_000_000;
         for (format, reserved) in [
-            (TimestampFormat::Absolute, 12),
+            (TimestampFormat::Absolute, 23),
+            (TimestampFormat::Time, 12),
             (TimestampFormat::Mark, 12),
             (TimestampFormat::Delta, 11),
         ] {
@@ -1629,6 +1721,8 @@ mod tests {
                 (0, None, None),
                 (long, Some(0), Some(0)),
                 (0, Some(long), Some(long)),
+                // A mark set in this session, with restored history above it.
+                (-long, None, Some(long)),
             ] {
                 let out = format_timestamp(ts(t), format, prev, mark);
                 assert!(

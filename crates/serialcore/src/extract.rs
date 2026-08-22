@@ -86,10 +86,14 @@ fn extract_kv(text: &str, separators: &[char], out: &mut Vec<(String, f64)>) {
         if token.is_empty() {
             continue;
         }
-        // Find the first separator character.
+        // Find the first separator character. Stepping over it by its own
+        // width, not by one byte: the separators come from the config file,
+        // where nothing stops one from being non-ASCII, and a fixed step of
+        // one would slice the token off a char boundary and panic.
         if let Some(pos) = token.find(|c| separators.contains(&c)) {
+            let sep_len = token[pos..].chars().next().map_or(1, char::len_utf8);
             let key = token[..pos].trim();
-            let val = token[pos + 1..].trim();
+            let val = token[pos + sep_len..].trim();
             if key.is_empty() {
                 continue;
             }
@@ -115,6 +119,26 @@ fn extract_regex(text: &str, re: &Regex, names: &[String], out: &mut Vec<(String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_multibyte_separator_splits_on_a_char_boundary() {
+        // Separators are only reachable by hand-editing the config, which
+        // does not stop them being non-ASCII — and stepping over one by a
+        // single byte used to land inside it and panic.
+        let rule = ExtractRule {
+            mode: ExtractMode::Kv,
+            prefix: None,
+            pattern: None,
+            kv_separators: Some(vec!['\u{2192}']),
+        };
+        let c = CompiledExtract::compile(&rule).unwrap();
+        let mut out = Vec::new();
+        c.extract("temp\u{2192}23.5 rpm\u{2192}1200", &mut out);
+        assert_eq!(
+            out,
+            vec![("temp".to_string(), 23.5), ("rpm".to_string(), 1200.0)]
+        );
+    }
 
     fn kv_rule(prefix: Option<&str>) -> ExtractRule {
         ExtractRule {
