@@ -197,8 +197,16 @@ fn preload_last_session(
         let mut framer = Framer::with_mode(conn.port_config.terminal);
         let mut framed = Vec::new();
         for (micros, bytes) in records {
+            // Checked: the offset comes off disk, and a capture torn by a
+            // crash (or an older one damaged since) can name one that runs
+            // the date past what chrono represents — which `+` answers with
+            // a panic, before the window has even opened.
+            let wall = meta
+                .start_wall
+                .checked_add_signed(chrono::Duration::microseconds(*micros as i64))
+                .unwrap_or(meta.start_wall);
             let ts = Timestamp {
-                wall: meta.start_wall + chrono::Duration::microseconds(*micros as i64),
+                wall,
                 micros: *micros,
             };
             framer.push(bytes, ts, &mut framed);
@@ -1115,6 +1123,7 @@ impl App {
             }
             conn.merged_upto = end;
         }
+        self.prune_merged();
         if fresh.is_empty() {
             return;
         }
@@ -1130,6 +1139,36 @@ impl App {
             self.merged.extend(fresh);
             self.merged.sort_by_key(|e| e.micros);
             self.merged_generation += 1;
+        }
+    }
+
+    /// Drop merged entries whose line has been evicted from its port's store.
+    ///
+    /// Without this the merged view is the one place in the app that grows
+    /// without bound: every port's store evicts at `max_lines`, but an entry
+    /// here outlives the line it points at, and is then a row that can only
+    /// ever draw as blank space. It is also built on every frame that carries
+    /// data, whether or not the merged tab is the one on screen, so a long
+    /// session at speed leaks it steadily.
+    ///
+    /// Only the front is walked. Entries are in timestamp order and each port
+    /// evicts its own oldest first, so that is where the dead ones collect —
+    /// and stopping at the first live entry keeps this proportional to what is
+    /// actually dropped rather than to the length of the view.
+    fn prune_merged(&mut self) {
+        let dead = self
+            .merged
+            .iter()
+            .take_while(|e| {
+                match self.connections.iter().find(|c| c.id == e.port) {
+                    Some(conn) => e.abs < conn.store.first_abs_index(),
+                    // The port is gone; closing one rebuilds the view anyway.
+                    None => true,
+                }
+            })
+            .count();
+        if dead > 0 {
+            self.merged.drain(..dead);
         }
     }
 
