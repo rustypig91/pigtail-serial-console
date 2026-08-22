@@ -5,6 +5,16 @@
 //!   becomes a series automatically.
 //! - *Regex*: named capture groups become series.
 //!
+//! Key-value parsing is two-level: a line is first cut into tokens on the
+//! characters that end one pair and start the next — spaces, commas, semicolons,
+//! tabs — and each token is then split at the first *separator* into a name and
+//! a number. A space therefore cannot be written into the separator list and
+//! mean "between name and value": by the time separators are consulted it has
+//! already done its other job. Putting whitespace in the list instead switches
+//! on bare-name pairing, where a word names the number that follows it
+//! (`temp 23.4`) — off by default, because prose like `Booting 42 modules`
+//! would otherwise plot a series.
+//!
 //! Rules may be gated by a prefix (only lines starting with e.g. `PLOT:` are
 //! parsed, and the prefix is stripped before parsing). Port scoping is applied
 //! by the caller, which owns the per-port association.
@@ -80,7 +90,17 @@ impl CompiledExtract {
 }
 
 fn extract_kv(text: &str, separators: &[char], out: &mut Vec<(String, f64)>) {
-    // Split on whitespace and commas; each token is `key<sep>value`.
+    // Whitespace can never be found *inside* a token — it is what ended the
+    // token — so its presence in the list means something else: pair a bare word
+    // with the number after it.
+    let bare_names = separators.iter().any(|c| c.is_whitespace());
+    // A name that has already met its separator and is waiting for its number,
+    // which is how `temp: 23.4` and `rpm = 1200` are written.
+    let mut pending: Option<&str> = None;
+    // The last bare word seen: a candidate name, promoted by a separator token
+    // that follows it, or by the next number when `bare_names` is on.
+    let mut last_word: Option<&str> = None;
+
     for token in text.split([',', ' ', '\t', ';']) {
         let token = token.trim();
         if token.is_empty() {
@@ -90,16 +110,46 @@ fn extract_kv(text: &str, separators: &[char], out: &mut Vec<(String, f64)>) {
         // width, not by one byte: the separators come from the config file,
         // where nothing stops one from being non-ASCII, and a fixed step of
         // one would slice the token off a char boundary and panic.
-        if let Some(pos) = token.find(|c| separators.contains(&c)) {
-            let sep_len = token[pos..].chars().next().map_or(1, char::len_utf8);
-            let key = token[..pos].trim();
-            let val = token[pos + sep_len..].trim();
-            if key.is_empty() {
-                continue;
+        let at = token.find(|c: char| !c.is_whitespace() && separators.contains(&c));
+        match at {
+            Some(pos) => {
+                let sep_len = token[pos..].chars().next().map_or(1, char::len_utf8);
+                let key = token[..pos].trim();
+                let val = token[pos + sep_len..].trim();
+                // A token that *starts* with the separator names nothing itself:
+                // the name is the word standing before it (`rpm = 1200`).
+                let name = if key.is_empty() {
+                    pending.take().or_else(|| last_word.take())
+                } else {
+                    Some(key)
+                };
+                pending = None;
+                last_word = None;
+                match (name, val.parse::<f64>()) {
+                    (Some(name), Ok(v)) => out.push((name.to_string(), v)),
+                    // `temp:` on its own — the number is the next token.
+                    (Some(name), Err(_)) if val.is_empty() => pending = Some(name),
+                    _ => {}
+                }
             }
-            if let Ok(v) = val.parse::<f64>() {
-                out.push((key.to_string(), v));
-            }
+            None => match token.parse::<f64>() {
+                Ok(v) => {
+                    let name =
+                        pending
+                            .take()
+                            .or_else(|| if bare_names { last_word.take() } else { None });
+                    if let Some(name) = name {
+                        out.push((name.to_string(), v));
+                    }
+                    last_word = None;
+                }
+                // A word where a number was expected breaks the pair being
+                // built: `temp: none` plots nothing.
+                Err(_) => {
+                    pending = None;
+                    last_word = Some(token);
+                }
+            },
         }
     }
 }
@@ -216,5 +266,82 @@ mod tests {
         let mut out = Vec::new();
         c.extract("a|1 b|2", &mut out);
         assert_eq!(out, vec![("a".into(), 1.0), ("b".into(), 2.0)]);
+    }
+    fn kv_extract(rule: &ExtractRule, line: &str) -> Vec<(String, f64)> {
+        let c = CompiledExtract::compile(rule).unwrap();
+        let mut out = Vec::new();
+        c.extract(line, &mut out);
+        out
+    }
+
+    /// The way most human-readable output is actually written: the separator
+    /// ends its token and the number stands on its own.
+    #[test]
+    fn a_value_in_the_next_token_still_pairs() {
+        let rule = kv_rule(None);
+        assert_eq!(
+            kv_extract(&rule, "temp: 23.4, rpm = 1200"),
+            vec![("temp".into(), 23.4), ("rpm".into(), 1200.0)]
+        );
+    }
+
+    /// A word standing where the number should be ends the pair rather than
+    /// letting the name reach past it to a later number.
+    #[test]
+    fn a_dangling_name_does_not_swallow_a_later_number() {
+        let rule = kv_rule(None);
+        assert_eq!(kv_extract(&rule, "temp: none 42"), vec![]);
+    }
+
+    /// Off by default: prose has plenty of `word number` in it, and none of it
+    /// is a series.
+    #[test]
+    fn a_bare_word_is_not_a_name_unless_asked_for() {
+        let rule = kv_rule(None);
+        assert_eq!(kv_extract(&rule, "Booting 42 modules"), vec![]);
+    }
+
+    /// Whitespace in the separator list is what asks for it — a space cannot be
+    /// found inside a token, since it is what ends one.
+    #[test]
+    fn whitespace_in_the_separators_pairs_a_word_with_the_number_after_it() {
+        let rule = ExtractRule {
+            mode: ExtractMode::Kv,
+            prefix: None,
+            pattern: None,
+            kv_separators: Some(vec![':', '=', ' ']),
+        };
+        assert_eq!(
+            kv_extract(&rule, "temp 23.4 rpm 1200"),
+            vec![("temp".into(), 23.4), ("rpm".into(), 1200.0)]
+        );
+        // The unit after a value is a word, so it becomes the *next* candidate
+        // name and is dropped when a real name follows.
+        assert_eq!(
+            kv_extract(&rule, "temp 23.4 C rpm 1200"),
+            vec![("temp".into(), 23.4), ("rpm".into(), 1200.0)]
+        );
+        // Explicit pairs keep working alongside it.
+        assert_eq!(
+            kv_extract(&rule, "temp:23.4 rpm 1200"),
+            vec![("temp".into(), 23.4), ("rpm".into(), 1200.0)]
+        );
+    }
+
+    /// A clock in a log line is not a pair, in either mode.
+    #[test]
+    fn a_timestamp_is_not_mistaken_for_a_pair() {
+        for seps in [vec![':', '='], vec![':', '=', ' ']] {
+            let rule = ExtractRule {
+                mode: ExtractMode::Kv,
+                prefix: None,
+                pattern: None,
+                kv_separators: Some(seps),
+            };
+            assert_eq!(
+                kv_extract(&rule, "12:30:00 temp:5"),
+                vec![("temp".into(), 5.0)]
+            );
+        }
     }
 }

@@ -224,6 +224,26 @@ fn preload_last_session(
         let Some(last_ts) = framed.last().map(|line| line.ts) else {
             continue;
         };
+        // The console's marker text, shared with the hex view's boundary so the
+        // two views name the same capture the same way.
+        let label = format!(
+            "previous session · {}",
+            // Local time, like every other wall-clock stamp on screen; only
+            // storage is UTC.
+            meta.start_wall
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+        );
+        // The same records, as the bytes they were on the wire. Pushed as one
+        // run so the hex view numbers them from this capture's start.
+        let raw_start = conn.raw_next();
+        for (_, bytes) in records {
+            conn.push_raw_bytes(bytes);
+        }
+        conn.raw_sessions.push(RawSession {
+            start: raw_start,
+            label: Some(label.clone()),
+        });
         for line in framed {
             let styled = serialcore::ansi::parse_line(&line.text, line.cursor);
             conn.store.append(IncomingLine {
@@ -238,14 +258,7 @@ fn preload_last_session(
         // Boundary closing this capture. Below it is either the next restored
         // session or, after the last one, the live output.
         conn.store.append(IncomingLine {
-            text: format!(
-                "previous session · {}",
-                // Local time, like every other wall-clock stamp on screen; only
-                // storage is UTC.
-                meta.start_wall
-                    .with_timezone(&chrono::Local)
-                    .format("%Y-%m-%d %H:%M")
-            ),
+            text: label,
             ts: last_ts,
             port: conn.id,
             flags: LineFlags::RECONNECT_MARKER,
@@ -255,8 +268,49 @@ fn preload_last_session(
     }
 }
 
-/// Maximum raw bytes kept per connection for the live hex view.
+/// Maximum raw bytes kept per connection for the hex view.
 const RAW_RING_CAP: usize = 1 << 20; // 1 MiB
+
+/// Append `bytes` to a raw ring holding at most `cap`, evicting from the front,
+/// and advance `base` by everything that did not stay.
+///
+/// `base + ring.len()` is the absolute index of the next byte, and every
+/// [`RawSession::start`] is measured on that scale — so a byte dropped here must
+/// be counted here, including the head of a push larger than the ring itself.
+/// Get that wrong and the hex view addresses the wrong bytes.
+///
+/// Evicting in bulk rather than a byte at a time is what makes preloading
+/// worthwhile: a session restore can hand this several megabytes to pour
+/// through a one-megabyte ring.
+fn push_raw(ring: &mut VecDeque<u8>, base: &mut u64, bytes: &[u8], cap: usize) {
+    // Only the tail of an oversized push can survive it.
+    let keep = bytes.len().min(cap);
+    *base += (bytes.len() - keep) as u64;
+    let bytes = &bytes[bytes.len() - keep..];
+
+    let overflow = (ring.len() + keep).saturating_sub(cap);
+    if overflow > 0 {
+        ring.drain(..overflow);
+        *base += overflow as u64;
+    }
+    ring.extend(bytes.iter().copied());
+}
+
+/// One run's worth of bytes inside a connection's raw ring.
+///
+/// The ring holds this run's output *and* whatever was restored from earlier
+/// captures, one after the other, exactly as the console holds their lines. The
+/// hex view counts each run's offsets from its own first byte, so a dump always
+/// starts at `00000000` however much history sits above it.
+pub struct RawSession {
+    /// Absolute index — counting every byte ever pushed to this connection — of
+    /// this run's first byte. Offsets shown in the hex view are measured from
+    /// here, and eviction never shifts it.
+    pub start: u64,
+    /// Boundary drawn under this run's bytes, carrying the same text as the
+    /// console's marker. `None` for the run in progress, which nothing closes.
+    pub label: Option<String>,
+}
 
 /// One open connection (a tab).
 pub struct Connection {
@@ -296,6 +350,11 @@ pub struct Connection {
     pub console_layout: Option<(usize, u8)>,
     /// Bounded ring of raw bytes for hex view.
     pub raw_ring: VecDeque<u8>,
+    /// Bytes dropped from the front of `raw_ring`, for translating a
+    /// [`RawSession`]'s absolute start into a position in the ring.
+    pub raw_base: u64,
+    /// The runs whose bytes the ring holds, oldest first.
+    pub raw_sessions: Vec<RawSession>,
     pub last_error: Option<String>,
     /// User-set time mark for delta-from-mark display, on the session axis, so
     /// a mark set on a restored line is negative. Deliberately not persisted:
@@ -332,6 +391,9 @@ pub struct Connection {
     pub series: Vec<SeriesEntry>,
     pub series_index: HashMap<String, usize>,
     pub plot_follow: bool,
+    /// Set by the plot's Fit button, consumed by the next frame's draw: the
+    /// bounds can only be set from inside the plot's own closure.
+    pub plot_fit: bool,
     pub show_plot: bool,
     // Transmit state. Line ending / echo / history settings live in
     // `port_config`. `tx_input` accumulates the current input line locally (for
@@ -366,13 +428,8 @@ impl Connection {
                     self.last_error = Some(e);
                 }
                 ReaderEvent::Batch(batch) => {
-                    self.recompile_extract_if_dirty();
-                    for b in &batch.raw {
-                        if self.raw_ring.len() == RAW_RING_CAP {
-                            self.raw_ring.pop_front();
-                        }
-                        self.raw_ring.push_back(*b);
-                    }
+                    self.open_live_raw_session();
+                    self.push_raw_bytes(&batch.raw);
                     let _ = max_lines;
                     let mut pairs: Vec<(String, f64)> = Vec::new();
                     for line in batch.lines {
@@ -410,6 +467,28 @@ impl Connection {
             }
         }
         changed
+    }
+
+    /// Absolute index of the next byte to enter the raw ring.
+    pub fn raw_next(&self) -> u64 {
+        self.raw_base + self.raw_ring.len() as u64
+    }
+
+    /// Append bytes to the hex view's ring, evicting from the front at capacity.
+    pub fn push_raw_bytes(&mut self, bytes: &[u8]) {
+        push_raw(&mut self.raw_ring, &mut self.raw_base, bytes, RAW_RING_CAP);
+    }
+
+    /// Open the run of bytes this session is producing, unless it is open
+    /// already. Called on arrival rather than at connect: restored history is
+    /// pushed first, and this run's bytes begin after it.
+    fn open_live_raw_session(&mut self) {
+        if self.raw_sessions.last().map_or(true, |s| s.label.is_some()) {
+            self.raw_sessions.push(RawSession {
+                start: self.raw_next(),
+                label: None,
+            });
+        }
     }
 
     /// Bring the console's visual-row index up to date for a view `cols`
@@ -457,7 +536,13 @@ impl Connection {
             .all(|r| !r.enabled || r.pattern.is_empty())
     }
 
-    fn recompile_extract_if_dirty(&mut self) {
+    /// Compile any changed extraction rules and, when they have changed,
+    /// re-derive every series from the lines already in the console.
+    ///
+    /// Re-reading the session is the whole point: a rule is written *after*
+    /// seeing the output that suggested it, and a plot that began at the moment
+    /// you finished typing would omit exactly the lines that prompted the rule.
+    fn maintain_extract(&mut self) {
         if !self.extract_dirty {
             return;
         }
@@ -470,25 +555,127 @@ impl Connection {
                 Err(e) => self.extract_errors.push(e),
             }
         }
+        self.rebuild_series();
+    }
+
+    /// Re-run the compiled rules over the whole store, replacing the series.
+    fn rebuild_series(&mut self) {
+        // Colour, visibility and Y2 belong to the series *name*, not to the rule
+        // text that happened to produce it: keep them across a re-read so
+        // touching a rule does not reshuffle a plot you have just set up.
+        let remembered: HashMap<String, SeriesStyle> = self
+            .series
+            .iter()
+            .map(|e| {
+                (
+                    e.series.name().to_string(),
+                    SeriesStyle {
+                        color: e.color,
+                        visible: e.visible,
+                        own_axis: e.own_axis,
+                    },
+                )
+            })
+            .collect();
+        self.series.clear();
+        self.series_index.clear();
+        if self.extract_compiled.is_empty() {
+            return;
+        }
+        // Destructured so the store stays borrowed for reading while the series
+        // it feeds are written — disjoint fields, but only field access proves
+        // that to the borrow checker.
+        let Connection {
+            store,
+            series,
+            series_index,
+            extract_compiled,
+            ..
+        } = self;
+        extract_all(store, extract_compiled, series, series_index, &remembered);
     }
 
     fn push_series_point(&mut self, name: &str, t: f64, value: f64, line: u64) {
-        let idx = match self.series_index.get(name) {
-            Some(&i) => i,
-            None => {
-                let color = SERIES_PALETTE[self.series.len() % SERIES_PALETTE.len()];
-                self.series.push(SeriesEntry {
-                    series: Series::new(name.to_string(), DEFAULT_CAPACITY),
-                    color,
-                    visible: true,
-                    own_axis: false,
-                });
-                let i = self.series.len() - 1;
-                self.series_index.insert(name.to_string(), i);
-                i
-            }
-        };
+        let idx = series_slot(&mut self.series, &mut self.series_index, None, name);
         self.series[idx].series.push(t, value, line);
+    }
+}
+
+/// How a series is drawn, remembered by name across a rebuild.
+#[derive(Clone, Copy)]
+struct SeriesStyle {
+    color: egui::Color32,
+    visible: bool,
+    own_axis: bool,
+}
+
+/// Index of the series called `name`, appending it when it is new. `remembered`
+/// gives back the look a series of that name had before a rebuild.
+fn series_slot(
+    series: &mut Vec<SeriesEntry>,
+    index: &mut HashMap<String, usize>,
+    remembered: Option<&HashMap<String, SeriesStyle>>,
+    name: &str,
+) -> usize {
+    if let Some(&i) = index.get(name) {
+        return i;
+    }
+    let style = remembered
+        .and_then(|m| m.get(name).copied())
+        .unwrap_or_else(|| SeriesStyle {
+            color: SERIES_PALETTE[series.len() % SERIES_PALETTE.len()],
+            visible: true,
+            own_axis: false,
+        });
+    series.push(SeriesEntry {
+        series: Series::new(name.to_string(), DEFAULT_CAPACITY),
+        color: style.color,
+        visible: style.visible,
+        own_axis: style.own_axis,
+    });
+    index.insert(name.to_string(), series.len() - 1);
+    series.len() - 1
+}
+
+/// Fill `series` by running `rules` over every line of `store` that this run
+/// recorded.
+///
+/// Restored history is skipped. It sits at a negative stamp (see
+/// [`SessionClock::micros_at`]), often hours or days below zero, and folding it
+/// into the same axis would stretch the plot across the gap between two runs to
+/// show a handful of stale points. The plot covers the session in front of you.
+fn extract_all(
+    store: &LineStore,
+    rules: &[CompiledExtract],
+    series: &mut Vec<SeriesEntry>,
+    index: &mut HashMap<String, usize>,
+    remembered: &HashMap<String, SeriesStyle>,
+) {
+    let mut pairs: Vec<(String, f64)> = Vec::new();
+    for abs in store.first_abs_index()..store.next_abs_index() {
+        let Some(line) = store.get(abs) else {
+            continue;
+        };
+        // The gate live ingest applies — markers and your own echoed input are
+        // not device output — plus the session cut-off.
+        if line.meta.flags.contains(LineFlags::RECONNECT_MARKER)
+            || line.meta.flags.contains(LineFlags::TX_ECHO)
+            || line.meta.ts.micros < 0
+        {
+            continue;
+        }
+        pairs.clear();
+        for rule in rules {
+            rule.extract(line.text, &mut pairs);
+        }
+        if pairs.is_empty() {
+            continue;
+        }
+        let t = line.meta.ts.micros as f64 / 1_000_000.0;
+        for (name, value) in pairs.drain(..) {
+            let idx = series_slot(series, index, Some(remembered), &name);
+            series[idx].series.push(t, value, abs);
+        }
     }
 }
 
@@ -863,6 +1050,8 @@ impl App {
             top_line: None,
             console_layout: None,
             raw_ring: VecDeque::new(),
+            raw_base: 0,
+            raw_sessions: Vec::new(),
             last_error: None,
             mark_micros: None,
             hex_view: false,
@@ -886,6 +1075,7 @@ impl App {
             series: Vec::new(),
             series_index: HashMap::new(),
             plot_follow: true,
+            plot_fit: false,
             show_plot: false,
             tx_input: String::new(),
             tx_history: Vec::new(),
@@ -1229,7 +1419,11 @@ impl App {
             let conn = &mut self.connections[i];
             conn.handle.clear_log();
             conn.store.clear();
+            // The offsets restart at zero with the next byte: nothing is left
+            // above for them to be counted from.
+            conn.raw_base = conn.raw_next();
             conn.raw_ring.clear();
+            conn.raw_sessions.clear();
             // Everything derived from the lines that just went away. The dirty
             // flags make the next frame rebuild both indices against the now
             // empty store rather than leaving stale absolute indices behind.
@@ -1297,6 +1491,9 @@ impl eframe::App for App {
         let max_lines = self.config.settings.max_lines;
         let mut any_data = false;
         for conn in &mut self.connections {
+            // Before the drain: a rule edited last frame re-reads the console's
+            // history here, and the lines arriving below then extend it once.
+            conn.maintain_extract();
             if conn.drain_events(max_lines) {
                 any_data = true;
             }
@@ -1479,5 +1676,135 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+    fn stored(lines: &[(&str, i64, LineFlags)]) -> LineStore {
+        let mut store = LineStore::new(1000);
+        for (text, micros, flags) in lines {
+            store.append(IncomingLine {
+                text: (*text).to_string(),
+                ts: Timestamp {
+                    wall: chrono::Utc::now(),
+                    micros: *micros,
+                },
+                port: PortId(0),
+                flags: *flags,
+                spans: Default::default(),
+                cursor: None,
+            });
+        }
+        store
+    }
+
+    /// The default rule: every `name:value` / `name=value` pair on a line.
+    fn kv_rules() -> Vec<CompiledExtract> {
+        vec![CompiledExtract::compile(&ExtractRule {
+            mode: serialcore::config::ExtractMode::Kv,
+            prefix: None,
+            pattern: None,
+            kv_separators: None,
+        })
+        .unwrap()]
+    }
+
+    fn extracted(store: &LineStore, remembered: &HashMap<String, SeriesStyle>) -> Vec<SeriesEntry> {
+        let mut series = Vec::new();
+        let mut index = HashMap::new();
+        extract_all(store, &kv_rules(), &mut series, &mut index, remembered);
+        series
+    }
+
+    /// The point of re-reading: a rule is written after seeing the output that
+    /// suggested it, and used to plot nothing until the *next* line arrived.
+    #[test]
+    fn a_rule_reads_the_lines_already_in_the_console() {
+        let store = stored(&[
+            ("temp:1", 1_000_000, LineFlags::default()),
+            ("nothing here", 2_000_000, LineFlags::default()),
+            ("temp:3", 3_000_000, LineFlags::default()),
+        ]);
+        let series = extracted(&store, &HashMap::new());
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].series.name(), "temp");
+        assert_eq!(series[0].series.len(), 2);
+        let last = series[0].series.last().unwrap();
+        assert_eq!((last.t, last.value), (3.0, 3.0));
+        assert_eq!(last.line, 2, "the point still points back at its line");
+    }
+
+    /// Everything the live path skips, the re-read skips too — plus the
+    /// previous run's output, which sits at a negative stamp.
+    #[test]
+    fn a_re_read_takes_only_this_session_s_device_output() {
+        let store = stored(&[
+            ("temp:9", -60_000_000, LineFlags::default()),
+            ("temp:2", 0, LineFlags::RECONNECT_MARKER),
+            ("temp:5", 1_000_000, LineFlags::TX_ECHO),
+            ("temp:7", 2_000_000, LineFlags::default()),
+        ]);
+        let series = extracted(&store, &HashMap::new());
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].series.len(), 1);
+        assert_eq!(series[0].series.last().unwrap().value, 7.0);
+    }
+
+    /// Editing a rule must not reshuffle a plot you have just set up.
+    #[test]
+    fn a_re_read_keeps_the_look_of_a_series_it_finds_again() {
+        let store = stored(&[("temp:1 rpm:2", 1_000_000, LineFlags::default())]);
+        let mut remembered = HashMap::new();
+        remembered.insert(
+            "rpm".to_string(),
+            SeriesStyle {
+                color: egui::Color32::RED,
+                visible: false,
+                own_axis: true,
+            },
+        );
+        let series = extracted(&store, &remembered);
+        let rpm = series.iter().find(|e| e.series.name() == "rpm").unwrap();
+        assert_eq!(rpm.color, egui::Color32::RED);
+        assert!(!rpm.visible);
+        assert!(rpm.own_axis, "the Y2 toggle survives the re-read");
+        let temp = series.iter().find(|e| e.series.name() == "temp").unwrap();
+        assert_eq!(
+            temp.color, SERIES_PALETTE[0],
+            "a series seen for the first time still takes a palette colour"
+        );
+    }
+    fn ring(cap: usize, pushes: &[&[u8]]) -> (VecDeque<u8>, u64) {
+        let mut ring = VecDeque::new();
+        let mut base = 0;
+        for bytes in pushes {
+            push_raw(&mut ring, &mut base, bytes, cap);
+        }
+        (ring, base)
+    }
+
+    /// `base + len` has to stay the count of every byte ever pushed: the hex
+    /// view resolves a run's absolute start through it, and a byte lost without
+    /// being counted would slide every offset in the view.
+    #[test]
+    fn the_raw_ring_counts_every_byte_it_drops() {
+        let (ring, base) = ring(4, &[b"ab", b"cdef"]);
+        assert_eq!(base + ring.len() as u64, 6);
+        assert_eq!(ring.iter().copied().collect::<Vec<u8>>(), b"cdef");
+        assert_eq!(base, 2);
+    }
+
+    /// A push bigger than the ring keeps its tail — and still counts the head it
+    /// threw away.
+    #[test]
+    fn a_push_larger_than_the_ring_keeps_its_tail() {
+        let (ring, base) = ring(4, &[b"abcdefghij"]);
+        assert_eq!(ring.iter().copied().collect::<Vec<u8>>(), b"ghij");
+        assert_eq!(base, 6);
+        assert_eq!(base + ring.len() as u64, 10);
+    }
+
+    #[test]
+    fn a_ring_under_capacity_drops_nothing() {
+        let (ring, base) = ring(8, &[b"ab", b"cd"]);
+        assert_eq!(ring.iter().copied().collect::<Vec<u8>>(), b"abcd");
+        assert_eq!(base, 0);
     }
 }

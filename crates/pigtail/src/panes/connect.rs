@@ -100,10 +100,12 @@ impl App {
         }
     }
 
-    /// The bottom status footer: connection state, view details, and the Pin
-    /// (autoscroll) toggle.
+    /// The bottom status footer: connection state, view details, and the view
+    /// toggles — hex, plot and Pin (autoscroll).
     pub(crate) fn show_footer(&mut self, ctx: &egui::Context) {
         let mut toggle_pin = false;
+        let mut toggle_plot = false;
+        let mut toggle_hex = false;
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if self.merged_selected {
@@ -142,6 +144,23 @@ impl App {
                     {
                         toggle_pin = true;
                     }
+                    // Added after the pin in a right-to-left layout, so they
+                    // land to its left: Hex | Plot | Pinned.
+                    if ui
+                        .selectable_label(conn.show_plot, "Plot")
+                        .on_hover_text("Show the plot pane below the console")
+                        .clicked()
+                    {
+                        toggle_plot = true;
+                    }
+                    if ui
+                        .selectable_label(conn.hex_view, "Hex")
+                        .on_hover_text("Show raw bytes instead of decoded lines")
+                        .clicked()
+                    {
+                        toggle_hex = true;
+                    }
+                    ui.separator();
                     if !conn.follow && conn.new_since_scroll > 0 {
                         ui.label(format!("{} new", conn.new_since_scroll));
                     }
@@ -156,12 +175,20 @@ impl App {
             });
         });
 
-        if toggle_pin {
+        if toggle_pin || toggle_plot || toggle_hex {
             if let Some(active) = self.active_index() {
                 let conn = &mut self.connections[active];
-                conn.follow = !conn.follow;
-                if conn.follow {
-                    conn.new_since_scroll = 0;
+                if toggle_pin {
+                    conn.follow = !conn.follow;
+                    if conn.follow {
+                        conn.new_since_scroll = 0;
+                    }
+                }
+                if toggle_plot {
+                    conn.show_plot = !conn.show_plot;
+                }
+                if toggle_hex {
+                    conn.hex_view = !conn.hex_view;
                 }
             }
         }
