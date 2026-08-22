@@ -3,12 +3,96 @@
 //! device (see `transmit`) — with an optional search bar and a right-click menu
 //! that toggles everything else so the main view stays clean.
 
-use crate::app::{App, CompiledHighlight, Connection, MergedEntry};
+use crate::app::{App, CompiledHighlight, Connection, MergedEntry, RawSession};
 use crate::wrap::{rows_for, WrapIndex};
 use egui::text::LayoutJob;
 use serialcore::clock::Timestamp;
 use serialcore::config::{TimestampFormat, MAX_CONSOLE_FONT_SIZE, MIN_CONSOLE_FONT_SIZE};
 use serialcore::store::{LineFlags, LineRef, LineStore, PortId};
+
+/// The colour the console draws a session boundary in, shared with the hex
+/// view's own boundary rows.
+const BOUNDARY_COLOR: egui::Color32 = egui::Color32::from_rgb(0xe5, 0xc0, 0x40);
+
+/// One run of bytes as the hex view lays it out: the 16-byte rows it still has
+/// resident, and the boundary that closes it.
+struct HexSegment {
+    /// Absolute index of the run's first byte — the origin its offsets count
+    /// from, which is what makes every run's dump start at `00000000`.
+    origin: u64,
+    /// Absolute index one past the run's last byte.
+    end: u64,
+    /// Row indices, relative to `origin`, of the first and last row still
+    /// holding a resident byte. A run whose front has been evicted starts part
+    /// way down its own dump rather than renumbering itself.
+    first_row: usize,
+    last_row: usize,
+    label: Option<String>,
+}
+
+impl HexSegment {
+    fn rows(&self) -> usize {
+        self.last_row - self.first_row + 1 + usize::from(self.label.is_some())
+    }
+}
+
+/// What sits on one row of the hex view.
+enum HexRow<'a> {
+    Boundary(&'a str),
+    /// A 16-byte row of `origin`'s run, `row` rows into it.
+    Bytes {
+        origin: u64,
+        end: u64,
+        row: usize,
+    },
+}
+
+/// Lay the resident runs out into rows, dropping those the ring has evicted
+/// entirely — a boundary with nothing above it is just noise, exactly as it is
+/// in the console.
+fn hex_segments(sessions: &[RawSession], base: u64, len: usize) -> Vec<HexSegment> {
+    let resident_end = base + len as u64;
+    let mut out = Vec::new();
+    for (i, session) in sessions.iter().enumerate() {
+        let end = sessions
+            .get(i + 1)
+            .map_or(resident_end, |next| next.start)
+            .min(resident_end);
+        let first = session.start.max(base);
+        if end <= first {
+            continue;
+        }
+        out.push(HexSegment {
+            origin: session.start,
+            end,
+            first_row: ((first - session.start) / 16) as usize,
+            last_row: ((end - 1 - session.start) / 16) as usize,
+            label: session.label.clone(),
+        });
+    }
+    out
+}
+
+/// What to draw on row `row` of the whole view.
+fn hex_row(segments: &[HexSegment], mut row: usize) -> Option<HexRow<'_>> {
+    for segment in segments {
+        let rows = segment.rows();
+        if row < rows {
+            let data_rows = segment.last_row - segment.first_row + 1;
+            return Some(if row < data_rows {
+                HexRow::Bytes {
+                    origin: segment.origin,
+                    end: segment.end,
+                    row: segment.first_row + row,
+                }
+            } else {
+                HexRow::Boundary(segment.label.as_deref()?)
+            });
+        }
+        row -= rows;
+    }
+    None
+}
 
 /// Horizontal gap between a row's markers (port tag, timestamp, the sent-line
 /// ">") and the text they precede.
@@ -747,8 +831,8 @@ impl App {
         );
         let font = m.font.clone();
         let conn = &self.connections[active];
-        let total_bytes = conn.raw_ring.len();
-        let rows = total_bytes.div_ceil(16);
+        let segments = hex_segments(&conn.raw_sessions, conn.raw_base, conn.raw_ring.len());
+        let rows: usize = segments.iter().map(HexSegment::rows).sum();
         let row_height = m.row_height;
         ui.spacing_mut().item_spacing.y = 0.0;
 
@@ -771,22 +855,9 @@ impl App {
             let conn = &self.connections[active];
             ui.set_width(ui.available_width());
             for row in row_range {
-                let start = row * 16;
-                let mut hex = String::with_capacity(48);
-                let mut ascii = String::with_capacity(16);
-                for col in 0..16 {
-                    match conn.raw_ring.get(start + col) {
-                        Some(&b) => {
-                            hex.push_str(&format!("{b:02X} "));
-                            ascii.push(if (0x20..0x7f).contains(&b) {
-                                b as char
-                            } else {
-                                '.'
-                            });
-                        }
-                        None => hex.push_str("   "),
-                    }
-                }
+                let Some(item) = hex_row(&segments, row) else {
+                    continue;
+                };
                 // Full-width interactive row so the right-click menu works
                 // over hex content, not just empty margins. The id is keyed on
                 // `row` (a stable byte offset) rather than egui's default
@@ -795,9 +866,47 @@ impl App {
                 // scrolls a different row into this same screen slot every
                 // time new bytes arrive.
                 let row_id = ui.id().with(("hex_row", active, row));
+                let (text, color) = match item {
+                    HexRow::Boundary(label) => (format!("── {label} ──"), BOUNDARY_COLOR),
+                    HexRow::Bytes { origin, end, row } => {
+                        let offset = row * 16;
+                        let mut hex = String::with_capacity(48);
+                        let mut ascii = String::with_capacity(16);
+                        for col in 0..16 {
+                            // Addressed from the run's own origin, so a byte
+                            // belonging to the run below — or one already
+                            // evicted from the front — leaves a hole rather
+                            // than being pulled into this dump.
+                            let abs = origin + (offset + col) as u64;
+                            let byte = if abs >= conn.raw_base && abs < end {
+                                conn.raw_ring.get((abs - conn.raw_base) as usize).copied()
+                            } else {
+                                None
+                            };
+                            match byte {
+                                Some(b) => {
+                                    hex.push_str(&format!("{b:02X} "));
+                                    ascii.push(if (0x20..0x7f).contains(&b) {
+                                        b as char
+                                    } else {
+                                        '.'
+                                    });
+                                }
+                                None => {
+                                    hex.push_str("   ");
+                                    ascii.push(' ');
+                                }
+                            }
+                        }
+                        (
+                            format!("{offset:08X}  {hex} |{ascii}|"),
+                            ui.visuals().strong_text_color(),
+                        )
+                    }
+                };
                 let mut job = LayoutJob::default();
                 job.append(
-                    &format!("{start:08X}  {hex} |{ascii}|"),
+                    &text,
                     0.0,
                     egui::TextFormat {
                         // The console font, whose own row height is what
@@ -806,7 +915,7 @@ impl App {
                         // `show_rows`' own virtualization) to line up with what
                         // is actually painted.
                         font_id: font.clone(),
-                        color: ui.visuals().strong_text_color(),
+                        color,
                         ..Default::default()
                     },
                 );
@@ -1731,5 +1840,90 @@ mod tests {
                 );
             }
         }
+    }
+    fn sessions(spec: &[(u64, Option<&str>)]) -> Vec<RawSession> {
+        spec.iter()
+            .map(|(start, label)| RawSession {
+                start: *start,
+                label: label.map(str::to_string),
+            })
+            .collect()
+    }
+
+    fn row_offset(segments: &[HexSegment], row: usize) -> Option<usize> {
+        match hex_row(segments, row)? {
+            HexRow::Bytes { row, .. } => Some(row * 16),
+            HexRow::Boundary(_) => None,
+        }
+    }
+
+    /// The point of tracking runs at all: every dump starts at zero, however
+    /// much history sits above it.
+    #[test]
+    fn each_session_is_numbered_from_its_own_first_byte() {
+        // 40 restored bytes, closed by a boundary, then 60 live ones.
+        let s = sessions(&[(0, Some("previous session · x")), (40, None)]);
+        let segments = hex_segments(&s, 0, 100);
+        let rows: usize = segments.iter().map(HexSegment::rows).sum();
+        // 3 rows of history + its boundary + 4 rows of live output.
+        assert_eq!(rows, 8);
+        assert_eq!(row_offset(&segments, 0), Some(0x00));
+        assert_eq!(row_offset(&segments, 2), Some(0x20));
+        assert!(matches!(
+            hex_row(&segments, 3),
+            Some(HexRow::Boundary(label)) if label.starts_with("previous session")
+        ));
+        assert_eq!(
+            row_offset(&segments, 4),
+            Some(0x00),
+            "the live run starts its own count over"
+        );
+    }
+
+    /// A run's last row must not reach down into the next run's bytes.
+    #[test]
+    fn a_row_stops_at_the_end_of_its_own_session() {
+        let s = sessions(&[(0, Some("a")), (40, None)]);
+        let segments = hex_segments(&s, 0, 100);
+        let Some(HexRow::Bytes { origin, end, row }) = hex_row(&segments, 2) else {
+            panic!("expected the history's last row");
+        };
+        assert_eq!((origin, end, row), (0, 40, 2));
+        // Row 2 spans bytes 32..48, but the run ends at 40: the rest is a hole.
+        assert!(origin + (row * 16 + 8) as u64 >= end);
+    }
+
+    /// Eviction is what the ring does under load, and a boundary with nothing
+    /// above it would be noise — the console drops its marker the same way.
+    #[test]
+    fn a_fully_evicted_session_takes_its_boundary_with_it() {
+        let s = sessions(&[(0, Some("a")), (40, None)]);
+        let segments = hex_segments(&s, 40, 60);
+        assert_eq!(segments.len(), 1);
+        assert!(segments[0].label.is_none());
+        assert_eq!(row_offset(&segments, 0), Some(0x00));
+    }
+
+    /// A half-evicted run keeps counting from where it began, so the offsets
+    /// still name the byte the device sent.
+    #[test]
+    fn a_partly_evicted_session_keeps_its_own_offsets() {
+        let s = sessions(&[(0, None)]);
+        let segments = hex_segments(&s, 20, 80);
+        assert_eq!(
+            row_offset(&segments, 0),
+            Some(0x10),
+            "the first whole row still holding a byte"
+        );
+        assert!(
+            hex_row(&segments, 6).is_none(),
+            "nothing past the resident rows"
+        );
+    }
+
+    #[test]
+    fn nothing_resident_is_no_rows() {
+        assert!(hex_segments(&[], 0, 0).is_empty());
+        assert!(hex_segments(&sessions(&[(0, None)]), 0, 0).is_empty());
     }
 }

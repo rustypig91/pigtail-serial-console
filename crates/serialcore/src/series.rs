@@ -58,6 +58,22 @@ impl Series {
         self.buf.push_back(SeriesPoint { t, value, line });
     }
 
+    /// The full value extent `(min, max)`, ignoring points that are not finite.
+    ///
+    /// A device is free to print `nan` or `inf`, and `parse::<f64>` takes both;
+    /// letting either into a min/max would poison the window computed from it —
+    /// NaN loses every comparison, so a single one would swallow the range.
+    pub fn value_range(&self) -> Option<(f64, f64)> {
+        let mut range: Option<(f64, f64)> = None;
+        for p in self.buf.iter().filter(|p| p.value.is_finite()) {
+            range = Some(match range {
+                Some((lo, hi)) => (lo.min(p.value), hi.max(p.value)),
+                None => (p.value, p.value),
+            });
+        }
+        range
+    }
+
     /// The full time extent `(min_t, max_t)`, if any points exist.
     pub fn t_range(&self) -> Option<(f64, f64)> {
         match (self.buf.front(), self.buf.back()) {
@@ -229,5 +245,21 @@ mod tests {
         for w in pts.windows(2) {
             assert!(w[0][0] <= w[1][0], "x not monotonic: {:?} {:?}", w[0], w[1]);
         }
+    }
+    #[test]
+    fn value_range_covers_every_point_and_skips_the_unplottable() {
+        let mut s = Series::new("t", 100);
+        for (i, v) in [3.0, -2.0, f64::NAN, 7.5, f64::INFINITY].iter().enumerate() {
+            s.push(i as f64, *v, i as u64);
+        }
+        assert_eq!(s.value_range(), Some((-2.0, 7.5)));
+    }
+
+    #[test]
+    fn value_range_of_nothing_plottable_is_none() {
+        let mut s = Series::new("t", 100);
+        assert_eq!(s.value_range(), None);
+        s.push(0.0, f64::NAN, 0);
+        assert_eq!(s.value_range(), None);
     }
 }

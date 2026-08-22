@@ -6,7 +6,7 @@ Most serial terminals just show you text. Pigtail is built around the parts of f
 
 - **Reconnects by device identity, not port path.** When a target resets and re-enumerates on a new port, Pigtail finds it again automatically.
 - **Filtering reveals history, not just new output.** Type a filter and it applies retroactively to everything already captured, not only what arrives afterward.
-- **Live plotting linked to the log.** Numeric values extracted from the stream (`temp:23.4, rpm:1200`, or a regex) are plotted live, and clicking a plot point jumps to the log line that produced it.
+- **Live plotting linked to the log.** Numeric values extracted from the stream (`temp:23.4, rpm:1200`, or a regex) are plotted live, and clicking a plot point jumps to the log line that produced it. Adding or editing a rule re-reads the whole session, so it also plots the output that already scrolled past.
 - **Nothing is lost.** Raw bytes are written to disk continuously as they arrive; the UI is just a view over that capture.
 
 ## Features

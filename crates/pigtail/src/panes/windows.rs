@@ -155,66 +155,178 @@ impl App {
         let mut open = self.show_extract_win;
         egui::Window::new("Plot extraction")
             .open(&mut open)
-            .default_width(320.0)
+            .default_width(360.0)
             .show(ctx, |ui| {
                 let Some(active) = self.active_index() else {
                     ui.weak("Connect a port to extract series.");
                     return;
                 };
                 let conn = &mut self.connections[active];
-                ui.weak("Applies to lines that arrive after the rule is added.");
+                ui.weak(
+                    "Rules pick numbers out of the console and plot them. Editing a rule \
+                     re-reads this whole session, so the plot shows every line that matches \
+                     — not only the ones still to come.",
+                );
+                ui.add_space(4.0);
 
                 let mut remove: Option<usize> = None;
                 for (i, rule) in conn.extract_rules.iter_mut().enumerate() {
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
-                            let mut is_regex = rule.mode == ExtractMode::Regex;
-                            if ui.selectable_label(!is_regex, "kv").clicked() {
-                                is_regex = false;
+                            ui.label("Read numbers as:");
+                            // Named for what each mode does to a line, not for
+                            // the config keyword behind it.
+                            let mut mode = rule.mode;
+                            ui.selectable_value(&mut mode, ExtractMode::Kv, "name = value pairs")
+                                .on_hover_text(
+                                    "Split the line into pairs at every space, comma or \
+                                     semicolon, then read each pair as a name and a number.\n\n\
+                                     `temp:23.4 rpm:1200` plots temp and rpm.",
+                                );
+                            ui.selectable_value(&mut mode, ExtractMode::Regex, "a regex pattern")
+                                .on_hover_text(
+                                    "Match the line against a regular expression; every named \
+                                     capture group becomes a series.\n\n\
+                                     `rpm=(?P<rpm>\\d+)` plots rpm.",
+                                );
+                            if mode != rule.mode {
+                                rule.mode = mode;
                                 conn.extract_dirty = true;
                             }
-                            if ui.selectable_label(is_regex, "regex").clicked() {
-                                is_regex = true;
-                                conn.extract_dirty = true;
-                            }
-                            rule.mode = if is_regex {
-                                ExtractMode::Regex
-                            } else {
-                                ExtractMode::Kv
-                            };
-                            if ui.small_button("🗑").clicked() {
+                            if ui
+                                .small_button("🗑")
+                                .on_hover_text("Delete this rule")
+                                .clicked()
+                            {
                                 remove = Some(i);
                             }
                         });
-                        let mut prefix = rule.prefix.clone().unwrap_or_default();
-                        if ui
-                            .add(
-                                egui::TextEdit::singleline(&mut prefix)
-                                    .hint_text("prefix gate, e.g. PLOT:")
-                                    .desired_width(200.0),
-                            )
-                            .changed()
-                        {
-                            rule.prefix = if prefix.is_empty() {
-                                None
-                            } else {
-                                Some(prefix)
-                            };
-                            conn.extract_dirty = true;
-                        }
-                        if rule.mode == ExtractMode::Regex {
-                            let mut pat = rule.pattern.clone().unwrap_or_default();
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut pat)
-                                        .hint_text("(?P<rpm>\\d+)")
-                                        .desired_width(200.0),
-                                )
-                                .changed()
-                            {
-                                rule.pattern = if pat.is_empty() { None } else { Some(pat) };
-                                conn.extract_dirty = true;
-                            }
+
+                        // Written by the mode arms below, shown under the grid.
+                        let mut example = String::new();
+                        egui::Grid::new(("extract-rule", i))
+                            .num_columns(2)
+                            .spacing([8.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.label("Only lines starting with")
+                                    .on_hover_text(
+                                        "Skip every line that does not start with this text; the \
+                                         text itself is not parsed. Leave empty to read every line.",
+                                    );
+                                let mut prefix = rule.prefix.clone().unwrap_or_default();
+                                if ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut prefix)
+                                            .hint_text("any line")
+                                            .desired_width(180.0),
+                                    )
+                                    .changed()
+                                {
+                                    rule.prefix = if prefix.is_empty() {
+                                        None
+                                    } else {
+                                        Some(prefix)
+                                    };
+                                    conn.extract_dirty = true;
+                                }
+                                ui.end_row();
+
+                                match rule.mode {
+                                    ExtractMode::Kv => {
+                                        let seps = rule
+                                            .kv_separators
+                                            .clone()
+                                            .unwrap_or_else(|| vec![':', '=']);
+                                        // The space lives in the same list, but
+                                        // it gets a checkbox: it is invisible in
+                                        // a text box, and it means something
+                                        // different from the other separators.
+                                        let mut spaced = seps.iter().any(|c| c.is_whitespace());
+                                        let mut typed: String =
+                                            seps.iter().filter(|c| !c.is_whitespace()).collect();
+
+                                        ui.label("Joined by").on_hover_text(
+                                            "The characters that may stand between a name and its \
+                                             number. A space cannot go here — it already does the \
+                                             other job, ending one pair and starting the next — so \
+                                             it has its own box below.",
+                                        );
+                                        let edited = ui.add(
+                                            egui::TextEdit::singleline(&mut typed)
+                                                .hint_text(":= (default)")
+                                                .desired_width(180.0),
+                                        );
+                                        ui.end_row();
+
+                                        ui.label("");
+                                        let toggled = ui
+                                            .checkbox(&mut spaced, "…or just a space: temp 23.4")
+                                            .on_hover_text(
+                                                "Off by default: with it on, any word followed by \
+                                                 a number is plotted, so a line like \
+                                                 `Booting 42 modules` becomes a series too.",
+                                            );
+                                        ui.end_row();
+
+                                        if edited.changed() || toggled.changed() {
+                                            let mut chars: Vec<char> = typed
+                                                .chars()
+                                                .filter(|c| !c.is_whitespace())
+                                                .collect();
+                                            if spaced {
+                                                chars.push(' ');
+                                            }
+                                            rule.kv_separators = Some(chars);
+                                            conn.extract_dirty = true;
+                                        }
+                                        // An empty box means the built-in
+                                        // `:` and `=`, so the example says so
+                                        // rather than showing the space.
+                                        let joiner = typed
+                                            .chars()
+                                            .next()
+                                            .map(String::from)
+                                            .unwrap_or_else(|| {
+                                                if spaced { " " } else { ":" }.to_string()
+                                            });
+                                        example = format!(
+                                            "e.g. `temp{joiner}23.4 rpm{joiner}1200` → series temp, rpm"
+                                        );
+                                    }
+                                    ExtractMode::Regex => {
+                                        ui.label("Pattern").on_hover_text(
+                                            "A regular expression. Each `(?P<name>…)` group \
+                                             becomes a series called `name`, and its text must \
+                                             parse as a number.",
+                                        );
+                                        let mut pat = rule.pattern.clone().unwrap_or_default();
+                                        if ui
+                                            .add(
+                                                egui::TextEdit::singleline(&mut pat)
+                                                    .hint_text("rpm=(?P<rpm>\\d+)")
+                                                    .desired_width(180.0),
+                                            )
+                                            .changed()
+                                        {
+                                            rule.pattern =
+                                                if pat.is_empty() { None } else { Some(pat) };
+                                            conn.extract_dirty = true;
+                                        }
+                                        ui.end_row();
+                                        example =
+                                            "e.g. `rpm=(?P<rpm>\\d+) duty=(?P<duty>[\\d.]+)` \
+                                             → series rpm, duty"
+                                                .to_string();
+                                    }
+                                }
+                            });
+
+                        ui.weak(example);
+                        if rule.mode == ExtractMode::Kv {
+                            ui.weak(
+                                "One pair ends and the next begins at a space, comma, \
+                                 semicolon or tab.",
+                            );
                         }
                     });
                 }
@@ -230,6 +342,24 @@ impl App {
                         kv_separators: None,
                     });
                     conn.extract_dirty = true;
+                    // A rule is only ever added to see what it draws.
+                    conn.show_plot = true;
+                }
+
+                // What the rules are actually producing, so a rule that matches
+                // nothing is visible as such without hunting for the plot.
+                ui.separator();
+                for err in &conn.extract_errors {
+                    ui.colored_label(egui::Color32::from_rgb(0xff, 0x88, 0x55), err);
+                }
+                if conn.extract_rules.is_empty() {
+                    ui.weak("No rules yet.");
+                } else if conn.series.is_empty() {
+                    ui.weak("No series — nothing in this session's output matched.");
+                } else {
+                    let names: Vec<&str> =
+                        conn.series.iter().map(|e| e.series.name()).collect();
+                    ui.weak(format!("Plotting: {}", names.join(", ")));
                 }
             });
         self.show_extract_win = open;
