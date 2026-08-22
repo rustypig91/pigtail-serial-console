@@ -343,11 +343,24 @@ pub struct Profile {
     pub extract: Vec<ExtractRule>,
 }
 
+/// Bounds for [`Settings::console_font_size`], shared by the settings pane and
+/// the console's Ctrl+wheel gesture. Anything outside this is unreadable or
+/// leaves no room for a line of output.
+pub const MIN_CONSOLE_FONT_SIZE: u8 = 6;
+pub const MAX_CONSOLE_FONT_SIZE: u8 = 40;
+
 /// Global settings.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default = "default_max_lines")]
     pub max_lines: usize,
+    /// Point size of the console's monospace text (see the bounds above).
+    #[serde(default = "default_console_font_size")]
+    pub console_font_size: u8,
+    /// Fold a line too long for the window onto further rows instead of letting
+    /// it run off the right edge.
+    #[serde(default = "default_true")]
+    pub wrap_lines: bool,
     #[serde(default)]
     pub timestamp_format: TimestampFormat,
     #[serde(default = "default_retention")]
@@ -368,6 +381,8 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             max_lines: default_max_lines(),
+            console_font_size: default_console_font_size(),
+            wrap_lines: true,
             timestamp_format: TimestampFormat::default(),
             session_retention_days: default_retention(),
             theme: default_theme(),
@@ -476,6 +491,11 @@ fn default_true() -> bool {
 fn default_max_lines() -> usize {
     1_000_000
 }
+/// Matches egui's own monospace text style, so an existing install looks
+/// unchanged until the size is touched.
+fn default_console_font_size() -> u8 {
+    12
+}
 fn default_retention() -> u32 {
     30
 }
@@ -540,6 +560,21 @@ mod tests {
         let settings: Settings = toml::from_str("max_lines = 1000").unwrap();
         assert!(settings.check_updates);
         assert_eq!(settings.skipped_version, None);
+    }
+
+    #[test]
+    fn console_font_size_absent_means_the_default() {
+        let settings: Settings = toml::from_str("max_lines = 1000").unwrap();
+        assert_eq!(settings.console_font_size, default_console_font_size());
+        let back: Settings = toml::from_str(
+            &toml::to_string(&Settings {
+                console_font_size: 20,
+                ..Settings::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(back.console_font_size, 20);
     }
 
     #[test]

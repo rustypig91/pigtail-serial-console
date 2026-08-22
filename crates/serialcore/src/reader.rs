@@ -598,6 +598,7 @@ mod tests {
             start_wall: chrono::Utc::now(),
             app_version: "test".into(),
             port_label: "test".into(),
+            cleared: false,
         }
     }
 

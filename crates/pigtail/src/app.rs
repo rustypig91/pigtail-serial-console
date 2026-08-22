@@ -2,6 +2,7 @@
 //! `panes` modules; holds no IO — data arrives from reader threads via channels.
 
 use crate::paths::AppPaths;
+use crate::wrap::WrapIndex;
 use crossbeam_channel::Receiver;
 use serialcore::clock::{SessionClock, Timestamp};
 use serialcore::config::{Config, ExtractRule, PortConfig, PortIdentity, SavedConnection};
@@ -94,59 +95,133 @@ fn snapshot_captures(sessions_dir: &std::path::Path) -> Vec<(PathBuf, SessionMet
     out
 }
 
-/// Preload the most recent prior capture for `identity` into `conn.store`, then
-/// append a boundary marker, so a reopened tab shows the output it had before
-/// the app was last closed with new live output continuing below.
+/// Order this device's captures oldest-first.
+///
+/// Sorting on `start_wall` alone is not enough: it is the app's clock anchor,
+/// so every capture written in one run of the app carries the same value. The
+/// micros stamp on the first record breaks those ties, being measured from that
+/// same anchor.
+///
+/// A capture holding no records at all has no such stamp, and sorts *last*
+/// within its run rather than first. It is either the one still being written
+/// to or one just emptied by a clear, and both are the newest thing in the run;
+/// placing an emptied capture first would let history restore walk past it into
+/// the older captures whose output the clear discarded.
+fn captures_for<'a>(
+    captures: &'a [(PathBuf, SessionMeta)],
+    identity: &PortIdentity,
+) -> Vec<(&'a PathBuf, &'a SessionMeta)> {
+    let mut mine: Vec<(&PathBuf, &SessionMeta, u64)> = captures
+        .iter()
+        .filter(|(_, m)| &m.identity == identity)
+        .map(|(path, m)| {
+            let first = session::read_first_micros(path)
+                .ok()
+                .flatten()
+                .unwrap_or(u64::MAX);
+            (path, m, first)
+        })
+        .collect();
+    mine.sort_by_key(|(_, m, first)| (m.start_wall, *first));
+    mine.into_iter().map(|(p, m, _)| (p, m)).collect()
+}
+
+/// Stored history ready to replay: one entry per capture, oldest first, each
+/// pairing the capture's metadata with the tail of its raw records.
+type RestoredHistory<'a> = Vec<(&'a SessionMeta, Vec<(u64, Vec<u8>)>)>;
+
+/// Collect this device's stored history, walking back from the newest capture
+/// until `budget` bytes of raw records are covered. Returns the captures
+/// oldest-first, each with the tail of its records, ready to replay.
+fn gather_history<'a>(
+    captures: &'a [(PathBuf, SessionMeta)],
+    identity: &PortIdentity,
+    mut budget: usize,
+) -> RestoredHistory<'a> {
+    let mine = captures_for(captures, identity);
+    let mut restored: RestoredHistory<'a> = Vec::new();
+    for (path, meta) in mine.iter().rev() {
+        if budget == 0 {
+            break;
+        }
+        if let Ok(records) = session::read_tail_records(path, budget) {
+            let used: usize = records.iter().map(|(_, b)| b.len()).sum();
+            budget = budget.saturating_sub(used);
+            if !records.is_empty() {
+                restored.push((*meta, records));
+            }
+        }
+        // A capture the user cleared mid-session holds only what arrived after
+        // the clear, and everything older was discarded on purpose: stop here
+        // rather than putting it back.
+        if meta.cleared {
+            break;
+        }
+    }
+    restored.reverse();
+    restored
+}
+
+/// Preload the prior captures for `identity` into `conn.store`, then append a
+/// boundary marker, so a reopened tab shows the output it had before the app
+/// was last closed with new live output continuing below.
+///
+/// History is gathered from the newest capture backwards until
+/// `PRELOAD_TAIL_BYTES` is filled, rather than from the newest one alone. A
+/// single run can leave several captures behind — applying new port options
+/// respawns the reader onto a fresh one — and what the console showed at exit
+/// was itself part restored, part live, so stopping at the newest capture
+/// throws away output that was on screen when the app closed.
 fn preload_last_session(
     conn: &mut Connection,
     captures: &[(PathBuf, SessionMeta)],
     identity: &PortIdentity,
 ) {
-    let Some((path, meta)) = captures
-        .iter()
-        .filter(|(_, m)| &m.identity == identity)
-        .max_by_key(|(_, m)| m.start_wall)
-    else {
+    let restored = gather_history(captures, identity, PRELOAD_TAIL_BYTES);
+    let Some((newest, _)) = restored.last() else {
         return;
     };
-    let Ok(records) = session::read_tail_records(path, PRELOAD_TAIL_BYTES) else {
-        return;
-    };
-    if records.is_empty() {
-        return;
-    }
+    let newest = *newest;
 
     // Re-frame the raw bytes exactly as the reader did, stamping each line with
     // the *original* wall-clock time (start of that capture plus its offset) so
-    // absolute timestamps read as when the data actually arrived.
-    let mut framer = Framer::with_mode(conn.port_config.terminal);
-    let mut framed = Vec::new();
-    for (micros, bytes) in &records {
-        let ts = Timestamp {
-            wall: meta.start_wall + chrono::Duration::microseconds(*micros as i64),
-            micros: *micros,
-        };
-        framer.push(bytes, ts, &mut framed);
-    }
-    framer.flush_final(&mut framed);
-    if framed.is_empty() {
-        return;
-    }
-
-    let last_ts = framed.last().map(|l| l.ts).unwrap_or(Timestamp {
-        wall: meta.start_wall,
+    // absolute timestamps read as when the data actually arrived. Each capture
+    // is framed on its own: they are separate streams, and the last line of one
+    // must not swallow the first line of the next.
+    let mut last_ts = Timestamp {
+        wall: newest.start_wall,
         micros: 0,
-    });
-    for line in framed {
-        let styled = serialcore::ansi::parse_line(&line.text, line.cursor);
-        conn.store.append(IncomingLine {
-            text: styled.text,
-            ts: line.ts,
-            port: conn.id,
-            flags: line.flags,
-            spans: styled.spans,
-            cursor: styled.cursor.map(|c| c as u32),
-        });
+    };
+    let mut any = false;
+    for (meta, records) in &restored {
+        let mut framer = Framer::with_mode(conn.port_config.terminal);
+        let mut framed = Vec::new();
+        for (micros, bytes) in records {
+            let ts = Timestamp {
+                wall: meta.start_wall + chrono::Duration::microseconds(*micros as i64),
+                micros: *micros,
+            };
+            framer.push(bytes, ts, &mut framed);
+        }
+        framer.flush_final(&mut framed);
+        if let Some(line) = framed.last() {
+            last_ts = line.ts;
+            any = true;
+        }
+        for line in framed {
+            let styled = serialcore::ansi::parse_line(&line.text, line.cursor);
+            conn.store.append(IncomingLine {
+                text: styled.text,
+                ts: line.ts,
+                port: conn.id,
+                flags: line.flags,
+                spans: styled.spans,
+                cursor: styled.cursor.map(|c| c as u32),
+            });
+        }
+    }
+    if !any {
+        return;
     }
 
     // Boundary between restored history (above) and live output (below).
@@ -155,7 +230,8 @@ fn preload_last_session(
             "previous session · {}",
             // Local time, like every other wall-clock stamp on screen; only
             // storage is UTC.
-            meta.start_wall
+            newest
+                .start_wall
                 .with_timezone(&chrono::Local)
                 .format("%Y-%m-%d %H:%M")
         ),
@@ -192,6 +268,20 @@ pub struct Connection {
     /// height is computed directly (no measured-content feedback, which would
     /// chase noise and jitter). Stable frame-to-frame; a stale value is harmless.
     pub pin_view_h: f32,
+    /// Running visual-row totals for the console, which stop matching line
+    /// counts as soon as one long line wraps onto several rows.
+    pub wrap_index: WrapIndex,
+    /// Bumped whenever the set of displayed lines is rebuilt wholesale (a
+    /// filter edit), which is the one change `wrap_index` cannot follow
+    /// incrementally.
+    pub filter_generation: u64,
+    /// Absolute index of the line at the top of the view last frame. Re-pinning
+    /// to it is what keeps the reader's place when the rows underneath change
+    /// height — a text-size change, a window resize.
+    pub top_line: Option<u64>,
+    /// Console columns and text size the view was last laid out with; `None`
+    /// until it has been drawn once. A change means every row moved.
+    pub console_layout: Option<(usize, u8)>,
     /// Bounded ring of raw bytes for hex view.
     pub raw_ring: VecDeque<u8>,
     pub last_error: Option<String>,
@@ -211,7 +301,9 @@ pub struct Connection {
     pub search_pos: Option<usize>,
     pub search_dirty: bool,
     pub search_tested_upto: u64,
-    /// The line the user selected (for bookmarks and plot↔log linking).
+    /// The line last jumped to — a search hit, or the line behind a plot point
+    /// that was clicked. Not drawn in the log itself; it is what puts the
+    /// log→plot marker on the plot.
     pub selected: Option<u64>,
     /// Scroll request: centre this absolute line on the next frame.
     pub scroll_to: Option<u64>,
@@ -305,6 +397,43 @@ impl Connection {
         changed
     }
 
+    /// Bring the console's visual-row index up to date for a view `cols`
+    /// characters wide (0 when wrapping is off). Cheap on a normal frame: only
+    /// lines appended since the last call are counted.
+    pub fn sync_wrap(&mut self, cols: usize) {
+        // Destructured so the index can be updated while the store it reads
+        // stays borrowed — they are disjoint fields, but only field access
+        // proves that to the borrow checker.
+        let Connection {
+            store,
+            filter_index,
+            filter_rules,
+            filter_generation,
+            wrap_index,
+            ..
+        } = self;
+        let filter_active = !filter_rules
+            .iter()
+            .all(|r| !r.enabled || r.pattern.is_empty());
+        let matching = filter_index.matching();
+        let first_abs = store.first_abs_index();
+        let entries = if filter_active {
+            matching.len()
+        } else {
+            store.len()
+        };
+        let abs_of = |i: usize| {
+            if filter_active {
+                matching[i]
+            } else {
+                first_abs + i as u64
+            }
+        };
+        wrap_index.sync(cols, *filter_generation, entries, abs_of, |i| {
+            crate::panes::wrap_len(store, abs_of(i))
+        });
+    }
+
     /// True if at least one filter rule is enabled and non-empty.
     pub fn filter_index_active(&self) -> bool {
         !self
@@ -393,11 +522,14 @@ pub struct App {
     /// Timestamp-interleaved merged view across all ports (spec §7.12).
     pub merged: Vec<MergedEntry>,
     pub merged_dirty: bool,
+    /// Visual-row totals for the merged view, as `Connection::wrap_index` is
+    /// for a single tab.
+    pub merged_wrap: WrapIndex,
+    /// Bumped whenever `merged` is rebuilt or reordered rather than appended
+    /// to, which is the one change `merged_wrap` cannot follow incrementally.
+    pub merged_generation: u64,
     /// True when the merged pseudo-tab is active.
     pub merged_selected: bool,
-    /// Deferred bookmark actions from the context menu (applied after drawing).
-    pub pending_bookmark_toggle: bool,
-    pub pending_bookmark_nav: Option<i64>,
     // Floating tool windows, toggled from the console right-click menu, so the
     // main window stays uncluttered.
     pub show_settings: bool,
@@ -415,6 +547,10 @@ pub struct App {
     pub update_manual: bool,
     /// `Some` while the update notice is showing.
     pub update_dialog: Option<UpdateDialog>,
+    /// Console text size to flash over the middle of the window, and the time
+    /// it was set. Ctrl+wheel has nothing else to show for itself: the change
+    /// it makes is legible only if you already know what you are looking for.
+    pub font_toast: Option<(u8, f64)>,
 }
 
 impl App {
@@ -452,9 +588,9 @@ impl App {
             highlight_dirty: true,
             merged: Vec::new(),
             merged_dirty: false,
+            merged_wrap: WrapIndex::new(),
+            merged_generation: 0,
             merged_selected: false,
-            pending_bookmark_toggle: false,
-            pending_bookmark_nav: None,
             show_settings: false,
             show_filters_win: false,
             show_highlight_win: false,
@@ -464,6 +600,7 @@ impl App {
             update_rx: None,
             update_manual: false,
             update_dialog: None,
+            font_toast: None,
         };
 
         // Silent startup check for a newer release. Debug builds are skipped: a
@@ -541,6 +678,7 @@ impl App {
             start_wall: self.clock.start_wall(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             port_label: identity.label(),
+            cleared: false,
         };
         let reader_config = reader::ReaderConfig {
             port_id: id,
@@ -691,6 +829,10 @@ impl App {
             follow: true,
             new_since_scroll: 0,
             pin_view_h: 0.0,
+            wrap_index: WrapIndex::new(),
+            filter_generation: 0,
+            top_line: None,
+            console_layout: None,
             raw_ring: VecDeque::new(),
             last_error: None,
             mark_micros: None,
@@ -886,6 +1028,8 @@ impl App {
             if conn.filter_dirty {
                 conn.filter_dirty = false;
                 conn.filter_index.rebuild(&conn.store, &set);
+                // The displayed set just changed out from under the row index.
+                conn.filter_generation += 1;
             } else {
                 conn.filter_index.prune_evicted(&conn.store);
                 conn.filter_index.extend(&conn.store, &set);
@@ -950,6 +1094,7 @@ impl App {
         if self.merged_dirty {
             self.merged_dirty = false;
             self.merged.clear();
+            self.merged_generation += 1;
             for conn in &mut self.connections {
                 conn.merged_upto = conn.store.first_abs_index();
             }
@@ -979,9 +1124,12 @@ impl App {
         if fresh[0].micros >= last_micros {
             self.merged.extend(fresh);
         } else {
-            // Rare: a slow port produced an earlier timestamp. Merge properly.
+            // Rare: a slow port produced an earlier timestamp. Merge properly —
+            // and since that reorders entries the row index already counted,
+            // make it count them again.
             self.merged.extend(fresh);
             self.merged.sort_by_key(|e| e.micros);
+            self.merged_generation += 1;
         }
     }
 
@@ -1024,46 +1172,6 @@ impl App {
             conn.follow = true;
         }
         self.merged_dirty = true;
-    }
-
-    /// Toggle a bookmark on the active connection's selected line.
-    pub fn toggle_bookmark(&mut self) {
-        let Some(conn) = self.connections.get_mut(self.active) else {
-            return;
-        };
-        let Some(sel) = conn.selected else {
-            return;
-        };
-        let on = conn
-            .store
-            .get(sel)
-            .map(|l| l.meta.flags.contains(LineFlags::BOOKMARK))
-            .unwrap_or(false);
-        conn.store.set_flag(sel, LineFlags::BOOKMARK, !on);
-    }
-
-    /// Move selection to the next/previous bookmarked line (`dir` = +1/-1).
-    pub fn goto_bookmark(&mut self, dir: i64) {
-        let Some(conn) = self.connections.get_mut(self.active) else {
-            return;
-        };
-        let first = conn.store.first_abs_index();
-        let end = conn.store.next_abs_index();
-        let from = conn.selected.unwrap_or(if dir > 0 { first } else { end });
-        let range: Vec<u64> = if dir > 0 {
-            (from + 1..end).collect()
-        } else {
-            (first..from).rev().collect()
-        };
-        for abs in range {
-            if let Some(l) = conn.store.get(abs) {
-                if l.meta.flags.contains(LineFlags::BOOKMARK) {
-                    conn.selected = Some(abs);
-                    conn.scroll_to = Some(abs);
-                    return;
-                }
-            }
-        }
     }
 
     /// Index of the active connection, clamped, or `None` if there are none.
@@ -1139,6 +1247,7 @@ impl eframe::App for App {
         self.show_tool_windows(ctx);
         self.show_settings_window(ctx);
         self.show_update_dialog(ctx);
+        self.show_font_toast(ctx);
 
         // egui only draws when something asks it to, and nothing here animates on
         // its own clock, so an *open but silent* connection must not schedule
@@ -1155,5 +1264,144 @@ impl eframe::App for App {
         if any_data {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serialcore::session::SessionWriter;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pigtail-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        dir
+    }
+
+    fn identity(serial: &str) -> PortIdentity {
+        PortIdentity {
+            vid: Some(0x0483),
+            pid: Some(0x374B),
+            serial_number: Some(serial.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Write a capture holding `records`, returning what `snapshot_captures`
+    /// would have produced for it.
+    fn capture(
+        dir: &std::path::Path,
+        identity: &PortIdentity,
+        start: chrono::DateTime<chrono::Utc>,
+        records: &[(u64, &[u8])],
+    ) -> (PathBuf, SessionMeta) {
+        let meta = SessionMeta {
+            identity: identity.clone(),
+            config: PortConfig::default(),
+            start_wall: start,
+            app_version: "test".into(),
+            port_label: identity.label(),
+            cleared: false,
+        };
+        let mut w = SessionWriter::create(dir, &meta).unwrap();
+        for (micros, bytes) in records {
+            w.write_record(*micros, bytes).unwrap();
+        }
+        w.flush().unwrap();
+        (w.bin_path().to_path_buf(), meta)
+    }
+
+    fn texts(restored: &RestoredHistory<'_>) -> Vec<String> {
+        restored
+            .iter()
+            .flat_map(|(_, records)| records.iter())
+            .map(|(_, bytes)| String::from_utf8_lossy(bytes).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn history_spans_every_capture_of_the_device() {
+        let dir = scratch("history");
+        let dev = identity("A1");
+        // One run of the app leaves several captures behind — applying new port
+        // options respawns the reader onto a fresh one — and they all carry the
+        // app clock's `start_wall`, so only the record stamps order them.
+        let run = chrono::Utc::now();
+        let older = capture(&dir, &dev, run, &[(1_000, b"before the reconnect\n")]);
+        let newer = capture(&dir, &dev, run, &[(9_000, b"after it\n")]);
+        // A second device's capture must not leak into this one's history.
+        let other = capture(&dir, &identity("B2"), run, &[(2_000, b"other device\n")]);
+
+        let captures = vec![newer, older, other];
+        let restored = gather_history(&captures, &dev, 1 << 20);
+        assert_eq!(
+            texts(&restored),
+            vec!["before the reconnect\n", "after it\n"],
+            "both captures restore, oldest first"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn history_stops_at_a_cleared_capture() {
+        let dir = scratch("cleared");
+        let dev = identity("A1");
+        let run = chrono::Utc::now();
+        let older = capture(&dir, &dev, run, &[(1_000, b"cleared away\n")]);
+        let mut newer = capture(&dir, &dev, run, &[(9_000, b"kept\n")]);
+        newer.1.cleared = true;
+
+        let captures = vec![older, newer];
+        let restored = gather_history(&captures, &dev, 1 << 20);
+        assert_eq!(
+            texts(&restored),
+            vec!["kept\n"],
+            "output discarded by Clear console does not come back"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn history_stops_at_a_capture_cleared_with_nothing_after_it() {
+        // Clear console empties the capture, so until new output arrives it has
+        // no records — and so no first stamp to order it by. It is still the
+        // newest capture of the run, and the walk back has to stop at it rather
+        // than treat it as the oldest and reach past it.
+        let dir = scratch("cleared-empty");
+        let dev = identity("A1");
+        let run = chrono::Utc::now();
+        let older = capture(&dir, &dev, run, &[(1_000, b"cleared away\n")]);
+        let mut newer = capture(&dir, &dev, run, &[]);
+        newer.1.cleared = true;
+
+        let captures = vec![older, newer];
+        let restored = gather_history(&captures, &dev, 1 << 20);
+        assert!(
+            texts(&restored).is_empty(),
+            "a clear with no output after it still holds back the older captures"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn history_is_bounded_by_the_byte_budget() {
+        let dir = scratch("budget");
+        let dev = identity("A1");
+        let run = chrono::Utc::now();
+        let older = capture(&dir, &dev, run, &[(1_000, b"0123456789")]);
+        let newer = capture(&dir, &dev, run, &[(9_000, b"0123456789")]);
+
+        let captures = vec![older, newer];
+        let restored = gather_history(&captures, &dev, 10);
+        assert_eq!(
+            texts(&restored).len(),
+            1,
+            "the budget stops the walk at the newest capture"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

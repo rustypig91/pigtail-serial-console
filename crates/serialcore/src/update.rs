@@ -120,10 +120,7 @@ pub fn fetch_latest() -> CheckResult {
     let mut resp = ureq::get(&url)
         .header("Accept", "application/vnd.github+json")
         // The API rejects requests with no User-Agent outright.
-        .header(
-            "User-Agent",
-            concat!("pigtail/", env!("CARGO_PKG_VERSION")),
-        )
+        .header("User-Agent", concat!("pigtail/", env!("CARGO_PKG_VERSION")))
         .config()
         .timeout_global(Some(TIMEOUT))
         // Statuses are inspected below: a 404 here means "no release published

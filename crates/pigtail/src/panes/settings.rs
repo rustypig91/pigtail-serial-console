@@ -1,6 +1,7 @@
 //! Settings window (spec §7.14, §5 M5): max lines, retention, theme, updates.
 
 use crate::app::App;
+use serialcore::config::{MAX_CONSOLE_FONT_SIZE, MIN_CONSOLE_FONT_SIZE};
 
 impl App {
     pub(crate) fn show_settings_window(&mut self, ctx: &egui::Context) {
@@ -16,6 +17,27 @@ impl App {
                     .num_columns(2)
                     .spacing([12.0, 8.0])
                     .show(ui, |ui| {
+                        ui.label("Console text size");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.config.settings.console_font_size)
+                                    .speed(0.2)
+                                    .range(MIN_CONSOLE_FONT_SIZE..=MAX_CONSOLE_FONT_SIZE)
+                                    .suffix(" pt"),
+                            )
+                            .on_hover_text("Ctrl+scroll over the console changes this too")
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Long lines");
+                        changed |= ui
+                            .checkbox(&mut self.config.settings.wrap_lines, "wrap")
+                            .on_hover_text(
+                                "Off: a long line runs past the right edge and is clipped",
+                            )
+                            .changed();
+                        ui.end_row();
+
                         ui.label("Max lines in memory");
                         changed |= ui
                             .add(
@@ -56,10 +78,7 @@ impl App {
 
                         ui.label("Updates");
                         changed |= ui
-                            .checkbox(
-                                &mut self.config.settings.check_updates,
-                                "check at startup",
-                            )
+                            .checkbox(&mut self.config.settings.check_updates, "check at startup")
                             .on_hover_text(
                                 "Asks GitHub for the newest release. \
                                  The only network request pigtail makes.",
