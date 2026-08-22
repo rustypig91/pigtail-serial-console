@@ -388,7 +388,11 @@ fn run(
                     last_byte = Instant::now();
                     provisional_flushed = false;
                     if let Some(w) = &mut writer {
-                        if let Err(e) = w.write_record(ts.micros, &buf[..n]) {
+                        // A capture only ever records bytes this run read, so
+                        // its offsets are never the negative side of the axis
+                        // (which belongs to *restored* history); the file
+                        // format keeps them unsigned.
+                        if let Err(e) = w.write_record(ts.micros.max(0) as u64, &buf[..n]) {
                             event_tx.send(ReaderEvent::Error(format!("log write: {e}")));
                         }
                     }

@@ -284,8 +284,15 @@ impl PortConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TimestampFormat {
+    /// Wall clock, dated. A console can hold days of output — restored history
+    /// above this session's — so the date is what tells one day's lines from
+    /// another's.
     #[default]
     Absolute,
+    /// Wall clock, time of day only. Half the width of the dated form, for a
+    /// session short enough that the date is the same on every line and the
+    /// columns are better spent on the text.
+    Time,
     Delta,
     Mark,
     None,
