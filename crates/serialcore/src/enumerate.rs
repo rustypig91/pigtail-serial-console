@@ -117,6 +117,27 @@ pub fn match_identity(saved: &PortIdentity, discovered: &[DiscoveredPort]) -> Ma
     MatchResult::None
 }
 
+/// True when `a` and `b` name the same physical device by the priority rules
+/// above, not by struct equality — two observations of one device (a saved
+/// profile vs. a live connection, or a connection vs. a departure event) can
+/// disagree on fields like `path_fallback` that don't change what the device
+/// *is*.
+pub fn identities_match(a: &PortIdentity, b: &PortIdentity) -> bool {
+    if a.has_usb() && a.serial_number.is_some() {
+        return b.vid == a.vid
+            && b.pid == a.pid
+            && b.serial_number == a.serial_number
+            && interface_ok(a, b);
+    }
+    if a.has_usb() && a.serial_number.is_none() {
+        return b.vid == a.vid && b.pid == a.pid && b.serial_number.is_none() && interface_ok(a, b);
+    }
+    if !a.has_usb() && !a.path_fallback.is_empty() {
+        return !b.has_usb() && b.path_fallback == a.path_fallback;
+    }
+    false
+}
+
 fn collect(discovered: &[DiscoveredPort], pred: impl Fn(&DiscoveredPort) -> bool) -> Vec<usize> {
     discovered
         .iter()
