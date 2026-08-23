@@ -7,7 +7,7 @@ use crossbeam_channel::Receiver;
 use serialcore::clock::{SessionClock, Timestamp};
 use serialcore::config::{Config, ExtractRule, PortConfig, PortIdentity, SavedConnection};
 use serialcore::enumerate::{
-    match_identity, spawn_enumerator, DiscoveredPort, EnumEvent, MatchResult,
+    identities_match, match_identity, spawn_enumerator, DiscoveredPort, EnumEvent, MatchResult,
 };
 use serialcore::extract::CompiledExtract;
 use serialcore::filter::{Combine, FilterIndex, FilterRule, FilterSet};
@@ -713,6 +713,25 @@ pub struct App {
     pub enum_rx: Receiver<EnumEvent>,
     pub available: Vec<DiscoveredPort>,
     pub connections: Vec<Connection>,
+    /// Saved identities of profiles the user explicitly closed via
+    /// [`App::close_connection`] while their device was still present.
+    /// Suppresses `auto_connect_profiles` for that profile until the device
+    /// departs, so closing an auto-connect tab sticks instead of the next
+    /// enumerator tick silently reopening it. Membership is decided by
+    /// `identities_match` (in turn `match_identity`), not struct equality,
+    /// since a device's discovered `PortIdentity` (e.g. `path_fallback`) can
+    /// vary between the moment it was saved and the moment it's closed or
+    /// departs — a plain `HashSet` would need `contains`/`remove` to use that
+    /// same struct equality, so this stays a `Vec` scanned by
+    /// `identities_match` everywhere it's touched.
+    ///
+    /// Mirrored to `config.auto_connect_suppressed` and flushed to disk
+    /// (`save_session`) on every change, so it survives a restart while the
+    /// device stays connected. On restart this can't distinguish "still
+    /// connected" from "departed and came back while the app was closed" —
+    /// the latter is stale suppression until the device departs again while
+    /// the app is running.
+    pub auto_connect_suppressed: Vec<PortIdentity>,
     /// Active tab index; `connections.len()` selects the merged view.
     pub active: usize,
     pub next_port_id: u32,
@@ -759,33 +778,24 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, paths: AppPaths, config: Config) -> App {
-        // Theme from settings.
-        let dark = config.settings.theme != "light";
-        cc.egui_ctx.set_visuals(if dark {
-            egui::Visuals::dark()
-        } else {
-            egui::Visuals::light()
-        });
-
-        // The wake every background thread gets: an idle UI schedules no frames
-        // of its own, so a repaint request is the only thing that brings it back.
-        let wake = Wake::new({
-            let ctx = cc.egui_ctx.clone();
-            move || ctx.request_repaint()
-        });
-
-        let (tx, rx) = crossbeam_channel::unbounded();
-        spawn_enumerator(tx, Duration::from_millis(500), wake.clone());
-
-        let mut app = App {
+    /// Build an `App` from its already-resolved dependencies. Shared by
+    /// `App::new` (a live `eframe::CreationContext`) and the test harness (a
+    /// hand-rolled `Wake`/channel), so a new field is added to `App` in one
+    /// place instead of two struct literals kept in sync by hand.
+    fn assemble(config: Config, paths: AppPaths, wake: Wake, enum_rx: Receiver<EnumEvent>) -> App {
+        // Restored from disk rather than starting empty: a tab the user closed
+        // while its device stayed connected should stay closed across a
+        // restart too, not just for the rest of the current run.
+        let auto_connect_suppressed = config.auto_connect_suppressed.clone();
+        App {
             clock: SessionClock::new(),
             config,
             paths,
             wake,
-            enum_rx: rx,
+            enum_rx,
             available: Vec::new(),
             connections: Vec::new(),
+            auto_connect_suppressed,
             active: 0,
             next_port_id: 0,
             config_dialog: None,
@@ -807,7 +817,29 @@ impl App {
             update_manual: false,
             update_dialog: None,
             font_toast: None,
-        };
+        }
+    }
+
+    pub fn new(cc: &eframe::CreationContext<'_>, paths: AppPaths, config: Config) -> App {
+        // Theme from settings.
+        let dark = config.settings.theme != "light";
+        cc.egui_ctx.set_visuals(if dark {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        });
+
+        // The wake every background thread gets: an idle UI schedules no frames
+        // of its own, so a repaint request is the only thing that brings it back.
+        let wake = Wake::new({
+            let ctx = cc.egui_ctx.clone();
+            move || ctx.request_repaint()
+        });
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        spawn_enumerator(tx, Duration::from_millis(500), wake.clone());
+
+        let mut app = App::assemble(config, paths, wake, rx);
 
         // Silent startup check for a newer release. Debug builds are skipped: a
         // working copy is routinely at the same version as — or ahead of — the
@@ -1011,7 +1043,9 @@ impl App {
         self.save_session();
     }
 
-    /// Persist the set of currently-open connections so they reopen next launch.
+    /// Persist the set of currently-open connections so they reopen next
+    /// launch, and the current auto-connect suppression set so a tab closed
+    /// while its device stayed connected doesn't reopen on restart either.
     fn save_session(&mut self) {
         self.config.last_open = self
             .connections
@@ -1021,6 +1055,7 @@ impl App {
                 config: c.port_config.clone(),
             })
             .collect();
+        self.config.auto_connect_suppressed = self.auto_connect_suppressed.clone();
         self.write_config();
     }
 
@@ -1167,10 +1202,27 @@ impl App {
             if !profile.auto_connect {
                 continue;
             }
+            // A suppressed entry's own identity can drift from a *live*
+            // profile's identity in ways struct equality wouldn't forgive
+            // (see `auto_connect_suppressed`'s doc comment), so this has to
+            // go through `identities_match` rather than a struct-equality
+            // lookup.
+            if self
+                .auto_connect_suppressed
+                .iter()
+                .any(|suppressed| identities_match(suppressed, &profile.identity))
+            {
+                continue;
+            }
+            // Same reasoning applies to an already-open connection: one
+            // opened manually, or restored from `last_open`, can carry a
+            // `path_fallback` that no longer matches the profile's saved
+            // identity even though both name the same device. Struct
+            // equality here would miss that and open a second tab for it.
             let already = self
                 .connections
                 .iter()
-                .any(|c| c.identity == profile.identity);
+                .any(|c| identities_match(&profile.identity, &c.identity));
             if already {
                 continue;
             }
@@ -1193,6 +1245,35 @@ impl App {
             return;
         }
         let conn = self.connections.remove(index);
+        // A user-initiated close of an *auto-connect* profile must stick
+        // while the device stays plugged in, or the next enumerator tick
+        // would just reopen it (issue #10). Lifted once the device departs,
+        // below. Profiles with auto_connect off are left alone: nothing
+        // would reopen them, so recording a suppression here would only
+        // become a surprise later if the user turns auto_connect on while
+        // the device is still connected.
+        //
+        // Identity equality here must go through `identities_match`, not
+        // struct equality: `conn.identity` can carry a `path_fallback`
+        // captured at a different time (and thus a different OS path) than
+        // the profile's saved identity, even though both name the same
+        // physical device. Every auto-connect profile that matches is
+        // suppressed, not just the first found: a manually-opened
+        // connection's identity never carries `interface_hint` (enumeration
+        // can't observe it), so two profiles that differ only by
+        // `interface_hint` can both match the same closed tab, and picking
+        // just one would silently leave the other free to reopen it.
+        for profile in &self.config.profiles {
+            if profile.auto_connect
+                && identities_match(&profile.identity, &conn.identity)
+                && !self
+                    .auto_connect_suppressed
+                    .iter()
+                    .any(|i| identities_match(i, &profile.identity))
+            {
+                self.auto_connect_suppressed.push(profile.identity.clone());
+            }
+        }
         conn.handle.shutdown();
         if self.active >= self.connections.len() {
             self.active = self.connections.len().saturating_sub(1);
@@ -1203,11 +1284,50 @@ impl App {
 
     fn poll_enumerator(&mut self) {
         let mut updated = false;
+        let mut suppressed_changed = false;
         while let Ok(ev) = self.enum_rx.try_recv() {
-            if let EnumEvent::Snapshot(snap) = ev {
-                self.available = snap;
-                updated = true;
+            match ev {
+                EnumEvent::Snapshot(snap) => {
+                    self.available = snap;
+                    updated = true;
+                }
+                EnumEvent::Departed(port) => {
+                    // `diff_snapshots` matches by OS path, so a device that
+                    // merely renumbers (reset, driver re-enumeration) without
+                    // being physically unplugged produces a `Departed` for
+                    // its old path even though it's still here — under a new
+                    // path, in this same tick's `Snapshot`, already applied
+                    // to `self.available` above. Lifting suppression on that
+                    // would defeat the whole point of suppressing: the very
+                    // next `auto_connect_profiles` call in this same poll
+                    // would reopen the tab the user just closed. Only lift it
+                    // when the identity is genuinely no longer present.
+                    if self
+                        .available
+                        .iter()
+                        .any(|d| identities_match(&port.identity, &d.identity))
+                    {
+                        continue;
+                    }
+                    // Suppressed entries are profile identities, and `port`
+                    // is a freshly-enumerated identity that may carry a
+                    // different `path_fallback` than the profile's saved
+                    // one, so lift suppression by `identities_match`, not
+                    // struct equality.
+                    let before = self.auto_connect_suppressed.len();
+                    self.auto_connect_suppressed
+                        .retain(|ident| !identities_match(ident, &port.identity));
+                    suppressed_changed |= self.auto_connect_suppressed.len() != before;
+                }
+                EnumEvent::Arrived(_) => {}
             }
+        }
+        // Flush once for the whole batch rather than per event, so unplugging
+        // several suppressed devices at once doesn't do a full config write
+        // for each — only the final state matters, and it must still happen
+        // before `auto_connect_profiles` below in case that opens a tab.
+        if suppressed_changed {
+            self.save_session();
         }
         if updated {
             self.auto_connect_profiles();
@@ -1543,6 +1663,7 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serialcore::config::Profile;
     use serialcore::session::SessionWriter;
 
     fn scratch(name: &str) -> PathBuf {
@@ -1806,5 +1927,388 @@ mod tests {
         let (ring, base) = ring(8, &[b"ab", b"cd"]);
         assert_eq!(ring.iter().copied().collect::<Vec<u8>>(), b"abcd");
         assert_eq!(base, 0);
+    }
+
+    /// A minimal `App`, built by hand rather than through `App::new` (which
+    /// needs a live `eframe::CreationContext`). Its own enumerator channel is
+    /// swapped for one this test controls.
+    fn test_app(name: &str) -> (App, crossbeam_channel::Sender<EnumEvent>) {
+        test_app_with_config(name, Config::default())
+    }
+
+    /// Like `test_app`, but seeded with a config the test provides — for
+    /// cases that need to check what `App::assemble` does with e.g. a
+    /// restored `auto_connect_suppressed` list.
+    fn test_app_with_config(
+        name: &str,
+        config: Config,
+    ) -> (App, crossbeam_channel::Sender<EnumEvent>) {
+        let dir = scratch(name);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let app = App::assemble(
+            config,
+            AppPaths {
+                config_file: dir.join("pigtail.toml"),
+                sessions: dir.join("sessions"),
+                crash_log: dir.join("crash.log"),
+            },
+            Wake::new(|| {}),
+            rx,
+        );
+        (app, tx)
+    }
+
+    /// A reader handle backed by no real device, for tests that only care
+    /// about connection bookkeeping. Its thread exits as soon as it is asked
+    /// to shut down.
+    fn inert_handle(id: PortId) -> reader::ReaderHandle {
+        let config = reader::ReaderConfig {
+            port_id: id,
+            clock: SessionClock::new(),
+            session_dir: None,
+            meta: SessionMeta {
+                identity: PortIdentity::default(),
+                config: PortConfig::default(),
+                start_wall: chrono::Utc::now(),
+                app_version: "test".into(),
+                port_label: String::new(),
+                cleared: false,
+            },
+            terminal: Default::default(),
+            wake: Wake::new(|| {}),
+        };
+        reader::spawn(
+            config,
+            SourceSpec::OneShot(Box::new(
+                serialcore::source::ScriptedSource::new(Vec::new()),
+            )),
+        )
+    }
+
+    /// An auto-connect profile named "probe" for the given identity, with the
+    /// filler fields the suppression tests below don't care about.
+    fn auto_connect_profile(identity: PortIdentity) -> Profile {
+        Profile {
+            name: "probe".into(),
+            identity,
+            port: PortConfig::default(),
+            auto_connect: true,
+            highlight: Vec::new(),
+            extract: Vec::new(),
+        }
+    }
+
+    /// PR #27 fixed auto-connect reopening a tab the user just closed, by
+    /// suppressing that device until it departs. The fix must key suppression
+    /// off device identity (`match_identity`), not `PortIdentity` struct
+    /// equality: `path_fallback` is re-captured live on every enumeration and
+    /// commonly differs across sessions/replugs for the very same physical
+    /// device (see `enumerate.rs`'s own module doc).
+    #[test]
+    fn close_then_departure_suppression_matches_by_device_identity_not_path() {
+        let (mut app, enum_tx) = test_app("suppress");
+
+        let mut profile_identity = identity("A1");
+        profile_identity.path_fallback = "COM3".into();
+        app.config
+            .profiles
+            .push(auto_connect_profile(profile_identity.clone()));
+
+        // Connected (manually, or by a previous auto-connect) while the OS
+        // happened to expose the device at a different path than the one the
+        // profile remembers.
+        let mut live_identity = identity("A1");
+        live_identity.path_fallback = "COM5".into();
+        let id = PortId(0);
+        let conn = app.make_connection(
+            id,
+            "probe (COM5)".into(),
+            live_identity,
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        app.connections.push(conn);
+
+        app.close_connection(0);
+        assert_eq!(
+            app.auto_connect_suppressed.iter().collect::<Vec<_>>(),
+            vec![&profile_identity],
+            "closing the tab must suppress the matching profile's own identity, \
+             not the connection's differently-pathed one, or auto-connect \
+             reopens it on the very next enumerator tick (issue #10)"
+        );
+
+        // The device eventually departs, enumerated this session at a third
+        // path yet again.
+        let mut departed_identity = identity("A1");
+        departed_identity.path_fallback = "COM7".into();
+        enum_tx
+            .send(EnumEvent::Departed(DiscoveredPort {
+                path: "COM7".into(),
+                identity: departed_identity,
+            }))
+            .unwrap();
+        app.poll_enumerator();
+
+        assert!(
+            app.auto_connect_suppressed.is_empty(),
+            "suppression must lift once the device departs, regardless of the \
+             path it happened to enumerate at"
+        );
+    }
+
+    /// Non-USB devices (e.g. a built-in UART with no vid/pid) are matched by
+    /// `match_identity`'s Rule 3, which compares only `path` to
+    /// `path_fallback` — unlike struct equality, it doesn't care whether
+    /// other fields (e.g. `manufacturer`, populated live but absent on a
+    /// hand-written profile) agree. Closing such a tab must still suppress
+    /// auto-connect for it.
+    #[test]
+    fn close_connection_suppresses_non_usb_profile_by_path_fallback() {
+        let (mut app, _enum_tx) = test_app("suppress-non-usb");
+
+        let profile_identity = PortIdentity {
+            path_fallback: "/dev/ttyS0".into(),
+            ..Default::default()
+        };
+        app.config
+            .profiles
+            .push(auto_connect_profile(profile_identity.clone()));
+
+        let live_identity = PortIdentity {
+            path_fallback: "/dev/ttyS0".into(),
+            manufacturer: Some("Live-Enumerated Corp".into()),
+            ..Default::default()
+        };
+        let id = PortId(0);
+        let conn = app.make_connection(
+            id,
+            "probe (/dev/ttyS0)".into(),
+            live_identity,
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        app.connections.push(conn);
+
+        app.close_connection(0);
+        assert_eq!(
+            app.auto_connect_suppressed.iter().collect::<Vec<_>>(),
+            vec![&profile_identity],
+            "closing the tab of a non-USB device must suppress its profile too, \
+             not just USB ones, even when the live identity disagrees with the \
+             saved one on a field Rule 3 doesn't consider"
+        );
+    }
+
+    /// A profile that matches the closed connection's identity but has
+    /// `auto_connect` off is left alone: nothing would have reopened it, so
+    /// suppressing it now would only surprise the user if they later turn
+    /// `auto_connect` on for it while the device is still connected.
+    #[test]
+    fn close_connection_ignores_non_auto_connect_profile_match() {
+        let (mut app, _enum_tx) = test_app("suppress-dormant");
+
+        let profile_identity = identity("A1");
+        let mut dormant = auto_connect_profile(profile_identity.clone());
+        dormant.auto_connect = false;
+        app.config.profiles.push(dormant);
+
+        let id = PortId(0);
+        let conn = app.make_connection(
+            id,
+            "probe".into(),
+            profile_identity,
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        app.connections.push(conn);
+
+        app.close_connection(0);
+        assert!(
+            app.auto_connect_suppressed.is_empty(),
+            "closing a manually-opened tab must not suppress a profile whose \
+             auto_connect is off"
+        );
+    }
+
+    /// Two profiles can both match the identity of a manually-opened
+    /// connection, since a live connection's identity never carries
+    /// `interface_hint` (enumeration can't observe it) and so can't
+    /// disambiguate profiles that differ only by that field. Closing the tab
+    /// must suppress every matching auto-connect profile, not just the first
+    /// one found, or the other stays free to reopen the tab that was just
+    /// closed.
+    #[test]
+    fn close_connection_suppresses_all_matching_profiles() {
+        let (mut app, _enum_tx) = test_app("suppress-ambiguous");
+
+        let mut probe_a = identity("A1");
+        probe_a.interface_hint = Some(0);
+        let mut probe_b = identity("A1");
+        probe_b.interface_hint = Some(2);
+        app.config
+            .profiles
+            .push(auto_connect_profile(probe_a.clone()));
+        app.config
+            .profiles
+            .push(auto_connect_profile(probe_b.clone()));
+
+        // Opened manually, so its identity carries no interface_hint at all
+        // -- matching both profiles above.
+        let id = PortId(0);
+        let conn = app.make_connection(
+            id,
+            "probe".into(),
+            identity("A1"),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        app.connections.push(conn);
+
+        app.close_connection(0);
+        let mut suppressed = app.auto_connect_suppressed.clone();
+        suppressed.sort_by_key(|i| i.interface_hint);
+        assert_eq!(
+            suppressed,
+            vec![probe_a, probe_b],
+            "an ambiguous match must suppress every matching profile, not just \
+             whichever one iteration happened to find first"
+        );
+    }
+
+    /// `auto_connect_suppressed` must survive a restart while the device
+    /// stays connected: `close_connection` persists it into `Config`, and
+    /// `App::assemble` (used by both `App::new` and this test harness) seeds
+    /// its in-memory set back from `Config` on construction.
+    #[test]
+    fn auto_connect_suppressed_persists_across_restart() {
+        let (mut app, _enum_tx) = test_app("suppress-persist");
+
+        let profile_identity = identity("A1");
+        app.config
+            .profiles
+            .push(auto_connect_profile(profile_identity.clone()));
+        let id = PortId(0);
+        let conn = app.make_connection(
+            id,
+            "probe".into(),
+            profile_identity.clone(),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        app.connections.push(conn);
+        app.close_connection(0);
+        assert!(!app.auto_connect_suppressed.is_empty());
+
+        // Simulate relaunch: build a fresh App from the config as saved to
+        // disk-equivalent state, the way `App::new` would after reading it
+        // back from the config file.
+        let (restarted, _tx) = test_app_with_config("suppress-persist-2", app.config.clone());
+        assert_eq!(
+            restarted.auto_connect_suppressed, app.auto_connect_suppressed,
+            "a suppression recorded before restart must still be in effect \
+             immediately after, or the tab the user closed reopens on the \
+             very first enumerator tick"
+        );
+    }
+
+    /// `diff_snapshots` matches by OS path, so a device that merely renumbers
+    /// (e.g. a firmware reset) without being physically unplugged produces a
+    /// `Departed` for its old path even though it's still present under a new
+    /// one. That `Departed` must not lift suppression, or the very next
+    /// `auto_connect_profiles` call in the same poll reopens the tab the user
+    /// just closed -- exactly what suppression exists to prevent.
+    #[test]
+    fn departure_does_not_lift_suppression_when_device_only_renumbered() {
+        let (mut app, enum_tx) = test_app("suppress-renumber");
+
+        let profile_identity = identity("A1");
+        app.config
+            .profiles
+            .push(auto_connect_profile(profile_identity.clone()));
+
+        let id = PortId(0);
+        let conn = app.make_connection(
+            id,
+            "probe (COM5)".into(),
+            identity("A1"),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        app.connections.push(conn);
+        app.close_connection(0);
+        assert!(!app.auto_connect_suppressed.is_empty());
+
+        // The enumerator sends the new snapshot (device still present, now at
+        // a different path) before the Departed event for the old path, same
+        // as `spawn_enumerator` does within one tick.
+        let mut renumbered = identity("A1");
+        renumbered.path_fallback = "COM9".into();
+        enum_tx
+            .send(EnumEvent::Snapshot(vec![DiscoveredPort {
+                path: "COM9".into(),
+                identity: renumbered,
+            }]))
+            .unwrap();
+        let mut departed_identity = identity("A1");
+        departed_identity.path_fallback = "COM5".into();
+        enum_tx
+            .send(EnumEvent::Departed(DiscoveredPort {
+                path: "COM5".into(),
+                identity: departed_identity,
+            }))
+            .unwrap();
+        app.poll_enumerator();
+
+        assert!(
+            !app.auto_connect_suppressed.is_empty(),
+            "a renumber, not a real unplug, must not lift suppression"
+        );
+        assert_eq!(
+            app.connections.len(),
+            0,
+            "the profile must stay suppressed rather than reopening a tab \
+             for the device that never actually departed"
+        );
+    }
+
+    /// A profile must not be auto-connected a second time when it's already
+    /// open under an identity captured at a different moment (e.g. restored
+    /// from `last_open`, or opened manually) -- struct equality would miss
+    /// the match if `path_fallback` drifted, and open a duplicate tab.
+    #[test]
+    fn auto_connect_skips_profile_already_open_under_a_differently_pathed_identity() {
+        let (mut app, _enum_tx) = test_app("suppress-dup-open");
+
+        let mut profile_identity = identity("A1");
+        profile_identity.path_fallback = "COM3".into();
+        app.config
+            .profiles
+            .push(auto_connect_profile(profile_identity));
+
+        let mut live_identity = identity("A1");
+        live_identity.path_fallback = "COM5".into();
+        let id = PortId(0);
+        let conn = app.make_connection(
+            id,
+            "probe (COM5)".into(),
+            live_identity.clone(),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        app.connections.push(conn);
+
+        app.available.push(DiscoveredPort {
+            path: "COM5".into(),
+            identity: live_identity,
+        });
+        app.auto_connect_profiles();
+
+        assert_eq!(
+            app.connections.len(),
+            1,
+            "a profile already open under a live identity with a different \
+             path_fallback must not be auto-connected again"
+        );
     }
 }
