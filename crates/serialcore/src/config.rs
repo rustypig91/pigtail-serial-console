@@ -434,6 +434,11 @@ pub struct Config {
     /// Connections open at last exit, reopened on the next launch.
     #[serde(default, rename = "last_open")]
     pub last_open: Vec<SavedConnection>,
+    /// Identities of auto-connect profiles the user explicitly closed while
+    /// their device stayed connected, so a restart doesn't immediately
+    /// reopen the tab the user just closed. See `App::auto_connect_suppressed`.
+    #[serde(default)]
+    pub auto_connect_suppressed: Vec<PortIdentity>,
 }
 
 impl Config {
@@ -465,6 +470,7 @@ impl Default for Config {
             highlight: default_highlight_rules(),
             presets: Vec::new(),
             last_open: Vec::new(),
+            auto_connect_suppressed: Vec::new(),
         }
     }
 }
@@ -668,6 +674,11 @@ theme = "dark"
                     ..Default::default()
                 },
                 config: PortConfig::default(),
+            }],
+            auto_connect_suppressed: vec![PortIdentity {
+                vid: Some(5),
+                pid: Some(6),
+                ..Default::default()
             }],
         };
         let s = cfg.to_toml().unwrap();
