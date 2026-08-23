@@ -1217,7 +1217,7 @@ impl App {
         // Suppress whichever profile actually matches this connection, so the
         // set stays keyed on the profile's own identity throughout.
         let discovered = [DiscoveredPort {
-            path: String::new(),
+            path: conn.identity.path_fallback.clone(),
             identity: conn.identity.clone(),
         }];
         if let Some(profile) = self.config.profiles.iter().find(|p| {
@@ -1996,6 +1996,49 @@ mod tests {
             app.auto_connect_suppressed.is_empty(),
             "suppression must lift once the device departs, regardless of the \
              path it happened to enumerate at"
+        );
+    }
+
+    /// Non-USB devices (e.g. a built-in UART with no vid/pid) are matched by
+    /// `match_identity`'s Rule 3, which compares `path` to `path_fallback`.
+    /// Closing such a tab must still suppress auto-connect for it.
+    #[test]
+    fn close_connection_suppresses_non_usb_profile_by_path_fallback() {
+        let (mut app, _enum_tx) = test_app("suppress-non-usb");
+
+        let profile_identity = PortIdentity {
+            path_fallback: "/dev/ttyS0".into(),
+            ..Default::default()
+        };
+        app.config.profiles.push(Profile {
+            name: "probe".into(),
+            identity: profile_identity.clone(),
+            port: PortConfig::default(),
+            auto_connect: true,
+            highlight: Vec::new(),
+            extract: Vec::new(),
+        });
+
+        let live_identity = PortIdentity {
+            path_fallback: "/dev/ttyS0".into(),
+            ..Default::default()
+        };
+        let id = PortId(0);
+        let conn = app.make_connection(
+            id,
+            "probe (/dev/ttyS0)".into(),
+            live_identity,
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        app.connections.push(conn);
+
+        app.close_connection(0);
+        assert_eq!(
+            app.auto_connect_suppressed.iter().collect::<Vec<_>>(),
+            vec![&profile_identity],
+            "closing the tab of a non-USB device must suppress its profile too, \
+             not just USB ones"
         );
     }
 }
