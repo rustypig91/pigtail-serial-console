@@ -713,10 +713,14 @@ pub struct App {
     pub enum_rx: Receiver<EnumEvent>,
     pub available: Vec<DiscoveredPort>,
     pub connections: Vec<Connection>,
-    /// Identities the user explicitly closed via [`App::close_connection`]
-    /// while their device was still present. Suppresses `auto_connect_profiles`
-    /// for that identity until the device departs, so closing an auto-connect
-    /// tab sticks instead of the next enumerator tick silently reopening it.
+    /// Saved identities of profiles the user explicitly closed via
+    /// [`App::close_connection`] while their device was still present.
+    /// Suppresses `auto_connect_profiles` for that profile until the device
+    /// departs, so closing an auto-connect tab sticks instead of the next
+    /// enumerator tick silently reopening it. Membership is decided by
+    /// `match_identity`, not struct equality, since a device's discovered
+    /// `PortIdentity` (e.g. `path_fallback`) can vary between the moment it
+    /// was saved and the moment it's closed or departs.
     pub auto_connect_suppressed: HashSet<PortIdentity>,
     /// Active tab index; `connections.len()` selects the merged view.
     pub active: usize,
@@ -1205,7 +1209,25 @@ impl App {
         // A user-initiated close of an auto-connect profile must stick while
         // the device stays plugged in, or the next enumerator tick would just
         // reopen it (issue #10). Lifted once the device departs, below.
-        self.auto_connect_suppressed.insert(conn.identity.clone());
+        //
+        // Identity equality here must go through `match_identity`, not struct
+        // equality: `conn.identity` can carry a `path_fallback` captured at a
+        // different time (and thus a different OS path) than the profile's
+        // saved identity, even though both name the same physical device.
+        // Suppress whichever profile actually matches this connection, so the
+        // set stays keyed on the profile's own identity throughout.
+        let discovered = [DiscoveredPort {
+            path: String::new(),
+            identity: conn.identity.clone(),
+        }];
+        if let Some(profile) = self.config.profiles.iter().find(|p| {
+            matches!(
+                match_identity(&p.identity, &discovered),
+                MatchResult::Definite(_)
+            )
+        }) {
+            self.auto_connect_suppressed.insert(profile.identity.clone());
+        }
         conn.handle.shutdown();
         if self.active >= self.connections.len() {
             self.active = self.connections.len().saturating_sub(1);
@@ -1227,7 +1249,19 @@ impl App {
                     // being explicitly closed no longer means anything --
                     // when it comes back, auto-connect should treat it as
                     // fresh rather than staying suppressed forever.
-                    self.auto_connect_suppressed.remove(&port.identity);
+                    //
+                    // Suppressed entries are profile identities, and `port`
+                    // is a freshly-enumerated identity that may carry a
+                    // different `path_fallback` than the profile's saved
+                    // one, so lift suppression by `match_identity`, not
+                    // struct equality.
+                    let departed = [port.clone()];
+                    self.auto_connect_suppressed.retain(|ident| {
+                        !matches!(
+                            match_identity(ident, &departed),
+                            MatchResult::Definite(_)
+                        )
+                    });
                 }
                 EnumEvent::Arrived(_) => {}
             }
@@ -1566,6 +1600,7 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serialcore::config::Profile;
     use serialcore::session::SessionWriter;
 
     fn scratch(name: &str) -> PathBuf {
@@ -1829,5 +1864,138 @@ mod tests {
         let (ring, base) = ring(8, &[b"ab", b"cd"]);
         assert_eq!(ring.iter().copied().collect::<Vec<u8>>(), b"abcd");
         assert_eq!(base, 0);
+    }
+
+    /// A minimal `App`, built by hand rather than through `App::new` (which
+    /// needs a live `eframe::CreationContext`). Its own enumerator channel is
+    /// swapped for one this test controls.
+    fn test_app(name: &str) -> (App, crossbeam_channel::Sender<EnumEvent>) {
+        let dir = scratch(name);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let app = App {
+            clock: SessionClock::new(),
+            config: Config::default(),
+            paths: AppPaths {
+                config_file: dir.join("pigtail.toml"),
+                sessions: dir.join("sessions"),
+                crash_log: dir.join("crash.log"),
+            },
+            wake: Wake::new(|| {}),
+            enum_rx: rx,
+            available: Vec::new(),
+            connections: Vec::new(),
+            auto_connect_suppressed: HashSet::new(),
+            active: 0,
+            next_port_id: 0,
+            config_dialog: None,
+            highlight_cache: Vec::new(),
+            highlight_dirty: true,
+            merged: Vec::new(),
+            merged_seq: 0,
+            merged_dirty: false,
+            merged_wrap: WrapIndex::new(),
+            merged_generation: 0,
+            merged_selected: false,
+            show_settings: false,
+            show_filters_win: false,
+            show_highlight_win: false,
+            show_extract_win: false,
+            show_search: false,
+            search_focus_request: false,
+            update_rx: None,
+            update_manual: false,
+            update_dialog: None,
+            font_toast: None,
+        };
+        (app, tx)
+    }
+
+    /// A reader handle backed by no real device, for tests that only care
+    /// about connection bookkeeping. Its thread exits as soon as it is asked
+    /// to shut down.
+    fn inert_handle(id: PortId) -> reader::ReaderHandle {
+        let config = reader::ReaderConfig {
+            port_id: id,
+            clock: SessionClock::new(),
+            session_dir: None,
+            meta: SessionMeta {
+                identity: PortIdentity::default(),
+                config: PortConfig::default(),
+                start_wall: chrono::Utc::now(),
+                app_version: "test".into(),
+                port_label: String::new(),
+                cleared: false,
+            },
+            terminal: Default::default(),
+            wake: Wake::new(|| {}),
+        };
+        reader::spawn(
+            config,
+            SourceSpec::OneShot(Box::new(serialcore::source::ScriptedSource::new(Vec::new()))),
+        )
+    }
+
+    /// PR #27 fixed auto-connect reopening a tab the user just closed, by
+    /// suppressing that device until it departs. The fix must key suppression
+    /// off device identity (`match_identity`), not `PortIdentity` struct
+    /// equality: `path_fallback` is re-captured live on every enumeration and
+    /// commonly differs across sessions/replugs for the very same physical
+    /// device (see `enumerate.rs`'s own module doc).
+    #[test]
+    fn close_then_departure_suppression_matches_by_device_identity_not_path() {
+        let (mut app, enum_tx) = test_app("suppress");
+
+        let mut profile_identity = identity("A1");
+        profile_identity.path_fallback = "COM3".into();
+        app.config.profiles.push(Profile {
+            name: "probe".into(),
+            identity: profile_identity.clone(),
+            port: PortConfig::default(),
+            auto_connect: true,
+            highlight: Vec::new(),
+            extract: Vec::new(),
+        });
+
+        // Connected (manually, or by a previous auto-connect) while the OS
+        // happened to expose the device at a different path than the one the
+        // profile remembers.
+        let mut live_identity = identity("A1");
+        live_identity.path_fallback = "COM5".into();
+        let id = PortId(0);
+        let conn = app.make_connection(
+            id,
+            "probe (COM5)".into(),
+            live_identity,
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        app.connections.push(conn);
+
+        app.close_connection(0);
+        assert_eq!(
+            app.auto_connect_suppressed.iter().collect::<Vec<_>>(),
+            vec![&profile_identity],
+            "closing the tab must suppress the matching profile's own identity, \
+             not the connection's differently-pathed one, or auto-connect \
+             reopens it on the very next enumerator tick (issue #10)"
+        );
+
+        // The device eventually departs, enumerated this session at a third
+        // path yet again.
+        let mut departed_identity = identity("A1");
+        departed_identity.path_fallback = "COM7".into();
+        enum_tx
+            .send(EnumEvent::Departed(DiscoveredPort {
+                path: "COM7".into(),
+                identity: departed_identity,
+            }))
+            .unwrap();
+        app.poll_enumerator();
+
+        assert!(
+            app.auto_connect_suppressed.is_empty(),
+            "suppression must lift once the device departs, regardless of the \
+             path it happened to enumerate at"
+        );
     }
 }
