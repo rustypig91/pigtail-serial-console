@@ -265,6 +265,25 @@ impl LineStore {
         // "lines evicted" notice in the header stays quiet.
     }
 
+    /// Change the eviction cap, applying it immediately if the store is now
+    /// over capacity. Cheap to call every frame: a no-op once the cap matches
+    /// what's already set.
+    pub fn set_max_lines(&mut self, max_lines: usize) {
+        let max_lines = max_lines.max(1);
+        if max_lines == self.max_lines {
+            return;
+        }
+        self.max_lines = max_lines;
+        // Evict the whole excess in one pass rather than via maybe_evict's
+        // small fixed chunks: a cap dropped far below a large resident count
+        // (e.g. 1,000,000 -> 10,000) would otherwise take hundreds of
+        // O(remaining-length) drains, turning a single shrink into O(n^2)
+        // work on the UI thread that owns this store.
+        if self.lines.len() > self.max_lines {
+            self.evict(self.lines.len() - self.max_lines);
+        }
+    }
+
     /// Evict from the front in a ~10% chunk when over capacity. Never one line
     /// at a time (that would be O(n) per line, spec §7.7).
     fn maybe_evict(&mut self) {
@@ -273,11 +292,21 @@ impl LineStore {
         }
         let evict_count = (self.max_lines / 10).max(1);
         let evict_count = evict_count.min(self.lines.len());
+        self.evict(evict_count);
+    }
+
+    /// Evict exactly `count` lines from the front (clamped to what's resident)
+    /// in a single arena/metadata compaction.
+    fn evict(&mut self, count: usize) {
+        let count = count.min(self.lines.len());
+        if count == 0 {
+            return;
+        }
 
         // Byte cutoff: start offset of the first line we keep.
         let byte_cutoff = self
             .lines
-            .get(evict_count)
+            .get(count)
             .map(|m| m.start as usize)
             .unwrap_or(self.arena.len());
 
@@ -286,11 +315,11 @@ impl LineStore {
         self.arena_base += byte_cutoff as u64;
 
         // Drop metadata and shift offsets.
-        self.lines.drain(..evict_count);
+        self.lines.drain(..count);
         for m in &mut self.lines {
             m.start -= byte_cutoff as u32;
         }
-        self.line_base += evict_count as u64;
+        self.line_base += count as u64;
         self.evicted_any = true;
     }
 
@@ -442,5 +471,64 @@ mod tests {
         assert_eq!(idx, 2);
         assert_eq!(s.get(2).unwrap().text, "after");
         assert_eq!(s.first_abs_index(), 2);
+    }
+
+    #[test]
+    fn set_max_lines_evicts_existing_lines_immediately() {
+        // A cap lowered from Settings must apply to lines already resident,
+        // not just to future appends (issue #13).
+        let clock = SessionClock::new();
+        let mut s = LineStore::new(1000);
+        for n in 0..50 {
+            s.append(incoming(&format!("line {n}"), &clock));
+        }
+        assert_eq!(s.len(), 50);
+
+        s.set_max_lines(10);
+        assert!(s.len() <= 10, "lowering the cap evicts without a new append");
+        assert!(s.evicted_any());
+        let last = s.next_abs_index() - 1;
+        assert_eq!(s.get(last).unwrap().text, "line 49");
+    }
+
+    #[test]
+    fn set_max_lines_is_a_no_op_when_unchanged() {
+        let clock = SessionClock::new();
+        let mut s = LineStore::new(1000);
+        for n in 0..50 {
+            s.append(incoming(&format!("line {n}"), &clock));
+        }
+        s.set_max_lines(1000);
+        assert_eq!(s.len(), 50, "same cap shouldn't evict anything");
+        assert!(!s.evicted_any());
+    }
+
+    #[test]
+    fn set_max_lines_allows_growing_the_cap() {
+        let clock = SessionClock::new();
+        let mut s = LineStore::new(10);
+        for n in 0..30 {
+            s.append(incoming(&format!("line {n}"), &clock));
+        }
+        assert!(s.len() <= 10);
+
+        // Raising the cap doesn't retroactively un-evict, but it does stop
+        // further eviction until the new, larger cap is reached.
+        s.set_max_lines(1000);
+        let first_after_raise = s.first_abs_index();
+        for n in 30..60 {
+            s.append(incoming(&format!("line {n}"), &clock));
+        }
+        assert_eq!(
+            s.first_abs_index(),
+            first_after_raise,
+            "no further eviction once the cap is well above the resident count"
+        );
+        assert_eq!(s.len(), 60 - first_after_raise as usize);
+        assert_eq!(s.get(59).unwrap().text, "line 59");
+        assert_eq!(
+            s.get(first_after_raise).unwrap().text,
+            format!("line {first_after_raise}")
+        );
     }
 }
