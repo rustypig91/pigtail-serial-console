@@ -18,7 +18,7 @@ use serialcore::session::{self, SessionMeta};
 use serialcore::store::{IncomingLine, LineFlags, LineStore, PortId};
 use serialcore::update;
 use serialcore::wake::Wake;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -713,6 +713,11 @@ pub struct App {
     pub enum_rx: Receiver<EnumEvent>,
     pub available: Vec<DiscoveredPort>,
     pub connections: Vec<Connection>,
+    /// Identities the user explicitly closed via [`App::close_connection`]
+    /// while their device was still present. Suppresses `auto_connect_profiles`
+    /// for that identity until the device departs, so closing an auto-connect
+    /// tab sticks instead of the next enumerator tick silently reopening it.
+    pub auto_connect_suppressed: HashSet<PortIdentity>,
     /// Active tab index; `connections.len()` selects the merged view.
     pub active: usize,
     pub next_port_id: u32,
@@ -786,6 +791,7 @@ impl App {
             enum_rx: rx,
             available: Vec::new(),
             connections: Vec::new(),
+            auto_connect_suppressed: HashSet::new(),
             active: 0,
             next_port_id: 0,
             config_dialog: None,
@@ -1167,6 +1173,9 @@ impl App {
             if !profile.auto_connect {
                 continue;
             }
+            if self.auto_connect_suppressed.contains(&profile.identity) {
+                continue;
+            }
             let already = self
                 .connections
                 .iter()
@@ -1193,6 +1202,10 @@ impl App {
             return;
         }
         let conn = self.connections.remove(index);
+        // A user-initiated close of an auto-connect profile must stick while
+        // the device stays plugged in, or the next enumerator tick would just
+        // reopen it (issue #10). Lifted once the device departs, below.
+        self.auto_connect_suppressed.insert(conn.identity.clone());
         conn.handle.shutdown();
         if self.active >= self.connections.len() {
             self.active = self.connections.len().saturating_sub(1);
@@ -1204,9 +1217,19 @@ impl App {
     fn poll_enumerator(&mut self) {
         let mut updated = false;
         while let Ok(ev) = self.enum_rx.try_recv() {
-            if let EnumEvent::Snapshot(snap) = ev {
-                self.available = snap;
-                updated = true;
+            match ev {
+                EnumEvent::Snapshot(snap) => {
+                    self.available = snap;
+                    updated = true;
+                }
+                EnumEvent::Departed(port) => {
+                    // The device is gone, so the suppression it earned by
+                    // being explicitly closed no longer means anything --
+                    // when it comes back, auto-connect should treat it as
+                    // fresh rather than staying suppressed forever.
+                    self.auto_connect_suppressed.remove(&port.identity);
+                }
+                EnumEvent::Arrived(_) => {}
             }
         }
         if updated {
