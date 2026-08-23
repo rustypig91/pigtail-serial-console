@@ -407,6 +407,7 @@ pub struct Connection {
 
 impl Connection {
     fn drain_events(&mut self, max_lines: usize) -> bool {
+        self.store.set_max_lines(max_lines);
         let mut changed = false;
         // Non-blocking drain of all pending reader events (spec §5).
         while let Ok(ev) = self.handle.events.try_recv() {
@@ -430,7 +431,6 @@ impl Connection {
                 ReaderEvent::Batch(batch) => {
                     self.open_live_raw_session();
                     self.push_raw_bytes(&batch.raw);
-                    let _ = max_lines;
                     let mut pairs: Vec<(String, f64)> = Vec::new();
                     for line in batch.lines {
                         // Parse SGR colours and strip other escapes (spec §2, §7.9).

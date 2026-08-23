@@ -265,6 +265,20 @@ impl LineStore {
         // "lines evicted" notice in the header stays quiet.
     }
 
+    /// Change the eviction cap, applying it immediately if the store is now
+    /// over capacity. Cheap to call every frame: a no-op once the cap matches
+    /// what's already set.
+    pub fn set_max_lines(&mut self, max_lines: usize) {
+        let max_lines = max_lines.max(1);
+        if max_lines == self.max_lines {
+            return;
+        }
+        self.max_lines = max_lines;
+        while self.lines.len() > self.max_lines {
+            self.maybe_evict();
+        }
+    }
+
     /// Evict from the front in a ~10% chunk when over capacity. Never one line
     /// at a time (that would be O(n) per line, spec §7.7).
     fn maybe_evict(&mut self) {
@@ -442,5 +456,54 @@ mod tests {
         assert_eq!(idx, 2);
         assert_eq!(s.get(2).unwrap().text, "after");
         assert_eq!(s.first_abs_index(), 2);
+    }
+
+    #[test]
+    fn set_max_lines_evicts_existing_lines_immediately() {
+        // A cap lowered from Settings must apply to lines already resident,
+        // not just to future appends (issue #13).
+        let clock = SessionClock::new();
+        let mut s = LineStore::new(1000);
+        for n in 0..50 {
+            s.append(incoming(&format!("line {n}"), &clock));
+        }
+        assert_eq!(s.len(), 50);
+
+        s.set_max_lines(10);
+        assert!(s.len() <= 10, "lowering the cap evicts without a new append");
+        assert!(s.evicted_any());
+        let last = s.next_abs_index() - 1;
+        assert_eq!(s.get(last).unwrap().text, "line 49");
+    }
+
+    #[test]
+    fn set_max_lines_is_a_no_op_when_unchanged() {
+        let clock = SessionClock::new();
+        let mut s = LineStore::new(1000);
+        for n in 0..50 {
+            s.append(incoming(&format!("line {n}"), &clock));
+        }
+        s.set_max_lines(1000);
+        assert_eq!(s.len(), 50, "same cap shouldn't evict anything");
+        assert!(!s.evicted_any());
+    }
+
+    #[test]
+    fn set_max_lines_allows_growing_the_cap() {
+        let clock = SessionClock::new();
+        let mut s = LineStore::new(10);
+        for n in 0..30 {
+            s.append(incoming(&format!("line {n}"), &clock));
+        }
+        assert!(s.len() <= 10);
+
+        // Raising the cap doesn't retroactively un-evict, but it does stop
+        // further eviction until the new, larger cap is reached.
+        s.set_max_lines(1000);
+        for n in 30..60 {
+            s.append(incoming(&format!("line {n}"), &clock));
+        }
+        assert_eq!(s.len(), s.next_abs_index() as usize - s.first_abs_index() as usize);
+        assert!(s.len() > 10);
     }
 }
