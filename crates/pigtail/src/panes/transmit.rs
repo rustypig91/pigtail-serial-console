@@ -15,6 +15,7 @@
 
 use crate::app::App;
 use egui::{Event, Key};
+use serialcore::reader::ConnState;
 use serialcore::store::{IncomingLine, LineFlags};
 
 impl App {
@@ -33,6 +34,14 @@ impl App {
         let Some(conn) = self.connections.get_mut(active) else {
             return;
         };
+        // A `Closed` tab (a dead reader left by a failed reconnect, see
+        // `App::reconnect_with_config`) has no channel on the other end:
+        // typing into it would be silently dropped while local echo still
+        // showed it as sent, so it's excluded here rather than left to look
+        // like it worked.
+        if conn.state == ConnState::Closed {
+            return;
+        }
         let ending = conn.port_config.line_ending;
         let local_echo = conn.port_config.local_echo;
         let local_history = conn.port_config.local_history;

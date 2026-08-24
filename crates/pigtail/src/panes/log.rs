@@ -8,6 +8,7 @@ use crate::wrap::{rows_for, WrapIndex};
 use egui::text::LayoutJob;
 use serialcore::clock::Timestamp;
 use serialcore::config::{TimestampFormat, MAX_CONSOLE_FONT_SIZE, MIN_CONSOLE_FONT_SIZE};
+use serialcore::reader::ConnState;
 use serialcore::store::{LineFlags, LineRef, LineStore, PortId};
 
 /// The colour the console draws a session boundary in, shared with the hex
@@ -426,7 +427,11 @@ impl App {
         // Raw console input: forward the keyboard to the device whenever a live
         // tab is showing and nothing else (search box, a dialog) holds focus.
         // Runs after drawing so this frame's focus state is settled.
+        // `update_dialog` needs an explicit check here too: its buttons never
+        // take egui focus, so `memory().focused()` alone wouldn't catch it.
         if self.config_dialog.is_none()
+            && self.connect_errors.is_empty()
+            && self.update_dialog.is_none()
             && !self.merged_selected
             && ctx.memory(|m| m.focused().is_none())
         {
@@ -985,15 +990,20 @@ impl App {
             if menu.clear_mark {
                 conn.mark_micros = None;
             }
-            if menu.toggle_dtr {
+            // A `Closed` tab (a dead reader left by a failed reconnect) has no
+            // channel on the other end: these would be silently dropped while
+            // the UI still showed them as applied, so they're skipped rather
+            // than left to look like they worked (see `console_key_input`).
+            let live = conn.state != ConnState::Closed;
+            if menu.toggle_dtr && live {
                 conn.dtr = !conn.dtr;
                 conn.handle.set_dtr(conn.dtr);
             }
-            if menu.toggle_rts {
+            if menu.toggle_rts && live {
                 conn.rts = !conn.rts;
                 conn.handle.set_rts(conn.rts);
             }
-            if menu.send_break {
+            if menu.send_break && live {
                 conn.handle.send_break();
             }
         }

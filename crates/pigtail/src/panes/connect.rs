@@ -12,6 +12,21 @@ const COMMON_BAUDS: &[u32] = &[
 ];
 
 impl App {
+    /// A plain acknowledgement dialog for `connect_errors`: a connect, reconnect,
+    /// or port-detection start that failed outright (e.g. the OS refused to
+    /// spawn its thread) rather than through the normal per-connection error
+    /// path, since there is no live connection to show it on. Shows one message
+    /// at a time, oldest first, so simultaneous failures all get seen rather
+    /// than the latest silently replacing the others.
+    pub(crate) fn show_connect_error(&mut self, ctx: &egui::Context) {
+        let Some(err) = self.connect_errors.front() else {
+            return;
+        };
+        if super::update::show_ack_window(ctx, err.title, &err.message) {
+            self.connect_errors.pop_front();
+        }
+    }
+
     /// The top header: one tab per connection, a merged tab, and `+`/save/⚙.
     pub(crate) fn show_header(&mut self, ctx: &egui::Context) {
         let mut to_close: Option<usize> = None;
@@ -197,6 +212,14 @@ impl App {
     /// The modal new-connection dialog (opening a tab first configures the port).
     pub(crate) fn show_config_dialog(&mut self, ctx: &egui::Context) {
         if self.config_dialog.is_none() {
+            return;
+        }
+        // Both this and `show_connect_error` anchor at CENTER_CENTER (see the
+        // note in `show_update_dialog`). A connect error can land while this
+        // dialog is already open (e.g. auto-connect losing a thread-spawn
+        // race in the background), so defer to it the same way the update
+        // notice does rather than stacking the two windows.
+        if self.defer_to_connect_error() {
             return;
         }
         let mut do_connect = false;
