@@ -12,6 +12,31 @@ const COMMON_BAUDS: &[u32] = &[
 ];
 
 impl App {
+    /// A plain acknowledgement dialog for `connect_error`: a connect, reconnect,
+    /// or port-detection start that failed outright (e.g. the OS refused to
+    /// spawn its thread) rather than through the normal per-connection error
+    /// path, since there is no live connection to show it on.
+    pub(crate) fn show_connect_error(&mut self, ctx: &egui::Context) {
+        let Some(message) = self.connect_error.clone() else {
+            return;
+        };
+        let mut close = false;
+        egui::Window::new("Couldn't connect")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(&message);
+                ui.add_space(8.0);
+                if ui.button("Ok").clicked() {
+                    close = true;
+                }
+            });
+        if close {
+            self.connect_error = None;
+        }
+    }
+
     /// The top header: one tab per connection, a merged tab, and `+`/save/⚙.
     pub(crate) fn show_header(&mut self, ctx: &egui::Context) {
         let mut to_close: Option<usize> = None;

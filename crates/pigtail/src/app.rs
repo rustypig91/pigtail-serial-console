@@ -775,6 +775,11 @@ pub struct App {
     /// it was set. Ctrl+wheel has nothing else to show for itself: the change
     /// it makes is legible only if you already know what you are looking for.
     pub font_toast: Option<(u8, f64)>,
+    /// Set when a background operation the user just triggered — opening or
+    /// reconnecting a port, starting the enumerator — failed outright (e.g.
+    /// the OS refused to spawn its thread) rather than through the normal
+    /// per-connection error path.
+    pub connect_error: Option<String>,
 }
 
 impl App {
@@ -817,6 +822,7 @@ impl App {
             update_manual: false,
             update_dialog: None,
             font_toast: None,
+            connect_error: None,
         }
     }
 
@@ -837,9 +843,18 @@ impl App {
         });
 
         let (tx, rx) = crossbeam_channel::unbounded();
-        spawn_enumerator(tx, Duration::from_millis(500), wake.clone());
+        // A failure here means the OS refused to create the thread (resource
+        // exhaustion) — rare, and not fatal: the app still runs, it just won't
+        // discover ports or auto-connect until restarted with more headroom.
+        let enum_spawn_err = spawn_enumerator(tx, Duration::from_millis(500), wake.clone())
+            .err()
+            .map(|e| format!("couldn't start port detection: {e}"));
 
         let mut app = App::assemble(config, paths, wake, rx);
+        if let Some(e) = enum_spawn_err {
+            tracing::error!("{e}");
+            app.connect_error = Some(e);
+        }
 
         // Silent startup check for a newer release. Debug builds are skipped: a
         // working copy is routinely at the same version as — or ahead of — the
@@ -862,8 +877,13 @@ impl App {
         // shared borrow of `app` across the `connections.last_mut()`.
         let clock = app.clock.clone();
         for saved in app.config.last_open.clone() {
+            let before = app.connections.len();
             app.open_connection(saved.identity.clone(), None, saved.config);
-            if let Some(conn) = app.connections.last_mut() {
+            // `open_connection` pushes nothing on a spawn failure (surfaced via
+            // `connect_error` instead), so `last_mut` here would otherwise wrongly
+            // re-preload a previous iteration's tab.
+            if app.connections.len() > before {
+                let conn = app.connections.last_mut().unwrap();
                 preload_last_session(conn, &prior_captures, &saved.identity, &clock);
             }
         }
@@ -912,7 +932,7 @@ impl App {
         identity: &PortIdentity,
         config: &PortConfig,
         initial_path: Option<String>,
-    ) -> reader::ReaderHandle {
+    ) -> std::io::Result<reader::ReaderHandle> {
         let meta = SessionMeta {
             identity: identity.clone(),
             config: config.clone(),
@@ -935,6 +955,15 @@ impl App {
             initial_path,
         };
         reader::spawn(reader_config, spec)
+    }
+
+    /// Record `err` from a failed [`App::spawn_serial_reader`] as a
+    /// user-visible error instead of letting it crash the app (spec: a
+    /// resource-exhaustion thread-spawn failure is recoverable, not fatal).
+    fn report_connect_error(&mut self, identity: &PortIdentity, err: std::io::Error) {
+        let msg = format!("couldn't open {}: {err}", identity.label());
+        tracing::error!("{msg}");
+        self.connect_error = Some(msg);
     }
 
     /// Reconnect the tab identified by `port_id` with new port settings, in
@@ -967,7 +996,24 @@ impl App {
 
         // Keep the same port id so the preserved lines still map to this tab in
         // the merged view; only the reader (and its capture file) is replaced.
-        let handle = self.spawn_serial_reader(port_id, &identity, &config, initial_path.clone());
+        let handle =
+            match self.spawn_serial_reader(port_id, &identity, &config, initial_path.clone()) {
+                Ok(handle) => handle,
+                Err(e) => {
+                    // The old reader is already shut down and inert (its thread is
+                    // gone, so it needs no further handling), and there is no new
+                    // one to replace it with. Leave the tab in place — its console
+                    // history is worth keeping — marked closed with the error, but
+                    // do not change its identity/config/label since the switch to
+                    // them never actually took effect.
+                    self.report_connect_error(&identity, e);
+                    let conn = &mut self.connections[index];
+                    conn.state = ConnState::Closed;
+                    conn.last_error = Some("reconnect failed: couldn't start reader thread".into());
+                    self.merged_dirty = true;
+                    return;
+                }
+            };
 
         let path_label = initial_path.unwrap_or_else(|| identity.label());
         let label = format!("{} ({})", identity.label(), path_label);
@@ -1034,7 +1080,13 @@ impl App {
         let path_label = initial_path.clone().unwrap_or_else(|| identity.label());
         let label = format!("{} ({})", identity.label(), path_label);
 
-        let handle = self.spawn_serial_reader(id, &identity, &port_config, initial_path);
+        let handle = match self.spawn_serial_reader(id, &identity, &port_config, initial_path) {
+            Ok(handle) => handle,
+            Err(e) => {
+                self.report_connect_error(&identity, e);
+                return;
+            }
+        };
         let conn = self.make_connection(id, label, identity, port_config, handle);
         self.connections.push(conn);
         self.active = self.connections.len() - 1;
@@ -1641,6 +1693,7 @@ impl eframe::App for App {
         self.show_settings_window(ctx);
         self.show_update_dialog(ctx);
         self.show_font_toast(ctx);
+        self.show_connect_error(ctx);
 
         // egui only draws when something asks it to, and nothing here animates on
         // its own clock, so an *open but silent* connection must not schedule
@@ -1983,6 +2036,7 @@ mod tests {
                 serialcore::source::ScriptedSource::new(Vec::new()),
             )),
         )
+        .unwrap()
     }
 
     /// An auto-connect profile named "probe" for the given identity, with the

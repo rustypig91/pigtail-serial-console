@@ -195,7 +195,7 @@ pub fn spawn_enumerator(
     tx: Sender<EnumEvent>,
     interval: Duration,
     wake: Wake,
-) -> std::thread::JoinHandle<()> {
+) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("enumerator".into())
         .spawn(move || {
@@ -218,7 +218,6 @@ pub fn spawn_enumerator(
                 std::thread::sleep(interval);
             }
         })
-        .expect("spawn enumerator thread")
 }
 
 #[cfg(test)]

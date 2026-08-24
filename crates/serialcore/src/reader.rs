@@ -187,22 +187,23 @@ impl Drop for ReaderHandle {
     }
 }
 
-/// Spawn a reader thread for the given source.
-pub fn spawn(config: ReaderConfig, spec: SourceSpec) -> ReaderHandle {
+/// Spawn a reader thread for the given source. Fails only if the OS refuses to
+/// create the thread (e.g. resource exhaustion), which callers should surface
+/// as a "couldn't open port" error rather than letting it crash the app.
+pub fn spawn(config: ReaderConfig, spec: SourceSpec) -> std::io::Result<ReaderHandle> {
     let (event_tx, event_rx) = crossbeam_channel::bounded(CHANNEL_CAPACITY);
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let port_id = config.port_id;
     let name = format!("reader-{}", port_id.0);
     let join = std::thread::Builder::new()
         .name(name)
-        .spawn(move || run(config, spec, event_tx, cmd_rx))
-        .expect("spawn reader thread");
-    ReaderHandle {
+        .spawn(move || run(config, spec, event_tx, cmd_rx))?;
+    Ok(ReaderHandle {
         port_id,
         events: event_rx,
         cmd: cmd_tx,
         join: Some(join),
-    }
+    })
 }
 
 /// A factory that (re)opens the underlying source.
@@ -674,7 +675,7 @@ mod tests {
             terminal: crate::config::TerminalMode::Classic,
             wake: Wake::none(),
         };
-        let handle = spawn(config, SourceSpec::OneShot(Box::new(src)));
+        let handle = spawn(config, SourceSpec::OneShot(Box::new(src))).unwrap();
 
         // Deliberately never drained: the channel fills, and the reader parks
         // on the next state or error it has to get out.
@@ -715,7 +716,7 @@ mod tests {
             terminal: crate::config::TerminalMode::Classic,
             wake: Wake::none(),
         };
-        let handle = spawn(config, SourceSpec::OneShot(Box::new(src)));
+        let handle = spawn(config, SourceSpec::OneShot(Box::new(src))).unwrap();
         let (lines, states) = collect_lines(&handle, Duration::from_secs(2));
         assert_eq!(lines, vec!["hello", "world"]);
         assert!(states.contains(&ConnState::Connected));
@@ -740,7 +741,7 @@ mod tests {
             terminal: crate::config::TerminalMode::Vt100,
             wake: Wake::none(),
         };
-        let handle = spawn(config, SourceSpec::OneShot(Box::new(src)));
+        let handle = spawn(config, SourceSpec::OneShot(Box::new(src))).unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut lines: Vec<FramedLine> = Vec::new();
@@ -772,7 +773,7 @@ mod tests {
             terminal: crate::config::TerminalMode::Classic,
             wake: Wake::none(),
         };
-        let handle = spawn(config, SourceSpec::OneShot(Box::new(src)));
+        let handle = spawn(config, SourceSpec::OneShot(Box::new(src))).unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut got_provisional = false;
