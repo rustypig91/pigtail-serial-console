@@ -12,28 +12,18 @@ const COMMON_BAUDS: &[u32] = &[
 ];
 
 impl App {
-    /// A plain acknowledgement dialog for `connect_error`: a connect, reconnect,
+    /// A plain acknowledgement dialog for `connect_errors`: a connect, reconnect,
     /// or port-detection start that failed outright (e.g. the OS refused to
     /// spawn its thread) rather than through the normal per-connection error
-    /// path, since there is no live connection to show it on.
+    /// path, since there is no live connection to show it on. Shows one message
+    /// at a time, oldest first, so simultaneous failures all get seen rather
+    /// than the latest silently replacing the others.
     pub(crate) fn show_connect_error(&mut self, ctx: &egui::Context) {
-        let Some(message) = self.connect_error.clone() else {
+        let Some(message) = self.connect_errors.front() else {
             return;
         };
-        let mut close = false;
-        egui::Window::new("Couldn't connect")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                ui.label(&message);
-                ui.add_space(8.0);
-                if ui.button("Ok").clicked() {
-                    close = true;
-                }
-            });
-        if close {
-            self.connect_error = None;
+        if super::update::show_ack_window(ctx, "Couldn't connect", message) {
+            self.connect_errors.pop_front();
         }
     }
 

@@ -8,6 +8,14 @@ impl App {
         let Some(dialog) = &self.update_dialog else {
             return;
         };
+        // Nothing to download or skip: this is a plain acknowledgement, same
+        // shape as any other one-off failure dialog (e.g. `show_connect_error`).
+        if dialog.download_url.is_none() && dialog.skip_version.is_none() {
+            if show_ack_window(ctx, &dialog.title, &dialog.message) {
+                self.update_dialog = None;
+            }
+            return;
+        }
         // Decided inside the closure, acted on after it, so the handlers can
         // touch `self` (config, dialog state) without borrowing it twice.
         let mut open_url: Option<String> = None;
@@ -62,4 +70,23 @@ impl App {
             self.update_dialog = None;
         }
     }
+}
+
+/// A plain title+message+"Ok" acknowledgement window, shared by every dialog
+/// that has nothing to offer beyond dismissal (the update notice's plain
+/// case, and `show_connect_error`). Returns `true` once the user dismisses it.
+pub(crate) fn show_ack_window(ctx: &egui::Context, title: &str, message: &str) -> bool {
+    let mut close = false;
+    egui::Window::new(title)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            ui.label(message);
+            ui.add_space(8.0);
+            if ui.button("Ok").clicked() {
+                close = true;
+            }
+        });
+    close
 }

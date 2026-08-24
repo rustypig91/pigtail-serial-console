@@ -775,11 +775,14 @@ pub struct App {
     /// it was set. Ctrl+wheel has nothing else to show for itself: the change
     /// it makes is legible only if you already know what you are looking for.
     pub font_toast: Option<(u8, f64)>,
-    /// Set when a background operation the user just triggered — opening or
-    /// reconnecting a port, starting the enumerator — failed outright (e.g.
-    /// the OS refused to spawn its thread) rather than through the normal
-    /// per-connection error path.
-    pub connect_error: Option<String>,
+    /// Background operations that failed outright — opening or reconnecting a
+    /// port, starting the enumerator — rather than through the normal
+    /// per-connection error path (e.g. the OS refused to spawn a thread).
+    /// A queue, not a single slot: two such failures can land in the same
+    /// tick (e.g. two auto-connect profiles both losing a thread-exhaustion
+    /// race), and neither should silently erase the other before either is
+    /// shown.
+    pub connect_errors: VecDeque<String>,
 }
 
 impl App {
@@ -822,7 +825,7 @@ impl App {
             update_manual: false,
             update_dialog: None,
             font_toast: None,
-            connect_error: None,
+            connect_errors: VecDeque::new(),
         }
     }
 
@@ -853,7 +856,7 @@ impl App {
         let mut app = App::assemble(config, paths, wake, rx);
         if let Some(e) = enum_spawn_err {
             tracing::error!("{e}");
-            app.connect_error = Some(e);
+            app.connect_errors.push_back(e);
         }
 
         // Silent startup check for a newer release. Debug builds are skipped: a
@@ -880,7 +883,7 @@ impl App {
             let before = app.connections.len();
             app.open_connection(saved.identity.clone(), None, saved.config);
             // `open_connection` pushes nothing on a spawn failure (surfaced via
-            // `connect_error` instead), so `last_mut` here would otherwise wrongly
+            // `connect_errors` instead), so `last_mut` here would otherwise wrongly
             // re-preload a previous iteration's tab.
             if app.connections.len() > before {
                 let conn = app.connections.last_mut().unwrap();
@@ -960,10 +963,13 @@ impl App {
     /// Record `err` from a failed [`App::spawn_serial_reader`] as a
     /// user-visible error instead of letting it crash the app (spec: a
     /// resource-exhaustion thread-spawn failure is recoverable, not fatal).
-    fn report_connect_error(&mut self, identity: &PortIdentity, err: std::io::Error) {
+    /// Returns the formatted message so callers that also need it (e.g. to
+    /// annotate a tab's `last_error`) don't have to reformat `err` themselves.
+    fn report_connect_error(&mut self, identity: &PortIdentity, err: std::io::Error) -> String {
         let msg = format!("couldn't open {}: {err}", identity.label());
         tracing::error!("{msg}");
-        self.connect_error = Some(msg);
+        self.connect_errors.push_back(msg.clone());
+        msg
     }
 
     /// Reconnect the tab identified by `port_id` with new port settings, in
@@ -1006,10 +1012,10 @@ impl App {
                     // history is worth keeping — marked closed with the error, but
                     // do not change its identity/config/label since the switch to
                     // them never actually took effect.
-                    self.report_connect_error(&identity, e);
+                    let msg = self.report_connect_error(&identity, e);
                     let conn = &mut self.connections[index];
                     conn.state = ConnState::Closed;
-                    conn.last_error = Some("reconnect failed: couldn't start reader thread".into());
+                    conn.last_error = Some(msg);
                     self.merged_dirty = true;
                     return;
                 }
@@ -1271,10 +1277,16 @@ impl App {
             // `path_fallback` that no longer matches the profile's saved
             // identity even though both name the same device. Struct
             // equality here would miss that and open a second tab for it.
-            let already = self
-                .connections
-                .iter()
-                .any(|c| identities_match(&profile.identity, &c.identity));
+            //
+            // A `Closed` tab doesn't count: that state (only reachable via a
+            // failed reconnect, see `reconnect_with_config`) marks a tab kept
+            // around purely for its console history, with a dead reader that
+            // will never reconnect on its own — treating it as "already open"
+            // would leave the device permanently unreachable by auto-connect
+            // once the transient spawn failure that closed it has cleared.
+            let already = self.connections.iter().any(|c| {
+                c.state != ConnState::Closed && identities_match(&profile.identity, &c.identity)
+            });
             if already {
                 continue;
             }
@@ -2363,6 +2375,46 @@ mod tests {
             1,
             "a profile already open under a live identity with a different \
              path_fallback must not be auto-connected again"
+        );
+    }
+
+    /// A tab left in `ConnState::Closed` by a failed reconnect (see
+    /// `reconnect_with_config`) is a dead reader kept only for its console
+    /// history -- it must not count as "already open", or a transient
+    /// thread-spawn failure permanently disables auto-connect for that
+    /// device even after the resource pressure that caused it clears.
+    #[test]
+    fn auto_connect_reopens_a_profile_whose_tab_was_left_closed_by_a_failed_reconnect() {
+        let (mut app, _enum_tx) = test_app("reopen-after-closed-reconnect");
+
+        let mut profile_identity = identity("A1");
+        profile_identity.path_fallback = "COM3".into();
+        app.config
+            .profiles
+            .push(auto_connect_profile(profile_identity.clone()));
+
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe (COM3)".into(),
+            profile_identity.clone(),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        conn.state = ConnState::Closed;
+        app.connections.push(conn);
+
+        app.available.push(DiscoveredPort {
+            path: "COM3".into(),
+            identity: profile_identity,
+        });
+        app.auto_connect_profiles();
+
+        assert_eq!(
+            app.connections.len(),
+            2,
+            "a Closed tab from a failed reconnect must not block auto-connect \
+             from reopening the device once it's reachable again"
         );
     }
 }
