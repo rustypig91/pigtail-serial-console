@@ -166,14 +166,18 @@ pub fn fetch_latest() -> CheckResult {
 
 /// Run [`fetch_latest`] on a background thread. The single result arrives on the
 /// returned channel; `wake` brings an idle UI back to read it. Dropping the
-/// receiver is fine — the send simply fails and the thread exits.
-pub fn spawn_check(wake: Wake) -> Receiver<CheckResult> {
+/// receiver is fine — the send simply fails and the thread exits. Fails only
+/// if the OS refuses to create the thread (e.g. resource exhaustion), which
+/// callers should surface as an error rather than letting it crash the app.
+pub fn spawn_check(wake: Wake) -> std::io::Result<Receiver<CheckResult>> {
     let (tx, rx) = crossbeam_channel::bounded(1);
-    std::thread::spawn(move || {
-        let _ = tx.send(fetch_latest());
-        wake.signal();
-    });
-    rx
+    std::thread::Builder::new()
+        .name("update-check".into())
+        .spawn(move || {
+            let _ = tx.send(fetch_latest());
+            wake.signal();
+        })?;
+    Ok(rx)
 }
 
 #[cfg(test)]

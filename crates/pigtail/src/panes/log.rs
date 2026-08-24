@@ -427,6 +427,7 @@ impl App {
         // tab is showing and nothing else (search box, a dialog) holds focus.
         // Runs after drawing so this frame's focus state is settled.
         if self.config_dialog.is_none()
+            && self.connect_errors.is_empty()
             && !self.merged_selected
             && ctx.memory(|m| m.focused().is_none())
         {

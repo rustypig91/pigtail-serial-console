@@ -44,14 +44,9 @@ impl App {
                             skip = Some(version.clone());
                         }
                     }
-                    // With nothing to download the dialog is only an
-                    // acknowledgement, and "Later" would imply a pending action.
-                    let dismiss = if dialog.download_url.is_some() {
-                        "Later"
-                    } else {
-                        "Ok"
-                    };
-                    if ui.button(dismiss).clicked() {
+                    // The nothing-to-download case returns early above, so
+                    // this is always the "download available" dialog.
+                    if ui.button("Later").clicked() {
                         close = true;
                     }
                 });
