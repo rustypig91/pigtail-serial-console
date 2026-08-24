@@ -426,8 +426,11 @@ impl App {
         // Raw console input: forward the keyboard to the device whenever a live
         // tab is showing and nothing else (search box, a dialog) holds focus.
         // Runs after drawing so this frame's focus state is settled.
+        // `update_dialog` needs an explicit check here too: its buttons never
+        // take egui focus, so `memory().focused()` alone wouldn't catch it.
         if self.config_dialog.is_none()
             && self.connect_errors.is_empty()
+            && self.update_dialog.is_none()
             && !self.merged_selected
             && ctx.memory(|m| m.focused().is_none())
         {

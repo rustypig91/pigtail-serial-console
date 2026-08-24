@@ -693,6 +693,15 @@ pub struct ConfigDialog {
 }
 
 /// The update notice: what it says, and what its buttons do.
+/// A background failure with nowhere else to show itself (see
+/// `App::connect_errors`): a title naming what was being attempted, and the
+/// formatted error.
+#[derive(PartialEq)]
+pub struct ConnectError {
+    pub title: &'static str,
+    pub message: String,
+}
+
 pub struct UpdateDialog {
     pub title: String,
     pub message: String,
@@ -782,7 +791,7 @@ pub struct App {
     /// tick (e.g. two auto-connect profiles both losing a thread-exhaustion
     /// race), and neither should silently erase the other before either is
     /// shown.
-    pub connect_errors: VecDeque<String>,
+    pub connect_errors: VecDeque<ConnectError>,
 }
 
 impl App {
@@ -849,13 +858,11 @@ impl App {
         // A failure here means the OS refused to create the thread (resource
         // exhaustion) — rare, and not fatal: the app still runs, it just won't
         // discover ports or auto-connect until restarted with more headroom.
-        let enum_spawn_err = spawn_enumerator(tx, Duration::from_millis(500), wake.clone())
-            .err()
-            .map(|e| format!("couldn't start port detection: {e}"));
+        let enum_spawn_err = spawn_enumerator(tx, Duration::from_millis(500), wake.clone()).err();
 
         let mut app = App::assemble(config, paths, wake, rx);
         if let Some(e) = enum_spawn_err {
-            app.record_connect_error(e);
+            app.record_connect_error("Couldn't start port detection", e.to_string());
         }
 
         // Silent startup check for a newer release. Debug builds are skipped: a
@@ -959,20 +966,21 @@ impl App {
         reader::spawn(reader_config, spec)
     }
 
-    /// Log `msg` and queue it as a user-visible background-operation error
-    /// (spec: a resource-exhaustion thread-spawn failure is recoverable, not
-    /// fatal). Shared by every such failure site so they can't drift apart.
+    /// Log `title: message` and queue it as a user-visible background-operation
+    /// error (spec: a resource-exhaustion thread-spawn failure is recoverable,
+    /// not fatal). Shared by every such failure site so they can't drift apart.
     ///
     /// Skips an immediate repeat of the last queued message (a flapping
     /// device retried by auto-connect would otherwise queue an identical
     /// dialog on every attempt) and caps the queue so a sustained flap can't
     /// grow it without bound.
-    fn record_connect_error(&mut self, msg: String) {
-        tracing::error!("{msg}");
-        if self.connect_errors.back() == Some(&msg) {
+    fn record_connect_error(&mut self, title: &'static str, message: String) {
+        tracing::error!("{title}: {message}");
+        let err = ConnectError { title, message };
+        if self.connect_errors.back() == Some(&err) {
             return;
         }
-        self.connect_errors.push_back(msg);
+        self.connect_errors.push_back(err);
         const MAX_CONNECT_ERRORS: usize = 20;
         while self.connect_errors.len() > MAX_CONNECT_ERRORS {
             self.connect_errors.pop_front();
@@ -985,7 +993,7 @@ impl App {
     /// annotate a tab's `last_error`) don't have to reformat `err` themselves.
     fn report_connect_error(&mut self, identity: &PortIdentity, err: std::io::Error) -> String {
         let msg = format!("couldn't open {}: {err}", identity.label());
-        self.record_connect_error(msg.clone());
+        self.record_connect_error("Couldn't connect", msg.clone());
         msg
     }
 
@@ -1257,7 +1265,7 @@ impl App {
         self.update_manual = manual;
         match update::spawn_check(self.wake.clone()) {
             Ok(rx) => self.update_rx = Some(rx),
-            Err(e) => self.record_connect_error(format!("couldn't start update check: {e}")),
+            Err(e) => self.record_connect_error("Couldn't check for updates", e.to_string()),
         }
     }
 
