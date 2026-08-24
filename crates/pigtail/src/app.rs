@@ -855,8 +855,7 @@ impl App {
 
         let mut app = App::assemble(config, paths, wake, rx);
         if let Some(e) = enum_spawn_err {
-            tracing::error!("{e}");
-            app.connect_errors.push_back(e);
+            app.record_connect_error(e);
         }
 
         // Silent startup check for a newer release. Debug builds are skipped: a
@@ -960,15 +959,21 @@ impl App {
         reader::spawn(reader_config, spec)
     }
 
+    /// Log `msg` and queue it as a user-visible background-operation error
+    /// (spec: a resource-exhaustion thread-spawn failure is recoverable, not
+    /// fatal). Shared by every such failure site so they can't drift apart.
+    fn record_connect_error(&mut self, msg: String) {
+        tracing::error!("{msg}");
+        self.connect_errors.push_back(msg);
+    }
+
     /// Record `err` from a failed [`App::spawn_serial_reader`] as a
-    /// user-visible error instead of letting it crash the app (spec: a
-    /// resource-exhaustion thread-spawn failure is recoverable, not fatal).
+    /// user-visible error instead of letting it crash the app.
     /// Returns the formatted message so callers that also need it (e.g. to
     /// annotate a tab's `last_error`) don't have to reformat `err` themselves.
     fn report_connect_error(&mut self, identity: &PortIdentity, err: std::io::Error) -> String {
         let msg = format!("couldn't open {}: {err}", identity.label());
-        tracing::error!("{msg}");
-        self.connect_errors.push_back(msg.clone());
+        self.record_connect_error(msg.clone());
         msg
     }
 
@@ -1014,6 +1019,13 @@ impl App {
                     // them never actually took effect.
                     let msg = self.report_connect_error(&identity, e);
                     let conn = &mut self.connections[index];
+                    // The reader that would have completed the last open line is
+                    // gone for good (no replacement was spawned), so finalize it
+                    // now the same way the normal state-transition path
+                    // (`drain_events`) and the success path below do — otherwise
+                    // its caret stays lit forever on a tab that will never
+                    // reconnect.
+                    conn.store.finalize_last_provisional();
                     conn.state = ConnState::Closed;
                     conn.last_error = Some(msg);
                     self.merged_dirty = true;
@@ -1327,15 +1339,27 @@ impl App {
         // can't observe it), so two profiles that differ only by
         // `interface_hint` can both match the same closed tab, and picking
         // just one would silently leave the other free to reopen it.
-        for profile in &self.config.profiles {
-            if profile.auto_connect
-                && identities_match(&profile.identity, &conn.identity)
-                && !self
-                    .auto_connect_suppressed
-                    .iter()
-                    .any(|i| identities_match(i, &profile.identity))
-            {
-                self.auto_connect_suppressed.push(profile.identity.clone());
+        //
+        // Skipped entirely if another live tab for the same device is still
+        // open (e.g. this is the `Closed` zombie a failed reconnect left
+        // behind, see `reconnect_with_config`): the device is still actively
+        // connected, so suppressing it here would just block auto-connect
+        // from ever reopening the device once that other tab, too, is closed.
+        let still_open = self
+            .connections
+            .iter()
+            .any(|c| c.state != ConnState::Closed && identities_match(&c.identity, &conn.identity));
+        if !still_open {
+            for profile in &self.config.profiles {
+                if profile.auto_connect
+                    && identities_match(&profile.identity, &conn.identity)
+                    && !self
+                        .auto_connect_suppressed
+                        .iter()
+                        .any(|i| identities_match(i, &profile.identity))
+                {
+                    self.auto_connect_suppressed.push(profile.identity.clone());
+                }
             }
         }
         conn.handle.shutdown();
