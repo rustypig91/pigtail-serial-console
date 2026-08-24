@@ -962,9 +962,21 @@ impl App {
     /// Log `msg` and queue it as a user-visible background-operation error
     /// (spec: a resource-exhaustion thread-spawn failure is recoverable, not
     /// fatal). Shared by every such failure site so they can't drift apart.
+    ///
+    /// Skips an immediate repeat of the last queued message (a flapping
+    /// device retried by auto-connect would otherwise queue an identical
+    /// dialog on every attempt) and caps the queue so a sustained flap can't
+    /// grow it without bound.
     fn record_connect_error(&mut self, msg: String) {
         tracing::error!("{msg}");
+        if self.connect_errors.back() == Some(&msg) {
+            return;
+        }
         self.connect_errors.push_back(msg);
+        const MAX_CONNECT_ERRORS: usize = 20;
+        while self.connect_errors.len() > MAX_CONNECT_ERRORS {
+            self.connect_errors.pop_front();
+        }
     }
 
     /// Record `err` from a failed [`App::spawn_serial_reader`] as a

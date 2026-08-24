@@ -8,6 +8,13 @@ impl App {
         let Some(dialog) = &self.update_dialog else {
             return;
         };
+        // Both this and `show_connect_error` anchor at CENTER_CENTER, so
+        // showing them in the same frame would stack them exactly on top of
+        // each other. Connect errors take priority; the update notice waits
+        // its turn and reappears once the queue drains.
+        if !self.connect_errors.is_empty() {
+            return;
+        }
         // Nothing to download or skip: this is a plain acknowledgement, same
         // shape as any other one-off failure dialog (e.g. `show_connect_error`).
         if dialog.download_url.is_none() && dialog.skip_version.is_none() {
