@@ -970,21 +970,32 @@ impl App {
     /// error (spec: a resource-exhaustion thread-spawn failure is recoverable,
     /// not fatal). Shared by every such failure site so they can't drift apart.
     ///
-    /// Skips an immediate repeat of the last queued message (a flapping
-    /// device retried by auto-connect would otherwise queue an identical
-    /// dialog on every attempt) and caps the queue so a sustained flap can't
-    /// grow it without bound.
+    /// Skips a repeat of any message already queued (a flapping device
+    /// retried by auto-connect would otherwise queue an identical dialog on
+    /// every attempt — scanning the whole queue, not just the tail, also
+    /// catches two distinct devices flapping in alternation) and caps the
+    /// queue so a sustained flap can't grow it without bound. Once at the
+    /// cap, new arrivals are dropped rather than the front entry, which is
+    /// either on screen right now or the oldest one the user hasn't
+    /// acknowledged yet.
     fn record_connect_error(&mut self, title: &'static str, message: String) {
         tracing::error!("{title}: {message}");
         let err = ConnectError { title, message };
-        if self.connect_errors.back() == Some(&err) {
+        if self.connect_errors.contains(&err) {
+            return;
+        }
+        const MAX_CONNECT_ERRORS: usize = 20;
+        if self.connect_errors.len() >= MAX_CONNECT_ERRORS {
             return;
         }
         self.connect_errors.push_back(err);
-        const MAX_CONNECT_ERRORS: usize = 20;
-        while self.connect_errors.len() > MAX_CONNECT_ERRORS {
-            self.connect_errors.pop_front();
-        }
+    }
+
+    /// Whether a modal dialog anchored at CENTER_CENTER (see `show_connect_error`)
+    /// should wait its turn behind the connect-error queue instead of
+    /// stacking on top of it.
+    pub(crate) fn defer_to_connect_error(&self) -> bool {
+        !self.connect_errors.is_empty()
     }
 
     /// Record `err` from a failed [`App::spawn_serial_reader`] as a
@@ -1011,11 +1022,12 @@ impl App {
         let Some(index) = self.connections.iter().position(|c| c.id == port_id) else {
             return;
         };
+        let old_identity = self.connections[index].identity.clone();
         let identity = initial_path
             .as_ref()
             .and_then(|p| self.available.iter().find(|d| &d.path == p))
             .map(|d| d.identity.clone())
-            .unwrap_or_else(|| self.connections[index].identity.clone());
+            .unwrap_or_else(|| old_identity.clone());
 
         // Close the old reader *before* opening the new one. Both address the
         // same device, and a serial port is opened exclusively — with the old
@@ -1043,8 +1055,7 @@ impl App {
                     // `identity` is the *new*, not-yet-adopted device, and a
                     // message naming it would be talking about a device the tab
                     // never shows.
-                    let tab_identity = self.connections[index].identity.clone();
-                    let msg = self.report_connect_error(&tab_identity, e);
+                    let msg = self.report_connect_error(&old_identity, e);
                     let conn = &mut self.connections[index];
                     // The reader that would have completed the last open line is
                     // gone for good (no replacement was spawned), so finalize it
@@ -1144,7 +1155,11 @@ impl App {
         let handle = match self.spawn_serial_reader(id, &identity, &port_config, initial_path) {
             Ok(handle) => handle,
             Err(e) => {
-                self.report_connect_error(&identity, e);
+                // No tab exists yet to attach the message to, so there is no
+                // use for `report_connect_error`'s returned copy here — queue
+                // it directly instead of formatting-then-cloning-then-discarding.
+                let msg = format!("couldn't open {}: {e}", identity.label());
+                self.record_connect_error("Couldn't connect", msg);
                 return false;
             }
         };
@@ -1688,7 +1703,14 @@ impl App {
         };
         for i in targets {
             let conn = &mut self.connections[i];
-            conn.handle.clear_log();
+            // A Closed tab's reader thread is gone, so this command would
+            // silently vanish into a dropped channel — the on-disk capture
+            // wouldn't actually be truncated even though the UI below is
+            // cleared regardless. Skip it, matching the DTR/RTS/break/
+            // transmit guards elsewhere against a zombie tab.
+            if conn.state != ConnState::Closed {
+                conn.handle.clear_log();
+            }
             conn.store.clear();
             // The offsets restart at zero with the next byte: nothing is left
             // above for them to be counted from.

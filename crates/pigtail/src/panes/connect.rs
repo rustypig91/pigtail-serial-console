@@ -219,7 +219,7 @@ impl App {
         // dialog is already open (e.g. auto-connect losing a thread-spawn
         // race in the background), so defer to it the same way the update
         // notice does rather than stacking the two windows.
-        if !self.connect_errors.is_empty() {
+        if self.defer_to_connect_error() {
             return;
         }
         let mut do_connect = false;

@@ -12,7 +12,7 @@ impl App {
         // showing them in the same frame would stack them exactly on top of
         // each other. Connect errors take priority; the update notice waits
         // its turn and reappears once the queue drains.
-        if !self.connect_errors.is_empty() {
+        if self.defer_to_connect_error() {
             return;
         }
         // Nothing to download or skip: this is a plain acknowledgement, same
