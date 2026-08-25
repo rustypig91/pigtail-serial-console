@@ -1,0 +1,7 @@
+# Linux line endings everywhere: git stores LF, and checks out LF on
+# every platform, so a Windows editor cannot reintroduce CRLF.
+* text=auto eol=lf
+
+# Binary assets git must never touch.
+*.png binary
+*.ico binary
