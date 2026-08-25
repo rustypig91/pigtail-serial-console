@@ -1680,15 +1680,31 @@ impl App {
             conn.search_matches.clear();
             conn.search_tested_upto = conn.store.first_abs_index();
         }
-        // Drop evicted matches.
+        // Drop evicted matches. `search_pos` is an index *into* this vec, so it
+        // has to come down by however many were dropped off the front, or the
+        // hit the user is standing on silently becomes a different one.
         let first = conn.store.first_abs_index();
         if let Some(p) = conn.search_matches.iter().position(|&i| i >= first) {
             if p > 0 {
                 conn.search_matches.drain(..p);
+                conn.search_pos = conn.search_pos.map(|cur| cur.saturating_sub(p));
             }
         }
-        let start = conn.search_tested_upto.max(first);
+
         let end = conn.store.next_abs_index();
+        // The newest line is re-tested rather than trusted, exactly as
+        // `FilterIndex::extend` does and for the same reason: a line the device
+        // is still writing is shown provisionally and then *replaced in place*
+        // when it grows, keeping its absolute index — so "tested already" is not
+        // the same as "settled", and a half-written line that didn't match yet
+        // would otherwise stay unfindable for good (issue #39).
+        let newest = end.saturating_sub(1).max(first);
+        let start = conn.search_tested_upto.max(first).min(newest);
+        // Its verdict from last time goes with it: it may have matched then and
+        // not now. `search_matches` is ascending, so that is a suffix trim.
+        while conn.search_matches.last().is_some_and(|&abs| abs >= start) {
+            conn.search_matches.pop();
+        }
         for abs in start..end {
             if let Some(line) = conn.store.get(abs) {
                 if re.is_match(line.text) {
@@ -1697,6 +1713,14 @@ impl App {
             }
         }
         conn.search_tested_upto = end;
+
+        // A trim can leave the cursor past the end of what survived.
+        if conn
+            .search_pos
+            .is_some_and(|p| p >= conn.search_matches.len())
+        {
+            conn.search_pos = None;
+        }
         if conn.search_pos.is_none() && !conn.search_matches.is_empty() {
             conn.search_pos = Some(conn.search_matches.len() - 1);
         }
@@ -2892,6 +2916,181 @@ mod tests {
         assert_eq!(
             app.connections[0].last_error.as_ref().unwrap().msg,
             "transmit: dropped, not connected"
+        );
+    }
+
+    /// A connection with an injected event channel, so a test can feed it
+    /// batches without a live device. Returns the sender.
+    fn conn_with_injected_events(
+        app: &mut App,
+        id: PortId,
+    ) -> crossbeam_channel::Sender<ReaderEvent> {
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            identity("A1"),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        let (tx, rx) = crossbeam_channel::unbounded();
+        conn.handle.events = rx;
+        app.connections.push(conn);
+        tx
+    }
+
+    /// Issue #39: search tested every absolute index exactly once, but the
+    /// newest index is the one that can still change — a line the device is
+    /// still writing is shown provisionally and then replaced in place, keeping
+    /// its index. A match that only appears once the line finishes was
+    /// therefore unfindable for good, short of retyping the query.
+    ///
+    /// `FilterIndex::extend` re-tests the newest line for exactly this reason;
+    /// this pins the same rule onto search.
+    #[test]
+    fn search_finds_a_match_that_appears_only_once_the_line_finishes() {
+        let (mut app, _enum_tx) = test_app("search-provisional");
+        let tx = conn_with_injected_events(&mut app, PortId(0));
+        app.active = 0;
+        app.connections[0].search_query = "timeout".into();
+
+        let clock = SessionClock::new();
+        let mut framer = Framer::new();
+
+        // The device has written half a line and paused, so it is flushed
+        // provisionally. Nothing in it matches yet.
+        let mut lines = Vec::new();
+        framer.push(b"error: sen", clock.now(), &mut lines);
+        lines.push(framer.flush_provisional().expect("the open line is shown"));
+        tx.send(ReaderEvent::Batch(reader::Batch {
+            lines,
+            raw: b"error: sen".to_vec(),
+        }))
+        .unwrap();
+        app.connections[0].drain_events(1000);
+        app.maintain_search();
+        assert!(
+            app.connections[0].search_matches.is_empty(),
+            "nothing matches the half-written line, correctly"
+        );
+
+        // The rest of the line lands, replacing it in place at the same index.
+        let mut lines = Vec::new();
+        framer.push(b"sor timeout\n", clock.now(), &mut lines);
+        assert!(lines[0].flags.contains(LineFlags::CONTINUATION));
+        tx.send(ReaderEvent::Batch(reader::Batch {
+            lines,
+            raw: b"sor timeout\n".to_vec(),
+        }))
+        .unwrap();
+        app.connections[0].drain_events(1000);
+        app.maintain_search();
+
+        let conn = &app.connections[0];
+        assert_eq!(conn.store.len(), 1, "still the one line");
+        assert_eq!(conn.store.get(0).unwrap().text, "error: sensor timeout");
+        assert_eq!(
+            conn.search_matches,
+            vec![0],
+            "the completed line has to be findable; re-testing only new indices \
+             leaves it hidden for the rest of the session"
+        );
+    }
+
+    /// The converse of the above: a provisional line that *did* match and then
+    /// changed into something that does not must lose its entry, rather than
+    /// leaving Next/Prev landing on a line with no highlight on it.
+    #[test]
+    fn search_drops_a_match_the_line_no_longer_holds() {
+        let (mut app, _enum_tx) = test_app("search-unmatch");
+        let tx = conn_with_injected_events(&mut app, PortId(0));
+        app.active = 0;
+        app.connections[0].search_query = "abort".into();
+
+        let clock = SessionClock::new();
+        // VT100, where a bare CR overwrites the line in place — Classic treats
+        // it as a terminator, which is a different story entirely.
+        let mut framer = Framer::with_mode(serialcore::config::TerminalMode::Vt100);
+
+        let mut lines = Vec::new();
+        framer.push(b"abort", clock.now(), &mut lines);
+        lines.push(framer.flush_provisional().unwrap());
+        tx.send(ReaderEvent::Batch(reader::Batch {
+            lines,
+            raw: b"abort".to_vec(),
+        }))
+        .unwrap();
+        app.connections[0].drain_events(1000);
+        app.maintain_search();
+        assert_eq!(app.connections[0].search_matches, vec![0]);
+
+        // A bare CR wipes the line and the device writes something else over
+        // it — the progress-line idiom. The replacement no longer matches.
+        let mut lines = Vec::new();
+        framer.push(b"\rdone\n", clock.now(), &mut lines);
+        tx.send(ReaderEvent::Batch(reader::Batch {
+            lines,
+            raw: b"\rdone\n".to_vec(),
+        }))
+        .unwrap();
+        app.connections[0].drain_events(1000);
+        app.maintain_search();
+
+        let conn = &app.connections[0];
+        assert!(
+            conn.search_matches.is_empty(),
+            "the text that matched is gone, so the match is too; got {:?} for \
+             store {:?}",
+            conn.search_matches,
+            (0..conn.store.len())
+                .filter_map(|i| conn.store.get(i as u64).map(|l| l.text.to_string()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(conn.search_pos, None, "and no stale cursor into it");
+    }
+
+    /// `search_pos` is an index into `search_matches`, so dropping evicted
+    /// entries off the front has to bring it down too — otherwise the hit the
+    /// user is standing on silently becomes a later one.
+    #[test]
+    fn evicting_matches_keeps_the_cursor_on_the_same_line() {
+        let (mut app, _enum_tx) = test_app("search-evict");
+        let _tx = conn_with_injected_events(&mut app, PortId(0));
+        app.active = 0;
+        let conn = &mut app.connections[0];
+        conn.search_query = "hit".into();
+        conn.store.set_max_lines(100);
+        for n in 0..40 {
+            conn.store.append(IncomingLine {
+                text: format!("hit {n}"),
+                ts: Timestamp {
+                    wall: chrono::Utc::now(),
+                    micros: n as i64,
+                },
+                port: PortId(0),
+                flags: LineFlags::default(),
+                spans: Default::default(),
+                cursor: None,
+            });
+        }
+        app.maintain_search();
+
+        // Stand on a specific hit.
+        // A hit that survives the eviction below, so "the same line" is a
+        // question with an answer.
+        app.connections[0].search_pos = Some(35);
+        let standing_on = app.connections[0].search_matches[35];
+        assert_eq!(standing_on, 35);
+
+        // Tighten the cap so the front is evicted, then let search catch up.
+        app.connections[0].store.set_max_lines(10);
+        app.maintain_search();
+
+        let conn = &app.connections[0];
+        let pos = conn.search_pos.expect("still standing somewhere");
+        assert_eq!(
+            conn.search_matches[pos], standing_on,
+            "the cursor has to follow its line through the eviction, not stay \
+             at the same slot and point at a different hit"
         );
     }
 }
