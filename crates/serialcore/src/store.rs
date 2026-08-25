@@ -96,6 +96,19 @@ pub struct LineRef<'a> {
     pub meta: &'a LineMeta,
 }
 
+/// Upper bound on arena size, kept well below `u32::MAX` (the width of
+/// [`LineMeta::start`]) so byte offsets can never wrap. Sustained garbage
+/// input forces a truncated line roughly every `MAX_LINE_LEN` bytes, which
+/// can reach `u32::MAX` in far fewer lines than `max_lines` would evict for
+/// (issue #5) — so this budget is checked independently of line count.
+///
+/// Shrunk under `cfg(test)` so the eviction path can be exercised without
+/// allocating gigabytes of arena in every test run.
+#[cfg(not(test))]
+const MAX_ARENA_BYTES: usize = 1 << 31; // 2 GiB
+#[cfg(test)]
+const MAX_ARENA_BYTES: usize = 4096;
+
 /// Line arena with front eviction.
 ///
 /// External references to lines use *absolute* indices (`line_base + local`),
@@ -181,7 +194,12 @@ impl LineStore {
                     last.flags = flags;
                     last.spans = line.spans;
                     last.cursor = line.cursor;
-                    return self.line_base + (self.lines.len() as u64 - 1);
+                    let abs = self.line_base + (self.lines.len() as u64 - 1);
+                    // Line count never changes here, but the arena still
+                    // grows with every re-append, so it needs its own
+                    // byte-budget check (issue #5).
+                    self.maybe_evict();
+                    return abs;
                 }
             }
             // No provisional predecessor: fall through and append as new.
@@ -285,14 +303,30 @@ impl LineStore {
     }
 
     /// Evict from the front in a ~10% chunk when over capacity. Never one line
-    /// at a time (that would be O(n) per line, spec §7.7).
+    /// at a time (that would be O(n) per line, spec §7.7). Also evicts on
+    /// arena byte size alone, independent of line count: a stream of
+    /// truncated lines (or repeated provisional continuations) can blow past
+    /// `MAX_ARENA_BYTES` in far fewer lines than `max_lines`, and letting the
+    /// arena reach `u32::MAX` bytes would wrap `LineMeta::start` (issue #5).
     fn maybe_evict(&mut self) {
-        if self.lines.len() <= self.max_lines {
-            return;
+        let mut evict_count = if self.lines.len() > self.max_lines {
+            (self.max_lines / 10).max(1).min(self.lines.len())
+        } else {
+            0
+        };
+
+        if self.arena.len() > MAX_ARENA_BYTES {
+            // Evict back down to half the budget rather than just under it,
+            // so this doesn't refire on every single append while a fast
+            // stream keeps the arena hovering near the cap.
+            let target = self.arena.len() - MAX_ARENA_BYTES / 2;
+            let by_bytes = self.lines.partition_point(|m| (m.start as usize) < target);
+            evict_count = evict_count.max(by_bytes);
         }
-        let evict_count = (self.max_lines / 10).max(1);
-        let evict_count = evict_count.min(self.lines.len());
-        self.evict(evict_count);
+
+        if evict_count > 0 {
+            self.evict(evict_count);
+        }
     }
 
     /// Evict exactly `count` lines from the front (clamped to what's resident)
@@ -529,6 +563,52 @@ mod tests {
         assert_eq!(
             s.get(first_after_raise).unwrap().text,
             format!("line {first_after_raise}")
+        );
+    }
+
+    #[test]
+    fn arena_byte_budget_evicts_well_under_the_line_cap() {
+        // A flood of short lines under a huge max_lines cap must still evict
+        // once the arena's byte budget is exceeded, or a sustained stream
+        // could wrap the u32 arena offset (issue #5).
+        let clock = SessionClock::new();
+        let mut s = LineStore::new(1_000_000);
+        let line = "x".repeat(100);
+        for _ in 0..200 {
+            s.append(incoming(&line, &clock));
+        }
+        assert!(
+            s.len() < 200,
+            "byte budget should evict well before the line-count cap is reached"
+        );
+        assert!(s.evicted_any());
+        // The most recent line is still intact and correctly offset.
+        let last = s.next_abs_index() - 1;
+        assert_eq!(s.get(last).unwrap().text, line);
+    }
+
+    #[test]
+    fn arena_byte_budget_evicts_across_repeated_continuations() {
+        // A single line replaced over and over (e.g. a progress spinner that
+        // never finalizes) grows the arena without ever changing the line
+        // count, so the line-count cap alone would never fire. The byte
+        // budget must catch this path too (issue #5).
+        let clock = SessionClock::new();
+        let mut s = LineStore::new(1_000_000);
+        let mut prov = incoming("start", &clock);
+        prov.flags = LineFlags::PROVISIONAL;
+        s.append(prov);
+
+        let chunk = "y".repeat(100);
+        for _ in 0..200 {
+            let mut cont = incoming(&chunk, &clock);
+            cont.flags = LineFlags::CONTINUATION;
+            s.append(cont);
+        }
+
+        assert!(
+            s.approx_bytes() < 200 * 100,
+            "arena must not be allowed to grow unbounded across continuations"
         );
     }
 }
