@@ -309,23 +309,57 @@ impl LineStore {
     /// `MAX_ARENA_BYTES` in far fewer lines than `max_lines`, and letting the
     /// arena reach `u32::MAX` bytes would wrap `LineMeta::start` (issue #5).
     fn maybe_evict(&mut self) {
-        let mut evict_count = if self.lines.len() > self.max_lines {
+        if self.arena.len() > MAX_ARENA_BYTES {
+            // Re-appending a provisional line in place (see `append`) leaves
+            // its old bytes dead in the arena without changing `self.lines`
+            // at all. When that's the only resident line, no eviction target
+            // for `by_bytes` below can ever exist -- its own `start` is
+            // always near the tail -- so the dead space has to be reclaimed
+            // directly first, independent of evicting any line.
+            self.reclaim_dead_prefix();
+        }
+
+        let by_lines = if self.lines.len() > self.max_lines {
             (self.max_lines / 10).max(1).min(self.lines.len())
         } else {
             0
         };
 
-        if self.arena.len() > MAX_ARENA_BYTES {
+        let by_bytes = if self.arena.len() > MAX_ARENA_BYTES {
             // Evict back down to half the budget rather than just under it,
             // so this doesn't refire on every single append while a fast
             // stream keeps the arena hovering near the cap.
             let target = self.arena.len() - MAX_ARENA_BYTES / 2;
-            let by_bytes = self.lines.partition_point(|m| (m.start as usize) < target);
-            evict_count = evict_count.max(by_bytes);
-        }
+            self.lines.partition_point(|m| (m.start as usize) < target)
+        } else {
+            0
+        };
 
+        let evict_count = by_lines.max(by_bytes);
         if evict_count > 0 {
             self.evict(evict_count);
+        }
+    }
+
+    /// Drop the dead-byte prefix before the first resident line's `start`,
+    /// without evicting any line. That prefix is bytes an in-place
+    /// continuation replace (`append`) stranded when it moved a line's data
+    /// to the arena's tail -- always a contiguous run starting at 0, since
+    /// the arena is otherwise append-only and `lines` stays sorted by
+    /// `start`. A no-op once nothing is stranded.
+    fn reclaim_dead_prefix(&mut self) {
+        let dead = self
+            .lines
+            .first()
+            .map(|m| m.start as usize)
+            .unwrap_or(self.arena.len());
+        if dead == 0 {
+            return;
+        }
+        self.arena.drain(..dead);
+        self.arena_base += dead as u64;
+        for m in &mut self.lines {
+            m.start -= dead as u32;
         }
     }
 
@@ -592,23 +626,42 @@ mod tests {
         // A single line replaced over and over (e.g. a progress spinner that
         // never finalizes) grows the arena without ever changing the line
         // count, so the line-count cap alone would never fire. The byte
-        // budget must catch this path too (issue #5).
+        // budget must catch this path too (issue #5). Every re-flush keeps
+        // the line PROVISIONAL, exactly as the framer's `flush_provisional`
+        // does (a continuation with the flag already dropped would stop
+        // replacing in place after the first one, and not exercise this
+        // path at all).
         let clock = SessionClock::new();
         let mut s = LineStore::new(1_000_000);
         let mut prov = incoming("start", &clock);
         prov.flags = LineFlags::PROVISIONAL;
-        s.append(prov);
+        let idx = s.append(prov);
 
         let chunk = "y".repeat(100);
         for _ in 0..200 {
             let mut cont = incoming(&chunk, &clock);
-            cont.flags = LineFlags::CONTINUATION;
-            s.append(cont);
+            cont.flags = LineFlags::PROVISIONAL | LineFlags::CONTINUATION;
+            let idx2 = s.append(cont);
+            assert_eq!(idx2, idx, "still the same line, replaced in place");
         }
 
+        assert_eq!(
+            s.len(),
+            1,
+            "one line the whole time, so nothing was evicted"
+        );
+        assert!(
+            !s.evicted_any(),
+            "reclaiming dead space isn't evicting a line"
+        );
         assert!(
             s.approx_bytes() < 200 * 100,
-            "arena must not be allowed to grow unbounded across continuations"
+            "dead bytes from repeated re-appends must not accumulate unbounded"
+        );
+        assert_eq!(
+            s.get(idx).unwrap().text,
+            chunk,
+            "the live line still reads correctly"
         );
     }
 }
