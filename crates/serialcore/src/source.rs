@@ -172,12 +172,20 @@ fn is_disconnect(e: &std::io::Error) -> bool {
 
 fn map_open_error(path: &str, e: serialport::Error) -> SourceError {
     let msg = e.to_string();
+    // Checked ahead of the NoDevice branch below: on Windows, serialport-rs
+    // maps ERROR_ACCESS_DENIED to ErrorKind::NoDevice, so a real
+    // permission-denied open would otherwise be reported as "device not
+    // present" and never reach the permission hint.
+    if msg.to_lowercase().contains("permission denied")
+        || msg.to_lowercase().contains("access is denied")
+    {
+        return SourceError::Open(format!(
+            "{path}: permission denied. {}",
+            permission_hint(path)
+        ));
+    }
     if e.kind() == serialport::ErrorKind::NoDevice || msg.to_lowercase().contains("no such") {
         return SourceError::Open(format!("{path}: device not present"));
-    }
-    // Permission denied is the first thing that bites a new Linux user.
-    if msg.to_lowercase().contains("permission denied") {
-        return SourceError::Open(format!("{path}: permission denied. {}", permission_hint(path)));
     }
     SourceError::Open(format!("{path}: {msg}"))
 }
@@ -209,8 +217,29 @@ fn permission_hint(_path: &str) -> String {
 /// consults the same source (files, LDAP, sssd, ...) the system itself uses —
 /// unlike parsing `/etc/group` directly, this stays correct wherever group
 /// lookups are backed by something other than a local file.
+///
+/// Cached per path: a reader stuck on a permission-denied device retries the
+/// open every backoff cycle, and without a cache that would spawn `getent`
+/// and `stat` the device again on every single attempt for as long as the
+/// outage lasts.
 #[cfg(target_os = "linux")]
 fn device_group_name(path: &str) -> Option<String> {
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<String, Option<String>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    CACHE.with(|cache| {
+        if let Some(cached) = cache.borrow().get(path) {
+            return cached.clone();
+        }
+        let result = device_group_name_uncached(path);
+        cache.borrow_mut().insert(path.to_string(), result.clone());
+        result
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn device_group_name_uncached(path: &str) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     let gid = std::fs::metadata(path).ok()?.gid();
     let out = std::process::Command::new("getent")
@@ -343,7 +372,14 @@ mod tests {
         let path_str = path.to_str().unwrap();
         let gid = std::fs::metadata(&path).unwrap().gid();
 
-        let name = device_group_name(path_str).expect("group should resolve via getent");
+        // `getent` may simply be absent (minimal containers, some CI images);
+        // that is an environment gap, not a bug in `device_group_name`, so
+        // skip rather than fail the suite.
+        let Some(name) = device_group_name(path_str) else {
+            std::fs::remove_file(&path).unwrap();
+            eprintln!("skipping: `getent` unavailable in this environment");
+            return;
+        };
 
         // Round-trip through getent by name, rather than hardcoding an
         // expected group: CI and dev machines can have different primary

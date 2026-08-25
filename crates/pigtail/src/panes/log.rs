@@ -1059,7 +1059,10 @@ impl App {
             .save_file()
         {
             if let Err(e) = std::fs::write(&path, out) {
-                self.connections[active].last_error = Some(format!("export failed: {e}"));
+                // Not `conn.last_error`: that field drives the footer's
+                // connection-error indicator, and an export failure has
+                // nothing to do with the connection's health.
+                self.record_connect_error("Couldn't export", e.to_string());
             }
         }
     }

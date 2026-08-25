@@ -774,9 +774,11 @@ pub struct App {
     pub show_filters_win: bool,
     pub show_highlight_win: bool,
     pub show_extract_win: bool,
-    /// `true` while the popup showing the active tab's `last_error` in full is
-    /// open (clicked from the footer's error indicator).
-    pub show_error_win: bool,
+    /// `Some(port_id)` while the popup showing that connection's `last_error`
+    /// in full is open (clicked from the footer's error indicator). Keyed by
+    /// the connection it was opened for, not "whichever tab is active", so
+    /// switching tabs while it's open doesn't silently swap the message.
+    pub show_error_win: Option<PortId>,
     pub show_search: bool,
     /// Set when search should grab keyboard focus next frame (e.g. after Ctrl+F).
     pub search_focus_request: bool,
@@ -836,7 +838,7 @@ impl App {
             show_filters_win: false,
             show_highlight_win: false,
             show_extract_win: false,
-            show_error_win: false,
+            show_error_win: None,
             show_search: false,
             search_focus_request: false,
             update_rx: None,
@@ -987,7 +989,7 @@ impl App {
     /// cap, new arrivals are dropped rather than the front entry, which is
     /// either on screen right now or the oldest one the user hasn't
     /// acknowledged yet.
-    fn record_connect_error(&mut self, title: &'static str, message: String) {
+    pub(crate) fn record_connect_error(&mut self, title: &'static str, message: String) {
         tracing::error!("{title}: {message}");
         let err = ConnectError { title, message };
         if self.connect_errors.contains(&err) {
@@ -1760,7 +1762,7 @@ impl App {
             || self.show_filters_win
             || self.show_highlight_win
             || self.show_extract_win
-            || self.show_error_win
+            || self.show_error_win.is_some()
     }
 
     /// Index of the active connection, clamped, or `None` if there are none.

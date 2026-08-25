@@ -14,21 +14,23 @@ impl App {
     }
 
     /// The full connection-error message, opened by clicking the footer's
-    /// `⚠ error` indicator. Closes itself if the error clears (e.g. a
-    /// reconnect succeeds) while it's open.
+    /// `⚠ error` indicator. Scoped to the connection it was opened for (not
+    /// "whichever tab is active"), so switching tabs while it's open doesn't
+    /// swap the message. Closes itself if that connection's error clears
+    /// (e.g. a reconnect succeeds) or the tab is closed while it's open.
     fn show_error_window(&mut self, ctx: &egui::Context) {
-        if !self.show_error_win {
-            return;
-        }
-        let Some(active) = self.active_index() else {
-            self.show_error_win = false;
+        let Some(id) = self.show_error_win else {
             return;
         };
-        let Some(err) = self.connections[active].last_error.clone() else {
-            self.show_error_win = false;
+        let Some(conn) = self.connections.iter().find(|c| c.id == id) else {
+            self.show_error_win = None;
             return;
         };
-        let mut open = self.show_error_win;
+        let Some(err) = conn.last_error.clone() else {
+            self.show_error_win = None;
+            return;
+        };
+        let mut open = true;
         egui::Window::new("Connection error")
             .open(&mut open)
             .resizable(false)
@@ -36,7 +38,9 @@ impl App {
             .show(ctx, |ui| {
                 ui.label(err);
             });
-        self.show_error_win = open;
+        if !open {
+            self.show_error_win = None;
+        }
     }
 
     fn show_filters_window(&mut self, ctx: &egui::Context) {

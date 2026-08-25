@@ -12,12 +12,14 @@ const COMMON_BAUDS: &[u32] = &[
 ];
 
 impl App {
-    /// A plain acknowledgement dialog for `connect_errors`: a connect, reconnect,
-    /// or port-detection start that failed outright (e.g. the OS refused to
-    /// spawn its thread) rather than through the normal per-connection error
-    /// path, since there is no live connection to show it on. Shows one message
-    /// at a time, oldest first, so simultaneous failures all get seen rather
-    /// than the latest silently replacing the others.
+    /// A plain acknowledgement dialog for `connect_errors`: a one-off
+    /// background operation — connect, reconnect, port-detection start, an
+    /// export write — that failed outright rather than through the normal
+    /// per-connection error path, either because there is no live connection
+    /// to show it on or because the failure has nothing to do with a
+    /// connection's health. Shows one message at a time, oldest first, so
+    /// simultaneous failures all get seen rather than the latest silently
+    /// replacing the others.
     pub(crate) fn show_connect_error(&mut self, ctx: &egui::Context) {
         let Some(err) = self.connect_errors.front() else {
             return;
@@ -121,7 +123,7 @@ impl App {
         let mut toggle_pin = false;
         let mut toggle_plot = false;
         let mut toggle_hex = false;
-        let mut open_error_win = false;
+        let mut open_error_win: Option<serialcore::store::PortId> = None;
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if self.merged_selected {
@@ -151,7 +153,7 @@ impl App {
                             .on_hover_cursor(egui::CursorIcon::PointingHand)
                             .on_hover_text(err);
                         if resp.clicked() {
-                            open_error_win = true;
+                            open_error_win = Some(conn.id);
                         }
                     }
                     _ => {
@@ -232,8 +234,8 @@ impl App {
                 }
             }
         }
-        if open_error_win {
-            self.show_error_win = true;
+        if let Some(id) = open_error_win {
+            self.show_error_win = Some(id);
         }
     }
 
