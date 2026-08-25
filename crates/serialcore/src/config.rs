@@ -1,5 +1,5 @@
-//! Configuration and serde types: port identity, per-port config, profiles,
-//! and global settings. These are UI-agnostic and serialize to TOML.
+//! Configuration and serde types: port identity, per-port config, and global
+//! settings. These are UI-agnostic and serialize to TOML.
 
 use serde::{Deserialize, Serialize};
 
@@ -337,21 +337,6 @@ pub struct ExtractRule {
     pub kv_separators: Option<Vec<char>>,
 }
 
-/// A saved connection profile.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Profile {
-    pub name: String,
-    pub identity: PortIdentity,
-    #[serde(flatten)]
-    pub port: PortConfig,
-    #[serde(default)]
-    pub auto_connect: bool,
-    #[serde(default)]
-    pub highlight: Vec<HighlightRule>,
-    #[serde(default)]
-    pub extract: Vec<ExtractRule>,
-}
-
 /// Bounds for [`Settings::console_font_size`], shared by the settings pane and
 /// the console's Ctrl+wheel gesture. Anything outside this is unreadable or
 /// leaves no room for a line of output.
@@ -422,12 +407,9 @@ pub struct SavedConnection {
 /// Top-level config, matching the TOML layout in spec §7.14.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
-    #[serde(default, rename = "profile")]
-    pub profiles: Vec<Profile>,
     #[serde(default)]
     pub settings: Settings,
-    /// Global highlight rules applied to every connection (spec §7.9). Profiles
-    /// may also carry their own; the global list is the simple, always-on set.
+    /// Global highlight rules applied to every connection (spec §7.9).
     #[serde(default)]
     pub highlight: Vec<HighlightRule>,
     /// Named port-config presets for the new-connection dialog.
@@ -436,11 +418,6 @@ pub struct Config {
     /// Connections open at last exit, reopened on the next launch.
     #[serde(default, rename = "last_open")]
     pub last_open: Vec<SavedConnection>,
-    /// Identities of auto-connect profiles the user explicitly closed while
-    /// their device stayed connected, so a restart doesn't immediately
-    /// reopen the tab the user just closed. See `App::auto_connect_suppressed`.
-    #[serde(default)]
-    pub auto_connect_suppressed: Vec<PortIdentity>,
 }
 
 impl Config {
@@ -467,12 +444,10 @@ impl Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
-            profiles: Vec::new(),
             settings: Settings::default(),
             highlight: default_highlight_rules(),
             presets: Vec::new(),
             last_open: Vec::new(),
-            auto_connect_suppressed: Vec::new(),
         }
     }
 }
@@ -605,61 +580,38 @@ mod tests {
     #[test]
     fn parses_spec_example_config() {
         let toml_src = r##"
-[[profile]]
-name = "STM32 Nucleo debug"
-identity = { vid = 0x0483, pid = 0x374B, serial_number = "066AFF" }
-baud = 115200
+[settings]
+max_lines = 1000000
+timestamp_format = "delta"
+session_retention_days = 30
+theme = "dark"
+
+[[preset]]
+name = "fast"
+baud = 921600
 data_bits = 8
 parity = "none"
 stop_bits = 1
 flow_control = "none"
 dtr_on_open = true
 rts_on_open = false
-auto_connect = true
 
-[[profile.highlight]]
+[[highlight]]
 pattern = "ERROR|FATAL"
 color = "#ff5555"
 bold = true
-
-[[profile.extract]]
-mode = "kv"
-prefix = "PLOT:"
-
-[settings]
-max_lines = 1000000
-timestamp_format = "delta"
-session_retention_days = 30
-theme = "dark"
 "##;
         let cfg = Config::from_toml(toml_src).expect("parse");
-        assert_eq!(cfg.profiles.len(), 1);
-        let p = &cfg.profiles[0];
-        assert_eq!(p.name, "STM32 Nucleo debug");
-        assert_eq!(p.identity.vid, Some(0x0483));
-        assert_eq!(p.port.baud, 115_200);
-        assert!(p.auto_connect);
-        assert_eq!(p.highlight.len(), 1);
-        assert_eq!(p.extract[0].mode, ExtractMode::Kv);
         assert_eq!(cfg.settings.timestamp_format, TimestampFormat::Delta);
         assert_eq!(cfg.settings.max_lines, 1_000_000);
+        assert_eq!(cfg.presets.len(), 1);
+        assert_eq!(cfg.presets[0].config.baud, 921_600);
+        assert_eq!(cfg.highlight.len(), 1);
     }
 
     #[test]
     fn config_roundtrips() {
         let cfg = Config {
-            profiles: vec![Profile {
-                name: "t".into(),
-                identity: PortIdentity {
-                    vid: Some(1),
-                    pid: Some(2),
-                    ..Default::default()
-                },
-                port: PortConfig::default(),
-                auto_connect: true,
-                highlight: vec![],
-                extract: vec![],
-            }],
             settings: Settings::default(),
             highlight: vec![],
             presets: vec![NamedConfig {
@@ -676,11 +628,6 @@ theme = "dark"
                     ..Default::default()
                 },
                 config: PortConfig::default(),
-            }],
-            auto_connect_suppressed: vec![PortIdentity {
-                vid: Some(5),
-                pid: Some(6),
-                ..Default::default()
             }],
         };
         let s = cfg.to_toml().unwrap();
