@@ -171,23 +171,41 @@ fn is_disconnect(e: &std::io::Error) -> bool {
 }
 
 fn map_open_error(path: &str, e: serialport::Error) -> SourceError {
-    let msg = e.to_string();
-    // Checked ahead of the NoDevice branch below: on Windows, serialport-rs
-    // maps ERROR_ACCESS_DENIED to ErrorKind::NoDevice, so a real
-    // permission-denied open would otherwise be reported as "device not
-    // present" and never reach the permission hint.
-    if msg.to_lowercase().contains("permission denied")
-        || msg.to_lowercase().contains("access is denied")
-    {
+    // POSIX surfaces EACCES as this exact kind, so no string matching needed.
+    if e.kind() == serialport::ErrorKind::Io(std::io::ErrorKind::PermissionDenied) {
         return SourceError::Open(format!(
             "{path}: permission denied. {}",
             permission_hint(path)
         ));
     }
-    if e.kind() == serialport::ErrorKind::NoDevice || msg.to_lowercase().contains("no such") {
+    if e.kind() == serialport::ErrorKind::NoDevice {
+        // On Windows, serialport-rs maps ERROR_ACCESS_DENIED to the same
+        // ErrorKind::NoDevice as "no such device", and its message text is
+        // localized (FormatMessageW), so the two can't be told apart by
+        // string matching. If the port still shows up in the OS port
+        // enumeration, the failure is a permission/exclusivity problem, not
+        // the device being gone.
+        if windows_port_still_present(path) {
+            return SourceError::Open(format!(
+                "{path}: permission denied. {}",
+                permission_hint(path)
+            ));
+        }
         return SourceError::Open(format!("{path}: device not present"));
     }
-    SourceError::Open(format!("{path}: {msg}"))
+    SourceError::Open(format!("{path}: {}", e))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_port_still_present(path: &str) -> bool {
+    serialport::available_ports()
+        .map(|ports| ports.iter().any(|p| p.port_name == path))
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_port_still_present(_path: &str) -> bool {
+    false
 }
 
 /// The group that actually owns `path`, not a guess: distros differ on which
@@ -218,39 +236,75 @@ fn permission_hint(_path: &str) -> String {
 /// unlike parsing `/etc/group` directly, this stays correct wherever group
 /// lookups are backed by something other than a local file.
 ///
-/// Cached per path: a reader stuck on a permission-denied device retries the
-/// open every backoff cycle, and without a cache that would spawn `getent`
-/// and `stat` the device again on every single attempt for as long as the
-/// outage lasts.
+/// The `stat` is repeated on every call (cheap, and keeps the reported group
+/// current if the device's owning group changes mid-outage); only the
+/// gid-to-name lookup is cached, since that mapping is a machine-wide fact
+/// that isn't specific to a path.
 #[cfg(target_os = "linux")]
 fn device_group_name(path: &str) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let gid = std::fs::metadata(path).ok()?.gid();
+    group_name_for_gid(gid)
+}
+
+/// Cached per gid: a reader stuck on a permission-denied device retries the
+/// open every backoff cycle, and without a cache that would spawn `getent`
+/// again on every single attempt for as long as the outage lasts.
+#[cfg(target_os = "linux")]
+fn group_name_for_gid(gid: u32) -> Option<String> {
     thread_local! {
-        static CACHE: std::cell::RefCell<std::collections::HashMap<String, Option<String>>> =
+        static CACHE: std::cell::RefCell<std::collections::HashMap<u32, Option<String>>> =
             std::cell::RefCell::new(std::collections::HashMap::new());
     }
     CACHE.with(|cache| {
-        if let Some(cached) = cache.borrow().get(path) {
+        if let Some(cached) = cache.borrow().get(&gid) {
             return cached.clone();
         }
-        let result = device_group_name_uncached(path);
-        cache.borrow_mut().insert(path.to_string(), result.clone());
+        let result = getent_group_name(gid);
+        cache.borrow_mut().insert(gid, result.clone());
         result
     })
 }
 
+/// Runs `getent group <gid>`, bounded by a timeout so a reader thread can
+/// never hang here: `getent` can block indefinitely if it's backed by an
+/// unreachable network directory service (LDAP/sssd), and this call happens
+/// inside the reader thread's open-retry loop, which must stay responsive to
+/// `Shutdown` (see `ReaderHandle::shutdown_in_place`).
 #[cfg(target_os = "linux")]
-fn device_group_name_uncached(path: &str) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
-    let gid = std::fs::metadata(path).ok()?.gid();
-    let out = std::process::Command::new("getent")
+fn getent_group_name(gid: u32) -> Option<String> {
+    use std::io::Read;
+
+    const TIMEOUT: Duration = Duration::from_millis(500);
+    const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+    let mut child = std::process::Command::new("getent")
         .arg("group")
         .arg(gid.to_string())
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
-    if !out.status.success() {
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let status = loop {
+        match child.try_wait().ok()? {
+            Some(status) => break status,
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
+    };
+    if !status.success() {
         return None;
     }
-    let stdout = String::from_utf8(out.stdout).ok()?;
+    let mut stdout = String::new();
+    child.stdout.take()?.read_to_string(&mut stdout).ok()?;
     let name = stdout.split(':').next()?.trim();
     if name.is_empty() {
         None
@@ -395,5 +449,25 @@ mod tests {
         assert_eq!(resolved_gid, gid);
 
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn map_open_error_recognizes_permission_denied_by_kind_not_message_text() {
+        // Regression guard: this must key off `ErrorKind`, not a
+        // language-specific substring of the description, since the OS
+        // message can be localized (see `windows_port_still_present`).
+        let e = serialport::Error::new(
+            serialport::ErrorKind::Io(std::io::ErrorKind::PermissionDenied),
+            "Permission non accordée",
+        );
+        let err = map_open_error("/dev/ttyUSB0", e);
+        assert!(matches!(err, SourceError::Open(msg) if msg.contains("permission denied")));
+    }
+
+    #[test]
+    fn map_open_error_reports_device_not_present_for_no_device() {
+        let e = serialport::Error::new(serialport::ErrorKind::NoDevice, "Le fichier n'existe pas");
+        let err = map_open_error("/dev/ttyUSB0", e);
+        assert!(matches!(err, SourceError::Open(msg) if msg.contains("device not present")));
     }
 }

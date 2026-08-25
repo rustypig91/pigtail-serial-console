@@ -307,10 +307,14 @@ fn run(
         };
         event_tx.send(ReaderEvent::State(state));
 
-        // Reported once per (re)connect phase: an open failure like permission
-        // denied won't clear itself between backoff retries, so repeating it
-        // every attempt would just spam identical messages.
-        let mut reported = false;
+        // Reported once per distinct message within a (re)connect phase: an
+        // open failure like permission denied won't clear itself between
+        // backoff retries, so repeating it every attempt would just spam
+        // identical messages. But the underlying cause can change mid-phase
+        // (e.g. "device not present" while unplugged, then "permission
+        // denied" once it reappears with the wrong group), so re-report
+        // whenever the message itself changes.
+        let mut last_reported: Option<String> = None;
         let mut source = loop {
             match opener() {
                 Ok(s) => break s,
@@ -320,9 +324,10 @@ fn run(
                         event_tx.send(ReaderEvent::State(ConnState::Closed));
                         return;
                     }
-                    if !reported {
-                        event_tx.send(ReaderEvent::Error(e.to_string()));
-                        reported = true;
+                    let msg = e.to_string();
+                    if last_reported.as_deref() != Some(msg.as_str()) {
+                        event_tx.send(ReaderEvent::Error(msg.clone()));
+                        last_reported = Some(msg);
                     }
                     // Wait out the backoff while remaining responsive to Shutdown.
                     let targets = ClearTargets {
