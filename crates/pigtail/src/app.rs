@@ -1737,6 +1737,22 @@ impl App {
         self.merged_dirty = true;
     }
 
+    /// True while any modal dialog or floating tool window is open. Their
+    /// controls (buttons, checkboxes, ComboBoxes) never take egui focus, so
+    /// `memory().focused().is_none()` alone wouldn't catch them; callers that
+    /// need to know whether such UI is soaking up clicks/keys (e.g. gating
+    /// raw console input) should check this instead of the individual
+    /// fields, so a newly added window only needs to be listed here once.
+    pub fn floating_window_open(&self) -> bool {
+        self.config_dialog.is_some()
+            || !self.connect_errors.is_empty()
+            || self.update_dialog.is_some()
+            || self.show_settings
+            || self.show_filters_win
+            || self.show_highlight_win
+            || self.show_extract_win
+    }
+
     /// Index of the active connection, clamped, or `None` if there are none.
     pub fn active_index(&self) -> Option<usize> {
         if self.connections.is_empty() {
