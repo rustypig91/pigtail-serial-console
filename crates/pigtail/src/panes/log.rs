@@ -425,13 +425,13 @@ impl App {
         self.apply_menu(active, menu);
 
         // Raw console input: forward the keyboard to the device whenever a live
-        // tab is showing and nothing else (search box, a dialog) holds focus.
-        // Runs after drawing so this frame's focus state is settled.
-        // `update_dialog` needs an explicit check here too: its buttons never
-        // take egui focus, so `memory().focused()` alone wouldn't catch it.
-        if self.config_dialog.is_none()
-            && self.connect_errors.is_empty()
-            && self.update_dialog.is_none()
+        // tab is showing and nothing else (search box, a dialog, a floating
+        // tool window) holds focus. Runs after drawing so this frame's focus
+        // state is settled. `floating_window_open` covers dialogs/windows
+        // whose controls never take egui focus, so `memory().focused()` alone
+        // wouldn't catch them; a newly added window only needs to be added
+        // there, not here.
+        if !self.floating_window_open()
             && !self.merged_selected
             && ctx.memory(|m| m.focused().is_none())
         {
