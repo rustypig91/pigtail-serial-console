@@ -134,6 +134,50 @@ struct MenuAction {
     toggle_dtr: bool,
     toggle_rts: bool,
     send_break: bool,
+    /// Connection the port-specific actions land on, when the menu named one:
+    /// a merged row's own port. `None` means the active tab, which is what a
+    /// single connection's own console implies.
+    port: Option<PortId>,
+}
+
+/// What a console right-click menu points at — the row it was opened over and
+/// the connection that row belongs to.
+///
+/// A menu opened over merged empty space has no target at all: it points at no
+/// row, and so at no port, and the port-specific items are left out rather than
+/// fired at whichever tab happened to be active last.
+struct MenuTarget<'a> {
+    /// The connection the port-specific items act on. `None` for the active
+    /// tab — the one the console is already showing.
+    port: Option<PortId>,
+    /// That connection's label, shown at the top of the menu so it is obvious
+    /// which device is about to be poked. `None` for the active tab, which the
+    /// reader is looking at anyway.
+    label: Option<&'a str>,
+    /// The line "here" refers to: the row the menu was opened over, or `None`
+    /// over the empty space below the content.
+    line: Option<u64>,
+}
+
+impl<'a> MenuTarget<'a> {
+    /// A menu over the active tab's own console, opened over `line` (or over
+    /// the empty space below it).
+    fn active(line: Option<u64>) -> Self {
+        Self {
+            port: None,
+            label: None,
+            line,
+        }
+    }
+
+    /// A menu over a merged row, which names the port that row came from.
+    fn row(port: PortId, label: &'a str, line: u64) -> Self {
+        Self {
+            port: Some(port),
+            label: Some(label),
+            line: Some(line),
+        }
+    }
 }
 
 /// The console's layout for one frame: the font, the pitch every visual row
@@ -599,7 +643,15 @@ impl App {
             ui.id().with("console_bg"),
             egui::Sense::click(),
         );
-        bg.context_menu(|ui| console_menu(ui, menu, None, ts_format, has_mark));
+        bg.context_menu(|ui| {
+            console_menu(
+                ui,
+                menu,
+                Some(MenuTarget::active(None)),
+                ts_format,
+                has_mark,
+            )
+        });
 
         let row_of_line = |target: u64| -> Option<u64> {
             let entry = if filter_active {
@@ -694,7 +746,15 @@ impl App {
                         row_id: egui::Id::new(("console_row", conn.id, abs)),
                     };
                     let resp = render_row(ui, &line, &rctx);
-                    resp.context_menu(|ui| console_menu(ui, menu, Some(abs), ts_format, has_mark));
+                    resp.context_menu(|ui| {
+                        console_menu(
+                            ui,
+                            menu,
+                            Some(MenuTarget::active(Some(abs))),
+                            ts_format,
+                            has_mark,
+                        )
+                    });
                     entry += 1;
                 }
                 // The echo row trails the last line, so it is drawn only when
@@ -770,6 +830,10 @@ impl App {
             ui.id().with("merged_bg"),
             egui::Sense::click(),
         );
+        // No target: the empty space below merged output belongs to no port,
+        // so the port-specific items are left out here rather than aimed at
+        // whichever tab was last active (issue #11). Right-clicking a row
+        // offers them, resolved against that row's own port.
         bg.context_menu(|ui| console_menu(ui, menu, None, ts_format, false));
         ui.spacing_mut().item_spacing.y = 0.0;
 
@@ -813,7 +877,17 @@ impl App {
                             port_tag: Some((short_tag(&conn.label), color)),
                             row_id: egui::Id::new(("merged_row", port, abs)),
                         };
-                        render_row(ui, &line, &rctx);
+                        let resp = render_row(ui, &line, &rctx);
+                        let has_mark = conn.mark_micros.is_some();
+                        resp.context_menu(|ui| {
+                            console_menu(
+                                ui,
+                                menu,
+                                Some(MenuTarget::row(port, &conn.label, abs)),
+                                ts_format,
+                                has_mark,
+                            )
+                        });
                     }
                 });
             });
@@ -827,7 +901,15 @@ impl App {
             ui.id().with("hex_bg"),
             egui::Sense::click(),
         );
-        bg.context_menu(|ui| console_menu(ui, menu, None, ts_format, has_mark));
+        bg.context_menu(|ui| {
+            console_menu(
+                ui,
+                menu,
+                Some(MenuTarget::active(None)),
+                ts_format,
+                has_mark,
+            )
+        });
 
         let user_scrolled = ui.input(user_scrolled);
         if self.connections[active].follow && user_scrolled {
@@ -934,7 +1016,15 @@ impl App {
                     },
                 );
                 let resp = wrapped_text(ui, job, &m, u32::MAX, row_height, row_id);
-                resp.context_menu(|ui| console_menu(ui, menu, None, ts_format, has_mark));
+                resp.context_menu(|ui| {
+                    console_menu(
+                        ui,
+                        menu,
+                        Some(MenuTarget::active(None)),
+                        ts_format,
+                        has_mark,
+                    )
+                });
             }
         });
         rearm_follow_at_bottom(
@@ -947,12 +1037,30 @@ impl App {
     }
 
     /// Apply the actions collected from the right-click menu.
+    ///
+    /// `active` is the fallback target for the port-specific actions — right,
+    /// because a single connection's console only ever shows the active tab.
+    /// A merged row names its own port instead, which is what keeps "toggle
+    /// DTR" off a device the reader isn't even looking at.
     fn apply_menu(&mut self, active: usize, menu: MenuAction) {
+        // The connection the port-specific actions land on. A named port that
+        // has since gone away resolves to nothing at all: falling back to the
+        // active tab is exactly how a merged row's action could reach the wrong
+        // device.
+        let target = match menu.port {
+            Some(id) => self.connections.iter().position(|c| c.id == id),
+            None => Some(active),
+        };
+        // Everything below the mark is port-specific, so a menu whose port is
+        // gone leaves no trace — not even the format switch that "set mark"
+        // would otherwise make on its way to setting nothing.
+        let set_mark = menu.set_mark && target.is_some();
+
         if let Some(fmt) = menu.set_ts {
             self.config.settings.timestamp_format = fmt;
             self.write_config();
         }
-        if menu.set_mark && self.config.settings.timestamp_format != TimestampFormat::Mark {
+        if set_mark && self.config.settings.timestamp_format != TimestampFormat::Mark {
             // A mark only shows in the "from mark" format, so setting one while
             // in any other would look like the command did nothing at all.
             self.config.settings.timestamp_format = TimestampFormat::Mark;
@@ -973,20 +1081,23 @@ impl App {
                 self.search_focus_request = true;
             }
         }
-        if let Some(as_csv) = menu.export {
-            self.export_active_view(active, as_csv);
+        if let (Some(as_csv), Some(target)) = (menu.export, target) {
+            self.export_active_view(target, as_csv);
         }
         if menu.clear_console {
-            self.clear_console();
+            // The port the menu named, so a merged row clears the port that row
+            // came from rather than every one of them; the merged view's own
+            // background menu names none, and still clears the lot.
+            self.clear_console(menu.port);
         }
-        if let Some(conn) = self.connections.get_mut(active) {
+        if let Some(conn) = target.and_then(|i| self.connections.get_mut(i)) {
             if menu.toggle_hex {
                 conn.hex_view = !conn.hex_view;
             }
             if menu.toggle_plot {
                 conn.show_plot = !conn.show_plot;
             }
-            if menu.set_mark {
+            if set_mark {
                 // The line the menu was opened over — "here" — falling back to
                 // the newest line when it was opened over empty space.
                 let target = menu
@@ -1079,13 +1190,29 @@ impl App {
 }
 
 /// The right-click menu, common to rows and empty areas.
+///
+/// `target` says which connection the port-specific items act on and which row
+/// "here" means; `None` (merged empty space) points at no port, and leaves
+/// those items out entirely rather than letting them land on an arbitrary tab.
 fn console_menu(
     ui: &mut egui::Ui,
     menu: &mut MenuAction,
-    line: Option<u64>,
+    target: Option<MenuTarget<'_>>,
     cur_ts: TimestampFormat,
     has_mark: bool,
 ) {
+    // Only one context menu can be open at a time, so this closure runs for the
+    // one the user actually opened — recording its port once up here is enough
+    // for whichever item they then pick.
+    menu.port = target.as_ref().and_then(|t| t.port);
+    let line = target.as_ref().and_then(|t| t.line);
+    // Which port a merged row's items are about to hit. The console under the
+    // menu is showing every port at once, so without this the reader has no way
+    // to tell — and DTR, RTS and break reach a physical device.
+    if let Some(label) = target.as_ref().and_then(|t| t.label) {
+        ui.weak(label);
+        ui.separator();
+    }
     ui.menu_button("Timestamps", |ui| {
         for f in [
             TimestampFormat::Absolute,
@@ -1103,13 +1230,15 @@ fn console_menu(
             }
         }
     });
-    if ui.button("Toggle hex view").clicked() {
-        menu.toggle_hex = true;
-        ui.close_menu();
-    }
-    if ui.button("Toggle plot").clicked() {
-        menu.toggle_plot = true;
-        ui.close_menu();
+    if target.is_some() {
+        if ui.button("Toggle hex view").clicked() {
+            menu.toggle_hex = true;
+            ui.close_menu();
+        }
+        if ui.button("Toggle plot").clicked() {
+            menu.toggle_plot = true;
+            ui.close_menu();
+        }
     }
     ui.separator();
     if ui.button("Search…").clicked() {
@@ -1128,50 +1257,52 @@ fn console_menu(
         menu.open_extract = true;
         ui.close_menu();
     }
-    ui.separator();
-    ui.menu_button("Control lines", |ui| {
+    if target.is_some() {
+        ui.separator();
+        ui.menu_button("Control lines", |ui| {
+            if ui
+                .button("Toggle DTR")
+                .on_hover_text("Resets many boards")
+                .clicked()
+            {
+                menu.toggle_dtr = true;
+                ui.close_menu();
+            }
+            if ui.button("Toggle RTS").clicked() {
+                menu.toggle_rts = true;
+                ui.close_menu();
+            }
+            if ui.button("Send break").clicked() {
+                menu.send_break = true;
+                ui.close_menu();
+            }
+        });
+        ui.separator();
         if ui
-            .button("Toggle DTR")
-            .on_hover_text("Resets many boards")
+            .button("Set time mark here")
+            .on_hover_text("Timestamps switch to counting from this line, before it and after")
             .clicked()
         {
-            menu.toggle_dtr = true;
+            menu.set_mark = true;
+            menu.mark_line = line;
             ui.close_menu();
         }
-        if ui.button("Toggle RTS").clicked() {
-            menu.toggle_rts = true;
+        if has_mark && ui.button("Clear time mark").clicked() {
+            menu.clear_mark = true;
             ui.close_menu();
         }
-        if ui.button("Send break").clicked() {
-            menu.send_break = true;
-            ui.close_menu();
-        }
-    });
-    ui.separator();
-    if ui
-        .button("Set time mark here")
-        .on_hover_text("Timestamps switch to counting from this line, before it and after")
-        .clicked()
-    {
-        menu.set_mark = true;
-        menu.mark_line = line;
-        ui.close_menu();
+        ui.separator();
+        ui.menu_button("Export view", |ui| {
+            if ui.button("Text (.txt)").clicked() {
+                menu.export = Some(false);
+                ui.close_menu();
+            }
+            if ui.button("CSV (.csv)").clicked() {
+                menu.export = Some(true);
+                ui.close_menu();
+            }
+        });
     }
-    if has_mark && ui.button("Clear time mark").clicked() {
-        menu.clear_mark = true;
-        ui.close_menu();
-    }
-    ui.separator();
-    ui.menu_button("Export view", |ui| {
-        if ui.button("Text (.txt)").clicked() {
-            menu.export = Some(false);
-            ui.close_menu();
-        }
-        if ui.button("CSV (.csv)").clicked() {
-            menu.export = Some(true);
-            ui.close_menu();
-        }
-    });
     ui.separator();
     if ui
         .button("Clear console")

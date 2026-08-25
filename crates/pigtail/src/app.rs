@@ -1781,17 +1781,24 @@ impl App {
     ///
     /// Deliberately destructive — the point is that cleared output is gone, not
     /// merely scrolled away, so it also can't come back as preloaded history on
-    /// the next launch. From the merged view every port is cleared, since that
-    /// is what the window is showing; otherwise just the active tab.
+    /// the next launch. `port` names a single connection to clear, which is
+    /// what a merged *row*'s menu means; without one, the merged view clears
+    /// every port (that is what the window is showing) and a single tab clears
+    /// itself.
     ///
     /// Bytes already in flight (read but not yet drained from the reader
     /// channel) still land afterwards. That's a line or two at most, and they
     /// are output that arrived after the click.
-    pub fn clear_console(&mut self) {
-        let targets: Vec<usize> = if self.merged_selected {
-            (0..self.connections.len()).collect()
-        } else {
-            self.active_index().into_iter().collect()
+    pub fn clear_console(&mut self, port: Option<PortId>) {
+        let targets: Vec<usize> = match port {
+            Some(id) => self
+                .connections
+                .iter()
+                .position(|c| c.id == id)
+                .into_iter()
+                .collect(),
+            None if self.merged_selected => (0..self.connections.len()).collect(),
+            None => self.active_index().into_iter().collect(),
         };
         for i in targets {
             let conn = &mut self.connections[i];
