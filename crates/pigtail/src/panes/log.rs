@@ -307,7 +307,11 @@ struct RowCtx<'a> {
     rows: u32,
     prev_micros: Option<i64>,
     mark: Option<i64>,
+    /// The global highlight rules.
     highlight: &'a [CompiledHighlight],
+    /// This row's own device's rules, from its saved profile. Tried first, so a
+    /// device that names its own patterns wins on its own console.
+    profile_highlight: &'a [CompiledHighlight],
     search_re: Option<&'a regex::Regex>,
     is_search_current: bool,
     port_tag: Option<(String, egui::Color32)>,
@@ -740,6 +744,7 @@ impl App {
                         prev_micros,
                         mark,
                         highlight: highlight_cache,
+                        profile_highlight: &conn.profile_highlight,
                         search_re: search_re.as_ref(),
                         is_search_current: cur_match_abs == Some(abs),
                         port_tag: None,
@@ -872,6 +877,7 @@ impl App {
                             prev_micros: None,
                             mark: session_start,
                             highlight: highlight_cache,
+                            profile_highlight: &conn.profile_highlight,
                             search_re: None,
                             is_search_current: false,
                             port_tag: Some((short_tag(&conn.label), color)),
@@ -1629,7 +1635,9 @@ fn build_job(ui: &egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> LayoutJob 
     } else if line.meta.flags.contains(LineFlags::INVALID_UTF8) {
         base = egui::Color32::from_rgb(0xcc, 0x99, 0x66);
     } else {
-        for hl in rctx.highlight {
+        // The device's own rules ahead of the global ones: "first matching
+        // rule wins", and the more specific set gets to go first.
+        for hl in rctx.profile_highlight.iter().chain(rctx.highlight) {
             if hl.re.is_match(text) {
                 base = hl.color;
                 break;

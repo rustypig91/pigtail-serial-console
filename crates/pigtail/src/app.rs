@@ -376,6 +376,14 @@ pub struct Connection {
     pub raw_base: u64,
     /// The runs whose bytes the ring holds, oldest first.
     pub raw_sessions: Vec<RawSession>,
+    /// Highlight rules from this device's saved profile, compiled once when the
+    /// tab opened. Tried ahead of the global set (`App::highlight_cache`), so a
+    /// device that names its own patterns wins on its own console — and empty,
+    /// which is the usual case, costs a single `is_empty` per line.
+    ///
+    /// Fixed for the life of the tab: the only way to write these is the config
+    /// file, which is read when a connection is opened.
+    pub profile_highlight: Vec<CompiledHighlight>,
     /// The most recent error on this connection, kept with its scope: a
     /// successful (re)connect retires a [`ErrorScope::Connection`] error but
     /// says nothing about a [`ErrorScope::Session`] one, which outlives it.
@@ -1312,6 +1320,19 @@ impl App {
     ) -> Connection {
         let dtr = port_config.dtr_on_open;
         let rts = port_config.rts_on_open;
+        // A saved profile can name highlight and extraction rules for its
+        // device — "this board prints PLOT: lines, plot them". They are matched
+        // by device identity rather than by how the tab came to be open, so a
+        // port opened by hand, restored from `last_open` or auto-connected all
+        // get them (issue #44).
+        let profile = self
+            .config
+            .profiles
+            .iter()
+            .find(|p| identities_match(&p.identity, &identity));
+        let extract_rules = profile.map(|p| p.extract.clone()).unwrap_or_default();
+        let profile_highlight =
+            compile_highlight_rules(profile.map(|p| p.highlight.as_slice()).unwrap_or(&[]));
         Connection {
             id,
             label,
@@ -1330,6 +1351,7 @@ impl App {
             raw_ring: VecDeque::new(),
             raw_base: 0,
             raw_sessions: Vec::new(),
+            profile_highlight,
             last_error: None,
             mark_micros: None,
             hex_view: false,
@@ -1346,9 +1368,11 @@ impl App {
             selected: None,
             scroll_to: None,
             merged_upto: 0,
-            extract_rules: Vec::new(),
+            // Dirty when the profile brought rules, so the first frame
+            // compiles them and reads the console history they apply to.
+            extract_dirty: !extract_rules.is_empty(),
+            extract_rules,
             extract_compiled: Vec::new(),
-            extract_dirty: false,
             extract_errors: Vec::new(),
             series: Vec::new(),
             series_index: HashMap::new(),
@@ -1615,23 +1639,7 @@ impl App {
             return;
         }
         self.highlight_dirty = false;
-        self.highlight_cache.clear();
-        for rule in &self.config.highlight {
-            if !rule.enabled || rule.pattern.is_empty() {
-                continue;
-            }
-            let Ok(re) = regex::RegexBuilder::new(&rule.pattern)
-                .case_insensitive(true)
-                .build()
-            else {
-                continue;
-            };
-            self.highlight_cache.push(CompiledHighlight {
-                re,
-                color: parse_hex_color(&rule.color)
-                    .unwrap_or(egui::Color32::from_rgb(0xff, 0x55, 0x55)),
-            });
-        }
+        self.highlight_cache = compile_highlight_rules(&self.config.highlight);
     }
 
     /// Extend/rebuild each connection's filter index and prune evicted entries.
@@ -1895,6 +1903,30 @@ impl App {
         conn.selected = Some(abs);
         conn.scroll_to = Some(abs);
     }
+}
+
+/// Compile the enabled, non-empty rules; ones whose regex won't build are
+/// skipped. Shared by the global set and a profile's own (see
+/// [`Connection::profile_highlight`]).
+fn compile_highlight_rules(rules: &[serialcore::config::HighlightRule]) -> Vec<CompiledHighlight> {
+    let mut out = Vec::new();
+    for rule in rules {
+        if !rule.enabled || rule.pattern.is_empty() {
+            continue;
+        }
+        let Ok(re) = regex::RegexBuilder::new(&rule.pattern)
+            .case_insensitive(true)
+            .build()
+        else {
+            continue;
+        };
+        out.push(CompiledHighlight {
+            re,
+            color: parse_hex_color(&rule.color)
+                .unwrap_or(egui::Color32::from_rgb(0xff, 0x55, 0x55)),
+        });
+    }
+    out
 }
 
 /// Parse `#rrggbb` into a colour.
@@ -2893,5 +2925,94 @@ mod tests {
             app.connections[0].last_error.as_ref().unwrap().msg,
             "transmit: dropped, not connected"
         );
+    }
+
+    /// Issue #44: `Profile::highlight` and `Profile::extract` parsed from the
+    /// config, round-tripped back out on save, and were read by nothing. A
+    /// per-device profile's whole point — "this board prints PLOT: lines, plot
+    /// them" — silently did not happen.
+    #[test]
+    fn a_profile_seeds_its_device_s_extraction_and_highlight_rules() {
+        let (mut app, _enum_tx) = test_app("profile-rules");
+        let dev = identity("A1");
+        let mut profile = auto_connect_profile(dev.clone());
+        profile.extract = vec![ExtractRule {
+            mode: serialcore::config::ExtractMode::Kv,
+            prefix: Some("PLOT:".into()),
+            pattern: None,
+            kv_separators: None,
+        }];
+        profile.highlight = vec![serialcore::config::HighlightRule {
+            pattern: "PANIC".into(),
+            color: "#ff0000".into(),
+            bold: false,
+            enabled: true,
+        }];
+        app.config.profiles.push(profile);
+
+        let id = PortId(0);
+        let conn = app.make_connection(
+            id,
+            "probe".into(),
+            dev,
+            PortConfig::default(),
+            inert_handle(id),
+        );
+
+        assert_eq!(conn.extract_rules.len(), 1, "the rule came across");
+        assert_eq!(conn.extract_rules[0].prefix.as_deref(), Some("PLOT:"));
+        assert!(
+            conn.extract_dirty,
+            "and is compiled on the first frame, so it reads the history it applies to"
+        );
+        assert_eq!(conn.profile_highlight.len(), 1);
+        assert!(conn.profile_highlight[0].re.is_match("PANIC in task 3"));
+        assert_eq!(
+            conn.profile_highlight[0].color,
+            egui::Color32::from_rgb(0xff, 0, 0)
+        );
+    }
+
+    /// The rules follow the *device*, not how the tab came to be open, so a
+    /// port opened by hand picks up its profile's rules too. And a device with
+    /// no profile is left exactly as it was.
+    #[test]
+    fn profile_rules_are_matched_by_device_not_by_how_the_tab_opened() {
+        let (mut app, _enum_tx) = test_app("profile-rules-identity");
+        // The saved profile and the live connection disagree on
+        // `path_fallback`, as they routinely do across replugs — struct
+        // equality would miss the match.
+        let mut saved = identity("A1");
+        saved.path_fallback = "COM3".into();
+        let mut profile = auto_connect_profile(saved);
+        profile.extract = vec![ExtractRule {
+            mode: serialcore::config::ExtractMode::Kv,
+            prefix: None,
+            pattern: None,
+            kv_separators: None,
+        }];
+        app.config.profiles.push(profile);
+
+        let mut live = identity("A1");
+        live.path_fallback = "COM7".into();
+        let conn = app.make_connection(
+            PortId(0),
+            "probe".into(),
+            live,
+            PortConfig::default(),
+            inert_handle(PortId(0)),
+        );
+        assert_eq!(conn.extract_rules.len(), 1);
+
+        let stranger = app.make_connection(
+            PortId(1),
+            "other".into(),
+            identity("ZZ"),
+            PortConfig::default(),
+            inert_handle(PortId(1)),
+        );
+        assert!(stranger.extract_rules.is_empty());
+        assert!(stranger.profile_highlight.is_empty());
+        assert!(!stranger.extract_dirty, "nothing to compile");
     }
 }
