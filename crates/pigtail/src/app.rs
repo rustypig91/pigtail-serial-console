@@ -1302,7 +1302,7 @@ impl App {
         self.write_config();
     }
 
-    fn make_connection(
+    pub(crate) fn make_connection(
         &self,
         id: PortId,
         label: String,
@@ -1968,7 +1968,7 @@ impl eframe::App for App {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serialcore::config::Profile;
     use serialcore::session::SessionWriter;
@@ -2239,7 +2239,7 @@ mod tests {
     /// A minimal `App`, built by hand rather than through `App::new` (which
     /// needs a live `eframe::CreationContext`). Its own enumerator channel is
     /// swapped for one this test controls.
-    fn test_app(name: &str) -> (App, crossbeam_channel::Sender<EnumEvent>) {
+    pub(crate) fn test_app(name: &str) -> (App, crossbeam_channel::Sender<EnumEvent>) {
         test_app_with_config(name, Config::default())
     }
 
@@ -2268,7 +2268,7 @@ mod tests {
     /// A reader handle backed by no real device, for tests that only care
     /// about connection bookkeeping. Its thread exits as soon as it is asked
     /// to shut down.
-    fn inert_handle(id: PortId) -> reader::ReaderHandle {
+    pub(crate) fn inert_handle(id: PortId) -> reader::ReaderHandle {
         let config = reader::ReaderConfig {
             port_id: id,
             clock: SessionClock::new(),
