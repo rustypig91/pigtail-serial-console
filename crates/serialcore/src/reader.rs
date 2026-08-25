@@ -17,6 +17,7 @@ use crate::source::{ByteSource, SerialSource, SourceError};
 use crate::store::{LineFlags, PortId};
 use crate::wake::Wake;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -319,7 +320,7 @@ fn run(
     };
 
     let mut framer = Framer::with_mode(config.terminal);
-    let mut backlog: Vec<Batch> = Vec::new();
+    let mut backlog: VecDeque<Batch> = VecDeque::new();
     // Lives outside the connect loop only so a `ClearLog` arriving during a
     // reconnect backoff can empty it too; it is always drained before a
     // disconnect, so each connection still starts with an empty batch.
@@ -379,7 +380,7 @@ fn run(
         if let Some(lost) = lost_at.take() {
             let outage = lost.elapsed();
             let marker = reconnect_marker(&clock, outage);
-            backlog.push(Batch {
+            backlog.push_back(Batch {
                 lines: vec![marker],
                 raw: Vec::new(),
             });
@@ -537,7 +538,7 @@ struct ClearTargets<'a> {
     writer: &'a mut Option<SessionWriter>,
     framer: &'a mut Framer,
     pending: &'a mut Batch,
-    backlog: &'a mut Vec<Batch>,
+    backlog: &'a mut VecDeque<Batch>,
 }
 
 /// Discard the capture written so far plus everything still queued here. Data
@@ -607,21 +608,39 @@ fn drain_commands(
 /// Move `pending` into the backlog, then try to push backlog entries onto the
 /// channel. If the channel is full we keep them in the backlog and keep reading
 /// (rule 2: never block on the UI).
-fn flush_batch(pending: &mut Batch, backlog: &mut Vec<Batch>, event_tx: &EventTx) {
+fn flush_batch(pending: &mut Batch, backlog: &mut VecDeque<Batch>, event_tx: &EventTx) {
     if pending.lines.is_empty() && pending.raw.is_empty() {
         return;
     }
-    backlog.push(std::mem::take(pending));
+    backlog.push_back(std::mem::take(pending));
     drain_backlog(backlog, event_tx);
 }
 
-fn drain_backlog(backlog: &mut Vec<Batch>, event_tx: &EventTx) {
-    while let Some(batch) = backlog.first() {
-        match event_tx.try_send(ReaderEvent::Batch(batch.clone())) {
-            Ok(()) => {
-                backlog.remove(0);
+/// Hand as much of the backlog to the UI as the channel will take.
+///
+/// Every byte the reader produces passes through here, so a batch is *moved*
+/// onto the channel rather than copied onto it: a `Batch` owns up to a whole
+/// `READ_BUF` of raw bytes plus a `String` per line, and cloning one to satisfy
+/// a borrow — then dropping the original — was a full memcpy and a fresh
+/// allocation per line on the hot path, for nothing. `TrySendError::Full` hands
+/// the value back, which is what makes the move safe: a batch the channel
+/// refuses goes back on the front, in order, and is retried later.
+///
+/// The front is also where entries are taken from, hence `VecDeque`: draining
+/// *n* batches out of a `Vec` with `remove(0)` is O(n²), and the moment that
+/// matters is when the reader is already behind.
+fn drain_backlog(backlog: &mut VecDeque<Batch>, event_tx: &EventTx) {
+    while let Some(batch) = backlog.pop_front() {
+        match event_tx.try_send(ReaderEvent::Batch(batch)) {
+            Ok(()) => {}
+            // Keep accumulating; retry later. Order is preserved: this one goes
+            // back where it came from, ahead of everything queued behind it.
+            Err(TrySendError::Full(ev)) => {
+                if let ReaderEvent::Batch(batch) = ev {
+                    backlog.push_front(batch);
+                }
+                break;
             }
-            Err(TrySendError::Full(_)) => break, // keep accumulating; retry later
             Err(TrySendError::Disconnected(_)) => {
                 backlog.clear();
                 break;
@@ -899,6 +918,72 @@ mod tests {
         handle.shutdown();
     }
 
+    /// A backlog is only ever built when the UI is behind, and it has to come
+    /// back out in the order it went in, whole. The batches are *moved* onto
+    /// the channel now rather than cloned onto it (issue #42), and a move is
+    /// only safe because a refused send hands the value back — so this pins
+    /// down that a batch the channel would not take is put back on the front
+    /// rather than dropped or reordered.
+    #[test]
+    fn a_full_channel_holds_the_backlog_in_order_and_loses_nothing() {
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        let event_tx = EventTx {
+            tx,
+            wake: Wake::none(),
+        };
+        let mut backlog: VecDeque<Batch> = (0..5)
+            .map(|n| Batch {
+                lines: Vec::new(),
+                raw: vec![n as u8],
+            })
+            .collect();
+
+        // Only two fit.
+        drain_backlog(&mut backlog, &event_tx);
+        assert_eq!(backlog.len(), 3, "the rest stays put");
+        assert_eq!(
+            backlog.front().map(|b| b.raw.clone()),
+            Some(vec![2]),
+            "and the one the channel refused is back at the front, not dropped"
+        );
+
+        // The UI drains; the rest follows, still in order.
+        let mut seen = Vec::new();
+        while let Ok(ReaderEvent::Batch(b)) = rx.try_recv() {
+            seen.push(b.raw[0]);
+        }
+        drain_backlog(&mut backlog, &event_tx);
+        while let Ok(ReaderEvent::Batch(b)) = rx.try_recv() {
+            seen.push(b.raw[0]);
+        }
+        drain_backlog(&mut backlog, &event_tx);
+        while let Ok(ReaderEvent::Batch(b)) = rx.try_recv() {
+            seen.push(b.raw[0]);
+        }
+        assert!(backlog.is_empty());
+        assert_eq!(seen, vec![0, 1, 2, 3, 4], "every batch, once, in order");
+    }
+
+    /// A receiver that has gone away takes the backlog with it rather than
+    /// leaving the reader retrying a send that can never land.
+    #[test]
+    fn a_disconnected_channel_clears_the_backlog() {
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        drop(rx);
+        let event_tx = EventTx {
+            tx,
+            wake: Wake::none(),
+        };
+        let mut backlog: VecDeque<Batch> = (0..3)
+            .map(|n| Batch {
+                lines: Vec::new(),
+                raw: vec![n as u8],
+            })
+            .collect();
+        drain_backlog(&mut backlog, &event_tx);
+        assert!(backlog.is_empty());
+    }
+
     /// Regression test for #6: a `Transmit`/`SetDtr`/`SetRts`/`SendBreak`
     /// arriving during reconnect backoff has nowhere to go (there is no open
     /// source to write to), but it must not vanish without a trace — the UI
@@ -920,7 +1005,7 @@ mod tests {
             let mut writer: Option<SessionWriter> = None;
             let mut framer = Framer::with_mode(crate::config::TerminalMode::Classic);
             let mut pending = Batch::default();
-            let mut backlog: Vec<Batch> = Vec::new();
+            let mut backlog: VecDeque<Batch> = VecDeque::new();
 
             cmd_tx.send(cmd).unwrap();
             let targets = ClearTargets {
