@@ -947,7 +947,16 @@ impl App {
     }
 
     /// Open the modal new-connection dialog, seeded with sensible defaults.
+    ///
+    /// A no-op while a dialog is already open: replacing it would throw away
+    /// whatever the user has filled in so far (issue #16). `show_header`
+    /// disables the controls that lead here for the same reason, but the
+    /// guard lives here so every entry point — including the empty-console
+    /// "+ New connection" button — is covered by construction.
     pub fn open_config_dialog(&mut self) {
+        if self.config_dialog.is_some() {
+            return;
+        }
         let selected_path = self.available.first().map(|p| p.path.clone());
         self.config_dialog = Some(ConfigDialog {
             selected_path,
@@ -959,7 +968,12 @@ impl App {
 
     /// Open the config dialog to edit an existing tab's port options. Applying
     /// it reconnects that tab with the new settings.
+    /// Like `open_config_dialog`, this leaves an already-open dialog alone
+    /// rather than discarding its in-progress edits.
     pub fn open_port_options(&mut self, index: usize) {
+        if self.config_dialog.is_some() {
+            return;
+        }
         let Some(conn) = self.connections.get(index) else {
             return;
         };
@@ -1064,6 +1078,17 @@ impl App {
         config: PortConfig,
     ) {
         let Some(index) = self.connections.iter().position(|c| c.id == port_id) else {
+            // The tab the dialog was editing is gone. `show_header` disables
+            // closing a tab while the dialog is up, so this should not be
+            // reachable from the UI — but returning silently would close the
+            // dialog as if "Apply & reconnect" had worked (issue #16), so say
+            // so instead of pretending.
+            self.record_connect_error(
+                "Couldn't reconnect",
+                "the tab these port options belong to is no longer open, so there \
+                 is nothing to reconnect."
+                    .to_string(),
+            );
             return;
         };
         let old_identity = self.connections[index].identity.clone();
@@ -1156,16 +1181,39 @@ impl App {
     }
 
     /// Connect using the current dialog state, then close it.
+    ///
+    /// Every path below has already taken the dialog, so a silent return
+    /// would close it as if "Connect" had worked (issue #16) — the same
+    /// pretend-success `reconnect_with_config` reports on rather than hides.
     pub fn connect_from_dialog(&mut self) {
         let Some(dialog) = self.config_dialog.take() else {
             return;
         };
         let Some(path) = dialog.selected_path else {
+            // "Connect" is only enabled with a port selected, so this is not
+            // reachable by hand.
+            self.record_connect_error(
+                "Couldn't connect",
+                "no port was selected, so there is nothing to connect to.".to_string(),
+            );
             return;
         };
-        if let Some(port) = self.available.iter().find(|p| p.path == path).cloned() {
-            self.open_connection(port.identity, Some(port.path), dialog.config);
-        }
+        let Some(port) = self.available.iter().find(|p| p.path == path).cloned() else {
+            // Unlike the arm above this one *is* reachable: the port list is
+            // refreshed in the background, so a device that unplugs or
+            // re-enumerates between filling the dialog in and pressing
+            // Connect leaves the selected path behind, naming nothing.
+            self.record_connect_error(
+                "Couldn't connect",
+                format!(
+                    "{path} is no longer among the detected ports — it may have been \
+                     unplugged or renamed. Open a new connection to pick from the \
+                     ports present now."
+                ),
+            );
+            return;
+        };
+        self.open_connection(port.identity, Some(port.path), dialog.config);
     }
 
     /// Lower-level open used by manual connect and profile auto-connect. Saves
@@ -2660,6 +2708,104 @@ mod tests {
             app.auto_connect_suppressed.is_empty(),
             "closing an already-dead zombie tab must not suppress \
              auto-connect for its device"
+        );
+    }
+
+    /// The config dialog is modal: while one is open, the paths that would
+    /// open another (the header's "+", the empty console's "+ New
+    /// connection") must leave the in-progress form alone rather than
+    /// replacing it with a fresh one (issue #16).
+    #[test]
+    fn open_config_dialog_keeps_an_in_progress_dialog() {
+        let (mut app, _enum_tx) = test_app("dialog-clobber-new");
+
+        app.open_config_dialog();
+        app.config_dialog.as_mut().unwrap().preset_name = "half typed".into();
+        app.config_dialog.as_mut().unwrap().config.baud = 4800;
+
+        app.open_config_dialog();
+
+        let dialog = app.config_dialog.as_ref().expect("dialog still open");
+        assert_eq!(dialog.preset_name, "half typed");
+        assert_eq!(dialog.config.baud, 4800, "edits survive a second open");
+    }
+
+    /// Same for "Port options…" on a tab: it must not discard a dialog that
+    /// is already up, whichever tab that dialog belongs to.
+    #[test]
+    fn open_port_options_keeps_an_in_progress_dialog() {
+        let (mut app, _enum_tx) = test_app("dialog-clobber-options");
+
+        for (i, serial) in ["A1", "B2"].iter().enumerate() {
+            let id = PortId(i as u32);
+            let conn = app.make_connection(
+                id,
+                format!("probe {serial}"),
+                identity(serial),
+                PortConfig::default(),
+                inert_handle(id),
+            );
+            app.connections.push(conn);
+        }
+
+        app.open_port_options(0);
+        app.config_dialog.as_mut().unwrap().config.baud = 4800;
+
+        app.open_port_options(1);
+
+        let dialog = app.config_dialog.as_ref().expect("dialog still open");
+        assert_eq!(
+            dialog.editing,
+            Some(PortId(0)),
+            "the dialog still edits the tab it was opened for"
+        );
+        assert_eq!(dialog.config.baud, 4800, "its edits are not discarded");
+    }
+
+    /// Applying port options to a tab that is no longer open must say so
+    /// rather than closing the dialog as if the reconnect had happened
+    /// (issue #16).
+    #[test]
+    fn reconnect_with_config_reports_a_vanished_tab() {
+        let (mut app, _enum_tx) = test_app("reconnect-vanished");
+
+        app.reconnect_with_config(PortId(7), None, PortConfig::default());
+
+        let err = app
+            .connect_errors
+            .front()
+            .expect("a vanished tab is reported, not silently ignored");
+        assert_eq!(err.title, "Couldn't reconnect");
+    }
+
+    /// The same rule for a *new* connection: the port list is refreshed in
+    /// the background, so the selected path can stop naming a detected port
+    /// between filling the dialog in and pressing Connect. Closing the dialog
+    /// with no tab and no message would look exactly like success (issue #16).
+    #[test]
+    fn connect_from_dialog_reports_a_vanished_port() {
+        let (mut app, _enum_tx) = test_app("connect-vanished");
+
+        app.config_dialog = Some(ConfigDialog {
+            selected_path: Some("/dev/ttyUSB0".into()),
+            config: PortConfig::default(),
+            preset_name: String::new(),
+            editing: None,
+        });
+        // `available` is empty: the device is gone by the time Connect lands.
+        app.connect_from_dialog();
+
+        assert!(app.config_dialog.is_none(), "the dialog still closes");
+        assert!(app.connections.is_empty(), "no tab is opened");
+        let err = app
+            .connect_errors
+            .front()
+            .expect("a vanished port is reported, not silently ignored");
+        assert_eq!(err.title, "Couldn't connect");
+        assert!(
+            err.message.contains("/dev/ttyUSB0"),
+            "the message names the port that went away: {}",
+            err.message
         );
     }
 }
