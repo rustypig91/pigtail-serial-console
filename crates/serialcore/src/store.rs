@@ -181,12 +181,13 @@ impl LineStore {
         if line.flags.contains(LineFlags::CONTINUATION) {
             if let Some(last) = self.lines.last_mut() {
                 if last.flags.contains(LineFlags::PROVISIONAL) {
-                    // Re-append bytes; the old bytes become dead space reclaimed
-                    // at the next eviction. Provisional continuations are rare
-                    // relative to normal lines, so this waste is bounded.
-                    let start = self.arena.len() as u64 + self.arena_base;
+                    // The provisional line is always the arena's current tail
+                    // (nothing else can extend the arena past an open
+                    // provisional line), so replace it in place rather than
+                    // re-appending: no dead bytes are ever stranded, however
+                    // many lines are resident ahead of it.
+                    self.arena.truncate(last.start as usize);
                     self.arena.extend_from_slice(line.text.as_bytes());
-                    last.start = (start - self.arena_base) as u32;
                     last.len = line.text.len() as u32;
                     last.ts = line.ts;
                     let mut flags = line.flags;
@@ -195,9 +196,9 @@ impl LineStore {
                     last.spans = line.spans;
                     last.cursor = line.cursor;
                     let abs = self.line_base + (self.lines.len() as u64 - 1);
-                    // Line count never changes here, but the arena still
-                    // grows with every re-append, so it needs its own
-                    // byte-budget check (issue #5).
+                    // Line count never changes here, but a very large single
+                    // continuation could still blow past the byte budget on
+                    // its own, so it needs its own check (issue #5).
                     self.maybe_evict();
                     return abs;
                 }
@@ -305,20 +306,10 @@ impl LineStore {
     /// Evict from the front in a ~10% chunk when over capacity. Never one line
     /// at a time (that would be O(n) per line, spec §7.7). Also evicts on
     /// arena byte size alone, independent of line count: a stream of
-    /// truncated lines (or repeated provisional continuations) can blow past
-    /// `MAX_ARENA_BYTES` in far fewer lines than `max_lines`, and letting the
-    /// arena reach `u32::MAX` bytes would wrap `LineMeta::start` (issue #5).
+    /// truncated lines can blow past `MAX_ARENA_BYTES` in far fewer lines
+    /// than `max_lines`, and letting the arena reach `u32::MAX` bytes would
+    /// wrap `LineMeta::start` (issue #5).
     fn maybe_evict(&mut self) {
-        if self.arena.len() > MAX_ARENA_BYTES {
-            // Re-appending a provisional line in place (see `append`) leaves
-            // its old bytes dead in the arena without changing `self.lines`
-            // at all. When that's the only resident line, no eviction target
-            // for `by_bytes` below can ever exist -- its own `start` is
-            // always near the tail -- so the dead space has to be reclaimed
-            // directly first, independent of evicting any line.
-            self.reclaim_dead_prefix();
-        }
-
         let by_lines = if self.lines.len() > self.max_lines {
             (self.max_lines / 10).max(1).min(self.lines.len())
         } else {
@@ -338,28 +329,6 @@ impl LineStore {
         let evict_count = by_lines.max(by_bytes);
         if evict_count > 0 {
             self.evict(evict_count);
-        }
-    }
-
-    /// Drop the dead-byte prefix before the first resident line's `start`,
-    /// without evicting any line. That prefix is bytes an in-place
-    /// continuation replace (`append`) stranded when it moved a line's data
-    /// to the arena's tail -- always a contiguous run starting at 0, since
-    /// the arena is otherwise append-only and `lines` stays sorted by
-    /// `start`. A no-op once nothing is stranded.
-    fn reclaim_dead_prefix(&mut self) {
-        let dead = self
-            .lines
-            .first()
-            .map(|m| m.start as usize)
-            .unwrap_or(self.arena.len());
-        if dead == 0 {
-            return;
-        }
-        self.arena.drain(..dead);
-        self.arena_base += dead as u64;
-        for m in &mut self.lines {
-            m.start -= dead as u32;
         }
     }
 
@@ -663,5 +632,39 @@ mod tests {
             chunk,
             "the live line still reads correctly"
         );
+    }
+
+    #[test]
+    fn continuation_replace_does_not_strand_bytes_behind_earlier_lines() {
+        // The realistic case: some scrollback is already resident ahead of
+        // the line being continued (e.g. a progress line updating after
+        // earlier output). A continuation replace must not leave its old
+        // bytes dead in the middle of the arena -- if it did, `arena.len()`
+        // would inflate on every replace and eventually trigger `by_bytes`
+        // eviction of the unrelated earlier lines, even though live content
+        // never approaches the byte budget.
+        let clock = SessionClock::new();
+        let mut s = LineStore::new(1_000_000);
+        let earlier = s.append(incoming("earlier line still wanted", &clock));
+
+        let mut prov = incoming("start", &clock);
+        prov.flags = LineFlags::PROVISIONAL;
+        let idx = s.append(prov);
+
+        let chunk = "y".repeat(50);
+        for _ in 0..200 {
+            let mut cont = incoming(&chunk, &clock);
+            cont.flags = LineFlags::PROVISIONAL | LineFlags::CONTINUATION;
+            let idx2 = s.append(cont);
+            assert_eq!(idx2, idx, "still the same line, replaced in place");
+        }
+
+        assert!(
+            !s.evicted_any(),
+            "repeated updates to one line must not evict unrelated earlier lines"
+        );
+        assert_eq!(s.len(), 2, "both lines should still be resident");
+        assert_eq!(s.get(earlier).unwrap().text, "earlier line still wanted");
+        assert_eq!(s.get(idx).unwrap().text, chunk);
     }
 }
