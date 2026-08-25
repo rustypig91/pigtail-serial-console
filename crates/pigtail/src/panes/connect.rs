@@ -50,47 +50,66 @@ impl App {
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if modal_open {
-                    ui.disable();
-                }
-                for (i, conn) in self.connections.iter().enumerate() {
-                    let selected = !self.merged_selected && self.active == i;
-                    let label = format!("{} {}", state_dot(conn.state), short_label(&conn.label));
-                    let resp = ui.selectable_label(selected, label).on_hover_text(format!(
-                        "{}\n(middle-click or right-click to close)",
-                        conn.label
-                    ));
-                    if resp.clicked() {
-                        set_active = Some(i);
-                    }
-                    // Middle-click closes the tab.
-                    if resp.middle_clicked() {
-                        to_close = Some(i);
-                    }
-                    // Right-click menu on the tab.
-                    resp.context_menu(|ui| {
-                        if ui.button("Port options…").clicked() {
-                            port_options = Some(i);
-                            ui.close_menu();
+                // Only the tab strip and "+" are disabled: the settings gear
+                // and save-view button below act on neither the dialog nor
+                // the set of tabs, so there is nothing for them to corrupt.
+                ui.add_enabled_ui(!modal_open, |ui| {
+                    for (i, conn) in self.connections.iter().enumerate() {
+                        let selected = !self.merged_selected && self.active == i;
+                        let label =
+                            format!("{} {}", state_dot(conn.state), short_label(&conn.label));
+                        // `on_hover_text` only fires on an *enabled* widget,
+                        // so a disabled tab needs its own tooltip — without
+                        // one the header would be reduced to truncated
+                        // `short_label`s with no way to tell which device a
+                        // tab is while the dialog is up.
+                        let resp = ui
+                            .selectable_label(selected, label)
+                            .on_hover_text(format!(
+                                "{}\n(middle-click or right-click to close)",
+                                conn.label
+                            ))
+                            .on_disabled_hover_text(format!(
+                                "{}\n(finish or cancel the open dialog first)",
+                                conn.label
+                            ));
+                        if resp.clicked() {
+                            set_active = Some(i);
                         }
-                        if ui.button("Close tab").clicked() {
+                        // Middle-click closes the tab.
+                        if resp.middle_clicked() {
                             to_close = Some(i);
-                            ui.close_menu();
                         }
-                    });
-                }
+                        // Right-click menu on the tab.
+                        resp.context_menu(|ui| {
+                            if ui.button("Port options…").clicked() {
+                                port_options = Some(i);
+                                ui.close_menu();
+                            }
+                            if ui.button("Close tab").clicked() {
+                                to_close = Some(i);
+                                ui.close_menu();
+                            }
+                        });
+                    }
 
-                if self.connections.len() >= 2
-                    && ui
-                        .selectable_label(self.merged_selected, "Merged")
+                    if self.connections.len() >= 2
+                        && ui
+                            .selectable_label(self.merged_selected, "Merged")
+                            .clicked()
+                    {
+                        select_merged = true;
+                    }
+
+                    if ui
+                        .button("+")
+                        .on_hover_text("New connection")
+                        .on_disabled_hover_text("Finish or cancel the open dialog first")
                         .clicked()
-                {
-                    select_merged = true;
-                }
-
-                if ui.button("+").on_hover_text("New connection").clicked() {
-                    new_tab = true;
-                }
+                    {
+                        new_tab = true;
+                    }
+                });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("⚙").on_hover_text("Settings").clicked() {
@@ -349,6 +368,19 @@ impl App {
                         // identity even if the device isn't currently listed, so
                         // the apply button need not require a selected path.
                         let can = editing || dialog.selected_path.is_some();
+                        // A profile is built from a *listed* port (it needs
+                        // that port's identity, which only the detected-port
+                        // list carries), so unlike `can` this cannot fall
+                        // back on the edited tab: `open_port_options` leaves
+                        // `selected_path` empty for a tab whose device is
+                        // currently unplugged, and a selected path can go
+                        // stale while the dialog is open. Gating on the
+                        // lookup `save_dialog_as_profile` performs keeps the
+                        // button from being a silent no-op.
+                        let can_save_profile = dialog
+                            .selected_path
+                            .as_ref()
+                            .is_some_and(|path| available.iter().any(|p| &p.path == path));
                         let apply_label = if editing {
                             "Apply & reconnect"
                         } else {
@@ -364,8 +396,12 @@ impl App {
                             do_cancel = true;
                         }
                         if ui
-                            .add_enabled(can, egui::Button::new("Save as profile"))
+                            .add_enabled(can_save_profile, egui::Button::new("Save as profile"))
                             .on_hover_text("Persist device identity + params, with auto-connect")
+                            .on_disabled_hover_text(
+                                "Select a detected port above — a profile stores the \
+                                 device's identity, which only a listed port carries",
+                            )
                             .clicked()
                         {
                             save_profile = true;

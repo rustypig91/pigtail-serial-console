@@ -1181,16 +1181,39 @@ impl App {
     }
 
     /// Connect using the current dialog state, then close it.
+    ///
+    /// Every path below has already taken the dialog, so a silent return
+    /// would close it as if "Connect" had worked (issue #16) — the same
+    /// pretend-success `reconnect_with_config` reports on rather than hides.
     pub fn connect_from_dialog(&mut self) {
         let Some(dialog) = self.config_dialog.take() else {
             return;
         };
         let Some(path) = dialog.selected_path else {
+            // "Connect" is only enabled with a port selected, so this is not
+            // reachable by hand.
+            self.record_connect_error(
+                "Couldn't connect",
+                "no port was selected, so there is nothing to connect to.".to_string(),
+            );
             return;
         };
-        if let Some(port) = self.available.iter().find(|p| p.path == path).cloned() {
-            self.open_connection(port.identity, Some(port.path), dialog.config);
-        }
+        let Some(port) = self.available.iter().find(|p| p.path == path).cloned() else {
+            // Unlike the arm above this one *is* reachable: the port list is
+            // refreshed in the background, so a device that unplugs or
+            // re-enumerates between filling the dialog in and pressing
+            // Connect leaves the selected path behind, naming nothing.
+            self.record_connect_error(
+                "Couldn't connect",
+                format!(
+                    "{path} is no longer among the detected ports — it may have been \
+                     unplugged or renamed. Open a new connection to pick from the \
+                     ports present now."
+                ),
+            );
+            return;
+        };
+        self.open_connection(port.identity, Some(port.path), dialog.config);
     }
 
     /// Lower-level open used by manual connect and profile auto-connect. Saves
@@ -2753,5 +2776,36 @@ mod tests {
             .front()
             .expect("a vanished tab is reported, not silently ignored");
         assert_eq!(err.title, "Couldn't reconnect");
+    }
+
+    /// The same rule for a *new* connection: the port list is refreshed in
+    /// the background, so the selected path can stop naming a detected port
+    /// between filling the dialog in and pressing Connect. Closing the dialog
+    /// with no tab and no message would look exactly like success (issue #16).
+    #[test]
+    fn connect_from_dialog_reports_a_vanished_port() {
+        let (mut app, _enum_tx) = test_app("connect-vanished");
+
+        app.config_dialog = Some(ConfigDialog {
+            selected_path: Some("/dev/ttyUSB0".into()),
+            config: PortConfig::default(),
+            preset_name: String::new(),
+            editing: None,
+        });
+        // `available` is empty: the device is gone by the time Connect lands.
+        app.connect_from_dialog();
+
+        assert!(app.config_dialog.is_none(), "the dialog still closes");
+        assert!(app.connections.is_empty(), "no tab is opened");
+        let err = app
+            .connect_errors
+            .front()
+            .expect("a vanished port is reported, not silently ignored");
+        assert_eq!(err.title, "Couldn't connect");
+        assert!(
+            err.message.contains("/dev/ttyUSB0"),
+            "the message names the port that went away: {}",
+            err.message
+        );
     }
 }
