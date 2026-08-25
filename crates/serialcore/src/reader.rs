@@ -646,10 +646,34 @@ fn wait_or_shutdown(
             clear_log(targets, event_tx);
             false
         }
-        Ok(_) => false, // ignore control commands while disconnected
+        // Nothing to write to while disconnected, and staying here until
+        // reconnect would just delay input the user typed against a stale
+        // idea of the link. Report it instead of silently eating it.
+        Ok(ReaderCommand::Transmit(_)) => {
+            report_dropped_command(event_tx, "transmit");
+            false
+        }
+        Ok(ReaderCommand::SetDtr(_)) => {
+            report_dropped_command(event_tx, "dtr");
+            false
+        }
+        Ok(ReaderCommand::SetRts(_)) => {
+            report_dropped_command(event_tx, "rts");
+            false
+        }
+        Ok(ReaderCommand::SendBreak) => {
+            report_dropped_command(event_tx, "break");
+            false
+        }
         Err(crossbeam_channel::RecvTimeoutError::Timeout) => false,
         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => true,
     }
+}
+
+fn report_dropped_command(event_tx: &EventTx, label: &str) {
+    event_tx.send(ReaderEvent::session_error(format!(
+        "{label}: dropped, not connected"
+    )));
 }
 
 fn reconnect_marker(clock: &SessionClock, outage: Duration) -> FramedLine {
@@ -873,5 +897,48 @@ mod tests {
         }
         assert!(got_provisional, "expected a provisional prompt line");
         handle.shutdown();
+    }
+
+    /// Regression test for #6: a `Transmit`/`SetDtr`/`SetRts`/`SendBreak`
+    /// arriving during reconnect backoff has nowhere to go (there is no open
+    /// source to write to), but it must not vanish without a trace — the UI
+    /// needs an `Error` to tell the user their input was dropped.
+    #[test]
+    fn commands_dropped_while_reconnecting_are_reported() {
+        for (cmd, expected_label) in [
+            (ReaderCommand::Transmit(b"hi".to_vec()), "transmit"),
+            (ReaderCommand::SetDtr(true), "dtr"),
+            (ReaderCommand::SetRts(true), "rts"),
+            (ReaderCommand::SendBreak, "break"),
+        ] {
+            let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+            let (event_tx, event_rx) = crossbeam_channel::bounded(8);
+            let event_tx = EventTx {
+                tx: event_tx,
+                wake: Wake::none(),
+            };
+            let mut writer: Option<SessionWriter> = None;
+            let mut framer = Framer::with_mode(crate::config::TerminalMode::Classic);
+            let mut pending = Batch::default();
+            let mut backlog: Vec<Batch> = Vec::new();
+
+            cmd_tx.send(cmd).unwrap();
+            let targets = ClearTargets {
+                writer: &mut writer,
+                framer: &mut framer,
+                pending: &mut pending,
+                backlog: &mut backlog,
+            };
+            let shutdown = wait_or_shutdown(&cmd_rx, Duration::from_millis(10), targets, &event_tx);
+            assert!(!shutdown);
+
+            match event_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(ReaderEvent::Error {
+                    scope: ErrorScope::Session,
+                    msg,
+                }) => assert!(msg.contains(expected_label), "unexpected message: {msg}"),
+                other => panic!("expected a session error, got {other:?}"),
+            }
+        }
     }
 }

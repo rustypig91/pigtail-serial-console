@@ -464,7 +464,24 @@ impl Connection {
                 }
                 ReaderEvent::Error { scope, msg } => {
                     tracing::warn!(port = self.id.0, "{msg}");
-                    self.last_error = Some(TabError { scope, msg });
+                    // A dropped-command notice (session-scoped) while the link
+                    // itself is down would otherwise clobber the connection
+                    // error explaining *why* — and unlike a connection error,
+                    // nothing later clears it, so it would keep hiding the
+                    // real cause for the rest of the outage. The link being
+                    // down already implies commands can't get through, so
+                    // just keep showing that.
+                    let hides_connection_error = scope == ErrorScope::Session
+                        && matches!(
+                            self.last_error,
+                            Some(TabError {
+                                scope: ErrorScope::Connection,
+                                ..
+                            })
+                        );
+                    if !hides_connection_error {
+                        self.last_error = Some(TabError { scope, msg });
+                    }
                 }
                 ReaderEvent::Batch(batch) => {
                     self.open_live_raw_session();
@@ -2813,6 +2830,68 @@ mod tests {
             err.message.contains("/dev/ttyUSB0"),
             "the message names the port that went away: {}",
             err.message
+        );
+    }
+
+    /// Regression test for the PR #6 fix: a command dropped while
+    /// reconnecting is reported as a session-scoped error, but the tab only
+    /// has room for one `last_error`. It must not clobber a connection error
+    /// already explaining *why* the link is down — that message is more
+    /// useful, and unlike a connection error, nothing later clears a session
+    /// error, so overwriting it would hide the real cause for the rest of
+    /// the outage.
+    #[test]
+    fn dropped_command_error_does_not_hide_the_connection_error() {
+        let (mut app, _enum_tx) = test_app("dropped-command-error");
+
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            identity("A1"),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        // Swap in a channel this test controls, so it can inject events
+        // without a real reader thread.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        conn.handle.events = rx;
+        app.connections.push(conn);
+
+        tx.send(ReaderEvent::Error {
+            scope: ErrorScope::Connection,
+            msg: "device not present".into(),
+        })
+        .unwrap();
+        tx.send(ReaderEvent::Error {
+            scope: ErrorScope::Session,
+            msg: "transmit: dropped, not connected".into(),
+        })
+        .unwrap();
+        app.connections[0].drain_events(1000);
+
+        let err = app.connections[0]
+            .last_error
+            .as_ref()
+            .expect("an error is showing");
+        assert_eq!(
+            err.msg, "device not present",
+            "the connection error must survive a same-batch session error, \
+             or the real disconnect reason is gone for the rest of the outage"
+        );
+
+        // A session error is still shown when nothing more important is
+        // already up.
+        app.connections[0].last_error = None;
+        tx.send(ReaderEvent::Error {
+            scope: ErrorScope::Session,
+            msg: "transmit: dropped, not connected".into(),
+        })
+        .unwrap();
+        app.connections[0].drain_events(1000);
+        assert_eq!(
+            app.connections[0].last_error.as_ref().unwrap().msg,
+            "transmit: dropped, not connected"
         );
     }
 }
