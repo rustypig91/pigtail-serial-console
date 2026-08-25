@@ -38,6 +38,17 @@ impl AxisMap {
     fn to_secondary(self, y: f64) -> f64 {
         (y - self.offset) / self.scale
     }
+
+    /// The map that actually applies to one series: the shared map for a Y2
+    /// series, identity for everything else. Centralizes the "which axis is
+    /// this on" branch so callers don't each re-derive it.
+    fn for_entry(self, own_axis: bool) -> AxisMap {
+        if own_axis {
+            self
+        } else {
+            AxisMap::IDENTITY
+        }
+    }
 }
 
 /// The map laying `secondary`'s extent over `primary`'s, so two quantities of
@@ -63,6 +74,14 @@ fn axis_map(primary: Option<(f64, f64)>, secondary: Option<(f64, f64)>) -> AxisM
         return AxisMap::IDENTITY;
     }
     let scale = p_span / s_span;
+    // An extreme enough mismatch between the two spans underflows or
+    // overflows the division despite both spans being ordinary finite
+    // numbers on their own; a zero or non-finite scale would make
+    // `to_secondary` divide by zero, so treat it like `p_span <= 0.0`
+    // above — no mapping can meaningfully represent it.
+    if scale == 0.0 || !scale.is_finite() {
+        return AxisMap::IDENTITY;
+    }
     AxisMap {
         scale,
         offset: p0 - s0 * scale,
@@ -82,15 +101,20 @@ fn format_tick(value: f64, step: f64) -> String {
     format!("{value:.decimals$}")
 }
 
+/// Folds one more `(lo, hi)` span into a running range, or starts one.
+fn merge_range(acc: Option<(f64, f64)>, (lo, hi): (f64, f64)) -> Option<(f64, f64)> {
+    Some(match acc {
+        Some((a, b)) => (a.min(lo), b.max(hi)),
+        None => (lo, hi),
+    })
+}
+
 /// The full value extent of the visible series on one side of the Y2 split.
 fn group_range(all: &[SeriesEntry], own_axis: bool) -> Option<(f64, f64)> {
     let mut range: Option<(f64, f64)> = None;
     for entry in all.iter().filter(|e| e.visible && e.own_axis == own_axis) {
-        if let Some((lo, hi)) = entry.series.value_range() {
-            range = Some(match range {
-                Some((a, b)) => (a.min(lo), b.max(hi)),
-                None => (lo, hi),
-            });
+        if let Some(span) = entry.series.value_range() {
+            range = merge_range(range, span);
         }
     }
     range
@@ -105,28 +129,16 @@ fn group_range(all: &[SeriesEntry], own_axis: bool) -> Option<(f64, f64)> {
 fn fit_bounds(all: &[SeriesEntry], map: AxisMap) -> Option<PlotBounds> {
     let mut x: Option<(f64, f64)> = None;
     let mut y: Option<(f64, f64)> = None;
-    let merge = |acc: Option<(f64, f64)>, (lo, hi): (f64, f64)| {
-        Some(match acc {
-            Some((a, b)) => (a.min(lo), b.max(hi)),
-            None => (lo, hi),
-        })
-    };
     for entry in all.iter().filter(|e| e.visible) {
         // Both or neither: a series whose every value is unplottable (all NaN)
         // has a time extent but nothing to show at it.
         if let (Some(t), Some((lo, hi))) = (entry.series.t_range(), entry.series.value_range()) {
-            x = merge(x, t);
+            x = merge_range(x, t);
             // Where the trace is actually drawn, which for a Y2 series is not
             // where its numbers say — fitting on raw values would leave it off
             // screen.
-            y = merge(
-                y,
-                if entry.own_axis {
-                    (map.to_primary(lo), map.to_primary(hi))
-                } else {
-                    (lo, hi)
-                },
-            );
+            let m = map.for_entry(entry.own_axis);
+            y = merge_range(y, (m.to_primary(lo), m.to_primary(hi)));
         }
     }
     let (mut x0, mut x1) = x?;
@@ -223,19 +235,25 @@ impl App {
         // The Y2 split. Scanning the series for their extents is only worth
         // anything when something is actually on the second axis, and nothing
         // is unless the user ticks the box — so the common case pays nothing.
-        let secondary: HashSet<String> = conn
-            .series
-            .iter()
-            .filter(|e| e.visible && e.own_axis && !e.series.is_empty())
-            .map(|e| e.series.name().to_string())
-            .collect();
-        let map = if secondary.is_empty() {
-            AxisMap::IDENTITY
-        } else {
-            axis_map(
-                group_range(&conn.series, false).or_else(|| group_range(&conn.series, true)),
-                group_range(&conn.series, true),
-            )
+        //
+        // `secondary` has to agree exactly with what `group_range` counts:
+        // a Y2 series whose only samples are non-finite has a range of
+        // `None`, and if `secondary` disagreed by including it anyway, the
+        // ruler and label formatter below would switch on for an axis that
+        // `map` was never actually built to cover.
+        let secondary_range = group_range(&conn.series, true);
+        let secondary: HashSet<String> = match secondary_range {
+            Some(_) => conn
+                .series
+                .iter()
+                .filter(|e| e.visible && e.own_axis && e.series.value_range().is_some())
+                .map(|e| e.series.name().to_string())
+                .collect(),
+            None => HashSet::new(),
+        };
+        let map = match secondary_range {
+            Some(sec) => axis_map(group_range(&conn.series, false).or(Some(sec)), Some(sec)),
+            None => AxisMap::IDENTITY,
         };
 
         // Latest time across series, for auto-follow.
@@ -324,13 +342,13 @@ impl App {
                     continue;
                 }
                 let mut pts = entry.series.decimate(x0, x1, width);
-                if entry.own_axis {
-                    // Decimation picked the min/max of each column from the
-                    // raw values; the map is affine with a positive scale,
-                    // so those are still the min/max after it.
-                    for p in &mut pts {
-                        p[1] = map.to_primary(p[1]);
-                    }
+                // Decimation picked the min/max of each column from the raw
+                // values; the map is affine with a positive scale, so those
+                // are still the min/max after it. Identity for anything not
+                // on Y2, so this applies uniformly.
+                let m = map.for_entry(entry.own_axis);
+                for p in &mut pts {
+                    p[1] = m.to_primary(p[1]);
                 }
                 let line = Line::new(PlotPoints::from(pts))
                     .color(entry.color)
@@ -504,6 +522,9 @@ mod tests {
             (Some((0.0, 10.0)), Some((5.0, 5.0))),
             // A dead-flat primary: nothing to stretch onto.
             (Some((7.0, 7.0)), Some((0.0, 1.0))),
+            // A span ratio so extreme that `p_span / s_span` underflows to
+            // exactly 0.0 despite both spans being ordinary finite numbers.
+            (Some((0.0, 1e-300)), Some((0.0, 1e300))),
         ];
         for (primary, secondary) in cases {
             let map = axis_map(primary, secondary);
