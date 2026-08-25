@@ -75,7 +75,37 @@ pub struct Batch {
 pub enum ReaderEvent {
     State(ConnState),
     Batch(Batch),
-    Error(String),
+    Error { scope: ErrorScope, msg: String },
+}
+
+/// What an error is actually about, so the UI can tell a broken link from a
+/// failure alongside a working one. The two need opposite handling: a
+/// successful (re)connect makes a `Connection` error obsolete, but says
+/// nothing about a capture file that couldn't be written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorScope {
+    /// Opening or reading the device: the link is down, and the reader is
+    /// either retrying or giving up.
+    Connection,
+    /// Something beside the link — the capture file, a transmit, a control
+    /// line — while the connection itself may be perfectly healthy.
+    Session,
+}
+
+impl ReaderEvent {
+    fn connection_error(msg: impl Into<String>) -> Self {
+        ReaderEvent::Error {
+            scope: ErrorScope::Connection,
+            msg: msg.into(),
+        }
+    }
+
+    fn session_error(msg: impl Into<String>) -> Self {
+        ReaderEvent::Error {
+            scope: ErrorScope::Session,
+            msg: msg.into(),
+        }
+    }
 }
 
 /// Commands from the UI to a reader thread.
@@ -281,7 +311,7 @@ fn run(
         Some(dir) => match SessionWriter::create(dir, &config.meta) {
             Ok(w) => Some(w),
             Err(e) => {
-                event_tx.send(ReaderEvent::Error(format!("session log: {e}")));
+                event_tx.send(ReaderEvent::session_error(format!("session log: {e}")));
                 None
             }
         },
@@ -320,13 +350,13 @@ fn run(
                 Ok(s) => break s,
                 Err(e) => {
                     if !reconnect {
-                        event_tx.send(ReaderEvent::Error(e.to_string()));
+                        event_tx.send(ReaderEvent::connection_error(e.to_string()));
                         event_tx.send(ReaderEvent::State(ConnState::Closed));
                         return;
                     }
                     let msg = e.to_string();
                     if last_reported.as_deref() != Some(msg.as_str()) {
-                        event_tx.send(ReaderEvent::Error(msg.clone()));
+                        event_tx.send(ReaderEvent::connection_error(msg.clone()));
                         last_reported = Some(msg);
                     }
                     // Wait out the backoff while remaining responsive to Shutdown.
@@ -407,19 +437,19 @@ fn run(
                         // (which belongs to *restored* history); the file
                         // format keeps them unsigned.
                         if let Err(e) = w.write_record(ts.micros.max(0) as u64, &buf[..n]) {
-                            event_tx.send(ReaderEvent::Error(format!("log write: {e}")));
+                            event_tx.send(ReaderEvent::session_error(format!("log write: {e}")));
                         }
                     }
                     pending.raw.extend_from_slice(&buf[..n]);
                     framer.push(&buf[..n], ts, &mut pending.lines);
                 }
                 Err(SourceError::Disconnected(msg)) => {
-                    event_tx.send(ReaderEvent::Error(msg));
+                    event_tx.send(ReaderEvent::connection_error(msg));
                     break;
                 }
                 Err(e) => {
                     // Treat any read error as a loss; reconnect will retry.
-                    event_tx.send(ReaderEvent::Error(e.to_string()));
+                    event_tx.send(ReaderEvent::connection_error(e.to_string()));
                     break;
                 }
             }
@@ -519,7 +549,7 @@ fn clear_log(targets: ClearTargets<'_>, event_tx: &EventTx) {
     targets.framer.reset();
     if let Some(w) = targets.writer {
         if let Err(e) = w.truncate() {
-            event_tx.send(ReaderEvent::Error(format!("clear log: {e}")));
+            event_tx.send(ReaderEvent::session_error(format!("clear log: {e}")));
         }
     }
 }
@@ -551,22 +581,22 @@ fn drain_commands(
             ),
             ReaderCommand::Transmit(bytes) => {
                 if let Err(e) = source.write(&bytes) {
-                    event_tx.send(ReaderEvent::Error(format!("transmit: {e}")));
+                    event_tx.send(ReaderEvent::session_error(format!("transmit: {e}")));
                 }
             }
             ReaderCommand::SetDtr(on) => {
                 if let Err(e) = source.set_dtr(on) {
-                    event_tx.send(ReaderEvent::Error(format!("dtr: {e}")));
+                    event_tx.send(ReaderEvent::session_error(format!("dtr: {e}")));
                 }
             }
             ReaderCommand::SetRts(on) => {
                 if let Err(e) = source.set_rts(on) {
-                    event_tx.send(ReaderEvent::Error(format!("rts: {e}")));
+                    event_tx.send(ReaderEvent::session_error(format!("rts: {e}")));
                 }
             }
             ReaderCommand::SendBreak => {
                 if let Err(e) = source.send_break() {
-                    event_tx.send(ReaderEvent::Error(format!("break: {e}")));
+                    event_tx.send(ReaderEvent::session_error(format!("break: {e}")));
                 }
             }
         }
@@ -664,7 +694,7 @@ mod tests {
                         break;
                     }
                 }
-                Ok(ReaderEvent::Error(_)) => {}
+                Ok(ReaderEvent::Error { .. }) => {}
                 Err(_) => {}
             }
         }
@@ -734,6 +764,47 @@ mod tests {
         assert_eq!(lines, vec!["hello", "world"]);
         assert!(states.contains(&ConnState::Connected));
         assert!(states.contains(&ConnState::Closed));
+    }
+
+    #[test]
+    fn error_scope_separates_the_capture_file_from_the_link() {
+        // A session log that can't be created is reported *before* the first
+        // connect, so scoping it to the connection would have the UI wipe it
+        // the moment the port opens — leaving a run that silently captures
+        // nothing. Losing the link afterwards is what `Connection` is for.
+        let not_a_dir = std::env::temp_dir().join(format!(
+            "pigtail-not-a-dir-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&not_a_dir, b"x").unwrap();
+
+        let src = ScriptedSource::new(vec![(b"hello\n".to_vec(), Duration::ZERO)])
+            .no_delays()
+            .eof_when_done();
+        let config = ReaderConfig {
+            port_id: PortId(0),
+            clock: SessionClock::new(),
+            session_dir: Some(not_a_dir.clone()),
+            meta: test_meta(),
+            terminal: crate::config::TerminalMode::Classic,
+            wake: Wake::none(),
+        };
+        let handle = spawn(config, SourceSpec::OneShot(Box::new(src))).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut scopes = Vec::new();
+        while Instant::now() < deadline {
+            match handle.events.recv_timeout(Duration::from_millis(50)) {
+                Ok(ReaderEvent::Error { scope, .. }) => scopes.push(scope),
+                Ok(ReaderEvent::State(ConnState::Closed)) => break,
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        std::fs::remove_file(&not_a_dir).ok();
+
+        assert_eq!(scopes, vec![ErrorScope::Session, ErrorScope::Connection]);
     }
 
     #[test]

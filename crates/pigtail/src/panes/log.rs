@@ -1059,9 +1059,10 @@ impl App {
             .save_file()
         {
             if let Err(e) = std::fs::write(&path, out) {
-                // Not `conn.last_error`: that field drives the footer's
-                // connection-error indicator, and an export failure has
-                // nothing to do with the connection's health.
+                // Not `conn.last_error`: that field carries what the reader
+                // reports about a connection (its link, or its capture file),
+                // whereas an export is a UI action the user is standing there
+                // waiting on — a modal answers it where they're looking.
                 self.record_connect_error("Couldn't export", e.to_string());
             }
         }

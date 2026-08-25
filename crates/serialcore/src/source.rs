@@ -171,41 +171,55 @@ fn is_disconnect(e: &std::io::Error) -> bool {
 }
 
 fn map_open_error(path: &str, e: serialport::Error) -> SourceError {
-    // POSIX surfaces EACCES as this exact kind, so no string matching needed.
-    if e.kind() == serialport::ErrorKind::Io(std::io::ErrorKind::PermissionDenied) {
-        return SourceError::Open(format!(
+    use serialport::ErrorKind;
+    use std::io::ErrorKind as IoKind;
+
+    match e.kind() {
+        // POSIX surfaces EACCES as this exact kind, so no string matching needed.
+        ErrorKind::Io(IoKind::PermissionDenied) => SourceError::Open(format!(
             "{path}: permission denied. {}",
             permission_hint(path)
-        ));
+        )),
+        // A device that isn't there is ENOENT, which serialport maps to
+        // `Io(NotFound)` — *not* to `NoDevice`, despite the name. Unplugged
+        // adapters land here and nowhere else.
+        ErrorKind::Io(IoKind::NotFound) => SourceError::Open(format!("{path}: device not present")),
+        ErrorKind::NoDevice => map_no_device(path),
+        _ => SourceError::Open(format!("{path}: {}", e)),
     }
-    if e.kind() == serialport::ErrorKind::NoDevice {
-        // On Windows, serialport-rs maps ERROR_ACCESS_DENIED to the same
-        // ErrorKind::NoDevice as "no such device", and its message text is
-        // localized (FormatMessageW), so the two can't be told apart by
-        // string matching. If the port still shows up in the OS port
-        // enumeration, the failure is a permission/exclusivity problem, not
-        // the device being gone.
-        if windows_port_still_present(path) {
-            return SourceError::Open(format!(
-                "{path}: permission denied. {}",
-                permission_hint(path)
-            ));
-        }
-        return SourceError::Open(format!("{path}: device not present"));
-    }
-    SourceError::Open(format!("{path}: {}", e))
 }
 
-#[cfg(target_os = "windows")]
-fn windows_port_still_present(path: &str) -> bool {
-    serialport::available_ports()
-        .map(|ports| ports.iter().any(|p| p.port_name == path))
-        .unwrap_or(false)
-}
-
+/// `ErrorKind::NoDevice` means different things per platform, and the message
+/// text can't settle it: the OS writes it, localized.
+///
+/// On POSIX it never means the device is missing (that's `Io(NotFound)`).
+/// serialport raises it only for EBUSY from `TIOCEXCL` and EWOULDBLOCK from
+/// `flock`, both of which say another program already holds the port.
 #[cfg(not(target_os = "windows"))]
-fn windows_port_still_present(_path: &str) -> bool {
-    false
+fn map_no_device(path: &str) -> SourceError {
+    SourceError::Open(format!(
+        "{path}: port is in use by another program. Close whatever holds it \
+         (a serial monitor, ModemManager, or a getty on this device) and try again."
+    ))
+}
+
+/// On Windows, serialport-rs maps ERROR_ACCESS_DENIED to the same
+/// `ErrorKind::NoDevice` as "no such device". If the port still shows up in
+/// the OS port enumeration, the failure is a permission/exclusivity problem,
+/// not the device being gone.
+#[cfg(target_os = "windows")]
+fn map_no_device(path: &str) -> SourceError {
+    let still_present = serialport::available_ports()
+        .map(|ports| ports.iter().any(|p| p.port_name == path))
+        .unwrap_or(false);
+    if still_present {
+        SourceError::Open(format!(
+            "{path}: permission denied. {}",
+            permission_hint(path)
+        ))
+    } else {
+        SourceError::Open(format!("{path}: device not present"))
+    }
 }
 
 /// The group that actually owns `path`, not a guess: distros differ on which
@@ -455,7 +469,7 @@ mod tests {
     fn map_open_error_recognizes_permission_denied_by_kind_not_message_text() {
         // Regression guard: this must key off `ErrorKind`, not a
         // language-specific substring of the description, since the OS
-        // message can be localized (see `windows_port_still_present`).
+        // message can be localized (see `map_no_device`).
         let e = serialport::Error::new(
             serialport::ErrorKind::Io(std::io::ErrorKind::PermissionDenied),
             "Permission non accordée",
@@ -465,9 +479,25 @@ mod tests {
     }
 
     #[test]
-    fn map_open_error_reports_device_not_present_for_no_device() {
-        let e = serialport::Error::new(serialport::ErrorKind::NoDevice, "Le fichier n'existe pas");
+    fn map_open_error_reports_device_not_present_for_enoent() {
+        // An unplugged adapter is ENOENT, which serialport reports as
+        // `Io(NotFound)`; keying this off `NoDevice` instead would leave a
+        // missing device reading as a raw "No such file or directory".
+        let e = serialport::Error::new(
+            serialport::ErrorKind::Io(std::io::ErrorKind::NotFound),
+            "Le fichier n'existe pas",
+        );
         let err = map_open_error("/dev/ttyUSB0", e);
         assert!(matches!(err, SourceError::Open(msg) if msg.contains("device not present")));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn map_open_error_reports_no_device_as_port_in_use() {
+        // On POSIX, `NoDevice` is EBUSY / flock EWOULDBLOCK — the port is held
+        // by another program, not absent.
+        let e = serialport::Error::new(serialport::ErrorKind::NoDevice, "Device or resource busy");
+        let err = map_open_error("/dev/ttyUSB0", e);
+        assert!(matches!(err, SourceError::Open(msg) if msg.contains("in use by another program")));
     }
 }

@@ -140,27 +140,31 @@ impl App {
                 // Reconnecting so it can recover on its own), but the status
                 // bar should say what's actually wrong rather than keep
                 // claiming to be "connecting" while it fails over and over.
-                match (&conn.last_error, conn.state) {
-                    (Some(err), state) if state != ConnState::Connected => {
-                        let resp = ui.add(
-                            egui::Label::new(
-                                egui::RichText::new("⚠ error")
-                                    .color(egui::Color32::from_rgb(0xff, 0x55, 0x55)),
-                            )
-                            .sense(egui::Sense::click()),
-                        );
-                        let resp = resp
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .on_hover_text(err);
-                        if resp.clicked() {
-                            open_error_win = Some(conn.id);
-                        }
-                    }
-                    _ => {
-                        ui.colored_label(
-                            state_color(conn.state),
-                            format!("{} {}", state_dot(conn.state), conn.state),
-                        );
+                //
+                // While the link *is* up, though, the state is still worth
+                // showing, so an error raised alongside a working connection
+                // (a capture-file write that failed, say) sits next to it
+                // rather than replacing it — this footer is the only place
+                // such an error ever surfaces.
+                if conn.state == ConnState::Connected || conn.last_error.is_none() {
+                    ui.colored_label(
+                        state_color(conn.state),
+                        format!("{} {}", state_dot(conn.state), conn.state),
+                    );
+                }
+                if let Some(err) = &conn.last_error {
+                    let resp = ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("⚠ error")
+                                .color(egui::Color32::from_rgb(0xff, 0x55, 0x55)),
+                        )
+                        .sense(egui::Sense::click()),
+                    );
+                    let resp = resp
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(err.msg.as_str());
+                    if resp.clicked() {
+                        open_error_win = Some(conn.id);
                     }
                 }
                 ui.separator();

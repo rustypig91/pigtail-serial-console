@@ -4,6 +4,7 @@
 use crate::app::App;
 use serialcore::config::{ExtractMode, ExtractRule, HighlightRule};
 use serialcore::filter::{Combine, FilterRule};
+use serialcore::reader::ErrorScope;
 
 impl App {
     pub(crate) fn show_tool_windows(&mut self, ctx: &egui::Context) {
@@ -13,11 +14,11 @@ impl App {
         self.show_error_window(ctx);
     }
 
-    /// The full connection-error message, opened by clicking the footer's
-    /// `⚠ error` indicator. Scoped to the connection it was opened for (not
-    /// "whichever tab is active"), so switching tabs while it's open doesn't
-    /// swap the message. Closes itself if that connection's error clears
-    /// (e.g. a reconnect succeeds) or the tab is closed while it's open.
+    /// The full error message, opened by clicking the footer's `⚠ error`
+    /// indicator. Scoped to the connection it was opened for (not "whichever
+    /// tab is active"), so switching tabs while it's open doesn't swap the
+    /// message. Closes itself if that connection's error clears (e.g. a
+    /// reconnect succeeds) or the tab is closed while it's open.
     fn show_error_window(&mut self, ctx: &egui::Context) {
         let Some(id) = self.show_error_win else {
             return;
@@ -30,15 +31,36 @@ impl App {
             self.show_error_win = None;
             return;
         };
+        let title = match err.scope {
+            ErrorScope::Connection => "Connection error",
+            ErrorScope::Session => "Session error",
+        };
         let mut open = true;
-        egui::Window::new("Connection error")
+        let mut dismiss = false;
+        egui::Window::new(title)
+            // Fixed, so the window keeps its position and size when the title
+            // changes with the scope of the error being shown.
+            .id(egui::Id::new("error_window"))
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
             .show(ctx, |ui| {
-                ui.label(err);
+                ui.label(err.msg.as_str());
+                // Nothing else ever clears a session-scoped error: the
+                // connection recovering doesn't fix a capture file that
+                // couldn't be written, so without this it would sit in the
+                // footer for the rest of the run.
+                if err.scope == ErrorScope::Session {
+                    ui.separator();
+                    dismiss = ui.button("Dismiss").clicked();
+                }
             });
-        if !open {
+        if dismiss {
+            if let Some(conn) = self.connections.iter_mut().find(|c| c.id == id) {
+                conn.last_error = None;
+            }
+        }
+        if !open || dismiss {
             self.show_error_win = None;
         }
     }
