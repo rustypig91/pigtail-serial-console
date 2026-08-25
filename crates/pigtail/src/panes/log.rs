@@ -388,7 +388,16 @@ impl App {
                 ui.vertical_centered(|ui| {
                     ui.add_space(80.0);
                     ui.heading("No connection");
-                    if ui.button("+ New connection").clicked() {
+                    // Disabled while the config dialog is up: it is modal,
+                    // and reopening it here would discard a half-filled form
+                    // (issue #16, same as the header's "+").
+                    if ui
+                        .add_enabled(
+                            self.config_dialog.is_none(),
+                            egui::Button::new("+ New connection"),
+                        )
+                        .clicked()
+                    {
                         open_dialog = true;
                     }
                 });

@@ -38,8 +38,21 @@ impl App {
         let mut save_text = false;
         let mut port_options: Option<usize> = None;
 
+        // The config dialog is meant to be modal, but an `egui::Window` does
+        // not block input to what it covers, so the header would keep acting
+        // on clicks behind it: "+" or a tab's "Port options…" would replace
+        // the in-progress dialog with a fresh one, silently discarding a
+        // half-filled form, and "Close tab" would leave the dialog's
+        // `editing` pointing at a tab that no longer exists (issue #16).
+        // Disabled rather than merely ignored so the greying-out shows *why*
+        // the clicks do nothing.
+        let modal_open = self.config_dialog.is_some();
+
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                if modal_open {
+                    ui.disable();
+                }
                 for (i, conn) in self.connections.iter().enumerate() {
                     let selected = !self.merged_selected && self.active == i;
                     let label = format!("{} {}", state_dot(conn.state), short_label(&conn.label));
