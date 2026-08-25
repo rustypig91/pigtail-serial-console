@@ -171,7 +171,6 @@ impl App {
                                     .hint_text("#rrggbb"),
                             )
                             .changed();
-                        changed |= ui.checkbox(&mut rule.bold, "b").changed();
                         if let Some(c) = crate::app::parse_hex_color(&rule.color) {
                             ui.colored_label(c, "■");
                         }
@@ -188,7 +187,9 @@ impl App {
                     self.config.highlight.push(HighlightRule {
                         pattern: "ERROR|FATAL".into(),
                         color: "#ff5555".into(),
-                        bold: true,
+                        // Nothing draws bold (see `HighlightRule::bold`), so a
+                        // new rule no longer arrives with it set.
+                        bold: false,
                         enabled: true,
                     });
                     changed = true;
