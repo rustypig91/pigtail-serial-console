@@ -490,8 +490,7 @@ impl Connection {
                     for line in batch.lines {
                         // Parse SGR colours and strip other escapes (spec §2, §7.9).
                         let styled = serialcore::ansi::parse_line(&line.text, line.cursor);
-                        let is_data = !line.flags.contains(LineFlags::RECONNECT_MARKER)
-                            && !line.flags.contains(LineFlags::TX_ECHO);
+                        let is_data = feeds_plot(line.flags);
                         let text = styled.text;
                         let abs = self.store.append(IncomingLine {
                             text: text.clone(),
@@ -692,6 +691,28 @@ fn series_slot(
     series.len() - 1
 }
 
+/// Whether a line's text is something the extraction rules should read.
+///
+/// Shared by live ingest ([`Connection::drain_events`]) and the re-read
+/// ([`extract_all`]) so the plot cannot depend on which of the two produced a
+/// point. Three kinds of line are excluded:
+///
+/// - a reconnect/session marker, which is the app talking, not the device;
+/// - your own echoed input ([`LineFlags::TX_ECHO`]), for the same reason;
+/// - a still-open [`LineFlags::PROVISIONAL`] line, which is device output but
+///   only *part* of it. The framer shows an unterminated line after ~20ms of
+///   silence and replaces it in place as it grows, so extracting one plots a
+///   number that is still being typed: `temp:23.4` arriving in two reads
+///   deposits `temp = 23` off the provisional and `temp = 23.4` off the
+///   completed line, and the first is a spike that never existed (issue #38).
+///   A line is plottable once it is terminated, which is also when its number
+///   is known to be whole.
+fn feeds_plot(flags: LineFlags) -> bool {
+    !flags.contains(LineFlags::RECONNECT_MARKER)
+        && !flags.contains(LineFlags::TX_ECHO)
+        && !flags.contains(LineFlags::PROVISIONAL)
+}
+
 /// Fill `series` by running `rules` over every line of `store` that this run
 /// recorded.
 ///
@@ -711,12 +732,9 @@ fn extract_all(
         let Some(line) = store.get(abs) else {
             continue;
         };
-        // The gate live ingest applies — markers and your own echoed input are
-        // not device output — plus the session cut-off.
-        if line.meta.flags.contains(LineFlags::RECONNECT_MARKER)
-            || line.meta.flags.contains(LineFlags::TX_ECHO)
-            || line.meta.ts.micros < 0
-        {
+        // The gate live ingest applies (see `feeds_plot`), plus the session
+        // cut-off.
+        if !feeds_plot(line.meta.flags) || line.meta.ts.micros < 0 {
             continue;
         }
         pairs.clear();
@@ -2199,6 +2217,27 @@ pub(crate) mod tests {
             "a series seen for the first time still takes a palette colour"
         );
     }
+
+    /// A line the device is still writing is shown provisionally and replaced
+    /// in place as it grows, so extracting one plots a number that is still
+    /// being typed. The re-read has always skipped it by construction (it walks
+    /// the settled store); this pins the rule down explicitly.
+    #[test]
+    fn a_re_read_skips_a_line_the_device_is_still_writing() {
+        let store = stored(&[
+            ("temp:23", 1_000_000, LineFlags::PROVISIONAL),
+            ("rpm:1200", 2_000_000, LineFlags::default()),
+        ]);
+        let series = extracted(&store, &HashMap::new());
+        assert_eq!(
+            series
+                .iter()
+                .map(|e| e.series.name().to_string())
+                .collect::<Vec<_>>(),
+            vec!["rpm".to_string()],
+            "a half-written line is not a sample"
+        );
+    }
     fn ring(cap: usize, pushes: &[&[u8]]) -> (VecDeque<u8>, u64) {
         let mut ring = VecDeque::new();
         let mut base = 0;
@@ -2892,6 +2931,88 @@ pub(crate) mod tests {
         assert_eq!(
             app.connections[0].last_error.as_ref().unwrap().msg,
             "transmit: dropped, not connected"
+        );
+    }
+
+    /// Issue #38: a line the device is still writing reaches the UI twice —
+    /// once as a `PROVISIONAL` flush after ~20ms of silence, once as the
+    /// `CONTINUATION` that completes it — and `LineStore::append` replaces the
+    /// first in place, keeping its absolute index. Extracting the provisional
+    /// plots a number that is still being typed, and nothing takes it back
+    /// when the real one lands.
+    ///
+    /// The batch here is produced by the real `Framer`, not hand-written, so
+    /// this stays bound to what the reader actually emits.
+    #[test]
+    fn a_half_written_line_does_not_plant_a_plot_point() {
+        let (mut app, _enum_tx) = test_app("provisional-plot");
+
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            identity("A1"),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        let (tx, rx) = crossbeam_channel::unbounded();
+        conn.handle.events = rx;
+        conn.extract_rules = vec![ExtractRule {
+            mode: serialcore::config::ExtractMode::Kv,
+            prefix: None,
+            pattern: None,
+            kv_separators: None,
+        }];
+        conn.extract_dirty = true;
+        app.connections.push(conn);
+
+        // `temp:23.4\n` split across two reads, as a slow device (or a USB
+        // latency boundary) delivers it: the first half is flushed while the
+        // line is still open.
+        let clock = SessionClock::new();
+        let mut framer = Framer::new();
+        let mut lines = Vec::new();
+        framer.push(b"temp:23", clock.now(), &mut lines);
+        assert!(lines.is_empty(), "nothing is terminated yet");
+        let provisional = framer
+            .flush_provisional()
+            .expect("the open line is shown provisionally");
+        assert!(provisional.flags.contains(LineFlags::PROVISIONAL));
+        assert_eq!(provisional.text, "temp:23");
+        lines.push(provisional);
+        framer.push(b".4\n", clock.now(), &mut lines);
+        assert!(
+            lines[1].flags.contains(LineFlags::CONTINUATION),
+            "the completed line replaces the provisional one in place"
+        );
+        assert_eq!(lines[1].text, "temp:23.4");
+
+        tx.send(ReaderEvent::Batch(reader::Batch {
+            lines,
+            raw: b"temp:23.4\n".to_vec(),
+        }))
+        .unwrap();
+
+        let conn = &mut app.connections[0];
+        conn.maintain_extract();
+        conn.drain_events(1000);
+
+        assert_eq!(conn.store.len(), 1, "the two events are one line");
+        let temp = conn
+            .series
+            .iter()
+            .find(|e| e.series.name() == "temp")
+            .expect("temp is plotted");
+        assert_eq!(
+            temp.series.len(),
+            1,
+            "one line is one sample, not one per redraw of it"
+        );
+        assert_eq!(
+            temp.series.last().unwrap().value,
+            23.4,
+            "and it is the value the line finally held, not the half of it \
+             that happened to be on screen first"
         );
     }
 }
