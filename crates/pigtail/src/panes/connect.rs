@@ -500,11 +500,13 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
                             ui.selectable_value(&mut cfg.baud, b, b.to_string());
                         }
                     });
+                ui.label("or");
                 ui.add(
                     egui::DragValue::new(&mut cfg.baud)
-                        .speed(100.0)
+                        .speed(0.0)
                         .range(50..=6_000_000),
-                );
+                )
+                .on_hover_text("Click to type any baud rate");
             });
             ui.end_row();
 
