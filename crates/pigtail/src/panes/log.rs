@@ -1194,6 +1194,14 @@ impl App {
 /// `target` says which connection the port-specific items act on and which row
 /// "here" means; `None` (merged empty space) points at no port, and leaves
 /// those items out entirely rather than letting them land on an arbitrary tab.
+///
+/// It comes in three shapes, and each is offered a different menu:
+///
+/// - the active tab's own console (`MenuTarget::active`) gets everything;
+/// - a merged row (`MenuTarget::row`) gets only what can be aimed at its port —
+///   no hex, plot, search or time mark, since the merged view draws none of
+///   those and so would show nothing for them;
+/// - merged empty space (`None`) gets only what needs no port at all.
 fn console_menu(
     ui: &mut egui::Ui,
     menu: &mut MenuAction,
@@ -1206,13 +1214,17 @@ fn console_menu(
     // for whichever item they then pick.
     menu.port = target.as_ref().and_then(|t| t.port);
     let line = target.as_ref().and_then(|t| t.line);
-    // Which port a merged row's items are about to hit. The console under the
-    // menu is showing every port at once, so without this the reader has no way
-    // to tell — and DTR, RTS and break reach a physical device.
-    if let Some(label) = target.as_ref().and_then(|t| t.label) {
-        ui.weak(label);
-        ui.separator();
-    }
+    // A merged row names its own port. The label heads the block of items that
+    // actually act on it, rather than the whole menu — see there.
+    let row_label = target.as_ref().and_then(|t| t.label);
+    // The active tab's own console: a single connection's view, or its hex
+    // dump. Only there do the items that change what *this* console shows have
+    // anything to change. The merged view draws no hex dump, no plot, no search
+    // bar, and no mark of its own — `show_merged_rows` counts "from mark" from
+    // the session start for every port at once — so offering these on a merged
+    // row would flip a flag on a tab the reader isn't even looking at and
+    // change nothing they can see.
+    let own_console = target.is_some() && row_label.is_none();
     ui.menu_button("Timestamps", |ui| {
         for f in [
             TimestampFormat::Absolute,
@@ -1230,7 +1242,7 @@ fn console_menu(
             }
         }
     });
-    if target.is_some() {
+    if own_console {
         if ui.button("Toggle hex view").clicked() {
             menu.toggle_hex = true;
             ui.close_menu();
@@ -1241,7 +1253,7 @@ fn console_menu(
         }
     }
     ui.separator();
-    if ui.button("Search…").clicked() {
+    if own_console && ui.button("Search…").clicked() {
         menu.toggle_search = true;
         ui.close_menu();
     }
@@ -1259,6 +1271,17 @@ fn console_menu(
     }
     if target.is_some() {
         ui.separator();
+        // Which port the rest of this menu is about to hit. The console under a
+        // merged row's menu is showing every port at once, so without this the
+        // reader has no way to tell — and DTR, RTS and break reach a physical
+        // device. It sits here rather than at the top because only what follows
+        // is aimed at that port: the timestamp format is a global setting, and
+        // the filter, highlight and extraction windows edit the active tab.
+        if let Some(label) = row_label {
+            ui.weak(label)
+                .on_hover_text("What the items below act on — not the whole merged view");
+            ui.add_space(2.0);
+        }
         ui.menu_button("Control lines", |ui| {
             if ui
                 .button("Toggle DTR")
@@ -1277,19 +1300,21 @@ fn console_menu(
                 ui.close_menu();
             }
         });
-        ui.separator();
-        if ui
-            .button("Set time mark here")
-            .on_hover_text("Timestamps switch to counting from this line, before it and after")
-            .clicked()
-        {
-            menu.set_mark = true;
-            menu.mark_line = line;
-            ui.close_menu();
-        }
-        if has_mark && ui.button("Clear time mark").clicked() {
-            menu.clear_mark = true;
-            ui.close_menu();
+        if own_console {
+            ui.separator();
+            if ui
+                .button("Set time mark here")
+                .on_hover_text("Timestamps switch to counting from this line, before it and after")
+                .clicked()
+            {
+                menu.set_mark = true;
+                menu.mark_line = line;
+                ui.close_menu();
+            }
+            if has_mark && ui.button("Clear time mark").clicked() {
+                menu.clear_mark = true;
+                ui.close_menu();
+            }
         }
         ui.separator();
         ui.menu_button("Export view", |ui| {
@@ -1304,9 +1329,15 @@ fn console_menu(
         });
     }
     ui.separator();
+    // A merged row's clear takes that row's port alone; every other menu's
+    // takes the whole console it was opened over.
+    let clear_hint = match row_label {
+        Some(label) => format!("Discards every line from {label} and its session capture on disk"),
+        None => "Discards every line here and in the session capture on disk".to_owned(),
+    };
     if ui
         .button("Clear console")
-        .on_hover_text("Discards every line here and in the session capture on disk")
+        .on_hover_text(clear_hint)
         .clicked()
     {
         menu.clear_console = true;
