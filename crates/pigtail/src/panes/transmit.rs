@@ -143,10 +143,19 @@ impl App {
             }
         }
 
-        if out.is_empty() {
+        // Nothing typed at all. Checked against *both*, because a frame can
+        // produce a line to echo and no bytes to send: pressing Enter with the
+        // line ending set to "none" contributes an empty `ending.bytes()`, and
+        // the characters themselves went out in the frames they were typed in.
+        // Returning on `out` alone dropped that echo line on the floor — after
+        // `tx_input` had already been taken and pushed to history, so the input
+        // was consumed and only its echo went missing (issue #43).
+        if out.is_empty() && echo_lines.is_empty() {
             return;
         }
-        conn.handle.transmit(out);
+        if !out.is_empty() {
+            conn.handle.transmit(out);
+        }
         for line in echo_lines {
             conn.store.append(IncomingLine {
                 text: line,
@@ -222,4 +231,108 @@ fn ctrl_code(key: Key) -> Option<u8> {
         _ => return None,
     };
     Some(letter & 0x1f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::tests::{inert_handle, test_app};
+    use crate::app::{App, Connection};
+    use serialcore::config::{LineEnding, PortConfig};
+    use serialcore::store::PortId;
+
+    /// Feed one frame's worth of keyboard events to the console.
+    fn press(app: &mut App, events: Vec<Event>) {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events,
+            ..Default::default()
+        });
+        app.console_key_input(&ctx, 0);
+        let _ = ctx.end_pass();
+    }
+
+    fn enter() -> Event {
+        Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn echoed(conn: &Connection) -> Vec<String> {
+        (conn.store.first_abs_index()..conn.store.next_abs_index())
+            .filter_map(|i| conn.store.get(i))
+            .filter(|l| l.meta.flags.contains(LineFlags::TX_ECHO))
+            .map(|l| l.text.to_string())
+            .collect()
+    }
+
+    /// Issue #43: with the line ending set to "none", pressing Enter puts no
+    /// bytes in `out` — the typed characters went out in the frames they were
+    /// typed in, and `LineEnding::None` adds nothing of its own. The early
+    /// return on `out.is_empty()` then bailed *after* `tx_input` had been taken
+    /// and pushed to history, so the input was consumed and only its local echo
+    /// went missing.
+    #[test]
+    fn a_line_with_no_line_ending_is_still_echoed() {
+        for ending in [LineEnding::None, LineEnding::Lf] {
+            let (mut app, _enum_tx) = test_app("echo-no-ending");
+            let id = PortId(0);
+            let conn = app.make_connection(
+                id,
+                "probe".into(),
+                Default::default(),
+                PortConfig {
+                    line_ending: ending,
+                    local_echo: true,
+                    ..Default::default()
+                },
+                inert_handle(id),
+            );
+            app.connections.push(conn);
+
+            press(&mut app, vec![Event::Text("status".into())]);
+            assert_eq!(app.connections[0].tx_input, "status");
+
+            press(&mut app, vec![enter()]);
+            let conn = &app.connections[0];
+            assert_eq!(
+                echoed(conn),
+                vec!["status".to_string()],
+                "local echo has to commit the line whatever the line ending is; \
+                 with {ending:?} it was silently dropped"
+            );
+            assert_eq!(conn.tx_input, "", "and the input line is consumed");
+            assert_eq!(conn.tx_history, vec!["status".to_string()]);
+            assert!(conn.follow, "sending re-engages autoscroll");
+        }
+    }
+
+    /// The early return still has to fire on a frame that produced nothing at
+    /// all, or an idle frame would keep re-engaging follow under a user who has
+    /// deliberately scrolled back.
+    #[test]
+    fn a_frame_with_no_input_changes_nothing() {
+        let (mut app, _enum_tx) = test_app("echo-idle");
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            Default::default(),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        conn.follow = false;
+        app.connections.push(conn);
+
+        press(&mut app, Vec::new());
+        assert!(
+            !app.connections[0].follow,
+            "an idle frame must not re-engage follow"
+        );
+        assert!(app.connections[0].store.is_empty());
+    }
 }

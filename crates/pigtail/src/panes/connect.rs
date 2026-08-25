@@ -1,5 +1,5 @@
 //! Minimal chrome: the header (tabs + new/save/settings), the status footer,
-//! and the modal new-connection dialog with preset/profile management.
+//! and the modal new-connection dialog with preset management.
 
 use crate::app::{App, ConfigDialog};
 use serialcore::config::{
@@ -282,16 +282,15 @@ impl App {
         }
         // Both this and `show_connect_error` anchor at CENTER_CENTER (see the
         // note in `show_update_dialog`). A connect error can land while this
-        // dialog is already open (e.g. auto-connect losing a thread-spawn
-        // race in the background), so defer to it the same way the update
-        // notice does rather than stacking the two windows.
+        // dialog is already open (e.g. a background export failing), so defer
+        // to it the same way the update notice does rather than stacking the
+        // two windows.
         if self.defer_to_connect_error() {
             return;
         }
         let mut do_connect = false;
         let mut do_cancel = false;
         let mut persist = false;
-        let mut save_profile = false;
 
         {
             let App {
@@ -368,19 +367,6 @@ impl App {
                         // identity even if the device isn't currently listed, so
                         // the apply button need not require a selected path.
                         let can = editing || dialog.selected_path.is_some();
-                        // A profile is built from a *listed* port (it needs
-                        // that port's identity, which only the detected-port
-                        // list carries), so unlike `can` this cannot fall
-                        // back on the edited tab: `open_port_options` leaves
-                        // `selected_path` empty for a tab whose device is
-                        // currently unplugged, and a selected path can go
-                        // stale while the dialog is open. Gating on the
-                        // lookup `save_dialog_as_profile` performs keeps the
-                        // button from being a silent no-op.
-                        let can_save_profile = dialog
-                            .selected_path
-                            .as_ref()
-                            .is_some_and(|path| available.iter().any(|p| &p.path == path));
                         let apply_label = if editing {
                             "Apply & reconnect"
                         } else {
@@ -394,17 +380,6 @@ impl App {
                         }
                         if ui.button("Cancel").clicked() {
                             do_cancel = true;
-                        }
-                        if ui
-                            .add_enabled(can_save_profile, egui::Button::new("Save as profile"))
-                            .on_hover_text("Persist device identity + params, with auto-connect")
-                            .on_disabled_hover_text(
-                                "Select a detected port above — a profile stores the \
-                                 device's identity, which only a listed port carries",
-                            )
-                            .clicked()
-                        {
-                            save_profile = true;
                         }
                     });
                 });
@@ -431,9 +406,6 @@ impl App {
         if persist {
             self.write_config();
         }
-        if save_profile {
-            self.save_dialog_as_profile();
-        }
         if do_cancel {
             self.config_dialog = None;
         }
@@ -452,37 +424,6 @@ impl App {
         }
     }
 
-    /// Build a profile from the current dialog selection and persist it.
-    fn save_dialog_as_profile(&mut self) {
-        let Some(dialog) = &self.config_dialog else {
-            return;
-        };
-        let Some(path) = &dialog.selected_path else {
-            return;
-        };
-        let Some(port) = self.available.iter().find(|p| &p.path == path).cloned() else {
-            return;
-        };
-        let profile = serialcore::config::Profile {
-            name: port.identity.label(),
-            identity: port.identity,
-            port: dialog.config.clone(),
-            auto_connect: false,
-            highlight: Vec::new(),
-            extract: Vec::new(),
-        };
-        if let Some(existing) = self
-            .config
-            .profiles
-            .iter_mut()
-            .find(|p| p.identity == profile.identity)
-        {
-            existing.port = profile.port;
-        } else {
-            self.config.profiles.push(profile);
-        }
-        self.write_config();
-    }
 }
 
 /// Serial-parameter grid, operating on a borrowed [`PortConfig`].
