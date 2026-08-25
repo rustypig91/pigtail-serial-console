@@ -306,6 +306,14 @@ pub struct HighlightRule {
     pub pattern: String,
     /// `#rrggbb`.
     pub color: String,
+    /// Not rendered, and no longer offered in the UI.
+    ///
+    /// egui has no synthetic bold and no bold monospace face is bundled, so
+    /// there is nothing to draw a bold run *with* — highlighting is expressed
+    /// through colour alone (see `pigtail`'s `CompiledHighlight`). The field
+    /// stays so a config written when the checkbox existed still loads, and so
+    /// the setting is preserved rather than dropped on the next save, should a
+    /// bold face ever be added (issue #45).
     #[serde(default)]
     pub bold: bool,
     #[serde(default = "default_true")]
@@ -553,6 +561,36 @@ mod tests {
         assert!(
             cfg.highlight.iter().all(|r| !r.enabled),
             "seeded highlight rules must start disabled"
+        );
+    }
+
+    /// The bold checkbox is gone from the UI (issue #45: nothing could draw a
+    /// bold run), but the field stays — a config written while it existed has
+    /// to keep loading, and the setting has to survive the next save rather
+    /// than being silently dropped, in case a bold face is ever added.
+    #[test]
+    fn a_config_written_with_bold_highlights_still_loads_and_keeps_them() {
+        // `r##` not `r#`: the colour literal contains `"#`.
+        let cfg = Config::from_toml(
+            r##"
+[[highlight]]
+pattern = "PANIC"
+color = "#ff0000"
+bold = true
+enabled = true
+"##,
+        )
+        .expect("a config from before the checkbox was removed still parses");
+        assert_eq!(cfg.highlight.len(), 1);
+        assert!(
+            cfg.highlight[0].bold,
+            "the setting is preserved, not dropped"
+        );
+
+        let back = Config::from_toml(&cfg.to_toml().unwrap()).unwrap();
+        assert!(
+            back.highlight[0].bold,
+            "and survives a round trip through save"
         );
     }
 

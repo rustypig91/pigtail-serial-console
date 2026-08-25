@@ -46,9 +46,12 @@ pub const SERIES_PALETTE: [egui::Color32; 8] = [
     egui::Color32::from_rgb(0xb5, 0xd0, 0x6a),
 ];
 
-/// A compiled highlight rule cached for render-time use. (`bold` from the rule
-/// is not represented here: egui has no per-run bold without a bold font family,
-/// so highlighting is expressed through colour.)
+/// A compiled highlight rule cached for render-time use.
+///
+/// Colour only. egui has no synthetic bold and no bold monospace face is
+/// bundled, so there is nothing to draw a bold run *with* — hence
+/// [`serialcore::config::HighlightRule::bold`] is not represented here, and is
+/// no longer offered in the Highlight rules window either (issue #45).
 pub struct CompiledHighlight {
     pub re: regex::Regex,
     pub color: egui::Color32,

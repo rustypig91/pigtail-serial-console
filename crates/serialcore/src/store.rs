@@ -54,6 +54,10 @@ pub struct ColorSpan {
     pub len: u32,
     /// Packed `0x00RRGGBB`, or `NO_COLOR` for "default foreground".
     pub rgb: u32,
+    /// Parsed from SGR (`ESC[1m`) but not rendered: no bold monospace face is
+    /// bundled and egui has no synthetic bold, so a run has nothing to be drawn
+    /// bold *with*. Kept because the parse is correct and costs nothing, and
+    /// because it is what a bold face would be wired to (issue #45).
     pub bold: bool,
 }
 
@@ -522,7 +526,10 @@ mod tests {
         assert_eq!(s.len(), 50);
 
         s.set_max_lines(10);
-        assert!(s.len() <= 10, "lowering the cap evicts without a new append");
+        assert!(
+            s.len() <= 10,
+            "lowering the cap evicts without a new append"
+        );
         assert!(s.evicted_any());
         let last = s.next_abs_index() - 1;
         assert_eq!(s.get(last).unwrap().text, "line 49");
