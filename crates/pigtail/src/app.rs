@@ -493,6 +493,11 @@ impl Connection {
                         let is_data = !line.flags.contains(LineFlags::RECONNECT_MARKER)
                             && !line.flags.contains(LineFlags::TX_ECHO);
                         let text = styled.text;
+                        // Where a genuinely new line would land. A
+                        // `CONTINUATION` instead replaces the open provisional
+                        // line in place and hands back *its* index, which is
+                        // below this — see below.
+                        let next = self.store.next_abs_index();
                         let abs = self.store.append(IncomingLine {
                             text: text.clone(),
                             ts: line.ts,
@@ -501,7 +506,15 @@ impl Connection {
                             spans: styled.spans,
                             cursor: styled.cursor.map(|c| c as u32),
                         });
-                        if !self.follow {
+                        // Counted per *line*, not per event: a line the device
+                        // is still writing is re-sent every ~20ms as it grows,
+                        // and counting those would have the footer's "N new"
+                        // climb by ~50/s while the console gained nothing at
+                        // all (issue #46). Keyed off the index rather than the
+                        // flag, so a continuation with no provisional
+                        // predecessor — which `append` correctly treats as a
+                        // new line — still counts as one.
+                        if !self.follow && abs >= next {
                             self.new_since_scroll += 1;
                         }
                         // Run extraction and push points (spec §7.13).
@@ -2893,5 +2906,105 @@ mod tests {
             app.connections[0].last_error.as_ref().unwrap().msg,
             "transmit: dropped, not connected"
         );
+    }
+
+    /// Issue #46: the footer's "N new" badge counted line *events*, but a
+    /// `CONTINUATION` does not add a line — it replaces the open provisional
+    /// one in place and keeps its index. A line the device is still writing is
+    /// re-sent every ~20ms as it grows (a prompt echoing what is typed at it, a
+    /// status line being filled in), so the badge climbed once per redraw while
+    /// the console gained nothing. That number is what the user decides
+    /// "should I jump back to live?" on.
+    #[test]
+    fn the_unread_count_counts_lines_not_redraws_of_one() {
+        let (mut app, _enum_tx) = test_app("new-since-scroll");
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            identity("A1"),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        let (tx, rx) = crossbeam_channel::unbounded();
+        conn.handle.events = rx;
+        // Scrolled back, which is the only state the badge is shown in.
+        conn.follow = false;
+        app.connections.push(conn);
+
+        let clock = SessionClock::new();
+        let mut framer = Framer::new();
+
+        let send = |tx: &crossbeam_channel::Sender<ReaderEvent>, lines| {
+            tx.send(ReaderEvent::Batch(reader::Batch {
+                lines,
+                raw: Vec::new(),
+            }))
+            .unwrap();
+        };
+
+        // One settled line, then one the device has left open.
+        let mut lines = Vec::new();
+        framer.push(b"booting\n", clock.now(), &mut lines);
+        framer.push(b"ready>", clock.now(), &mut lines);
+        lines.push(framer.flush_provisional().unwrap());
+        send(&tx, lines);
+        app.connections[0].drain_events(1000);
+        assert_eq!(
+            app.connections[0].new_since_scroll, 2,
+            "the settled line and the open one are two lines"
+        );
+
+        // Twenty more bytes land on that same open line, each one flushed as it
+        // arrives — the shape of a prompt echoing back what is typed at it.
+        for byte in b"abcdefghijklmnopqrst" {
+            let mut lines = Vec::new();
+            framer.push(&[*byte], clock.now(), &mut lines);
+            lines.push(framer.flush_provisional().unwrap());
+            send(&tx, lines);
+            app.connections[0].drain_events(1000);
+        }
+
+        let conn = &app.connections[0];
+        assert_eq!(conn.store.len(), 2, "still two lines on screen");
+        assert_eq!(
+            conn.store.get(1).unwrap().text,
+            "ready>abcdefghijklmnopqrst",
+            "the one open line grew, rather than twenty more arriving"
+        );
+        assert_eq!(
+            conn.new_since_scroll, 2,
+            "and still two unread; redrawing a line is not new output"
+        );
+    }
+
+    /// The counter still has to move for lines that really are new.
+    #[test]
+    fn the_unread_count_still_counts_real_lines() {
+        let (mut app, _enum_tx) = test_app("new-since-scroll-real");
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            identity("A1"),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        let (tx, rx) = crossbeam_channel::unbounded();
+        conn.handle.events = rx;
+        conn.follow = false;
+        app.connections.push(conn);
+
+        let clock = SessionClock::new();
+        let mut framer = Framer::new();
+        let mut lines = Vec::new();
+        framer.push(b"one\ntwo\nthree\n", clock.now(), &mut lines);
+        tx.send(ReaderEvent::Batch(reader::Batch {
+            lines,
+            raw: Vec::new(),
+        }))
+        .unwrap();
+        app.connections[0].drain_events(1000);
+        assert_eq!(app.connections[0].new_since_scroll, 3);
     }
 }
