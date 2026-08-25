@@ -10,6 +10,33 @@ impl App {
         self.show_filters_window(ctx);
         self.show_highlight_window(ctx);
         self.show_extract_window(ctx);
+        self.show_error_window(ctx);
+    }
+
+    /// The full connection-error message, opened by clicking the footer's
+    /// `⚠ error` indicator. Closes itself if the error clears (e.g. a
+    /// reconnect succeeds) while it's open.
+    fn show_error_window(&mut self, ctx: &egui::Context) {
+        if !self.show_error_win {
+            return;
+        }
+        let Some(active) = self.active_index() else {
+            self.show_error_win = false;
+            return;
+        };
+        let Some(err) = self.connections[active].last_error.clone() else {
+            self.show_error_win = false;
+            return;
+        };
+        let mut open = self.show_error_win;
+        egui::Window::new("Connection error")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label(err);
+            });
+        self.show_error_win = open;
     }
 
     fn show_filters_window(&mut self, ctx: &egui::Context) {

@@ -421,6 +421,11 @@ impl Connection {
                     // otherwise stay lit across the outage and beyond it.
                     if s != ConnState::Connected {
                         self.store.finalize_last_provisional();
+                    } else {
+                        // A successful (re)connect means whatever was wrong
+                        // before no longer applies; don't leave a stale error
+                        // showing once the port is open again.
+                        self.last_error = None;
                     }
                     self.state = s;
                 }
@@ -769,6 +774,9 @@ pub struct App {
     pub show_filters_win: bool,
     pub show_highlight_win: bool,
     pub show_extract_win: bool,
+    /// `true` while the popup showing the active tab's `last_error` in full is
+    /// open (clicked from the footer's error indicator).
+    pub show_error_win: bool,
     pub show_search: bool,
     /// Set when search should grab keyboard focus next frame (e.g. after Ctrl+F).
     pub search_focus_request: bool,
@@ -828,6 +836,7 @@ impl App {
             show_filters_win: false,
             show_highlight_win: false,
             show_extract_win: false,
+            show_error_win: false,
             show_search: false,
             search_focus_request: false,
             update_rx: None,
@@ -1751,6 +1760,7 @@ impl App {
             || self.show_filters_win
             || self.show_highlight_win
             || self.show_extract_win
+            || self.show_error_win
     }
 
     /// Index of the active connection, clamped, or `None` if there are none.

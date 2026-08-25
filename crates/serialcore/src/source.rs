@@ -18,7 +18,7 @@ pub enum SourceError {
     Disconnected(String),
 
     /// Opening the device failed. On Linux, permission-denied errors carry a
-    /// hint about the `dialout` group.
+    /// hint naming whichever group actually owns the device node.
     #[error("{0}")]
     Open(String),
 
@@ -177,12 +177,57 @@ fn map_open_error(path: &str, e: serialport::Error) -> SourceError {
     }
     // Permission denied is the first thing that bites a new Linux user.
     if msg.to_lowercase().contains("permission denied") {
-        return SourceError::Open(format!(
-            "{path}: permission denied. On Linux, add yourself to the 'dialout' \
-             group: `sudo usermod -aG dialout $USER`, then log out and back in."
-        ));
+        return SourceError::Open(format!("{path}: permission denied. {}", permission_hint(path)));
     }
     SourceError::Open(format!("{path}: {msg}"))
+}
+
+/// The group that actually owns `path`, not a guess: distros differ on which
+/// group gates serial devices (`dialout` on Debian/Ubuntu, `uucp` on Arch,
+/// `lock`/`tty` elsewhere), so naming the wrong one would send a user down a
+/// dead end.
+#[cfg(target_os = "linux")]
+fn permission_hint(path: &str) -> String {
+    match device_group_name(path) {
+        Some(group) => format!(
+            "Add yourself to the '{group}' group: `sudo usermod -aG {group} $USER`, \
+             then log out and back in."
+        ),
+        None => format!(
+            "Add yourself to the group that owns the device (`ls -l {path}` shows which), \
+             then log out and back in."
+        ),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn permission_hint(_path: &str) -> String {
+    "Check that your account has permission to access this device.".to_string()
+}
+
+/// Resolve the group that owns the device node at `path` via `getent`, which
+/// consults the same source (files, LDAP, sssd, ...) the system itself uses —
+/// unlike parsing `/etc/group` directly, this stays correct wherever group
+/// lookups are backed by something other than a local file.
+#[cfg(target_os = "linux")]
+fn device_group_name(path: &str) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let gid = std::fs::metadata(path).ok()?.gid();
+    let out = std::process::Command::new("getent")
+        .arg("group")
+        .arg(gid.to_string())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(out.stdout).ok()?;
+    let name = stdout.split(':').next()?.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 /// A scripted source for tests: a list of `(bytes, delay)` pairs delivered in
@@ -287,5 +332,32 @@ mod tests {
             s.read(&mut buf),
             Err(SourceError::Disconnected(_))
         ));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn device_group_name_resolves_the_files_actual_group() {
+        use std::os::unix::fs::MetadataExt;
+        let path = std::env::temp_dir().join(format!("pigtail-test-{}", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        let path_str = path.to_str().unwrap();
+        let gid = std::fs::metadata(&path).unwrap().gid();
+
+        let name = device_group_name(path_str).expect("group should resolve via getent");
+
+        // Round-trip through getent by name, rather than hardcoding an
+        // expected group: CI and dev machines can have different primary
+        // groups, so the only thing worth asserting is that the name we
+        // returned actually maps back to the file's real gid.
+        let out = std::process::Command::new("getent")
+            .arg("group")
+            .arg(&name)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let resolved_gid: u32 = stdout.split(':').nth(2).unwrap().trim().parse().unwrap();
+        assert_eq!(resolved_gid, gid);
+
+        std::fs::remove_file(&path).unwrap();
     }
 }

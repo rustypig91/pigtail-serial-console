@@ -121,6 +121,7 @@ impl App {
         let mut toggle_pin = false;
         let mut toggle_plot = false;
         let mut toggle_hex = false;
+        let mut open_error_win = false;
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if self.merged_selected {
@@ -132,10 +133,34 @@ impl App {
                     return;
                 };
                 let conn = &self.connections[active];
-                ui.colored_label(
-                    state_color(conn.state),
-                    format!("{} {}", state_dot(conn.state), conn.state),
-                );
+                // A live error takes priority over the raw state: the reader
+                // keeps retrying in the background (state stays Connecting /
+                // Reconnecting so it can recover on its own), but the status
+                // bar should say what's actually wrong rather than keep
+                // claiming to be "connecting" while it fails over and over.
+                match (&conn.last_error, conn.state) {
+                    (Some(err), state) if state != ConnState::Connected => {
+                        let resp = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new("⚠ error")
+                                    .color(egui::Color32::from_rgb(0xff, 0x55, 0x55)),
+                            )
+                            .sense(egui::Sense::click()),
+                        );
+                        let resp = resp
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text(err);
+                        if resp.clicked() {
+                            open_error_win = true;
+                        }
+                    }
+                    _ => {
+                        ui.colored_label(
+                            state_color(conn.state),
+                            format!("{} {}", state_dot(conn.state), conn.state),
+                        );
+                    }
+                }
                 ui.separator();
                 ui.monospace(conn.port_config.summary());
                 ui.separator();
@@ -206,6 +231,9 @@ impl App {
                     conn.hex_view = !conn.hex_view;
                 }
             }
+        }
+        if open_error_win {
+            self.show_error_win = true;
         }
     }
 

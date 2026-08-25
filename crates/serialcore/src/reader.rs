@@ -307,6 +307,10 @@ fn run(
         };
         event_tx.send(ReaderEvent::State(state));
 
+        // Reported once per (re)connect phase: an open failure like permission
+        // denied won't clear itself between backoff retries, so repeating it
+        // every attempt would just spam identical messages.
+        let mut reported = false;
         let mut source = loop {
             match opener() {
                 Ok(s) => break s,
@@ -315,6 +319,10 @@ fn run(
                         event_tx.send(ReaderEvent::Error(e.to_string()));
                         event_tx.send(ReaderEvent::State(ConnState::Closed));
                         return;
+                    }
+                    if !reported {
+                        event_tx.send(ReaderEvent::Error(e.to_string()));
+                        reported = true;
                     }
                     // Wait out the backoff while remaining responsive to Shutdown.
                     let targets = ClearTargets {
