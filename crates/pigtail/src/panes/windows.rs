@@ -74,70 +74,29 @@ impl App {
             .open(&mut open)
             .default_width(300.0)
             .show(ctx, |ui| {
+                if self.merged_selected {
+                    ui.weak("Rules here apply only to the merged view.");
+                    show_filter_controls(
+                        ui,
+                        &mut self.merged_filter_rules,
+                        &mut self.merged_filter_combine,
+                        &mut self.merged_filter_dirty,
+                        &self.merged_filter_errors,
+                    );
+                    return;
+                }
                 let Some(active) = self.active_index() else {
                     ui.weak("Connect a port to filter.");
                     return;
                 };
                 let conn = &mut self.connections[active];
-                ui.horizontal(|ui| {
-                    ui.label("Combine:");
-                    let mut changed = ui
-                        .selectable_value(&mut conn.filter_combine, Combine::And, "AND")
-                        .changed();
-                    changed |= ui
-                        .selectable_value(&mut conn.filter_combine, Combine::Or, "OR")
-                        .changed();
-                    if changed {
-                        conn.filter_dirty = true;
-                    }
-                });
-                ui.label("Filter reveals matching history, not just new output.");
-
-                let mut remove: Option<usize> = None;
-                for (i, rule) in conn.filter_rules.iter_mut().enumerate() {
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            if ui.checkbox(&mut rule.enabled, "").changed() {
-                                conn.filter_dirty = true;
-                            }
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut rule.pattern)
-                                        .desired_width(160.0)
-                                        .hint_text("pattern"),
-                                )
-                                .changed()
-                            {
-                                conn.filter_dirty = true;
-                            }
-                            if ui.small_button("🗑").clicked() {
-                                remove = Some(i);
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            if ui.checkbox(&mut rule.is_regex, "regex").changed()
-                                || ui.checkbox(&mut rule.case_sensitive, "case").changed()
-                                || ui.checkbox(&mut rule.invert, "invert").changed()
-                            {
-                                conn.filter_dirty = true;
-                            }
-                        });
-                    });
-                }
-                if let Some(i) = remove {
-                    conn.filter_rules.remove(i);
-                    conn.filter_dirty = true;
-                }
-                if ui.button("+ Add filter").clicked() {
-                    conn.filter_rules.push(FilterRule::default());
-                    conn.filter_dirty = true;
-                }
-                for (i, err) in &conn.filter_errors {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0xff, 0x88, 0x55),
-                        format!("rule {}: {err}", i + 1),
-                    );
-                }
+                show_filter_controls(
+                    ui,
+                    &mut conn.filter_rules,
+                    &mut conn.filter_combine,
+                    &mut conn.filter_dirty,
+                    &conn.filter_errors,
+                );
             });
         self.show_filters_win = open;
     }
@@ -417,5 +376,59 @@ impl App {
                 }
             });
         self.show_extract_win = open;
+    }
+}
+
+fn show_filter_controls(
+    ui: &mut egui::Ui,
+    rules: &mut Vec<FilterRule>,
+    combine: &mut Combine,
+    dirty: &mut bool,
+    errors: &[(usize, String)],
+) {
+    ui.horizontal(|ui| {
+        ui.label("Combine:");
+        let mut changed = ui.selectable_value(combine, Combine::And, "AND").changed();
+        changed |= ui.selectable_value(combine, Combine::Or, "OR").changed();
+        *dirty |= changed;
+    });
+    ui.label("Filter reveals matching history, not just new output.");
+
+    let mut remove: Option<usize> = None;
+    for (i, rule) in rules.iter_mut().enumerate() {
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                *dirty |= ui.checkbox(&mut rule.enabled, "").changed();
+                *dirty |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut rule.pattern)
+                            .desired_width(160.0)
+                            .hint_text("pattern"),
+                    )
+                    .changed();
+                if ui.small_button("🗑").clicked() {
+                    remove = Some(i);
+                }
+            });
+            ui.horizontal(|ui| {
+                *dirty |= ui.checkbox(&mut rule.is_regex, "regex").changed()
+                    || ui.checkbox(&mut rule.case_sensitive, "case").changed()
+                    || ui.checkbox(&mut rule.invert, "invert").changed();
+            });
+        });
+    }
+    if let Some(i) = remove {
+        rules.remove(i);
+        *dirty = true;
+    }
+    if ui.button("+ Add filter").clicked() {
+        rules.push(FilterRule::default());
+        *dirty = true;
+    }
+    for (i, err) in errors {
+        ui.colored_label(
+            egui::Color32::from_rgb(0xff, 0x88, 0x55),
+            format!("rule {}: {err}", i + 1),
+        );
     }
 }

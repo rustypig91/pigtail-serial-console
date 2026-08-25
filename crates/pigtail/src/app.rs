@@ -829,6 +829,33 @@ pub struct App {
     /// Bumped whenever `merged` is rebuilt or reordered rather than appended
     /// to, which is the one change `merged_wrap` cannot follow incrementally.
     pub merged_generation: u64,
+    /// Per-port eviction boundary last applied to `merged`. This makes the
+    /// common append-only path a constant-time check per connection while still
+    /// letting `prune_merged` remove dead entries from inside the interleaving.
+    pub merged_pruned_before: HashMap<PortId, u64>,
+    /// Filter state owned by the merged pseudo-tab. A merged filter is kept
+    /// separate from every port's filter so its meaning does not depend on
+    /// whichever real tab happened to be active last.
+    pub merged_filter_rules: Vec<FilterRule>,
+    pub merged_filter_combine: Combine,
+    pub merged_filter_errors: Vec<(usize, String)>,
+    pub merged_filter_dirty: bool,
+    /// Cached subset of `merged` that passes the merged filter. This is only
+    /// consulted while a rule is active; the ordinary unfiltered path reads
+    /// `merged` directly and pays no extra per-frame scan.
+    pub merged_filtered: Vec<MergedEntry>,
+    pub merged_filter_generation: u64,
+    pub merged_filter_source_generation: u64,
+    pub merged_filter_upto_seq: u64,
+    /// Search state owned by the merged pseudo-tab. Matches keep the complete
+    /// merged key so navigation can identify both the port and its line.
+    pub merged_search_query: String,
+    pub merged_search_matches: Vec<MergedEntry>,
+    pub merged_search_pos: Option<usize>,
+    pub merged_search_dirty: bool,
+    pub merged_search_source_generation: u64,
+    pub merged_search_upto_seq: u64,
+    pub merged_scroll_to: Option<MergedEntry>,
     /// True when the merged pseudo-tab is active.
     pub merged_selected: bool,
     // Floating tool windows, toggled from the console right-click menu, so the
@@ -891,6 +918,22 @@ impl App {
             merged_dirty: false,
             merged_wrap: WrapIndex::new(),
             merged_generation: 0,
+            merged_pruned_before: HashMap::new(),
+            merged_filter_rules: Vec::new(),
+            merged_filter_combine: Combine::And,
+            merged_filter_errors: Vec::new(),
+            merged_filter_dirty: true,
+            merged_filtered: Vec::new(),
+            merged_filter_generation: 0,
+            merged_filter_source_generation: 0,
+            merged_filter_upto_seq: 0,
+            merged_search_query: String::new(),
+            merged_search_matches: Vec::new(),
+            merged_search_pos: None,
+            merged_search_dirty: true,
+            merged_search_source_generation: 0,
+            merged_search_upto_seq: 0,
+            merged_scroll_to: None,
             merged_selected: false,
             show_settings: false,
             show_filters_win: false,
@@ -1544,9 +1587,9 @@ impl App {
         if let Some(p) = conn.search_matches.iter().position(|&i| i >= first) {
             if p > 0 {
                 conn.search_matches.drain(..p);
-                conn.search_pos = conn
-                    .search_pos
-                    .and_then(|cur| if cur < p { None } else { Some(cur - p) });
+                conn.search_pos =
+                    conn.search_pos
+                        .and_then(|cur| if cur < p { None } else { Some(cur - p) });
             }
         } else if !conn.search_matches.is_empty() {
             // Every recorded match was evicted.
@@ -1597,8 +1640,11 @@ impl App {
             self.merged.clear();
             self.merged_seq = 0;
             self.merged_generation += 1;
+            self.merged_pruned_before.clear();
             for conn in &mut self.connections {
-                conn.merged_upto = conn.store.first_abs_index();
+                let first = conn.store.first_abs_index();
+                conn.merged_upto = first;
+                self.merged_pruned_before.insert(conn.id, first);
             }
         }
         // Collect new entries from every port.
@@ -1651,6 +1697,262 @@ impl App {
         }
     }
 
+    /// True when the merged pseudo-tab has at least one enabled, non-empty
+    /// filter rule. This deliberately follows `Connection::filter_index_active`:
+    /// even an invalid active rule keeps the filtered view selected while its
+    /// compile error is shown in the filter window.
+    pub(crate) fn merged_filter_active(&self) -> bool {
+        !self
+            .merged_filter_rules
+            .iter()
+            .all(|r| !r.enabled || r.pattern.is_empty())
+    }
+
+    /// The entries currently displayed by the merged pseudo-tab.
+    pub(crate) fn merged_view(&self) -> &[MergedEntry] {
+        if self.merged_filter_active() {
+            &self.merged_filtered
+        } else {
+            &self.merged
+        }
+    }
+
+    pub(crate) fn merged_view_generation(&self) -> u64 {
+        if self.merged_filter_active() {
+            // The low bit identifies which backing view the generation belongs
+            // to. The two counters advance independently and often hold the
+            // same value, so returning either one raw would let a filter toggle
+            // look unchanged to the wrap and search caches.
+            self.merged_filter_generation
+                .wrapping_mul(2)
+                .wrapping_add(1)
+        } else {
+            self.merged_generation.wrapping_mul(2)
+        }
+    }
+
+    /// Maintain the filtered merged subset without rescanning the entire log
+    /// for every paint. Filter edits and merged reorders rebuild it; ordinary
+    /// output appends new matches and only re-tests each port's mutable newest
+    /// line (the same provisional-line rule used by `FilterIndex`).
+    fn maintain_merged_filter(&mut self, any_data: bool) {
+        let (set, errors) =
+            FilterSet::compile(&self.merged_filter_rules, self.merged_filter_combine);
+        self.merged_filter_errors = errors;
+
+        if !self.merged_filter_active() {
+            if !self.merged_filtered.is_empty() {
+                self.merged_filtered.clear();
+                self.merged_filter_generation += 1;
+            }
+            self.merged_filter_dirty = false;
+            self.merged_filter_source_generation = self.merged_generation;
+            self.merged_filter_upto_seq = self.merged_seq;
+            return;
+        }
+
+        if self.merged_filter_dirty
+            || self.merged_filter_source_generation != self.merged_generation
+        {
+            self.merged_filter_dirty = false;
+            self.merged_filtered = self
+                .merged
+                .iter()
+                .copied()
+                .filter(|entry| merged_entry_matches(&self.connections, *entry, &set))
+                .collect();
+            self.merged_filter_generation += 1;
+            self.merged_filter_source_generation = self.merged_generation;
+            self.merged_filter_upto_seq = self.merged_seq;
+            return;
+        }
+
+        // A store eviction only removes a prefix of `merged`, so the filtered
+        // cache can lose the same prefix without forcing the wrap index to
+        // rebuild: its strictly increasing `seq` keys identify the shift.
+        if let Some(first) = self.merged.first().map(|entry| entry.seq) {
+            let keep = self
+                .merged_filtered
+                .partition_point(|entry| entry.seq < first);
+            if keep > 0 {
+                self.merged_filtered.drain(..keep);
+            }
+        } else {
+            self.merged_filtered.clear();
+        }
+
+        if !any_data {
+            return;
+        }
+
+        let old_upto = self.merged_filter_upto_seq;
+        let mut candidates: Vec<(MergedEntry, bool)> = self
+            .merged
+            .iter()
+            .copied()
+            .filter(|entry| entry.seq >= old_upto)
+            .map(|entry| {
+                let matches = merged_entry_matches(&self.connections, entry, &set);
+                (entry, matches)
+            })
+            .collect();
+
+        // The newest line on every port may have been replaced in place rather
+        // than appended. Re-test its old merged entry as well.
+        for conn in &self.connections {
+            let Some(abs) = conn.store.next_abs_index().checked_sub(1) else {
+                continue;
+            };
+            let Some(entry) = self
+                .merged
+                .iter()
+                .rev()
+                .find(|entry| entry.port == conn.id && entry.abs == abs)
+                .copied()
+            else {
+                continue;
+            };
+            if entry.seq < old_upto {
+                candidates.push((entry, merged_entry_matches(&self.connections, entry, &set)));
+            }
+        }
+
+        let mut changed_old_entry = false;
+        for (entry, matches) in candidates {
+            match self
+                .merged_filtered
+                .binary_search_by_key(&entry.seq, |candidate| candidate.seq)
+            {
+                Ok(pos) if !matches => {
+                    self.merged_filtered.remove(pos);
+                    changed_old_entry |= entry.seq < old_upto;
+                }
+                Err(pos) if matches => {
+                    self.merged_filtered.insert(pos, entry);
+                    changed_old_entry |= entry.seq < old_upto;
+                }
+                _ => {}
+            }
+        }
+        if changed_old_entry {
+            // Insertion/removal in the middle changes every following visual
+            // row. Appends are handled incrementally by `WrapIndex` instead.
+            self.merged_filter_generation += 1;
+        }
+        self.merged_filter_upto_seq = self.merged_seq;
+    }
+
+    /// Maintain search matches over exactly what the merged view displays.
+    /// Like the per-port search, regex errors fall back to a literal search.
+    fn maintain_merged_search(&mut self, any_data: bool) {
+        let source_generation = self.merged_view_generation();
+        if self.merged_search_query.is_empty() {
+            self.merged_search_matches.clear();
+            self.merged_search_pos = None;
+            self.merged_search_dirty = false;
+            self.merged_search_source_generation = source_generation;
+            self.merged_search_upto_seq = self.merged_seq;
+            return;
+        }
+        let re = regex::RegexBuilder::new(&self.merged_search_query)
+            .case_insensitive(true)
+            .build()
+            .or_else(|_| {
+                regex::RegexBuilder::new(&regex::escape(&self.merged_search_query))
+                    .case_insensitive(true)
+                    .build()
+            });
+        let Ok(re) = re else {
+            return;
+        };
+
+        if self.merged_search_dirty || self.merged_search_source_generation != source_generation {
+            self.merged_search_dirty = false;
+            self.merged_search_matches = self
+                .merged_view()
+                .iter()
+                .copied()
+                .filter(|entry| merged_entry_searches(&self.connections, *entry, &re))
+                .collect();
+            self.merged_search_pos = (!self.merged_search_matches.is_empty())
+                .then(|| self.merged_search_matches.len() - 1);
+            self.merged_search_source_generation = source_generation;
+            self.merged_search_upto_seq = self.merged_seq;
+            return;
+        }
+
+        let current = self
+            .merged_search_pos
+            .and_then(|pos| self.merged_search_matches.get(pos))
+            .map(|entry| entry.seq);
+        let view = self.merged_view();
+        if let Some(first) = view.first().map(|entry| entry.seq) {
+            let keep = self
+                .merged_search_matches
+                .partition_point(|entry| entry.seq < first);
+            if keep > 0 {
+                self.merged_search_matches.drain(..keep);
+            }
+        } else {
+            self.merged_search_matches.clear();
+        }
+
+        if any_data {
+            let old_upto = self.merged_search_upto_seq;
+            let mut candidates: Vec<(MergedEntry, bool)> = self
+                .merged_view()
+                .iter()
+                .copied()
+                .filter(|entry| entry.seq >= old_upto)
+                .map(|entry| {
+                    let matches = merged_entry_searches(&self.connections, entry, &re);
+                    (entry, matches)
+                })
+                .collect();
+            for conn in &self.connections {
+                let Some(abs) = conn.store.next_abs_index().checked_sub(1) else {
+                    continue;
+                };
+                let Some(entry) = self
+                    .merged_view()
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.port == conn.id && entry.abs == abs)
+                    .copied()
+                else {
+                    continue;
+                };
+                if entry.seq < old_upto {
+                    candidates.push((entry, merged_entry_searches(&self.connections, entry, &re)));
+                }
+            }
+            for (entry, matches) in candidates {
+                match self
+                    .merged_search_matches
+                    .binary_search_by_key(&entry.seq, |candidate| candidate.seq)
+                {
+                    Ok(pos) if !matches => {
+                        self.merged_search_matches.remove(pos);
+                    }
+                    Err(pos) if matches => self.merged_search_matches.insert(pos, entry),
+                    _ => {}
+                }
+            }
+            self.merged_search_upto_seq = self.merged_seq;
+        }
+
+        self.merged_search_pos = current
+            .and_then(|seq| {
+                self.merged_search_matches
+                    .binary_search_by_key(&seq, |entry| entry.seq)
+                    .ok()
+            })
+            .or_else(|| {
+                (!self.merged_search_matches.is_empty())
+                    .then(|| self.merged_search_matches.len() - 1)
+            });
+    }
+
     /// Drop merged entries whose line has been evicted from its port's store.
     ///
     /// Without this the merged view is the one place in the app that grows
@@ -1660,25 +1962,41 @@ impl App {
     /// data, whether or not the merged tab is the one on screen, so a long
     /// session at speed leaks it steadily.
     ///
-    /// Only the front is walked. Entries are in timestamp order and each port
-    /// evicts its own oldest first, so that is where the dead ones collect —
-    /// and stopping at the first live entry keeps this proportional to what is
-    /// actually dropped rather than to the length of the view.
+    /// Each port evicts independently, so a quiet port can keep the first merged
+    /// entry alive while a busy port leaves dead entries later in the
+    /// interleaving. Remove those interior entries too. A prefix-only removal
+    /// remains incremental; an interior removal bumps the generation because it
+    /// changes the position of every following row.
     fn prune_merged(&mut self) {
-        let dead = self
-            .merged
+        let first_by_port: HashMap<PortId, u64> = self
+            .connections
             .iter()
-            .take_while(|e| {
-                match self.connections.iter().find(|c| c.id == e.port) {
-                    Some(conn) => e.abs < conn.store.first_abs_index(),
-                    // The port is gone; closing one rebuilds the view anyway.
-                    None => true,
-                }
-            })
-            .count();
-        if dead > 0 {
-            self.merged.drain(..dead);
+            .map(|conn| (conn.id, conn.store.first_abs_index()))
+            .collect();
+        let eviction_advanced = first_by_port.len() != self.merged_pruned_before.len()
+            || first_by_port
+                .iter()
+                .any(|(port, first)| self.merged_pruned_before.get(port) != Some(first));
+        if !eviction_advanced {
+            return;
         }
+        let mut saw_live = false;
+        let mut removed_after_live = false;
+        self.merged.retain(|entry| {
+            let live = first_by_port
+                .get(&entry.port)
+                .is_some_and(|&first| entry.abs >= first);
+            if live {
+                saw_live = true;
+            } else if saw_live {
+                removed_after_live = true;
+            }
+            live
+        });
+        if removed_after_live {
+            self.merged_generation += 1;
+        }
+        self.merged_pruned_before = first_by_port;
     }
 
     /// Clear the console: drop every line on screen *and* the capture on disk.
@@ -1768,6 +2086,17 @@ impl App {
 
     /// Jump to the next/previous search match.
     pub fn search_step(&mut self, dir: i64) {
+        if self.merged_selected {
+            if self.merged_search_matches.is_empty() {
+                return;
+            }
+            let len = self.merged_search_matches.len() as i64;
+            let cur = self.merged_search_pos.unwrap_or(0) as i64;
+            let next = (cur + dir).rem_euclid(len) as usize;
+            self.merged_search_pos = Some(next);
+            self.merged_scroll_to = Some(self.merged_search_matches[next]);
+            return;
+        }
         let Some(conn) = self.connections.get_mut(self.active) else {
             return;
         };
@@ -1782,6 +2111,26 @@ impl App {
         conn.selected = Some(abs);
         conn.scroll_to = Some(abs);
     }
+}
+
+fn merged_entry_matches(connections: &[Connection], entry: MergedEntry, set: &FilterSet) -> bool {
+    connections
+        .iter()
+        .find(|conn| conn.id == entry.port)
+        .and_then(|conn| conn.store.get(entry.abs))
+        .is_some_and(|line| set.matches(line.text))
+}
+
+fn merged_entry_searches(
+    connections: &[Connection],
+    entry: MergedEntry,
+    re: &regex::Regex,
+) -> bool {
+    connections
+        .iter()
+        .find(|conn| conn.id == entry.port)
+        .and_then(|conn| conn.store.get(entry.abs))
+        .is_some_and(|line| re.is_match(line.text))
 }
 
 /// Parse `#rrggbb` into a colour.
@@ -1815,10 +2164,12 @@ impl eframe::App for App {
         // Maintain derived indices.
         self.rebuild_highlight_if_dirty();
         self.maintain_filters();
-        self.maintain_search();
         if any_data || self.merged_dirty {
             self.maintain_merged();
         }
+        self.maintain_merged_filter(any_data);
+        self.maintain_search();
+        self.maintain_merged_search(any_data);
 
         // Minimal chrome: a header of tabs on top, a status footer at the
         // bottom, and the console filling everything in between. Tool panels are
@@ -2196,6 +2547,213 @@ pub(crate) mod tests {
             )),
         )
         .unwrap()
+    }
+
+    fn add_merged_test_connection(
+        app: &mut App,
+        id: PortId,
+        label: &str,
+        lines: &[(&str, i64, LineFlags)],
+    ) {
+        let mut conn = app.make_connection(
+            id,
+            label.to_owned(),
+            identity(label),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        for (text, micros, flags) in lines {
+            conn.store.append(IncomingLine {
+                text: (*text).to_owned(),
+                ts: Timestamp {
+                    wall: chrono::Utc::now(),
+                    micros: *micros,
+                },
+                port: id,
+                flags: *flags,
+                spans: Default::default(),
+                cursor: None,
+            });
+        }
+        app.connections.push(conn);
+        app.merged_dirty = true;
+    }
+
+    #[test]
+    fn merged_filter_and_search_use_the_interleaved_view() {
+        let (mut app, _enum_tx) = test_app("merged-filter-search");
+        add_merged_test_connection(
+            &mut app,
+            PortId(1),
+            "alpha",
+            &[
+                ("alpha ready", 1, LineFlags::default()),
+                ("ERROR alpha", 3, LineFlags::default()),
+            ],
+        );
+        add_merged_test_connection(
+            &mut app,
+            PortId(2),
+            "beta",
+            &[
+                ("ERROR beta target", 2, LineFlags::default()),
+                ("beta ready", 4, LineFlags::default()),
+            ],
+        );
+        app.maintain_merged();
+        app.merged_filter_rules.push(FilterRule {
+            pattern: "ERROR".into(),
+            ..FilterRule::default()
+        });
+        app.merged_filter_dirty = true;
+        app.maintain_merged_filter(false);
+
+        let shown: Vec<_> = app
+            .merged_view()
+            .iter()
+            .map(|entry| (entry.port, entry.abs))
+            .collect();
+        assert_eq!(shown, [(PortId(2), 0), (PortId(1), 1)]);
+
+        app.merged_search_query = "target".into();
+        app.merged_search_dirty = true;
+        app.maintain_merged_search(false);
+        assert_eq!(app.merged_search_matches.len(), 1);
+        assert_eq!(app.merged_search_matches[0].port, PortId(2));
+
+        app.merged_selected = true;
+        app.search_step(1);
+        assert_eq!(
+            app.merged_scroll_to.map(|entry| (entry.port, entry.abs)),
+            Some((PortId(2), 0))
+        );
+    }
+
+    #[test]
+    fn merged_filter_and_search_retest_a_growing_line() {
+        let (mut app, _enum_tx) = test_app("merged-growing-line");
+        add_merged_test_connection(
+            &mut app,
+            PortId(1),
+            "probe",
+            &[("booting", 1, LineFlags::PROVISIONAL)],
+        );
+        app.maintain_merged();
+        app.merged_filter_rules.push(FilterRule {
+            pattern: "ERROR".into(),
+            ..FilterRule::default()
+        });
+        app.merged_filter_dirty = true;
+        app.maintain_merged_filter(false);
+        assert!(app.merged_view().is_empty());
+
+        app.connections[0].store.append(IncomingLine {
+            text: "booting: ERROR target".into(),
+            ts: Timestamp {
+                wall: chrono::Utc::now(),
+                micros: 2,
+            },
+            port: PortId(1),
+            flags: LineFlags::PROVISIONAL | LineFlags::CONTINUATION,
+            spans: Default::default(),
+            cursor: None,
+        });
+        app.maintain_merged_filter(true);
+        assert_eq!(app.merged_view().len(), 1);
+
+        app.merged_search_query = "target".into();
+        app.merged_search_dirty = true;
+        app.maintain_merged_search(true);
+        assert_eq!(app.merged_search_matches.len(), 1);
+    }
+
+    #[test]
+    fn merged_search_rebuilds_when_filter_mode_changes() {
+        let (mut app, _enum_tx) = test_app("merged-filter-generation");
+        add_merged_test_connection(
+            &mut app,
+            PortId(1),
+            "probe",
+            &[
+                ("keep target", 1, LineFlags::default()),
+                ("drop target", 2, LineFlags::default()),
+            ],
+        );
+        app.maintain_merged();
+        app.merged_search_query = "target".into();
+        app.merged_search_dirty = true;
+        app.maintain_merged_search(false);
+        assert_eq!(app.merged_search_matches.len(), 2);
+        let unfiltered_generation = app.merged_view_generation();
+
+        app.merged_filter_rules.push(FilterRule {
+            pattern: "keep".into(),
+            ..FilterRule::default()
+        });
+        app.merged_filter_dirty = true;
+        app.maintain_merged_filter(false);
+        assert_ne!(app.merged_view_generation(), unfiltered_generation);
+        app.maintain_merged_search(false);
+        assert_eq!(app.merged_search_matches.len(), 1);
+        assert_eq!(app.merged_search_matches[0].abs, 0);
+
+        app.merged_filter_rules[0].enabled = false;
+        app.merged_filter_dirty = true;
+        app.maintain_merged_filter(false);
+        assert_eq!(app.merged_view_generation(), unfiltered_generation);
+        app.maintain_merged_search(false);
+        assert_eq!(app.merged_search_matches.len(), 2);
+    }
+
+    #[test]
+    fn merged_caches_drop_a_busy_ports_interior_evictions() {
+        let (mut app, _enum_tx) = test_app("merged-interior-eviction");
+        add_merged_test_connection(
+            &mut app,
+            PortId(1),
+            "quiet",
+            &[("quiet", 0, LineFlags::default())],
+        );
+        add_merged_test_connection(
+            &mut app,
+            PortId(2),
+            "busy",
+            &[
+                ("hit one", 1, LineFlags::default()),
+                ("hit two", 2, LineFlags::default()),
+                ("hit three", 3, LineFlags::default()),
+            ],
+        );
+        app.maintain_merged();
+        app.merged_filter_rules.push(FilterRule {
+            pattern: "hit".into(),
+            ..FilterRule::default()
+        });
+        app.merged_filter_dirty = true;
+        app.maintain_merged_filter(false);
+        app.merged_search_query = "hit".into();
+        app.merged_search_dirty = true;
+        app.maintain_merged_search(false);
+        assert_eq!(app.merged_filtered.len(), 3);
+        assert_eq!(app.merged_search_matches.len(), 3);
+
+        // The quiet row remains the first merged entry while the busy port
+        // evicts two entries from the middle of the interleaving.
+        app.connections[1].store.set_max_lines(1);
+        app.maintain_merged();
+        app.maintain_merged_filter(false);
+        app.maintain_merged_search(false);
+
+        let remaining: Vec<_> = app
+            .merged
+            .iter()
+            .map(|entry| (entry.port, entry.abs))
+            .collect();
+        assert_eq!(remaining, [(PortId(1), 0), (PortId(2), 2)]);
+        assert_eq!(app.merged_filtered.len(), 1);
+        assert_eq!(app.merged_filtered[0].abs, 2);
+        assert_eq!(app.merged_search_matches.len(), 1);
+        assert_eq!(app.merged_search_matches[0].abs, 2);
     }
 
     /// `save_session` must not persist a `Closed` zombie into `last_open`: if

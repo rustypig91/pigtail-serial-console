@@ -451,10 +451,16 @@ impl App {
             self.active = active;
 
             // Optional search bar pinned to the top of the console.
-            if self.show_search && !self.merged_selected {
+            if self.show_search {
                 egui::TopBottomPanel::top("search_bar")
                     .show_separator_line(false)
-                    .show_inside(ui, |ui| self.show_search_bar(ui, active));
+                    .show_inside(ui, |ui| {
+                        if self.merged_selected {
+                            self.show_merged_search_bar(ui);
+                        } else {
+                            self.show_search_bar(ui, active);
+                        }
+                    });
             }
 
             // The console body fills the remaining space. The send prompt is now
@@ -560,6 +566,65 @@ impl App {
         }
     }
 
+    fn show_merged_search_bar(&mut self, ui: &mut egui::Ui) {
+        let mut next = false;
+        let mut prev = false;
+        let mut close = false;
+        let mut focus = std::mem::take(&mut self.search_focus_request);
+        ui.horizontal(|ui| {
+            ui.label("🔍");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.merged_search_query)
+                    .hint_text("search merged view (regex)…")
+                    .desired_width(240.0),
+            );
+            if resp.changed() {
+                self.merged_search_dirty = true;
+                self.merged_search_pos = None;
+            }
+            if focus {
+                resp.request_focus();
+                focus = false;
+            }
+            if resp.has_focus() || resp.lost_focus() {
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter)) {
+                    prev = true;
+                    resp.request_focus();
+                } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                    next = true;
+                    resp.request_focus();
+                }
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                    close = true;
+                }
+            }
+            if ui.small_button("Prev").clicked() {
+                prev = true;
+            }
+            if ui.small_button("Next").clicked() {
+                next = true;
+            }
+            if !self.merged_search_matches.is_empty() {
+                let n = self.merged_search_pos.map(|p| p + 1).unwrap_or(0);
+                ui.weak(format!("{n}/{}", self.merged_search_matches.len()));
+            }
+            if ui.small_button("Close").clicked() {
+                close = true;
+            }
+        });
+        if next {
+            self.search_step(1);
+        }
+        if prev {
+            self.search_step(-1);
+        }
+        if close {
+            self.show_search = false;
+            self.merged_search_query.clear();
+            self.merged_search_dirty = true;
+        }
+    }
+
     fn show_single_rows(&mut self, ui: &mut egui::Ui, active: usize, menu: &mut MenuAction) {
         let ts_format = self.config.settings.timestamp_format;
         let m = Metrics::new(
@@ -650,6 +715,7 @@ impl App {
                 Some(MenuTarget::active(None)),
                 ts_format,
                 has_mark,
+                false,
             )
         });
 
@@ -753,6 +819,7 @@ impl App {
                             Some(MenuTarget::active(Some(abs))),
                             ts_format,
                             has_mark,
+                            false,
                         )
                     });
                     entry += 1;
@@ -783,6 +850,14 @@ impl App {
 
     fn show_merged_rows(&mut self, ui: &mut egui::Ui, menu: &mut MenuAction) {
         let ts_format = self.config.settings.timestamp_format;
+        let filter_active = self.merged_filter_active();
+        let view_generation = self.merged_view_generation();
+        let goto = self.merged_scroll_to.take();
+        let search_re = compile_search(&self.merged_search_query);
+        let cur_match_seq = self
+            .merged_search_pos
+            .and_then(|pos| self.merged_search_matches.get(pos))
+            .map(|entry| entry.seq);
         let m = Metrics::new(
             ui,
             self.console_font(),
@@ -795,13 +870,18 @@ impl App {
             connections,
             highlight_cache,
             merged,
+            merged_filtered,
             merged_wrap,
-            merged_generation,
             ..
         } = self;
+        let view = if filter_active {
+            merged_filtered.as_slice()
+        } else {
+            merged.as_slice()
+        };
         let row_height = m.row_height;
         let index_of = |id: PortId| connections.iter().position(|c| c.id == id);
-        let entries = merged.len();
+        let entries = view.len();
         // The merged view carries no mark of its own — a mark belongs to one
         // port's console — so "from mark" counts from this run's start here,
         // the same zero a single tab falls back to.
@@ -812,11 +892,11 @@ impl App {
         // timestamp across every line framed out of the same read.
         merged_wrap.sync(
             m.cols,
-            *merged_generation,
+            view_generation,
             entries,
-            |i| merged[i].seq,
+            |i| view[i].seq,
             |i| {
-                let MergedEntry { port, abs, .. } = merged[i];
+                let MergedEntry { port, abs, .. } = view[i];
                 match index_of(port) {
                     Some(ci) => wrap_len(&connections[ci].store, abs),
                     None => 0,
@@ -824,6 +904,12 @@ impl App {
             },
         );
         let n_rows = merged_wrap.total_rows();
+        let scroll_offset = goto.and_then(|target| {
+            let entry = view
+                .binary_search_by_key(&target.seq, |entry| entry.seq)
+                .ok()?;
+            Some(merged_wrap.start_row(entry) as f32 * row_height - ui.available_height() * 0.5)
+        });
 
         let bg = ui.interact(
             ui.available_rect_before_wrap(),
@@ -834,63 +920,67 @@ impl App {
         // so the port-specific items are left out here rather than aimed at
         // whichever tab was last active (issue #11). Right-clicking a row
         // offers them, resolved against that row's own port.
-        bg.context_menu(|ui| console_menu(ui, menu, None, ts_format, false));
+        bg.context_menu(|ui| console_menu(ui, menu, None, ts_format, false, true));
         ui.spacing_mut().item_spacing.y = 0.0;
 
-        egui::ScrollArea::vertical()
+        let mut area = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .drag_to_scroll(false)
-            .stick_to_bottom(true)
-            .show_viewport(ui, |ui, viewport| {
-                ui.set_width(ui.available_width());
-                ui.set_height(n_rows as f32 * row_height);
-                let (first_entry, rect) = viewport_entries(ui, viewport, merged_wrap, row_height);
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    let last_row = (viewport.max.y / row_height).ceil() as u64 + 1;
-                    let mut entry = first_entry;
-                    while entry < entries && merged_wrap.start_row(entry) < last_row {
-                        let MergedEntry { port, abs, .. } = merged[entry];
-                        let rows = merged_wrap.rows(entry);
-                        entry += 1;
-                        // A row that can't be resolved still holds its space, or
-                        // everything below it shifts up out of place.
-                        let Some(ci) = index_of(port) else {
-                            ui.add_space(rows as f32 * row_height);
-                            continue;
-                        };
-                        let conn = &connections[ci];
-                        let Some(line) = conn.store.get(abs) else {
-                            ui.add_space(rows as f32 * row_height);
-                            continue;
-                        };
-                        let color = PORT_PALETTE[ci % PORT_PALETTE.len()];
-                        let rctx = RowCtx {
+            .stick_to_bottom(true);
+        if let Some(offset) = scroll_offset {
+            area = area.vertical_scroll_offset(offset.max(0.0));
+        }
+        area.show_viewport(ui, |ui, viewport| {
+            ui.set_width(ui.available_width());
+            ui.set_height(n_rows as f32 * row_height);
+            let (first_entry, rect) = viewport_entries(ui, viewport, merged_wrap, row_height);
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let last_row = (viewport.max.y / row_height).ceil() as u64 + 1;
+                let mut entry = first_entry;
+                while entry < entries && merged_wrap.start_row(entry) < last_row {
+                    let MergedEntry { port, abs, seq, .. } = view[entry];
+                    let rows = merged_wrap.rows(entry);
+                    entry += 1;
+                    // A row that can't be resolved still holds its space, or
+                    // everything below it shifts up out of place.
+                    let Some(ci) = index_of(port) else {
+                        ui.add_space(rows as f32 * row_height);
+                        continue;
+                    };
+                    let conn = &connections[ci];
+                    let Some(line) = conn.store.get(abs) else {
+                        ui.add_space(rows as f32 * row_height);
+                        continue;
+                    };
+                    let color = PORT_PALETTE[ci % PORT_PALETTE.len()];
+                    let rctx = RowCtx {
+                        ts_format,
+                        m: &m,
+                        rows,
+                        prev_micros: None,
+                        mark: session_start,
+                        highlight: highlight_cache,
+                        search_re: search_re.as_ref(),
+                        is_search_current: cur_match_seq == Some(seq),
+                        port_tag: Some((short_tag(&conn.label), color)),
+                        row_id: egui::Id::new(("merged_row", port, abs)),
+                    };
+                    let resp = render_row(ui, &line, &rctx);
+                    let has_mark = conn.mark_micros.is_some();
+                    resp.context_menu(|ui| {
+                        console_menu(
+                            ui,
+                            menu,
+                            Some(MenuTarget::row(port, &conn.label, abs)),
                             ts_format,
-                            m: &m,
-                            rows,
-                            prev_micros: None,
-                            mark: session_start,
-                            highlight: highlight_cache,
-                            search_re: None,
-                            is_search_current: false,
-                            port_tag: Some((short_tag(&conn.label), color)),
-                            row_id: egui::Id::new(("merged_row", port, abs)),
-                        };
-                        let resp = render_row(ui, &line, &rctx);
-                        let has_mark = conn.mark_micros.is_some();
-                        resp.context_menu(|ui| {
-                            console_menu(
-                                ui,
-                                menu,
-                                Some(MenuTarget::row(port, &conn.label, abs)),
-                                ts_format,
-                                has_mark,
-                            )
-                        });
-                    }
-                });
+                            has_mark,
+                            true,
+                        )
+                    });
+                }
             });
+        });
     }
 
     fn show_hex_rows(&mut self, ui: &mut egui::Ui, active: usize, menu: &mut MenuAction) {
@@ -908,6 +998,7 @@ impl App {
                 Some(MenuTarget::active(None)),
                 ts_format,
                 has_mark,
+                false,
             )
         });
 
@@ -1023,6 +1114,7 @@ impl App {
                         Some(MenuTarget::active(None)),
                         ts_format,
                         has_mark,
+                        false,
                     )
                 });
             }
@@ -1081,8 +1173,12 @@ impl App {
                 self.search_focus_request = true;
             }
         }
-        if let (Some(as_csv), Some(target)) = (menu.export, target) {
-            self.export_active_view(target, as_csv);
+        if let Some(as_csv) = menu.export {
+            if self.merged_selected {
+                self.export_merged_view(as_csv);
+            } else if let Some(target) = target {
+                self.export_active_view(target, as_csv);
+            }
         }
         if menu.clear_console {
             // The port the menu named, so a merged row clears the port that row
@@ -1187,6 +1283,66 @@ impl App {
             }
         }
     }
+
+    /// Export the merged tab exactly as displayed: timestamp-interleaved,
+    /// filtered by its own rules, and with every row identified by its port
+    /// tag. CSV gets the tag as a separate column; text mirrors the console's
+    /// `[tag] timestamp text` layout.
+    pub(crate) fn export_merged_view(&mut self, as_csv: bool) {
+        let out = format_merged_export(&self.connections, self.merged_view(), as_csv);
+
+        let ext = if as_csv { "csv" } else { "txt" };
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter(ext, &[ext])
+            .set_file_name(format!("merged-export.{ext}"))
+            .save_file()
+        {
+            if let Err(e) = std::fs::write(&path, out) {
+                self.record_connect_error("Couldn't export", e.to_string());
+            }
+        }
+    }
+}
+
+fn format_merged_export(
+    connections: &[Connection],
+    entries: &[MergedEntry],
+    as_csv: bool,
+) -> String {
+    let mut out = String::new();
+    if as_csv {
+        out.push_str("port,wall_time,micros,flags,text\n");
+    }
+    for entry in entries {
+        let Some(conn) = connections.iter().find(|conn| conn.id == entry.port) else {
+            continue;
+        };
+        let Some(line) = conn.store.get(entry.abs) else {
+            continue;
+        };
+        let tag = short_tag(&conn.label);
+        if as_csv {
+            out.push_str(&format!(
+                "{},{},{},{},{}\n",
+                csv_escape(&tag),
+                line.meta
+                    .ts
+                    .wall
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%dT%H:%M:%S%.6f%:z"),
+                line.meta.ts.micros,
+                line.meta.flags.0,
+                csv_escape(line.text),
+            ));
+        } else {
+            out.push_str(&format!(
+                "{tag}  {}  {}\n",
+                wall_clock(line.meta.ts),
+                line.text
+            ));
+        }
+    }
+    out
 }
 
 /// The right-click menu, common to rows and empty areas.
@@ -1198,16 +1354,17 @@ impl App {
 /// It comes in three shapes, and each is offered a different menu:
 ///
 /// - the active tab's own console (`MenuTarget::active`) gets everything;
-/// - a merged row (`MenuTarget::row`) gets only what can be aimed at its port —
-///   no hex, plot, search or time mark, since the merged view draws none of
-///   those and so would show nothing for them;
-/// - merged empty space (`None`) gets only what needs no port at all.
+/// - a merged row (`MenuTarget::row`) gets merged-view tools plus the physical
+///   controls and clear action that can be aimed at that row's port;
+/// - merged empty space (`None`) gets merged-view tools and actions for the
+///   whole merged console, but nothing aimed at an arbitrary port.
 fn console_menu(
     ui: &mut egui::Ui,
     menu: &mut MenuAction,
     target: Option<MenuTarget<'_>>,
     cur_ts: TimestampFormat,
     has_mark: bool,
+    merged_view: bool,
 ) {
     // Only one context menu can be open at a time, so this closure runs for the
     // one the user actually opened — recording its port once up here is enough
@@ -1218,13 +1375,9 @@ fn console_menu(
     // actually act on it, rather than the whole menu — see there.
     let row_label = target.as_ref().and_then(|t| t.label);
     // The active tab's own console: a single connection's view, or its hex
-    // dump. Only there do the items that change what *this* console shows have
-    // anything to change. The merged view draws no hex dump, no plot, no search
-    // bar, and no mark of its own — `show_merged_rows` counts "from mark" from
-    // the session start for every port at once — so offering these on a merged
-    // row would flip a flag on a tab the reader isn't even looking at and
-    // change nothing they can see.
-    let own_console = target.is_some() && row_label.is_none();
+    // dump. Hex, plot and time marks remain exclusive to it; search, filtering
+    // and export also have explicit merged-view implementations.
+    let own_console = !merged_view && target.is_some() && row_label.is_none();
     ui.menu_button("Timestamps", |ui| {
         for f in [
             TimestampFormat::Absolute,
@@ -1253,11 +1406,11 @@ fn console_menu(
         }
     }
     ui.separator();
-    if own_console && ui.button("Search…").clicked() {
+    if (own_console || merged_view) && ui.button("Search…").clicked() {
         menu.toggle_search = true;
         ui.close_menu();
     }
-    if ui.button("Filters…").clicked() {
+    if (own_console || merged_view) && ui.button("Filters…").clicked() {
         menu.open_filters = true;
         ui.close_menu();
     }
@@ -1265,9 +1418,13 @@ fn console_menu(
         menu.open_highlight = true;
         ui.close_menu();
     }
-    if ui.button("Plot extraction…").clicked() {
+    if own_console && ui.button("Plot extraction…").clicked() {
         menu.open_extract = true;
         ui.close_menu();
+    }
+    if merged_view {
+        ui.separator();
+        export_menu(ui, menu);
     }
     if target.is_some() {
         ui.separator();
@@ -1276,7 +1433,7 @@ fn console_menu(
         // reader has no way to tell — and DTR, RTS and break reach a physical
         // device. It sits here rather than at the top because only what follows
         // is aimed at that port: the timestamp format is a global setting, and
-        // the filter, highlight and extraction windows edit the active tab.
+        // the merged filter/search/export items above act on the whole view.
         if let Some(label) = row_label {
             ui.weak(label)
                 .on_hover_text("What the items below act on — not the whole merged view");
@@ -1316,17 +1473,10 @@ fn console_menu(
                 ui.close_menu();
             }
         }
+    }
+    if own_console {
         ui.separator();
-        ui.menu_button("Export view", |ui| {
-            if ui.button("Text (.txt)").clicked() {
-                menu.export = Some(false);
-                ui.close_menu();
-            }
-            if ui.button("CSV (.csv)").clicked() {
-                menu.export = Some(true);
-                ui.close_menu();
-            }
-        });
+        export_menu(ui, menu);
     }
     ui.separator();
     // A merged row's clear takes that row's port alone; every other menu's
@@ -1343,6 +1493,19 @@ fn console_menu(
         menu.clear_console = true;
         ui.close_menu();
     }
+}
+
+fn export_menu(ui: &mut egui::Ui, menu: &mut MenuAction) {
+    ui.menu_button("Export view", |ui| {
+        if ui.button("Text (.txt)").clicked() {
+            menu.export = Some(false);
+            ui.close_menu();
+        }
+        if ui.button("CSV (.csv)").clicked() {
+            menu.export = Some(true);
+            ui.close_menu();
+        }
+    });
 }
 
 /// Re-engage `follow` once the user's own scrolling (wheel or scrollbar drag)
@@ -1878,12 +2041,75 @@ fn fmt_delta(micros: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::tests::{inert_handle, test_app};
+    use serialcore::config::{PortConfig, PortIdentity};
+    use serialcore::store::IncomingLine;
 
     fn ts(micros: i64) -> Timestamp {
         Timestamp {
             wall: chrono::Utc::now(),
             micros,
         }
+    }
+
+    #[test]
+    fn merged_export_keeps_view_order_and_identifies_each_port() {
+        let (app, _enum_tx) = test_app("merged-export");
+        let mut alpha = app.make_connection(
+            PortId(1),
+            "alpha".into(),
+            PortIdentity::default(),
+            PortConfig::default(),
+            inert_handle(PortId(1)),
+        );
+        alpha.store.append(IncomingLine {
+            text: "alarm, now".into(),
+            ts: ts(2),
+            port: PortId(1),
+            flags: LineFlags::default(),
+            spans: Default::default(),
+            cursor: None,
+        });
+        let mut beta = app.make_connection(
+            PortId(2),
+            "beta".into(),
+            PortIdentity::default(),
+            PortConfig::default(),
+            inert_handle(PortId(2)),
+        );
+        beta.store.append(IncomingLine {
+            text: "ready".into(),
+            ts: ts(1),
+            port: PortId(2),
+            flags: LineFlags::default(),
+            spans: Default::default(),
+            cursor: None,
+        });
+        let connections = vec![alpha, beta];
+        let entries = [
+            MergedEntry {
+                micros: 1,
+                port: PortId(2),
+                abs: 0,
+                seq: 0,
+            },
+            MergedEntry {
+                micros: 2,
+                port: PortId(1),
+                abs: 0,
+                seq: 1,
+            },
+        ];
+
+        let text = format_merged_export(&connections, &entries, false);
+        let mut lines = text.lines();
+        assert!(lines.next().unwrap().starts_with("[beta  ]"));
+        assert!(lines.next().unwrap().starts_with("[alpha ]"));
+
+        let csv = format_merged_export(&connections, &entries, true);
+        assert!(csv.starts_with("port,wall_time,micros,flags,text\n"));
+        assert!(csv.contains("[beta  ]"));
+        assert!(csv.contains("\"alarm, now\""));
     }
 
     #[test]
