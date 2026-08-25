@@ -236,11 +236,13 @@ pub struct PortConfig {
     /// Line ending appended to sent input.
     #[serde(default)]
     pub line_ending: LineEnding,
-    /// Echo sent input as a line in the log.
-    #[serde(default = "default_true")]
+    /// Echo sent input as a line in the log. Off by default: a device that
+    /// echoes its own input would otherwise show every keystroke twice.
+    #[serde(default)]
     pub local_echo: bool,
     /// Recall sent-input history with Up/Down (captured locally, never sent).
-    #[serde(default = "default_true")]
+    /// Off by default so Up/Down reach the device's own shell history.
+    #[serde(default)]
     pub local_history: bool,
 }
 
@@ -256,8 +258,8 @@ impl Default for PortConfig {
             rts_on_open: false,
             terminal: TerminalMode::default(),
             line_ending: LineEnding::default(),
-            local_echo: true,
-            local_history: true,
+            local_echo: false,
+            local_history: false,
         }
     }
 }
