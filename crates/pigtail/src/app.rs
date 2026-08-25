@@ -1682,13 +1682,21 @@ impl App {
         }
         // Drop evicted matches. `search_pos` is an index *into* this vec, so it
         // has to come down by however many were dropped off the front, or the
-        // hit the user is standing on silently becomes a different one.
+        // hit the user is standing on silently becomes a different one. If the
+        // cursor's own match was among those dropped, it's invalidated rather
+        // than clamped, so it doesn't silently jump to an unrelated match.
         let first = conn.store.first_abs_index();
         if let Some(p) = conn.search_matches.iter().position(|&i| i >= first) {
             if p > 0 {
                 conn.search_matches.drain(..p);
-                conn.search_pos = conn.search_pos.map(|cur| cur.saturating_sub(p));
+                conn.search_pos = conn
+                    .search_pos
+                    .and_then(|cur| if cur < p { None } else { Some(cur - p) });
             }
+        } else if !conn.search_matches.is_empty() {
+            // Every recorded match was evicted.
+            conn.search_matches.clear();
+            conn.search_pos = None;
         }
 
         let end = conn.store.next_abs_index();
@@ -3092,5 +3100,105 @@ mod tests {
             "the cursor has to follow its line through the eviction, not stay \
              at the same slot and point at a different hit"
         );
+    }
+
+    /// If *every* recorded match is evicted at once, `search_matches` has to
+    /// be cleared rather than left holding indices the store can no longer
+    /// resolve — `maintain_search` only runs for the active connection, so a
+    /// background tab can evict its whole store between search passes.
+    #[test]
+    fn evicting_every_match_clears_search_state() {
+        let (mut app, _enum_tx) = test_app("search-evict-all");
+        let _tx = conn_with_injected_events(&mut app, PortId(0));
+        app.active = 0;
+        let conn = &mut app.connections[0];
+        conn.search_query = "hit".into();
+        conn.store.set_max_lines(200);
+        for n in 0..10 {
+            conn.store.append(IncomingLine {
+                text: format!("hit {n}"),
+                ts: Timestamp {
+                    wall: chrono::Utc::now(),
+                    micros: n as i64,
+                },
+                port: PortId(0),
+                flags: LineFlags::default(),
+                spans: Default::default(),
+                cursor: None,
+            });
+        }
+        app.maintain_search();
+        assert_eq!(app.connections[0].search_matches.len(), 10);
+        app.connections[0].search_pos = Some(9);
+
+        // Push enough non-matching lines to evict every matched line, without
+        // another search pass in between (mirrors an inactive tab).
+        let conn = &mut app.connections[0];
+        for n in 0..200 {
+            conn.store.append(IncomingLine {
+                text: format!("miss {n}"),
+                ts: Timestamp {
+                    wall: chrono::Utc::now(),
+                    micros: (100 + n) as i64,
+                },
+                port: PortId(0),
+                flags: LineFlags::default(),
+                spans: Default::default(),
+                cursor: None,
+            });
+        }
+        app.maintain_search();
+
+        let conn = &app.connections[0];
+        assert!(
+            conn.search_matches.is_empty(),
+            "every match was evicted, so none should remain: {:?}",
+            conn.search_matches
+        );
+        assert_eq!(conn.search_pos, None);
+    }
+
+    /// If the match the cursor is standing on is itself among the evicted
+    /// entries, the cursor has to be invalidated — clamping it into range
+    /// would silently land it on an unrelated match instead.
+    #[test]
+    fn evicting_the_current_match_resets_the_cursor() {
+        let (mut app, _enum_tx) = test_app("search-evict-cursor");
+        let _tx = conn_with_injected_events(&mut app, PortId(0));
+        app.active = 0;
+        let conn = &mut app.connections[0];
+        conn.search_query = "hit".into();
+        conn.store.set_max_lines(100);
+        for n in 0..40 {
+            conn.store.append(IncomingLine {
+                text: format!("hit {n}"),
+                ts: Timestamp {
+                    wall: chrono::Utc::now(),
+                    micros: n as i64,
+                },
+                port: PortId(0),
+                flags: LineFlags::default(),
+                spans: Default::default(),
+                cursor: None,
+            });
+        }
+        app.maintain_search();
+
+        // Stand on an early hit that will be evicted below.
+        app.connections[0].search_pos = Some(1);
+        assert_eq!(app.connections[0].search_matches[1], 1);
+
+        app.connections[0].store.set_max_lines(10);
+        app.maintain_search();
+
+        let conn = &app.connections[0];
+        if let Some(pos) = conn.search_pos {
+            assert_ne!(
+                conn.search_matches.get(pos).copied(),
+                Some(1),
+                "the evicted line is gone; the cursor must not silently land \
+                 on a different match in its old slot"
+            );
+        }
     }
 }
