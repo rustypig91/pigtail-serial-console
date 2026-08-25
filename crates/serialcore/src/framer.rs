@@ -497,13 +497,6 @@ impl Framer {
             self.cursor += overwrite_len;
             remaining = &remaining[overwrite_len..];
         }
-        // Enforce the length cap, breaking the line as many times as needed.
-        while self.tail.len() + remaining.len() > MAX_LINE_LEN {
-            let space = MAX_LINE_LEN - self.tail.len();
-            self.tail.extend_from_slice(&remaining[..space]);
-            remaining = &remaining[space..];
-            self.emit_truncated(out);
-        }
         self.tail.extend_from_slice(remaining);
         // From here on `remaining` only ever holds bytes that extend the tail
         // (the overwrite phase above already consumed any that landed inside
@@ -512,6 +505,32 @@ impl Framer {
         // stopped short of the tail's end (leaving trailing old content
         // beyond the cursor) would wrongly be treated as if it reached it.
         self.cursor += remaining.len();
+
+        // Enforce the length cap, breaking the line as many times as needed.
+        // The cap is on the *sanitized* text (spec §7.2), not the raw tail: a
+        // run of invalid bytes expands 1:2 under `sanitize_utf8` (each
+        // becomes `·`, 2 UTF-8 bytes), so capping on raw byte count alone
+        // could let an all-garbage tail's emitted text grow to ~2x
+        // MAX_LINE_LEN. This is checked against `self.tail` as one
+        // contiguous buffer *after* the append above, never against the new
+        // bytes on their own — otherwise a valid character split across this
+        // call's chunk boundary would be judged as two independent (and
+        // individually invalid) halves instead of the one valid character it
+        // forms once joined. Skipped below half the cap: sanitizing can at
+        // most double a buffer's length, so a tail that short can never
+        // exceed the cap, and scanning it would be wasted work on the hot
+        // append path.
+        while self.tail.len() > MAX_LINE_LEN / 2 {
+            let split = raw_len_for_sanitized_cap(&self.tail, MAX_LINE_LEN);
+            if split == self.tail.len() {
+                break;
+            }
+            let rest = self.tail.split_off(split);
+            let new_cursor = self.cursor.saturating_sub(split);
+            self.emit_truncated(out);
+            self.tail = rest;
+            self.cursor = new_cursor.min(self.tail.len());
+        }
     }
 
     /// The stamp for a line about to be emitted: the arrival of its first
@@ -675,6 +694,68 @@ fn skip_invisible_right(cursor: &mut usize, spans: &[(usize, usize)]) {
     while let Some(&(_, end)) = spans.iter().find(|&&(start, _)| start == *cursor) {
         *cursor = end;
     }
+}
+
+/// The largest prefix of `bytes`, on a UTF-8 char boundary, whose
+/// `sanitize_utf8` output is at most `cap` bytes long — or `bytes.len()`
+/// itself if the whole thing already fits. Used by [`Framer::append_to_tail`]
+/// to find where to force a break so the *sanitized* text — not just the raw
+/// tail — respects `MAX_LINE_LEN`, since a run of invalid bytes expands 1:2
+/// (each becomes `·`) under sanitization.
+///
+/// A trailing sequence that's merely *incomplete* — its lead byte(s) are
+/// here but its continuation bytes haven't arrived — is never counted or
+/// split into: `error_len() == None` means "not yet decidable", not
+/// "invalid", exactly like `pending_cr` elsewhere in this file. It's left
+/// out of the returned length so it stays whole in the tail; either more
+/// bytes complete it on a later call, or the line ends while it's still
+/// dangling and `sanitize_utf8` correctly turns it into `·` at emit time.
+fn raw_len_for_sanitized_cap(bytes: &[u8], cap: usize) -> usize {
+    let mut raw = 0;
+    let mut san = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match std::str::from_utf8(&bytes[i..]) {
+            Ok(s) => {
+                if san + s.len() <= cap {
+                    return raw + s.len();
+                }
+                let mut end = cap - san;
+                while end > 0 && !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                return raw + end;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                if san + valid > cap {
+                    let valid_str = std::str::from_utf8(&bytes[i..i + valid]).unwrap_or("");
+                    let mut end = cap - san;
+                    while end > 0 && !valid_str.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    return raw + end;
+                }
+                raw += valid;
+                san += valid;
+                i += valid;
+                let bad = match e.error_len() {
+                    Some(bad) => bad,
+                    None => return raw,
+                };
+                let dot = '\u{00B7}'.len_utf8();
+                for _ in 0..bad {
+                    if san + dot > cap {
+                        return raw;
+                    }
+                    san += dot;
+                    raw += 1;
+                    i += 1;
+                }
+            }
+        }
+    }
+    raw
 }
 
 /// Decode `bytes` as UTF-8, replacing each invalid byte with `·` (U+00B7).
@@ -1059,6 +1140,53 @@ mod tests {
         assert_eq!(out[0].text.len(), MAX_LINE_LEN);
         assert_eq!(out[1].text.len(), 100);
         assert!(!out[1].flags.contains(LineFlags::TRUNCATED));
+    }
+
+    #[test]
+    fn utf8_char_split_at_cap_boundary_survives_chunking() {
+        // A valid multi-byte character landing right at MAX_LINE_LEN must
+        // reassemble correctly regardless of how the caller happens to chunk
+        // it — the cap-enforcement split point must not judge tail and the
+        // newly arriving bytes as independent strings.
+        let mut prefix = vec![b'x'; MAX_LINE_LEN - 2];
+        prefix.extend_from_slice(&[0xE2, 0x82, 0xAC]); // '€'
+        prefix.push(b'\n');
+
+        let whole = frame_whole(&prefix);
+
+        let mut f = Framer::new();
+        let mut out = Vec::new();
+        // Split so only 2 of the euro sign's 3 bytes have arrived when the
+        // cap check runs.
+        let split = MAX_LINE_LEN;
+        f.push(&prefix[..split], ts(0), &mut out);
+        f.push(&prefix[split..], ts(1), &mut out);
+        f.flush_final(&mut out);
+
+        assert_eq!(texts(&out), texts(&whole), "split-chunked output diverged");
+        assert!(
+            texts(&out).iter().any(|t| t.contains('€')),
+            "euro sign must survive intact: {:?}",
+            texts(&out)
+        );
+    }
+
+    #[test]
+    fn all_invalid_utf8_tail_is_capped_after_sanitization_not_before() {
+        // Every raw byte here is invalid and expands to `·` (2 bytes) under
+        // `sanitize_utf8`. A cap enforced on raw byte count alone would let
+        // each emitted chunk's *text* grow to ~2x MAX_LINE_LEN; the real cap
+        // must hold on the sanitized text.
+        let input = vec![0xFFu8; MAX_LINE_LEN];
+        let out = frame_whole(&input);
+        assert!(!out.is_empty());
+        for line in &out {
+            assert!(line.text.len() <= MAX_LINE_LEN, "{}", line.text.len());
+            assert!(line.flags.contains(LineFlags::INVALID_UTF8));
+        }
+        // Sanity: this actually exercised the expansion path (more than one
+        // break was forced from a single MAX_LINE_LEN-sized raw input).
+        assert!(out.len() > 1);
     }
 
     #[test]
