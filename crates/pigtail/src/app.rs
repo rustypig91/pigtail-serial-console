@@ -12,7 +12,7 @@ use serialcore::enumerate::{
 use serialcore::extract::CompiledExtract;
 use serialcore::filter::{Combine, FilterIndex, FilterRule, FilterSet};
 use serialcore::framer::Framer;
-use serialcore::reader::{self, ConnState, ReaderEvent, SourceSpec};
+use serialcore::reader::{self, ConnState, ErrorScope, ReaderEvent, SourceSpec};
 use serialcore::series::{Series, DEFAULT_CAPACITY};
 use serialcore::session::{self, SessionMeta};
 use serialcore::store::{IncomingLine, LineFlags, LineStore, PortId};
@@ -312,6 +312,27 @@ pub struct RawSession {
     pub label: Option<String>,
 }
 
+/// An error shown on a connection's tab, paired with what it is about.
+///
+/// The scope is what keeps a reconnect from erasing errors it doesn't fix:
+/// only the link's own failures are retired by the link coming back.
+#[derive(Clone, Debug)]
+pub struct TabError {
+    pub scope: ErrorScope,
+    pub msg: String,
+}
+
+impl TabError {
+    /// An error about the link itself, raised by the UI rather than the reader
+    /// (a spawn that failed before any reader existed to report it).
+    pub fn connection(msg: impl Into<String>) -> Self {
+        TabError {
+            scope: ErrorScope::Connection,
+            msg: msg.into(),
+        }
+    }
+}
+
 /// One open connection (a tab).
 pub struct Connection {
     pub id: PortId,
@@ -355,7 +376,10 @@ pub struct Connection {
     pub raw_base: u64,
     /// The runs whose bytes the ring holds, oldest first.
     pub raw_sessions: Vec<RawSession>,
-    pub last_error: Option<String>,
+    /// The most recent error on this connection, kept with its scope: a
+    /// successful (re)connect retires a [`ErrorScope::Connection`] error but
+    /// says nothing about a [`ErrorScope::Session`] one, which outlives it.
+    pub last_error: Option<TabError>,
     /// User-set time mark for delta-from-mark display, on the session axis, so
     /// a mark set on a restored line is negative. Deliberately not persisted:
     /// a mark is a "measure from here" gesture on the console in front of you,
@@ -421,12 +445,26 @@ impl Connection {
                     // otherwise stay lit across the outage and beyond it.
                     if s != ConnState::Connected {
                         self.store.finalize_last_provisional();
+                    } else if matches!(
+                        self.last_error,
+                        Some(TabError {
+                            scope: ErrorScope::Connection,
+                            ..
+                        })
+                    ) {
+                        // A successful (re)connect means whatever was wrong
+                        // with the *link* no longer applies; don't leave a
+                        // stale error showing once the port is open again.
+                        // Session-scoped errors (a capture file that couldn't
+                        // be opened, say) are untouched by reconnecting, so
+                        // they survive it.
+                        self.last_error = None;
                     }
                     self.state = s;
                 }
-                ReaderEvent::Error(e) => {
-                    tracing::warn!(port = self.id.0, "{e}");
-                    self.last_error = Some(e);
+                ReaderEvent::Error { scope, msg } => {
+                    tracing::warn!(port = self.id.0, "{msg}");
+                    self.last_error = Some(TabError { scope, msg });
                 }
                 ReaderEvent::Batch(batch) => {
                     self.open_live_raw_session();
@@ -769,6 +807,11 @@ pub struct App {
     pub show_filters_win: bool,
     pub show_highlight_win: bool,
     pub show_extract_win: bool,
+    /// `Some(port_id)` while the popup showing that connection's `last_error`
+    /// in full is open (clicked from the footer's error indicator). Keyed by
+    /// the connection it was opened for, not "whichever tab is active", so
+    /// switching tabs while it's open doesn't silently swap the message.
+    pub show_error_win: Option<PortId>,
     pub show_search: bool,
     /// Set when search should grab keyboard focus next frame (e.g. after Ctrl+F).
     pub search_focus_request: bool,
@@ -828,6 +871,7 @@ impl App {
             show_filters_win: false,
             show_highlight_win: false,
             show_extract_win: false,
+            show_error_win: None,
             show_search: false,
             search_focus_request: false,
             update_rx: None,
@@ -978,7 +1022,7 @@ impl App {
     /// cap, new arrivals are dropped rather than the front entry, which is
     /// either on screen right now or the oldest one the user hasn't
     /// acknowledged yet.
-    fn record_connect_error(&mut self, title: &'static str, message: String) {
+    pub(crate) fn record_connect_error(&mut self, title: &'static str, message: String) {
         tracing::error!("{title}: {message}");
         let err = ConnectError { title, message };
         if self.connect_errors.contains(&err) {
@@ -1065,7 +1109,7 @@ impl App {
                     // reconnect.
                     conn.store.finalize_last_provisional();
                     conn.state = ConnState::Closed;
-                    conn.last_error = Some(msg);
+                    conn.last_error = Some(TabError::connection(msg));
                     self.merged_dirty = true;
                     return;
                 }
@@ -1751,6 +1795,7 @@ impl App {
             || self.show_filters_win
             || self.show_highlight_win
             || self.show_extract_win
+            || self.show_error_win.is_some()
     }
 
     /// Index of the active connection, clamped, or `None` if there are none.

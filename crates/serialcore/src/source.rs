@@ -18,7 +18,7 @@ pub enum SourceError {
     Disconnected(String),
 
     /// Opening the device failed. On Linux, permission-denied errors carry a
-    /// hint about the `dialout` group.
+    /// hint naming whichever group actually owns the device node.
     #[error("{0}")]
     Open(String),
 
@@ -171,18 +171,160 @@ fn is_disconnect(e: &std::io::Error) -> bool {
 }
 
 fn map_open_error(path: &str, e: serialport::Error) -> SourceError {
-    let msg = e.to_string();
-    if e.kind() == serialport::ErrorKind::NoDevice || msg.to_lowercase().contains("no such") {
-        return SourceError::Open(format!("{path}: device not present"));
+    use serialport::ErrorKind;
+    use std::io::ErrorKind as IoKind;
+
+    match e.kind() {
+        // POSIX surfaces EACCES as this exact kind, so no string matching needed.
+        ErrorKind::Io(IoKind::PermissionDenied) => SourceError::Open(format!(
+            "{path}: permission denied. {}",
+            permission_hint(path)
+        )),
+        // A device that isn't there is ENOENT, which serialport maps to
+        // `Io(NotFound)` — *not* to `NoDevice`, despite the name. Unplugged
+        // adapters land here and nowhere else.
+        ErrorKind::Io(IoKind::NotFound) => SourceError::Open(format!("{path}: device not present")),
+        ErrorKind::NoDevice => map_no_device(path),
+        _ => SourceError::Open(format!("{path}: {}", e)),
     }
-    // Permission denied is the first thing that bites a new Linux user.
-    if msg.to_lowercase().contains("permission denied") {
-        return SourceError::Open(format!(
-            "{path}: permission denied. On Linux, add yourself to the 'dialout' \
-             group: `sudo usermod -aG dialout $USER`, then log out and back in."
-        ));
+}
+
+/// `ErrorKind::NoDevice` means different things per platform, and the message
+/// text can't settle it: the OS writes it, localized.
+///
+/// On POSIX it never means the device is missing (that's `Io(NotFound)`).
+/// serialport raises it only for EBUSY from `TIOCEXCL` and EWOULDBLOCK from
+/// `flock`, both of which say another program already holds the port.
+#[cfg(not(target_os = "windows"))]
+fn map_no_device(path: &str) -> SourceError {
+    SourceError::Open(format!(
+        "{path}: port is in use by another program. Close whatever holds it \
+         (a serial monitor, ModemManager, or a getty on this device) and try again."
+    ))
+}
+
+/// On Windows, serialport-rs maps ERROR_ACCESS_DENIED to the same
+/// `ErrorKind::NoDevice` as "no such device". If the port still shows up in
+/// the OS port enumeration, the failure is a permission/exclusivity problem,
+/// not the device being gone.
+#[cfg(target_os = "windows")]
+fn map_no_device(path: &str) -> SourceError {
+    let still_present = serialport::available_ports()
+        .map(|ports| ports.iter().any(|p| p.port_name == path))
+        .unwrap_or(false);
+    if still_present {
+        SourceError::Open(format!(
+            "{path}: permission denied. {}",
+            permission_hint(path)
+        ))
+    } else {
+        SourceError::Open(format!("{path}: device not present"))
     }
-    SourceError::Open(format!("{path}: {msg}"))
+}
+
+/// The group that actually owns `path`, not a guess: distros differ on which
+/// group gates serial devices (`dialout` on Debian/Ubuntu, `uucp` on Arch,
+/// `lock`/`tty` elsewhere), so naming the wrong one would send a user down a
+/// dead end.
+#[cfg(target_os = "linux")]
+fn permission_hint(path: &str) -> String {
+    match device_group_name(path) {
+        Some(group) => format!(
+            "Add yourself to the '{group}' group: `sudo usermod -aG {group} $USER`, \
+             then log out and back in."
+        ),
+        None => format!(
+            "Add yourself to the group that owns the device (`ls -l {path}` shows which), \
+             then log out and back in."
+        ),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn permission_hint(_path: &str) -> String {
+    "Check that your account has permission to access this device.".to_string()
+}
+
+/// Resolve the group that owns the device node at `path` via `getent`, which
+/// consults the same source (files, LDAP, sssd, ...) the system itself uses —
+/// unlike parsing `/etc/group` directly, this stays correct wherever group
+/// lookups are backed by something other than a local file.
+///
+/// The `stat` is repeated on every call (cheap, and keeps the reported group
+/// current if the device's owning group changes mid-outage); only the
+/// gid-to-name lookup is cached, since that mapping is a machine-wide fact
+/// that isn't specific to a path.
+#[cfg(target_os = "linux")]
+fn device_group_name(path: &str) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let gid = std::fs::metadata(path).ok()?.gid();
+    group_name_for_gid(gid)
+}
+
+/// Cached per gid: a reader stuck on a permission-denied device retries the
+/// open every backoff cycle, and without a cache that would spawn `getent`
+/// again on every single attempt for as long as the outage lasts.
+#[cfg(target_os = "linux")]
+fn group_name_for_gid(gid: u32) -> Option<String> {
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<u32, Option<String>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    CACHE.with(|cache| {
+        if let Some(cached) = cache.borrow().get(&gid) {
+            return cached.clone();
+        }
+        let result = getent_group_name(gid);
+        cache.borrow_mut().insert(gid, result.clone());
+        result
+    })
+}
+
+/// Runs `getent group <gid>`, bounded by a timeout so a reader thread can
+/// never hang here: `getent` can block indefinitely if it's backed by an
+/// unreachable network directory service (LDAP/sssd), and this call happens
+/// inside the reader thread's open-retry loop, which must stay responsive to
+/// `Shutdown` (see `ReaderHandle::shutdown_in_place`).
+#[cfg(target_os = "linux")]
+fn getent_group_name(gid: u32) -> Option<String> {
+    use std::io::Read;
+
+    const TIMEOUT: Duration = Duration::from_millis(500);
+    const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+    let mut child = std::process::Command::new("getent")
+        .arg("group")
+        .arg(gid.to_string())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let status = loop {
+        match child.try_wait().ok()? {
+            Some(status) => break status,
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let mut stdout = String::new();
+    child.stdout.take()?.read_to_string(&mut stdout).ok()?;
+    let name = stdout.split(':').next()?.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 /// A scripted source for tests: a list of `(bytes, delay)` pairs delivered in
@@ -287,5 +429,75 @@ mod tests {
             s.read(&mut buf),
             Err(SourceError::Disconnected(_))
         ));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn device_group_name_resolves_the_files_actual_group() {
+        use std::os::unix::fs::MetadataExt;
+        let path = std::env::temp_dir().join(format!("pigtail-test-{}", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        let path_str = path.to_str().unwrap();
+        let gid = std::fs::metadata(&path).unwrap().gid();
+
+        // `getent` may simply be absent (minimal containers, some CI images);
+        // that is an environment gap, not a bug in `device_group_name`, so
+        // skip rather than fail the suite.
+        let Some(name) = device_group_name(path_str) else {
+            std::fs::remove_file(&path).unwrap();
+            eprintln!("skipping: `getent` unavailable in this environment");
+            return;
+        };
+
+        // Round-trip through getent by name, rather than hardcoding an
+        // expected group: CI and dev machines can have different primary
+        // groups, so the only thing worth asserting is that the name we
+        // returned actually maps back to the file's real gid.
+        let out = std::process::Command::new("getent")
+            .arg("group")
+            .arg(&name)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let resolved_gid: u32 = stdout.split(':').nth(2).unwrap().trim().parse().unwrap();
+        assert_eq!(resolved_gid, gid);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn map_open_error_recognizes_permission_denied_by_kind_not_message_text() {
+        // Regression guard: this must key off `ErrorKind`, not a
+        // language-specific substring of the description, since the OS
+        // message can be localized (see `map_no_device`).
+        let e = serialport::Error::new(
+            serialport::ErrorKind::Io(std::io::ErrorKind::PermissionDenied),
+            "Permission non accordée",
+        );
+        let err = map_open_error("/dev/ttyUSB0", e);
+        assert!(matches!(err, SourceError::Open(msg) if msg.contains("permission denied")));
+    }
+
+    #[test]
+    fn map_open_error_reports_device_not_present_for_enoent() {
+        // An unplugged adapter is ENOENT, which serialport reports as
+        // `Io(NotFound)`; keying this off `NoDevice` instead would leave a
+        // missing device reading as a raw "No such file or directory".
+        let e = serialport::Error::new(
+            serialport::ErrorKind::Io(std::io::ErrorKind::NotFound),
+            "Le fichier n'existe pas",
+        );
+        let err = map_open_error("/dev/ttyUSB0", e);
+        assert!(matches!(err, SourceError::Open(msg) if msg.contains("device not present")));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn map_open_error_reports_no_device_as_port_in_use() {
+        // On POSIX, `NoDevice` is EBUSY / flock EWOULDBLOCK — the port is held
+        // by another program, not absent.
+        let e = serialport::Error::new(serialport::ErrorKind::NoDevice, "Device or resource busy");
+        let err = map_open_error("/dev/ttyUSB0", e);
+        assert!(matches!(err, SourceError::Open(msg) if msg.contains("in use by another program")));
     }
 }

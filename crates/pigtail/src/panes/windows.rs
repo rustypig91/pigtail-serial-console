@@ -4,12 +4,65 @@
 use crate::app::App;
 use serialcore::config::{ExtractMode, ExtractRule, HighlightRule};
 use serialcore::filter::{Combine, FilterRule};
+use serialcore::reader::ErrorScope;
 
 impl App {
     pub(crate) fn show_tool_windows(&mut self, ctx: &egui::Context) {
         self.show_filters_window(ctx);
         self.show_highlight_window(ctx);
         self.show_extract_window(ctx);
+        self.show_error_window(ctx);
+    }
+
+    /// The full error message, opened by clicking the footer's `⚠ error`
+    /// indicator. Scoped to the connection it was opened for (not "whichever
+    /// tab is active"), so switching tabs while it's open doesn't swap the
+    /// message. Closes itself if that connection's error clears (e.g. a
+    /// reconnect succeeds) or the tab is closed while it's open.
+    fn show_error_window(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.show_error_win else {
+            return;
+        };
+        let Some(conn) = self.connections.iter().find(|c| c.id == id) else {
+            self.show_error_win = None;
+            return;
+        };
+        let Some(err) = conn.last_error.clone() else {
+            self.show_error_win = None;
+            return;
+        };
+        let title = match err.scope {
+            ErrorScope::Connection => "Connection error",
+            ErrorScope::Session => "Session error",
+        };
+        let mut open = true;
+        let mut dismiss = false;
+        egui::Window::new(title)
+            // Fixed, so the window keeps its position and size when the title
+            // changes with the scope of the error being shown.
+            .id(egui::Id::new("error_window"))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label(err.msg.as_str());
+                // Nothing else ever clears a session-scoped error: the
+                // connection recovering doesn't fix a capture file that
+                // couldn't be written, so without this it would sit in the
+                // footer for the rest of the run.
+                if err.scope == ErrorScope::Session {
+                    ui.separator();
+                    dismiss = ui.button("Dismiss").clicked();
+                }
+            });
+        if dismiss {
+            if let Some(conn) = self.connections.iter_mut().find(|c| c.id == id) {
+                conn.last_error = None;
+            }
+        }
+        if !open || dismiss {
+            self.show_error_win = None;
+        }
     }
 
     fn show_filters_window(&mut self, ctx: &egui::Context) {

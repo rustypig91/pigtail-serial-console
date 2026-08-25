@@ -12,12 +12,14 @@ const COMMON_BAUDS: &[u32] = &[
 ];
 
 impl App {
-    /// A plain acknowledgement dialog for `connect_errors`: a connect, reconnect,
-    /// or port-detection start that failed outright (e.g. the OS refused to
-    /// spawn its thread) rather than through the normal per-connection error
-    /// path, since there is no live connection to show it on. Shows one message
-    /// at a time, oldest first, so simultaneous failures all get seen rather
-    /// than the latest silently replacing the others.
+    /// A plain acknowledgement dialog for `connect_errors`: a one-off
+    /// background operation — connect, reconnect, port-detection start, an
+    /// export write — that failed outright rather than through the normal
+    /// per-connection error path, either because there is no live connection
+    /// to show it on or because the failure has nothing to do with a
+    /// connection's health. Shows one message at a time, oldest first, so
+    /// simultaneous failures all get seen rather than the latest silently
+    /// replacing the others.
     pub(crate) fn show_connect_error(&mut self, ctx: &egui::Context) {
         let Some(err) = self.connect_errors.front() else {
             return;
@@ -121,6 +123,7 @@ impl App {
         let mut toggle_pin = false;
         let mut toggle_plot = false;
         let mut toggle_hex = false;
+        let mut open_error_win: Option<serialcore::store::PortId> = None;
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if self.merged_selected {
@@ -132,10 +135,38 @@ impl App {
                     return;
                 };
                 let conn = &self.connections[active];
-                ui.colored_label(
-                    state_color(conn.state),
-                    format!("{} {}", state_dot(conn.state), conn.state),
-                );
+                // A live error takes priority over the raw state: the reader
+                // keeps retrying in the background (state stays Connecting /
+                // Reconnecting so it can recover on its own), but the status
+                // bar should say what's actually wrong rather than keep
+                // claiming to be "connecting" while it fails over and over.
+                //
+                // While the link *is* up, though, the state is still worth
+                // showing, so an error raised alongside a working connection
+                // (a capture-file write that failed, say) sits next to it
+                // rather than replacing it — this footer is the only place
+                // such an error ever surfaces.
+                if conn.state == ConnState::Connected || conn.last_error.is_none() {
+                    ui.colored_label(
+                        state_color(conn.state),
+                        format!("{} {}", state_dot(conn.state), conn.state),
+                    );
+                }
+                if let Some(err) = &conn.last_error {
+                    let resp = ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("⚠ error")
+                                .color(egui::Color32::from_rgb(0xff, 0x55, 0x55)),
+                        )
+                        .sense(egui::Sense::click()),
+                    );
+                    let resp = resp
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(err.msg.as_str());
+                    if resp.clicked() {
+                        open_error_win = Some(conn.id);
+                    }
+                }
                 ui.separator();
                 ui.monospace(conn.port_config.summary());
                 ui.separator();
@@ -206,6 +237,9 @@ impl App {
                     conn.hex_view = !conn.hex_view;
                 }
             }
+        }
+        if let Some(id) = open_error_win {
+            self.show_error_win = Some(id);
         }
     }
 
