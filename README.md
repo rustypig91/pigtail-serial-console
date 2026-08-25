@@ -18,7 +18,6 @@ Most serial terminals just show you text. Pigtail is built around the parts of f
 - Hex view alongside the text view
 - Transmit with configurable line endings, send history, and hex input
 - DTR/RTS toggles and break signal
-- Connection profiles with auto-connect on plug-in
 - Export the current (filtered) view to `.txt` or `.csv`
 - Startup notice when a newer release is published, with "skip this version"; the
   only network request pigtail makes, and switchable off in Settings

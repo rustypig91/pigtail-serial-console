@@ -30,7 +30,7 @@ pub fn identity_from_info(info: &SerialPortInfo) -> PortIdentity {
             interface_hint: usb_interface(usb),
         },
         // (interface_hint stays available for callers that build identities
-        // from other sources, e.g. saved profiles.)
+        // from other sources, e.g. hand-edited config.)
         _ => PortIdentity {
             path_fallback: info.port_name.clone(),
             ..Default::default()
@@ -40,8 +40,8 @@ pub fn identity_from_info(info: &SerialPortInfo) -> PortIdentity {
 
 // serialport 4.9's `UsbPortInfo` does not expose the USB interface number, so
 // enumeration cannot fill `interface_hint`. It remains part of `PortIdentity`
-// for saved profiles that disambiguate multi-interface probes by hand, and the
-// matcher honours it when both sides set it.
+// for hand-edited config that disambiguates multi-interface probes by hand,
+// and the matcher honours it when both sides set it.
 fn usb_interface(_usb: &serialport::UsbPortInfo) -> Option<u8> {
     None
 }
