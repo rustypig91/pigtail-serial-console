@@ -117,7 +117,11 @@ impl App {
                     }
                     if ui
                         .add_enabled(self.active_index().is_some(), egui::Button::new("💾"))
-                        .on_hover_text("Save this tab's view to a text file")
+                        .on_hover_text(if self.merged_selected {
+                            "Save the merged view to a text file"
+                        } else {
+                            "Save this tab's view to a text file"
+                        })
                         .clicked()
                     {
                         save_text = true;
@@ -143,7 +147,9 @@ impl App {
             self.open_config_dialog();
         }
         if save_text {
-            if let Some(active) = self.active_index() {
+            if self.merged_selected {
+                self.export_merged_view(false);
+            } else if let Some(active) = self.active_index() {
                 self.export_active_view(active, false);
             }
         }
@@ -159,7 +165,17 @@ impl App {
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if self.merged_selected {
+                    let shown = self.merged_view().len();
                     ui.label(format!("merged · {} lines", self.merged.len()));
+                    if self.merged_filter_active() {
+                        ui.separator();
+                        ui.label(format!("{shown} shown"));
+                    }
+                    if !self.merged_search_matches.is_empty() {
+                        ui.separator();
+                        let n = self.merged_search_pos.map(|p| p + 1).unwrap_or(0);
+                        ui.label(format!("match {n}/{}", self.merged_search_matches.len()));
+                    }
                     return;
                 }
                 let Some(active) = self.active_index() else {
@@ -423,7 +439,6 @@ impl App {
             }
         }
     }
-
 }
 
 /// Serial-parameter grid, operating on a borrowed [`PortConfig`].
