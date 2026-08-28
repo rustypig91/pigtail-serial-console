@@ -3,8 +3,9 @@
 //!
 //! Non-negotiable rules honoured here:
 //! 1. Batch before sending (~16ms or a few thousand lines).
-//! 2. Never block on the UI: the channel is bounded; if it is full we keep the
-//!    batch in a local backlog and keep reading — reading always takes priority.
+//! 2. Never block on the UI: the channel and local backlog are bounded; if the
+//!    UI remains behind, oldest live-view batches are dropped with a visible
+//!    gap notice — reading always takes priority.
 //! 3. The raw session log is written before any parsing.
 //! 4. The UI owns the store; data flows only through channels.
 
@@ -25,6 +26,14 @@ use std::time::{Duration, Instant};
 const READ_BUF: usize = 64 * 1024;
 const BATCH_INTERVAL: Duration = Duration::from_millis(16);
 const BATCH_MAX_LINES: usize = 4000;
+/// Heap budget for batches that could not be handed to the UI yet.
+///
+/// The channel itself is bounded, but without a second bound here a stalled UI
+/// (for example while a native file dialog is open) lets the reader retain
+/// output forever. When capture is available, the session writer has already
+/// recorded these bytes before they reach this queue; crossing the budget only
+/// discards stale live-view copies and reports the gap to the UI.
+const MAX_BACKLOG_BYTES: usize = 8 * 1024 * 1024;
 // Kept short so an interactive prompt's echo (characters the device sends back
 // with no trailing newline) appears promptly instead of feeling laggy.
 const PROVISIONAL_AFTER: Duration = Duration::from_millis(20);
@@ -76,7 +85,20 @@ pub struct Batch {
 pub enum ReaderEvent {
     State(ConnState),
     Batch(Batch),
-    Error { scope: ErrorScope, msg: String },
+    /// The UI fell far enough behind that old live-view batches had to be
+    /// discarded. Ordered ahead of the retained batches, so the UI can put a
+    /// visible boundary exactly where the gap occurred.
+    OutputDropped {
+        raw_bytes: u64,
+        line_updates: u64,
+        /// Logical stream position of the first discarded batch. This can be
+        /// older than the eviction itself when an open line spans batches.
+        at: Timestamp,
+    },
+    Error {
+        scope: ErrorScope,
+        msg: String,
+    },
 }
 
 /// What an error is actually about, so the UI can tell a broken link from a
@@ -251,6 +273,104 @@ struct EventTx {
     wake: Wake,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DroppedOutput {
+    raw_bytes: u64,
+    line_updates: u64,
+    at: Option<Timestamp>,
+}
+
+struct QueuedBatch {
+    batch: Batch,
+    /// Earliest stream timestamp this batch can affect. This can precede every
+    /// line it currently contains when its raw bytes continue an open line.
+    order_at: Timestamp,
+}
+
+/// Batches waiting for room on the UI channel, with an explicit heap budget.
+///
+/// Accounting capacities rather than lengths tracks the allocations the queue
+/// actually keeps alive. `VecDeque`'s own slots are included per resident
+/// `Batch`; its small spare-capacity slack remains bounded by the largest queue
+/// it has held, which is itself bounded here.
+#[derive(Default)]
+struct Backlog {
+    batches: VecDeque<QueuedBatch>,
+    allocated_bytes: usize,
+    dropped: DroppedOutput,
+}
+
+impl Backlog {
+    fn batch_bytes(batch: &Batch) -> usize {
+        std::mem::size_of::<QueuedBatch>()
+            .saturating_add(batch.raw.capacity())
+            .saturating_add(
+                batch
+                    .lines
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<FramedLine>()),
+            )
+            .saturating_add(
+                batch
+                    .lines
+                    .iter()
+                    .map(|line| line.text.capacity())
+                    .fold(0usize, usize::saturating_add),
+            )
+    }
+
+    fn push_unbounded(&mut self, batch: Batch, order_at: Timestamp) {
+        self.allocated_bytes = self
+            .allocated_bytes
+            .saturating_add(Self::batch_bytes(&batch));
+        self.batches.push_back(QueuedBatch { batch, order_at });
+    }
+
+    fn enforce_limit(&mut self, limit: usize) {
+        while self.allocated_bytes > limit {
+            let Some(queued) = self.pop_front() else {
+                break;
+            };
+            self.dropped.raw_bytes = self
+                .dropped
+                .raw_bytes
+                .saturating_add(queued.batch.raw.len() as u64);
+            self.dropped.line_updates = self
+                .dropped
+                .line_updates
+                .saturating_add(queued.batch.lines.len() as u64);
+            self.dropped.at.get_or_insert(queued.order_at);
+        }
+    }
+
+    #[cfg(test)]
+    fn push_with_limit(&mut self, batch: Batch, at: Timestamp, limit: usize) {
+        self.push_unbounded(batch, at);
+        self.enforce_limit(limit);
+    }
+
+    fn pop_front(&mut self) -> Option<QueuedBatch> {
+        let queued = self.batches.pop_front()?;
+        self.allocated_bytes = self
+            .allocated_bytes
+            .saturating_sub(Self::batch_bytes(&queued.batch));
+        Some(queued)
+    }
+
+    fn push_front(&mut self, queued: QueuedBatch) {
+        self.allocated_bytes = self
+            .allocated_bytes
+            .saturating_add(Self::batch_bytes(&queued.batch));
+        self.batches.push_front(queued);
+    }
+
+    fn clear(&mut self) {
+        self.batches.clear();
+        self.allocated_bytes = 0;
+        self.dropped = DroppedOutput::default();
+    }
+}
+
 impl EventTx {
     /// Send, blocking if the channel is full. Used for state and error events,
     /// which are rare and must not be dropped.
@@ -320,7 +440,7 @@ fn run(
     };
 
     let mut framer = Framer::with_mode(config.terminal);
-    let mut backlog: VecDeque<Batch> = VecDeque::new();
+    let mut backlog = Backlog::default();
     // Lives outside the connect loop only so a `ClearLog` arriving during a
     // reconnect backoff can empty it too; it is always drained before a
     // disconnect, so each connection still starts with an empty batch.
@@ -380,10 +500,14 @@ fn run(
         if let Some(lost) = lost_at.take() {
             let outage = lost.elapsed();
             let marker = reconnect_marker(&clock, outage);
-            backlog.push_back(Batch {
-                lines: vec![marker],
-                raw: Vec::new(),
-            });
+            let order_at = marker.ts;
+            backlog.push_unbounded(
+                Batch {
+                    lines: vec![marker],
+                    raw: Vec::new(),
+                },
+                order_at,
+            );
         }
         backoff = Duration::from_millis(100);
         first_connect = false;
@@ -407,7 +531,7 @@ fn run(
                 CommandOutcome::Shutdown => {
                     // Flush and exit.
                     framer.flush_final(&mut pending.lines);
-                    flush_batch(&mut pending, &mut backlog, &event_tx);
+                    flush_batch(&mut pending, &mut backlog, &event_tx, &framer, clock.now());
                     drain_backlog(&mut backlog, &event_tx);
                     if let Some(w) = &mut writer {
                         let _ = w.flush();
@@ -460,7 +584,7 @@ fn run(
             if (!pending.lines.is_empty() || !pending.raw.is_empty())
                 && (full || last_send.elapsed() >= BATCH_INTERVAL)
             {
-                flush_batch(&mut pending, &mut backlog, &event_tx);
+                flush_batch(&mut pending, &mut backlog, &event_tx, &framer, clock.now());
                 last_send = Instant::now();
             }
             // Try to drain any backlog that built up while the channel was full.
@@ -473,7 +597,7 @@ fn run(
         // a caret, and the reconnect marker would otherwise land *below* a line
         // still presenting itself as the live one.
         framer.flush_final(&mut pending.lines);
-        flush_batch(&mut pending, &mut backlog, &event_tx);
+        flush_batch(&mut pending, &mut backlog, &event_tx, &framer, clock.now());
         drain_backlog(&mut backlog, &event_tx);
         if let Some(w) = &mut writer {
             let _ = w.flush();
@@ -538,7 +662,7 @@ struct ClearTargets<'a> {
     writer: &'a mut Option<SessionWriter>,
     framer: &'a mut Framer,
     pending: &'a mut Batch,
-    backlog: &'a mut VecDeque<Batch>,
+    backlog: &'a mut Backlog,
 }
 
 /// Discard the capture written so far plus everything still queued here. Data
@@ -606,13 +730,47 @@ fn drain_commands(
 }
 
 /// Move `pending` into the backlog, then try to push backlog entries onto the
-/// channel. If the channel is full we keep them in the backlog and keep reading
-/// (rule 2: never block on the UI).
-fn flush_batch(pending: &mut Batch, backlog: &mut VecDeque<Batch>, event_tx: &EventTx) {
+/// channel. If the channel is full we retain them up to the backlog budget and
+/// keep reading (rule 2: never block on the UI).
+fn flush_batch(
+    pending: &mut Batch,
+    backlog: &mut Backlog,
+    event_tx: &EventTx,
+    framer: &Framer,
+    at: Timestamp,
+) {
     if pending.lines.is_empty() && pending.raw.is_empty() {
         return;
     }
-    backlog.push_back(std::mem::take(pending));
+    let order_at = pending
+        .lines
+        .iter()
+        .map(|line| line.ts)
+        .chain(framer.open_line_timestamp())
+        .min_by_key(|ts| ts.micros)
+        .unwrap_or(at);
+    enqueue_batch(std::mem::take(pending), backlog, event_tx, order_at);
+}
+
+/// Give queued batches every currently available channel slot before enforcing
+/// the local memory budget. This matters at the boundary: if the UI just made
+/// room, dropping an old batch before retrying the channel would manufacture a
+/// gap even though the output could have been delivered.
+fn enqueue_batch(batch: Batch, backlog: &mut Backlog, event_tx: &EventTx, order_at: Timestamp) {
+    enqueue_batch_with_limit(batch, backlog, event_tx, order_at, MAX_BACKLOG_BYTES);
+}
+
+fn enqueue_batch_with_limit(
+    batch: Batch,
+    backlog: &mut Backlog,
+    event_tx: &EventTx,
+    order_at: Timestamp,
+    limit: usize,
+) {
+    drain_backlog(backlog, event_tx);
+    backlog.push_unbounded(batch, order_at);
+    drain_backlog(backlog, event_tx);
+    backlog.enforce_limit(limit);
     drain_backlog(backlog, event_tx);
 }
 
@@ -629,15 +787,32 @@ fn flush_batch(pending: &mut Batch, backlog: &mut VecDeque<Batch>, event_tx: &Ev
 /// The front is also where entries are taken from, hence `VecDeque`: draining
 /// *n* batches out of a `Vec` with `remove(0)` is O(n²), and the moment that
 /// matters is when the reader is already behind.
-fn drain_backlog(backlog: &mut VecDeque<Batch>, event_tx: &EventTx) {
-    while let Some(batch) = backlog.pop_front() {
+fn drain_backlog(backlog: &mut Backlog, event_tx: &EventTx) {
+    if let Some(at) = backlog.dropped.at {
+        let ev = ReaderEvent::OutputDropped {
+            raw_bytes: backlog.dropped.raw_bytes,
+            line_updates: backlog.dropped.line_updates,
+            at,
+        };
+        match event_tx.try_send(ev) {
+            Ok(()) => backlog.dropped = DroppedOutput::default(),
+            Err(TrySendError::Full(_)) => return,
+            Err(TrySendError::Disconnected(_)) => {
+                backlog.clear();
+                return;
+            }
+        }
+    }
+
+    while let Some(queued) = backlog.pop_front() {
+        let QueuedBatch { batch, order_at } = queued;
         match event_tx.try_send(ReaderEvent::Batch(batch)) {
             Ok(()) => {}
             // Keep accumulating; retry later. Order is preserved: this one goes
             // back where it came from, ahead of everything queued behind it.
             Err(TrySendError::Full(ev)) => {
                 if let ReaderEvent::Batch(batch) = ev {
-                    backlog.push_front(batch);
+                    backlog.push_front(QueuedBatch { batch, order_at });
                 }
                 break;
             }
@@ -737,6 +912,7 @@ mod tests {
                         break;
                     }
                 }
+                Ok(ReaderEvent::OutputDropped { .. }) => {}
                 Ok(ReaderEvent::Error { .. }) => {}
                 Err(_) => {}
             }
@@ -931,18 +1107,24 @@ mod tests {
             tx,
             wake: Wake::none(),
         };
-        let mut backlog: VecDeque<Batch> = (0..5)
-            .map(|n| Batch {
-                lines: Vec::new(),
-                raw: vec![n as u8],
-            })
-            .collect();
+        let at = SessionClock::new().now();
+        let mut backlog = Backlog::default();
+        for n in 0..5 {
+            backlog.push_with_limit(
+                Batch {
+                    lines: Vec::new(),
+                    raw: vec![n as u8],
+                },
+                at,
+                usize::MAX,
+            );
+        }
 
         // Only two fit.
         drain_backlog(&mut backlog, &event_tx);
-        assert_eq!(backlog.len(), 3, "the rest stays put");
+        assert_eq!(backlog.batches.len(), 3, "the rest stays put");
         assert_eq!(
-            backlog.front().map(|b| b.raw.clone()),
+            backlog.batches.front().map(|b| b.batch.raw.clone()),
             Some(vec![2]),
             "and the one the channel refused is back at the front, not dropped"
         );
@@ -960,7 +1142,8 @@ mod tests {
         while let Ok(ReaderEvent::Batch(b)) = rx.try_recv() {
             seen.push(b.raw[0]);
         }
-        assert!(backlog.is_empty());
+        assert!(backlog.batches.is_empty());
+        assert!(backlog.dropped.at.is_none());
         assert_eq!(seen, vec![0, 1, 2, 3, 4], "every batch, once, in order");
     }
 
@@ -974,14 +1157,164 @@ mod tests {
             tx,
             wake: Wake::none(),
         };
-        let mut backlog: VecDeque<Batch> = (0..3)
-            .map(|n| Batch {
-                lines: Vec::new(),
-                raw: vec![n as u8],
+        let at = SessionClock::new().now();
+        let mut backlog = Backlog::default();
+        for n in 0..3 {
+            backlog.push_with_limit(
+                Batch {
+                    lines: Vec::new(),
+                    raw: vec![n as u8],
+                },
+                at,
+                usize::MAX,
+            );
+        }
+        drain_backlog(&mut backlog, &event_tx);
+        assert!(backlog.batches.is_empty());
+        assert!(backlog.dropped.at.is_none());
+    }
+
+    /// The remaining half of issue #42: once the UI channel is full, retained
+    /// batches have a hard heap budget. Oldest output is discarded first and
+    /// counted, while newer output stays in order.
+    #[test]
+    fn backlog_drops_oldest_batches_at_its_memory_limit() {
+        let at = SessionClock::new().now();
+        let later = Timestamp {
+            wall: at.wall + chrono::Duration::microseconds(1),
+            micros: at.micros + 1,
+        };
+        let make_batch = |n| Batch {
+            lines: Vec::new(),
+            raw: vec![n; 32],
+        };
+        let one_batch = Backlog::batch_bytes(&make_batch(0));
+        let limit = one_batch * 2;
+        let mut backlog = Backlog::default();
+
+        backlog.push_with_limit(make_batch(0), at, limit);
+        backlog.push_with_limit(make_batch(1), later, limit);
+        backlog.push_with_limit(make_batch(2), later, limit);
+
+        assert!(backlog.allocated_bytes <= limit);
+        assert_eq!(backlog.batches.len(), 2);
+        assert_eq!(backlog.batches[0].batch.raw[0], 1, "the oldest was dropped");
+        assert_eq!(backlog.batches[1].batch.raw[0], 2);
+        assert_eq!(backlog.dropped.raw_bytes, 32);
+        assert_eq!(backlog.dropped.line_updates, 0);
+        assert_eq!(backlog.dropped.at, Some(at));
+    }
+
+    /// Raw bytes in a later batch can continue a line whose timestamp belongs
+    /// to an earlier batch. If this batch is eventually dropped, its marker
+    /// needs that open-line timestamp so the merged view cannot sort a retained
+    /// completion ahead of the gap.
+    #[test]
+    fn dropped_partial_batch_keeps_the_open_lines_ordering_timestamp() {
+        let clock = SessionClock::new();
+        let line_at = clock.now();
+        let flush_at = Timestamp {
+            wall: line_at.wall + chrono::Duration::seconds(1),
+            micros: line_at.micros + 1_000_000,
+        };
+        let mut framer = Framer::new();
+        let mut pending = Batch {
+            lines: Vec::new(),
+            raw: b"partial".to_vec(),
+        };
+        framer.push(&pending.raw, line_at, &mut pending.lines);
+
+        let (tx, _rx) = crossbeam_channel::bounded(0);
+        let event_tx = EventTx {
+            tx,
+            wake: Wake::none(),
+        };
+        let mut backlog = Backlog::default();
+        flush_batch(&mut pending, &mut backlog, &event_tx, &framer, flush_at);
+
+        assert_eq!(backlog.batches.len(), 1);
+        assert_eq!(backlog.batches[0].order_at, line_at);
+        backlog.enforce_limit(0);
+        assert!(backlog.batches.is_empty());
+        assert_eq!(backlog.dropped.at, Some(line_at));
+    }
+
+    /// Catch-up and eviction can race at the budget boundary. If the UI has
+    /// made room, queued output must use it before the reader decides anything
+    /// needs to be discarded.
+    #[test]
+    fn available_channel_room_is_used_before_backlog_eviction() {
+        let at = SessionClock::new().now();
+        let make_batch = |n| Batch {
+            lines: Vec::new(),
+            raw: vec![n; 32],
+        };
+        let limit = Backlog::batch_bytes(&make_batch(0));
+        let mut backlog = Backlog::default();
+        backlog.push_with_limit(make_batch(0), at, limit);
+
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        let event_tx = EventTx {
+            tx,
+            wake: Wake::none(),
+        };
+        enqueue_batch_with_limit(make_batch(1), &mut backlog, &event_tx, at, limit);
+
+        let seen: Vec<u8> = rx
+            .try_iter()
+            .map(|ev| match ev {
+                ReaderEvent::Batch(batch) => batch.raw[0],
+                other => panic!("unexpected event: {other:?}"),
             })
             .collect();
+        assert_eq!(seen, vec![0, 1]);
+        assert!(backlog.batches.is_empty());
+        assert!(backlog.dropped.at.is_none());
+    }
+
+    /// The gap notice must precede every retained batch and survive a full
+    /// channel itself; otherwise the UI either hides the loss or draws the
+    /// marker after the data it applies to.
+    #[test]
+    fn dropped_output_notice_is_sent_before_retained_batches() {
+        let at = SessionClock::new().now();
+        let make_batch = |n| Batch {
+            lines: Vec::new(),
+            raw: vec![n; 32],
+        };
+        let limit = Backlog::batch_bytes(&make_batch(0));
+        let mut backlog = Backlog::default();
+        backlog.push_with_limit(make_batch(0), at, limit);
+        backlog.push_with_limit(make_batch(1), at, limit);
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let event_tx = EventTx {
+            tx,
+            wake: Wake::none(),
+        };
         drain_backlog(&mut backlog, &event_tx);
-        assert!(backlog.is_empty());
+
+        match rx.recv().unwrap() {
+            ReaderEvent::OutputDropped {
+                raw_bytes,
+                line_updates,
+                at: event_at,
+            } => {
+                assert_eq!(raw_bytes, 32);
+                assert_eq!(line_updates, 0);
+                assert_eq!(event_at, at);
+            }
+            other => panic!("expected the gap notice first, got {other:?}"),
+        }
+        assert_eq!(backlog.batches.len(), 1, "the refused batch stays queued");
+
+        drain_backlog(&mut backlog, &event_tx);
+        match rx.recv().unwrap() {
+            ReaderEvent::Batch(batch) => assert_eq!(batch.raw, vec![1; 32]),
+            other => panic!("expected the retained batch, got {other:?}"),
+        }
+        assert!(backlog.batches.is_empty());
+        assert!(backlog.dropped.at.is_none());
     }
 
     /// Regression test for #6: a `Transmit`/`SetDtr`/`SetRts`/`SendBreak`
@@ -1005,7 +1338,7 @@ mod tests {
             let mut writer: Option<SessionWriter> = None;
             let mut framer = Framer::with_mode(crate::config::TerminalMode::Classic);
             let mut pending = Batch::default();
-            let mut backlog: VecDeque<Batch> = VecDeque::new();
+            let mut backlog = Backlog::default();
 
             cmd_tx.send(cmd).unwrap();
             let targets = ClearTargets {
