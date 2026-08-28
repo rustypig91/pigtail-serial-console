@@ -3004,15 +3004,19 @@ pub(crate) mod tests {
         let tx = conn_with_injected_events(&mut app, id);
         let clock = SessionClock::new();
         let at = clock.now();
-        let line = |text: &str| serialcore::framer::FramedLine {
+        let later = |micros: i64| Timestamp {
+            wall: at.wall + chrono::Duration::microseconds(micros),
+            micros: at.micros + micros,
+        };
+        let line = |text: &str, ts| serialcore::framer::FramedLine {
             text: text.into(),
-            ts: at,
+            ts,
             flags: LineFlags::default(),
             cursor: None,
         };
 
         tx.send(ReaderEvent::Batch(reader::Batch {
-            lines: vec![line("before")],
+            lines: vec![line("before", at)],
             raw: b"old".to_vec(),
         }))
         .unwrap();
@@ -3023,7 +3027,7 @@ pub(crate) mod tests {
         })
         .unwrap();
         tx.send(ReaderEvent::Batch(reader::Batch {
-            lines: vec![line("after")],
+            lines: vec![line("after", later(1))],
             raw: b"new".to_vec(),
         }))
         .unwrap();
@@ -3045,6 +3049,22 @@ pub(crate) mod tests {
             .is_some_and(|label| label.contains("output dropped")));
         assert_eq!(conn.raw_sessions[1].start, 3);
         assert!(conn.raw_sessions[1].label.is_none());
+
+        app.maintain_merged();
+        let merged_text: Vec<&str> = app
+            .merged
+            .iter()
+            .map(|entry| app.connections[0].store.get(entry.abs).unwrap().text)
+            .collect();
+        assert_eq!(
+            merged_text,
+            vec![
+                "before",
+                "output dropped · 4096 bytes, 23 line updates · display was busy",
+                "after"
+            ],
+            "the merged view must not sort retained output ahead of its gap marker"
+        );
     }
 
     /// Issue #46: the footer's "N new" badge counted line *events*, but a

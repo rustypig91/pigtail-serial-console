@@ -601,6 +601,15 @@ impl Framer {
     pub fn tail_len(&self) -> usize {
         self.tail.len()
     }
+
+    /// Timestamp of the line currently being framed, if it has visible text.
+    ///
+    /// Reader batches use this as an ordering floor: a later batch may finish
+    /// a line whose first byte arrived in an earlier batch, and both emissions
+    /// must retain that original position on the merged timeline.
+    pub(crate) fn open_line_timestamp(&self) -> Option<Timestamp> {
+        self.tail_ts
+    }
 }
 
 /// The byte offset of the UTF-8 character boundary immediately before `idx`.
