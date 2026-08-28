@@ -387,4 +387,55 @@ mod tests {
         );
         let _ = ctx.end_pass();
     }
+
+    #[test]
+    fn tab_navigates_the_ui_when_there_is_no_console_to_receive_it() {
+        let (mut app, _enum_tx) = test_app("no-console-tab");
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![tab()],
+            ..Default::default()
+        });
+        let console_unfocused_at_frame_start = ctx.memory(|m| m.focused().is_none());
+
+        app.show_header(&ctx);
+        app.show_console(&ctx, console_unfocused_at_frame_start);
+
+        assert!(
+            ctx.memory(|m| m.focused().is_some()),
+            "without a connection, Tab must keep the UI focus egui assigned"
+        );
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn tab_navigates_the_ui_when_the_active_console_is_closed() {
+        let (mut app, _enum_tx) = test_app("closed-console-tab");
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            Default::default(),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        conn.state = ConnState::Closed;
+        app.connections.push(conn);
+
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![tab()],
+            ..Default::default()
+        });
+        let console_unfocused_at_frame_start = ctx.memory(|m| m.focused().is_none());
+
+        app.show_header(&ctx);
+        app.show_console(&ctx, console_unfocused_at_frame_start);
+
+        assert!(
+            ctx.memory(|m| m.focused().is_some()),
+            "a Closed tab cannot receive input, so Tab must retain UI focus"
+        );
+        let _ = ctx.end_pass();
+    }
 }

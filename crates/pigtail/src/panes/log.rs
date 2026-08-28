@@ -511,17 +511,22 @@ impl App {
                 })
             });
         let focused = ctx.memory(|m| m.focused());
-        if !self.floating_window_open()
-            && !self.merged_selected
-            && (focused.is_none() || tab_started_in_console)
-        {
-            if tab_started_in_console {
-                if let Some(id) = focused {
-                    ctx.memory_mut(|m| m.surrender_focus(id));
+        if !self.floating_window_open() && !self.merged_selected {
+            // Do not steal focus traversal unless there is a live console to
+            // receive the key. With no connection (or a Closed zombie tab),
+            // Tab belongs to the remaining UI controls instead.
+            if let Some(active) = self
+                .active_index()
+                .filter(|&active| self.connections[active].state != ConnState::Closed)
+            {
+                if focused.is_none() || tab_started_in_console {
+                    if tab_started_in_console {
+                        if let Some(id) = focused {
+                            ctx.memory_mut(|m| m.surrender_focus(id));
+                        }
+                    }
+                    self.console_key_input(ctx, active);
                 }
-            }
-            if let Some(active) = self.active_index() {
-                self.console_key_input(ctx, active);
             }
         }
     }
