@@ -2185,6 +2185,15 @@ pub fn parse_hex_color(s: &str) -> Option<egui::Color32> {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Capture this before drawing any widgets. When no widget owns the
+        // keyboard, egui treats Tab as focus traversal and gives the first
+        // header control focus while it is drawn. `show_console` needs the
+        // pre-draw state to distinguish that from a text field which already
+        // owned Tab when the frame began. A pending search-focus request also
+        // reserves the key for the search box that will appear this frame.
+        let console_unfocused_at_frame_start =
+            !self.search_focus_request && ctx.memory(|m| m.focused().is_none());
+
         self.poll_enumerator();
         self.poll_update_check();
 
@@ -2215,7 +2224,7 @@ impl eframe::App for App {
         self.show_header(ctx);
         self.show_footer(ctx);
         self.show_plot(ctx); // bottom panel, only when enabled for the tab
-        self.show_console(ctx);
+        self.show_console(ctx, console_unfocused_at_frame_start);
 
         // Floating windows.
         self.show_config_dialog(ctx);

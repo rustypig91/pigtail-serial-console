@@ -262,6 +262,16 @@ mod tests {
         }
     }
 
+    fn tab() -> Event {
+        Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
     fn echoed(conn: &Connection) -> Vec<String> {
         (conn.store.first_abs_index()..conn.store.next_abs_index())
             .filter_map(|i| conn.store.get(i))
@@ -334,5 +344,47 @@ mod tests {
             "an idle frame must not re-engage follow"
         );
         assert!(app.connections[0].store.is_empty());
+    }
+
+    /// A bare console has no focused widget. egui normally interprets Tab in
+    /// that state as a request to focus the first header control, which used to
+    /// make the post-layout console-input gate reject the same key event.
+    #[test]
+    fn tab_is_kept_by_an_unfocused_console_instead_of_ui_focus_navigation() {
+        let (mut app, _enum_tx) = test_app("console-tab");
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            Default::default(),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        conn.follow = false;
+        app.connections.push(conn);
+
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![tab()],
+            ..Default::default()
+        });
+        let console_unfocused_at_frame_start = ctx.memory(|m| m.focused().is_none());
+        app.show_header(&ctx);
+        assert!(
+            ctx.memory(|m| m.focused().is_some()),
+            "the test must reproduce egui claiming Tab for header focus"
+        );
+
+        app.show_console(&ctx, console_unfocused_at_frame_start);
+
+        assert!(
+            app.connections[0].follow,
+            "processing the Tab byte should re-engage console follow mode"
+        );
+        assert!(
+            ctx.memory(|m| m.focused().is_none()),
+            "Tab must not leave a UI control focused"
+        );
+        let _ = ctx.end_pass();
     }
 }

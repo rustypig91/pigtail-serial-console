@@ -395,7 +395,11 @@ impl App {
         ctx.request_repaint();
     }
 
-    pub(crate) fn show_console(&mut self, ctx: &egui::Context) {
+    pub(crate) fn show_console(
+        &mut self,
+        ctx: &egui::Context,
+        console_unfocused_at_frame_start: bool,
+    ) {
         let mut menu = MenuAction::default();
         let mut open_dialog = false;
         let mut font_steps = 0;
@@ -486,14 +490,36 @@ impl App {
         // Raw console input: forward the keyboard to the device whenever a live
         // tab is showing and nothing else (search box, a dialog, a floating
         // tool window) holds focus. Runs after drawing so this frame's focus
-        // state is settled. `floating_window_open` covers dialogs/windows
-        // whose controls never take egui focus, so `memory().focused()` alone
-        // wouldn't catch them; a newly added window only needs to be added
-        // there, not here.
+        // state is settled. There is one exception: if the frame began without
+        // a focused widget, egui claims Tab for focus traversal as soon as the
+        // first header control is drawn. In that case Tab still belongs to the
+        // console, so release the focus egui just assigned and forward it.
+        // `floating_window_open` covers dialogs/windows whose controls never
+        // take egui focus, so `memory().focused()` alone wouldn't catch them; a
+        // newly added window only needs to be added there, not here.
+        let tab_started_in_console = console_unfocused_at_frame_start
+            && ctx.input(|i| {
+                i.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::Tab,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                })
+            });
+        let focused = ctx.memory(|m| m.focused());
         if !self.floating_window_open()
             && !self.merged_selected
-            && ctx.memory(|m| m.focused().is_none())
+            && (focused.is_none() || tab_started_in_console)
         {
+            if tab_started_in_console {
+                if let Some(id) = focused {
+                    ctx.memory_mut(|m| m.surrender_focus(id));
+                }
+            }
             if let Some(active) = self.active_index() {
                 self.console_key_input(ctx, active);
             }
