@@ -484,6 +484,44 @@ impl Connection {
                         self.last_error = Some(TabError { scope, msg });
                     }
                 }
+                ReaderEvent::OutputDropped {
+                    raw_bytes,
+                    line_updates,
+                    at,
+                } => {
+                    let label = format!(
+                        "output dropped · {raw_bytes} bytes, {line_updates} line updates · display was busy"
+                    );
+
+                    // A missing completion may have belonged to the open line
+                    // already on screen. Close it before the boundary so a
+                    // retained continuation cannot rewrite text from before
+                    // the gap.
+                    self.store.finalize_last_provisional();
+
+                    // Close the current hex run with the same visible gap
+                    // marker. The next batch opens a fresh run whose offsets
+                    // restart at zero rather than pretending the retained raw
+                    // bytes are contiguous with bytes we discarded.
+                    if let Some(session) = self.raw_sessions.last_mut() {
+                        if session.label.is_none() {
+                            session.label = Some(label.clone());
+                        }
+                    }
+
+                    let next = self.store.next_abs_index();
+                    let abs = self.store.append(IncomingLine {
+                        text: label,
+                        ts: at,
+                        port: self.id,
+                        flags: LineFlags::RECONNECT_MARKER,
+                        spans: Default::default(),
+                        cursor: None,
+                    });
+                    if !self.follow && abs >= next {
+                        self.new_since_scroll += 1;
+                    }
+                }
                 ReaderEvent::Batch(batch) => {
                     self.open_live_raw_session();
                     self.push_raw_bytes(&batch.raw);
@@ -2954,6 +2992,59 @@ pub(crate) mod tests {
             app.connections[0].last_error.as_ref().unwrap().msg,
             "transmit: dropped, not connected"
         );
+    }
+
+    /// The bounded reader backlog reports a gap before the output it retained.
+    /// Both views must show that boundary: silently joining the raw bytes would
+    /// make the hex offsets claim two non-contiguous regions were one stream.
+    #[test]
+    fn dropped_reader_output_marks_the_console_and_hex_view() {
+        let (mut app, _enum_tx) = test_app("dropped-reader-output");
+        let id = PortId(0);
+        let tx = conn_with_injected_events(&mut app, id);
+        let clock = SessionClock::new();
+        let at = clock.now();
+        let line = |text: &str| serialcore::framer::FramedLine {
+            text: text.into(),
+            ts: at,
+            flags: LineFlags::default(),
+            cursor: None,
+        };
+
+        tx.send(ReaderEvent::Batch(reader::Batch {
+            lines: vec![line("before")],
+            raw: b"old".to_vec(),
+        }))
+        .unwrap();
+        tx.send(ReaderEvent::OutputDropped {
+            raw_bytes: 4096,
+            line_updates: 23,
+            at,
+        })
+        .unwrap();
+        tx.send(ReaderEvent::Batch(reader::Batch {
+            lines: vec![line("after")],
+            raw: b"new".to_vec(),
+        }))
+        .unwrap();
+
+        app.connections[0].drain_events(1000);
+        let conn = &app.connections[0];
+        assert_eq!(conn.store.len(), 3);
+        assert_eq!(conn.store.get(0).unwrap().text, "before");
+        let marker = conn.store.get(1).unwrap();
+        assert!(marker.meta.flags.contains(LineFlags::RECONNECT_MARKER));
+        assert!(marker.text.contains("4096 bytes, 23 line updates"));
+        assert_eq!(conn.store.get(2).unwrap().text, "after");
+
+        assert_eq!(conn.raw_ring.iter().copied().collect::<Vec<_>>(), b"oldnew");
+        assert_eq!(conn.raw_sessions.len(), 2);
+        assert!(conn.raw_sessions[0]
+            .label
+            .as_deref()
+            .is_some_and(|label| label.contains("output dropped")));
+        assert_eq!(conn.raw_sessions[1].start, 3);
+        assert!(conn.raw_sessions[1].label.is_none());
     }
 
     /// Issue #46: the footer's "N new" badge counted line *events*, but a
