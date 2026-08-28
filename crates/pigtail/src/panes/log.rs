@@ -1106,7 +1106,14 @@ impl App {
                         ..Default::default()
                     },
                 );
-                let resp = wrapped_text(ui, job, &m, u32::MAX, row_height, row_id);
+                // `LayoutJob`'s galley can be fractionally taller than the
+                // font's advertised row height. Letting that allocate directly
+                // in `show_rows` makes the painted rows drift from the fixed
+                // pitch the virtualizer (and the bottom-pin offset) uses. Keep
+                // the allocation in an exact-height slot, as the normal
+                // console does for every row.
+                let (mut row_ui, _slot) = row_slot(ui, row_height, egui::Sense::hover(), row_id);
+                let resp = wrapped_text(&mut row_ui, job, &m, u32::MAX, row_height, row_id);
                 resp.context_menu(|ui| {
                     console_menu(
                         ui,
@@ -2336,5 +2343,78 @@ mod tests {
     fn nothing_resident_is_no_rows() {
         assert!(hex_segments(&[], 0, 0).is_empty());
         assert!(hex_segments(&sessions(&[(0, None)]), 0, 0).is_empty());
+    }
+
+    /// Hex rendering must consume exactly the pitch passed to `show_rows`.
+    /// A text galley is slightly taller than `Fonts::row_height` at common font
+    /// sizes; allocating it directly used to extend `content_size` below the
+    /// computed bottom-pin offset, leaving the last line partly out of view.
+    #[test]
+    fn hex_rows_keep_the_virtualized_pitch_exact() {
+        let ctx = egui::Context::default();
+        let mut seen = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let m = Metrics::new(
+                        ui,
+                        egui::FontId::monospace(12.0),
+                        TimestampFormat::None,
+                        false,
+                        false,
+                        false,
+                    );
+                    let row_height = m.row_height;
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let rows = 100;
+                    let output = egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .drag_to_scroll(false)
+                        .vertical_scroll_offset(rows as f32 * row_height - ui.available_height())
+                        .show_rows(ui, row_height, rows, |ui, range| {
+                            for row in range {
+                                let row_id = ui.id().with(("inspect", row));
+                                let mut job = LayoutJob::default();
+                                job.append(
+                                    "00000000  00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F |................|",
+                                    0.0,
+                                    egui::TextFormat {
+                                        font_id: m.font.clone(),
+                                        ..Default::default()
+                                    },
+                                );
+                                let (mut row_ui, _slot) =
+                                    row_slot(ui, row_height, egui::Sense::hover(), row_id);
+                                let _ = wrapped_text(
+                                    &mut row_ui,
+                                    job,
+                                    &m,
+                                    u32::MAX,
+                                    row_height,
+                                    row_id,
+                                );
+                            }
+                        });
+                    seen = Some((
+                        row_height,
+                        output.content_size.y,
+                        output.inner_rect.height(),
+                        output.state.offset.y,
+                    ));
+                });
+            },
+        );
+        let (row_height, content, view, offset) = seen.unwrap();
+        let expected_content = 100.0 * row_height;
+        let expected_bottom = expected_content - view;
+        assert!((content - expected_content).abs() < 0.01);
+        assert!((offset - expected_bottom).abs() < 0.01);
     }
 }
