@@ -5,7 +5,7 @@
 //! back to the log line that produced it — the whole point of the feature. That
 //! third field must never be dropped as an optimisation.
 
-use std::collections::VecDeque;
+use std::collections::{vec_deque, VecDeque};
 
 /// Default per-series capacity (points).
 pub const DEFAULT_CAPACITY: usize = 100_000;
@@ -51,6 +51,8 @@ impl Series {
     }
 
     /// Push a sample, evicting the oldest when at capacity.
+    ///
+    /// Timestamps must be monotonically non-decreasing within a series.
     pub fn push(&mut self, t: f64, value: f64, line: u64) {
         if self.buf.len() == self.capacity {
             self.buf.pop_front();
@@ -82,40 +84,46 @@ impl Series {
         }
     }
 
-    /// All points in `[x0, x1]` as `[t, value]`, without decimation.
-    fn raw_in_range(&self, x0: f64, x1: f64) -> Vec<[f64; 2]> {
-        self.buf
-            .iter()
-            .filter(|p| p.t >= x0 && p.t <= x1)
-            .map(|p| [p.t, p.value])
-            .collect()
+    /// Iterate over the points in the closed interval `[x0, x1]`.
+    ///
+    /// Samples are appended in timestamp order, so finding the interval costs
+    /// O(log n) instead of scanning the whole ring buffer on every plot frame.
+    fn points_in_range(&self, x0: f64, x1: f64) -> vec_deque::Iter<'_, SeriesPoint> {
+        if x0.is_nan() || x1.is_nan() || x0 > x1 {
+            return self.buf.range(0..0);
+        }
+        let lo = self.buf.partition_point(|p| p.t < x0);
+        let hi = self.buf.partition_point(|p| p.t <= x1);
+        self.buf.range(lo..hi)
     }
 
     /// Find the point nearest to `t` within the window and return its line index
     /// (for plot→log linking). Returns `None` if empty.
     pub fn nearest_line(&self, t: f64) -> Option<u64> {
-        self.buf
-            .iter()
-            .min_by(|a, b| {
-                (a.t - t)
-                    .abs()
-                    .partial_cmp(&(b.t - t).abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|p| p.line)
+        self.nearest_point(t).map(|p| p.line)
     }
 
     /// The point nearest to time `t` (for plot→log linking).
     pub fn nearest_point(&self, t: f64) -> Option<SeriesPoint> {
-        self.buf
-            .iter()
-            .min_by(|a, b| {
-                (a.t - t)
-                    .abs()
-                    .partial_cmp(&(b.t - t).abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .copied()
+        let right = self.buf.partition_point(|p| p.t < t);
+        match (
+            right.checked_sub(1).and_then(|i| self.buf.get(i)),
+            self.buf.get(right),
+        ) {
+            (Some(left), Some(right)) if (t - left.t).abs() <= (right.t - t).abs() => {
+                // Match the old full scan's tie-breaking: if several points
+                // have the nearest timestamp, return the first one.
+                let first = self.buf.partition_point(|p| p.t < left.t);
+                self.buf.get(first).copied()
+            }
+            (Some(_), Some(right)) => Some(*right),
+            (Some(left), None) => {
+                let first = self.buf.partition_point(|p| p.t < left.t);
+                self.buf.get(first).copied()
+            }
+            (None, Some(right)) => Some(*right),
+            (None, None) => None,
+        }
     }
 
     /// Min/max-decimated points for the window `[x0, x1]` at a target column
@@ -124,9 +132,9 @@ impl Series {
     /// so a transient spike is never hidden by stride sampling.
     pub fn decimate(&self, x0: f64, x1: f64, width: usize) -> Vec<[f64; 2]> {
         let width = width.max(1);
-        let in_range = self.raw_in_range(x0, x1);
-        if in_range.len() <= width * 2 || x1 <= x0 {
-            return in_range;
+        let in_range = self.points_in_range(x0, x1);
+        if in_range.len() <= width.saturating_mul(2) || x1 <= x0 {
+            return in_range.map(|p| [p.t, p.value]).collect();
         }
         let span = x1 - x0;
         let mut out: Vec<[f64; 2]> = Vec::with_capacity(width * 2);
@@ -151,7 +159,8 @@ impl Series {
             }
         };
 
-        for p in &in_range {
+        for p in in_range {
+            let p = [p.t, p.value];
             let frac = ((p[0] - x0) / span).clamp(0.0, 1.0);
             let bucket = ((frac * width as f64) as usize).min(width - 1) as isize;
             if bucket != cur_bucket {
@@ -159,14 +168,14 @@ impl Series {
                     flush(&mut out, min_pt, max_pt);
                 }
                 cur_bucket = bucket;
-                min_pt = *p;
-                max_pt = *p;
+                min_pt = p;
+                max_pt = p;
             } else {
                 if p[1] < min_pt[1] {
-                    min_pt = *p;
+                    min_pt = p;
                 }
                 if p[1] > max_pt[1] {
-                    max_pt = *p;
+                    max_pt = p;
                 }
             }
         }
@@ -209,6 +218,48 @@ mod tests {
         }
         let pts = s.decimate(0.0, 9.0, 100);
         assert_eq!(pts.len(), 10);
+    }
+
+    #[test]
+    fn range_lookup_handles_closed_bounds_duplicates_and_wrapped_storage() {
+        let mut s = Series::new("t", 7);
+        for (line, t) in [-4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 2.0, 3.0, 4.0]
+            .into_iter()
+            .enumerate()
+        {
+            s.push(t, line as f64, line as u64);
+        }
+        assert!(
+            !s.buf.as_slices().1.is_empty(),
+            "test setup must wrap the deque"
+        );
+
+        assert_eq!(
+            s.decimate(-1.0, 2.0, 100),
+            vec![[-1.0, 2.0], [0.0, 3.0], [1.0, 4.0], [2.0, 5.0], [2.0, 6.0]]
+        );
+        assert_eq!(
+            s.decimate(2.0, 4.0, 100),
+            vec![[2.0, 5.0], [2.0, 6.0], [3.0, 7.0], [4.0, 8.0]]
+        );
+        assert_eq!(s.decimate(-1.0, 4.0, 1), vec![[-1.0, 2.0], [4.0, 8.0]]);
+        assert_eq!(s.decimate(2.0, 2.0, 100), vec![[2.0, 5.0], [2.0, 6.0]]);
+        assert!(s.decimate(2.0, 1.0, 100).is_empty());
+        assert!(s.decimate(f64::NAN, 2.0, 100).is_empty());
+    }
+
+    #[test]
+    fn nearest_point_uses_ordered_neighbors_and_keeps_first_tie() {
+        let mut s = Series::new("t", 5);
+        for (line, t) in [-2.0, 0.0, 0.0, 2.0, 4.0].into_iter().enumerate() {
+            s.push(t, line as f64, line as u64);
+        }
+
+        assert_eq!(s.nearest_point(-3.0).unwrap().line, 0);
+        assert_eq!(s.nearest_point(0.0).unwrap().line, 1);
+        assert_eq!(s.nearest_point(1.0).unwrap().line, 1);
+        assert_eq!(s.nearest_point(5.0).unwrap().line, 4);
+        assert_eq!(s.nearest_line(1.1), Some(3));
     }
 
     /// The key property (spec §10): a single-sample spike survives decimation to
