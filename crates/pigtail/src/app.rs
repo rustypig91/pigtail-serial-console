@@ -2185,15 +2185,6 @@ pub fn parse_hex_color(s: &str) -> Option<egui::Color32> {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Capture this before drawing any widgets. When no widget owns the
-        // keyboard, egui treats Tab as focus traversal and gives the first
-        // header control focus while it is drawn. `show_console` needs the
-        // pre-draw state to distinguish that from a text field which already
-        // owned Tab when the frame began. A pending search-focus request also
-        // reserves the key for the search box that will appear this frame.
-        let console_unfocused_at_frame_start =
-            !self.search_focus_request && ctx.memory(|m| m.focused().is_none());
-
         self.poll_enumerator();
         self.poll_update_check();
 
@@ -2221,10 +2212,15 @@ impl eframe::App for App {
         // Minimal chrome: a header of tabs on top, a status footer at the
         // bottom, and the console filling everything in between. Tool panels are
         // floating windows toggled from the console's right-click menu.
+        // Claim a console-owned Tab before any focusable widgets see the frame.
+        // Otherwise egui can focus a header control, and a batched Enter/Space
+        // event can activate that control before `show_console` gives Tab back
+        // to the device.
+        let console_tab_claimed = self.claim_console_tab_before_layout(ctx);
         self.show_header(ctx);
         self.show_footer(ctx);
         self.show_plot(ctx); // bottom panel, only when enabled for the tab
-        self.show_console(ctx, console_unfocused_at_frame_start);
+        self.show_console(ctx, console_tab_claimed);
 
         // Floating windows.
         self.show_config_dialog(ctx);
@@ -2233,6 +2229,9 @@ impl eframe::App for App {
         self.show_update_dialog(ctx);
         self.show_font_toast(ctx);
         self.show_connect_error(ctx);
+        // Keep the guard focused until every widget has been drawn, so none of
+        // the later floating windows can claim this Tab either.
+        self.release_console_tab_after_layout(ctx, console_tab_claimed);
 
         // egui only draws when something asks it to, and nothing here animates on
         // its own clock, so an *open but silent* connection must not schedule

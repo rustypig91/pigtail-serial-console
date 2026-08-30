@@ -15,6 +15,12 @@ use serialcore::store::{LineFlags, LineRef, LineStore, PortId};
 /// view's own boundary rows.
 const BOUNDARY_COLOR: egui::Color32 = egui::Color32::from_rgb(0xe5, 0xc0, 0x40);
 
+/// Temporary focus owner used to keep a console-owned Tab away from egui's
+/// focus traversal until every widget has been drawn for the frame.
+fn console_tab_guard_id() -> egui::Id {
+    egui::Id::new(("pigtail", "console_tab_guard"))
+}
+
 /// One run of bytes as the hex view lays it out: the 16-byte rows it still has
 /// resident, and the boundary that closes it.
 struct HexSegment {
@@ -323,6 +329,46 @@ struct RowCtx<'a> {
 }
 
 impl App {
+    /// Reserve an unfocused live console's Tab before egui lays out focusable
+    /// widgets. Requesting a non-widget focus id prevents Tab followed by
+    /// Enter/Space in the same input batch from activating a header control.
+    pub(crate) fn claim_console_tab_before_layout(&self, ctx: &egui::Context) -> bool {
+        let live_console = !self.search_focus_request
+            && !self.floating_window_open()
+            && !self.merged_selected
+            && self
+                .active_index()
+                .is_some_and(|active| self.connections[active].state != ConnState::Closed);
+        let tab_pressed = ctx.input(|i| {
+            i.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::Tab,
+                        pressed: true,
+                        ..
+                    }
+                )
+            })
+        });
+        let claim = live_console && tab_pressed && ctx.memory(|m| m.focused().is_none());
+        if claim {
+            ctx.memory_mut(|m| m.request_focus(console_tab_guard_id()));
+        }
+        claim
+    }
+
+    /// Drop the temporary focus only after all widgets have seen the frame.
+    pub(crate) fn release_console_tab_after_layout(
+        &self,
+        ctx: &egui::Context,
+        console_tab_claimed: bool,
+    ) {
+        if console_tab_claimed {
+            ctx.memory_mut(|m| m.surrender_focus(console_tab_guard_id()));
+        }
+    }
+
     /// The console's monospace font. Clamped here rather than at load, so a
     /// hand-edited config with an absurd size still renders.
     pub(crate) fn console_font(&self) -> egui::FontId {
@@ -395,11 +441,7 @@ impl App {
         ctx.request_repaint();
     }
 
-    pub(crate) fn show_console(
-        &mut self,
-        ctx: &egui::Context,
-        console_unfocused_at_frame_start: bool,
-    ) {
+    pub(crate) fn show_console(&mut self, ctx: &egui::Context, console_tab_claimed: bool) {
         let mut menu = MenuAction::default();
         let mut open_dialog = false;
         let mut font_steps = 0;
@@ -490,27 +532,14 @@ impl App {
         // Raw console input: forward the keyboard to the device whenever a live
         // tab is showing and nothing else (search box, a dialog, a floating
         // tool window) holds focus. Runs after drawing so this frame's focus
-        // state is settled. There is one exception: if the frame began without
-        // a focused widget, egui claims Tab for focus traversal as soon as the
-        // first header control is drawn. In that case Tab still belongs to the
-        // console, so release the focus egui just assigned and forward it.
+        // state is settled. A Tab claimed before layout temporarily belongs to
+        // `console_tab_guard_id`, which keeps egui from activating a header
+        // control if Enter/Space arrived in the same input batch.
         // `floating_window_open` covers dialogs/windows whose controls never
         // take egui focus, so `memory().focused()` alone wouldn't catch them; a
         // newly added window only needs to be added there, not here.
-        let tab_started_in_console = console_unfocused_at_frame_start
-            && ctx.input(|i| {
-                i.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: egui::Key::Tab,
-                            pressed: true,
-                            ..
-                        }
-                    )
-                })
-            });
         let focused = ctx.memory(|m| m.focused());
+        let console_owns_focus = console_tab_claimed && focused == Some(console_tab_guard_id());
         if !self.floating_window_open() && !self.merged_selected {
             // Do not steal focus traversal unless there is a live console to
             // receive the key. With no connection (or a Closed zombie tab),
@@ -519,12 +548,7 @@ impl App {
                 .active_index()
                 .filter(|&active| self.connections[active].state != ConnState::Closed)
             {
-                if focused.is_none() || tab_started_in_console {
-                    if tab_started_in_console {
-                        if let Some(id) = focused {
-                            ctx.memory_mut(|m| m.surrender_focus(id));
-                        }
-                    }
+                if focused.is_none() || console_owns_focus {
                     self.console_key_input(ctx, active);
                 }
             }

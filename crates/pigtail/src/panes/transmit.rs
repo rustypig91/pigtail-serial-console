@@ -368,14 +368,15 @@ mod tests {
             events: vec![tab()],
             ..Default::default()
         });
-        let console_unfocused_at_frame_start = ctx.memory(|m| m.focused().is_none());
+        let console_tab_claimed = app.claim_console_tab_before_layout(&ctx);
         app.show_header(&ctx);
         assert!(
             ctx.memory(|m| m.focused().is_some()),
-            "the test must reproduce egui claiming Tab for header focus"
+            "the console's temporary guard must own focus during layout"
         );
 
-        app.show_console(&ctx, console_unfocused_at_frame_start);
+        app.show_console(&ctx, console_tab_claimed);
+        app.release_console_tab_after_layout(&ctx, console_tab_claimed);
 
         assert!(
             app.connections[0].follow,
@@ -396,10 +397,11 @@ mod tests {
             events: vec![tab()],
             ..Default::default()
         });
-        let console_unfocused_at_frame_start = ctx.memory(|m| m.focused().is_none());
+        let console_tab_claimed = app.claim_console_tab_before_layout(&ctx);
 
         app.show_header(&ctx);
-        app.show_console(&ctx, console_unfocused_at_frame_start);
+        app.show_console(&ctx, console_tab_claimed);
+        app.release_console_tab_after_layout(&ctx, console_tab_claimed);
 
         assert!(
             ctx.memory(|m| m.focused().is_some()),
@@ -427,15 +429,63 @@ mod tests {
             events: vec![tab()],
             ..Default::default()
         });
-        let console_unfocused_at_frame_start = ctx.memory(|m| m.focused().is_none());
+        let console_tab_claimed = app.claim_console_tab_before_layout(&ctx);
 
         app.show_header(&ctx);
-        app.show_console(&ctx, console_unfocused_at_frame_start);
+        app.show_console(&ctx, console_tab_claimed);
+        app.release_console_tab_after_layout(&ctx, console_tab_claimed);
 
         assert!(
             ctx.memory(|m| m.focused().is_some()),
             "a Closed tab cannot receive input, so Tab must retain UI focus"
         );
+        let _ = ctx.end_pass();
+    }
+
+    /// A single egui frame can contain multiple keyboard events. The Tab guard
+    /// must stop a following Enter from activating the first header tab and
+    /// redirecting the whole batch away from the console that was active when
+    /// the user typed it.
+    #[test]
+    fn tab_and_enter_in_one_frame_stay_on_the_active_console() {
+        let (mut app, _enum_tx) = test_app("console-tab-enter");
+        for id in [PortId(0), PortId(1)] {
+            let mut conn = app.make_connection(
+                id,
+                format!("probe-{}", id.0),
+                Default::default(),
+                PortConfig::default(),
+                inert_handle(id),
+            );
+            conn.follow = false;
+            app.connections.push(conn);
+        }
+        app.active = 1;
+
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![tab(), enter()],
+            ..Default::default()
+        });
+        let console_tab_claimed = app.claim_console_tab_before_layout(&ctx);
+
+        app.show_header(&ctx);
+        assert_eq!(
+            app.active, 1,
+            "Enter in the Tab frame must not activate the first header tab"
+        );
+        app.show_console(&ctx, console_tab_claimed);
+        app.release_console_tab_after_layout(&ctx, console_tab_claimed);
+
+        assert!(
+            !app.connections[0].follow,
+            "the inactive connection must receive none of the input batch"
+        );
+        assert!(
+            app.connections[1].follow,
+            "Tab and Enter must be processed by the originally active console"
+        );
+        assert!(ctx.memory(|m| m.focused().is_none()));
         let _ = ctx.end_pass();
     }
 }
