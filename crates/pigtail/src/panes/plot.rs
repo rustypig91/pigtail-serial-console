@@ -217,7 +217,8 @@ impl App {
             // Per-series visibility + colour + own-axis toggles.
             for entry in &mut conn.series {
                 ui.checkbox(&mut entry.visible, "");
-                ui.colored_label(entry.color, "■");
+                ui.color_edit_button_srgba(&mut entry.color)
+                    .on_hover_text("Change series colour");
                 ui.label(entry.series.name());
                 ui.checkbox(&mut entry.own_axis, "Y2")
                     .on_hover_text("Put this series on a separate right axis");
