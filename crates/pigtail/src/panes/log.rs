@@ -21,6 +21,16 @@ fn console_tab_guard_id() -> egui::Id {
     egui::Id::new(("pigtail", "console_tab_guard"))
 }
 
+/// A search field is still part of the frame in which its Close button is
+/// clicked, so egui's missing-widget cleanup cannot release its focus until a
+/// later frame. Release it explicitly or a Tab arriving as the next event is
+/// rejected by both the UI traversal and the console input gates.
+fn surrender_search_focus_on_close(response: &egui::Response, close: bool) {
+    if close {
+        response.surrender_focus();
+    }
+}
+
 /// One run of bytes as the hex view lays it out: the 16-byte rows it still has
 /// resident, and the boundary that closes it.
 struct HexSegment {
@@ -619,6 +629,7 @@ impl App {
             if ui.small_button("Close").clicked() {
                 close = true;
             }
+            surrender_search_focus_on_close(&resp, close);
         });
         if next {
             self.search_step(1);
@@ -678,6 +689,7 @@ impl App {
             if ui.small_button("Close").clicked() {
                 close = true;
             }
+            surrender_search_focus_on_close(&resp, close);
         });
         if next {
             self.search_step(1);
@@ -2124,6 +2136,64 @@ mod tests {
             wall: chrono::Utc::now(),
             micros,
         }
+    }
+
+    #[test]
+    fn closing_a_focused_search_releases_the_next_tab_to_the_console() {
+        let (mut app, _enum_tx) = test_app("search-close-tab");
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            PortIdentity::default(),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        conn.follow = false;
+        app.connections.push(conn);
+
+        let ctx = egui::Context::default();
+        let mut query = String::new();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let response = ui.text_edit_singleline(&mut query);
+                response.request_focus();
+            });
+        });
+        assert!(ctx.memory(|memory| memory.focused().is_some()));
+
+        // The field is still rendered in the frame where its Close button is
+        // handled. Without the explicit surrender, its now-stale id survives
+        // into the next input frame and makes both sides reject Tab.
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let response = ui.text_edit_singleline(&mut query);
+                assert!(response.has_focus());
+                surrender_search_focus_on_close(&response, true);
+            });
+        });
+        assert!(ctx.memory(|memory| memory.focused().is_none()));
+
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        let console_tab_claimed = app.claim_console_tab_before_layout(&ctx);
+        assert!(console_tab_claimed);
+        app.show_header(&ctx);
+        app.show_console(&ctx, console_tab_claimed);
+        app.release_console_tab_after_layout(&ctx, console_tab_claimed);
+        assert!(
+            app.connections[0].follow,
+            "the Tab after closing search must reach the live console"
+        );
+        let _ = ctx.end_pass();
     }
 
     #[test]
