@@ -10,6 +10,7 @@ use serialcore::clock::Timestamp;
 use serialcore::config::{TimestampFormat, MAX_CONSOLE_FONT_SIZE, MIN_CONSOLE_FONT_SIZE};
 use serialcore::reader::ConnState;
 use serialcore::store::{LineFlags, LineRef, LineStore, PortId};
+use std::io::{BufWriter, Write};
 
 /// The colour the console draws a session boundary in, shared with the hex
 /// view's own boundary rows.
@@ -1320,60 +1321,30 @@ impl App {
 
     /// Export the active connection's current (filtered) view to a file.
     pub(crate) fn export_active_view(&mut self, active: usize, as_csv: bool) {
-        let Some(conn) = self.connections.get(active) else {
+        if self.connections.get(active).is_none() {
             return;
-        };
-        let filter_active = conn.filter_index_active();
-        let matching = conn.filter_index.matching();
-        let first = conn.store.first_abs_index();
-        let end = conn.store.next_abs_index();
-        let indices: Vec<u64> = if filter_active {
-            matching.to_vec()
-        } else {
-            (first..end).collect()
-        };
-
-        let mut out = String::new();
-        if as_csv {
-            out.push_str("wall_time,micros,flags,text\n");
         }
-        for abs in indices {
-            let Some(line) = conn.store.get(abs) else {
-                continue;
-            };
-            if as_csv {
-                out.push_str(&format!(
-                    "{},{},{},{}\n",
-                    // Local time like the console shows, but with the UTC offset
-                    // appended so the exported column stays unambiguous to
-                    // whatever reads it.
-                    line.meta
-                        .ts
-                        .wall
-                        .with_timezone(&chrono::Local)
-                        .format("%Y-%m-%dT%H:%M:%S%.6f%:z"),
-                    line.meta.ts.micros,
-                    line.meta.flags.0,
-                    csv_escape(line.text),
-                ));
-            } else {
-                out.push_str(&format!("{}  {}\n", wall_clock(line.meta.ts), line.text));
-            }
-        }
-
         let ext = if as_csv { "csv" } else { "txt" };
-        if let Some(path) = rfd::FileDialog::new()
+        let Some(path) = rfd::FileDialog::new()
             .add_filter(ext, &[ext])
             .set_file_name(format!("export.{ext}"))
             .save_file()
-        {
-            if let Err(e) = std::fs::write(&path, out) {
-                // Not `conn.last_error`: that field carries what the reader
-                // reports about a connection (its link, or its capture file),
-                // whereas an export is a UI action the user is standing there
-                // waiting on — a modal answers it where they're looking.
-                self.record_connect_error("Couldn't export", e.to_string());
-            }
+        else {
+            return;
+        };
+
+        let conn = &self.connections[active];
+        let result = std::fs::File::create(path).and_then(|file| {
+            let mut writer = BufWriter::new(file);
+            write_active_export(&mut writer, conn, as_csv)?;
+            writer.flush()
+        });
+        if let Err(e) = result {
+            // Not `conn.last_error`: that field carries what the reader
+            // reports about a connection (its link, or its capture file),
+            // whereas an export is a UI action the user is standing there
+            // waiting on — a modal answers it where they're looking.
+            self.record_connect_error("Couldn't export", e.to_string());
         }
     }
 
@@ -1395,6 +1366,54 @@ impl App {
             }
         }
     }
+}
+
+/// Stream one connection's displayed rows to `writer`, without materializing
+/// either the selected indices or the formatted export as a whole.
+fn write_active_export(
+    writer: &mut impl Write,
+    conn: &Connection,
+    as_csv: bool,
+) -> std::io::Result<()> {
+    if as_csv {
+        writeln!(writer, "wall_time,micros,flags,text")?;
+    }
+
+    let filtered = conn.filter_index_active();
+    let matching = conn.filter_index.matching();
+    let first = conn.store.first_abs_index();
+    let end = conn.store.next_abs_index();
+    let indices: Box<dyn Iterator<Item = u64> + '_> = if filtered {
+        Box::new(matching.iter().copied())
+    } else {
+        Box::new(first..end)
+    };
+
+    for abs in indices {
+        let Some(line) = conn.store.get(abs) else {
+            continue;
+        };
+        if as_csv {
+            writeln!(
+                writer,
+                "{},{},{},{}",
+                // Local time like the console shows, but with the UTC offset
+                // appended so the exported column stays unambiguous to
+                // whatever reads it.
+                line.meta
+                    .ts
+                    .wall
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%dT%H:%M:%S%.6f%:z"),
+                line.meta.ts.micros,
+                line.meta.flags.0,
+                csv_escape(line.text),
+            )?;
+        } else {
+            writeln!(writer, "{}  {}", wall_clock(line.meta.ts), line.text)?;
+        }
+    }
+    Ok(())
 }
 
 fn format_merged_export(
@@ -2136,6 +2155,7 @@ mod tests {
     use super::*;
     use crate::app::tests::{inert_handle, test_app};
     use serialcore::config::{PortConfig, PortIdentity};
+    use serialcore::filter::{FilterRule, FilterSet};
     use serialcore::store::IncomingLine;
 
     fn ts(micros: i64) -> Timestamp {
@@ -2261,6 +2281,46 @@ mod tests {
         assert!(csv.starts_with("port,wall_time,micros,flags,text\n"));
         assert!(csv.contains("[beta  ]"));
         assert!(csv.contains("\"alarm, now\""));
+    }
+
+    #[test]
+    fn active_export_writes_only_the_filtered_view() {
+        let (app, _enum_tx) = test_app("active-export");
+        let id = PortId(1);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            PortIdentity::default(),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        for (text, micros) in [("drop", 1), ("keep, \"quoted\"", 2)] {
+            conn.store.append(IncomingLine {
+                text: text.into(),
+                ts: ts(micros),
+                port: id,
+                flags: LineFlags::default(),
+                spans: Default::default(),
+                cursor: None,
+            });
+        }
+        conn.filter_rules = vec![FilterRule {
+            pattern: "keep".into(),
+            is_regex: false,
+            ..Default::default()
+        }];
+        let (filter, errors) = FilterSet::compile(&conn.filter_rules, conn.filter_combine);
+        assert!(errors.is_empty());
+        conn.filter_index.rebuild(&conn.store, &filter);
+
+        let mut csv = Vec::new();
+        write_active_export(&mut csv, &conn, true).unwrap();
+        let csv = String::from_utf8(csv).unwrap();
+        let lines: Vec<_> = csv.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "wall_time,micros,flags,text");
+        assert!(lines[1].ends_with(",2,0,\"keep, \"\"quoted\"\"\""));
+        assert!(!csv.contains("drop"));
     }
 
     #[test]
