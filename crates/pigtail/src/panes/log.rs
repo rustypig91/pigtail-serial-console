@@ -15,6 +15,27 @@ use serialcore::store::{LineFlags, LineRef, LineStore, PortId};
 /// view's own boundary rows.
 const BOUNDARY_COLOR: egui::Color32 = egui::Color32::from_rgb(0xe5, 0xc0, 0x40);
 
+/// Temporary focus owner used to keep a console-owned Tab away from egui's
+/// focus traversal until every widget has been drawn for the frame.
+fn console_tab_guard_id() -> egui::Id {
+    egui::Id::new(("pigtail", "console_tab_guard"))
+}
+
+/// Search controls are still part of the frame in which Close is activated, so
+/// egui's missing-widget cleanup cannot release their focus until a later
+/// frame. Release both possible owners explicitly or a Tab arriving as the
+/// next event is rejected by both the UI traversal and the console input gates.
+fn surrender_search_focus_on_close(
+    field: &egui::Response,
+    close_button: &egui::Response,
+    close: bool,
+) {
+    if close {
+        field.surrender_focus();
+        close_button.surrender_focus();
+    }
+}
+
 /// One run of bytes as the hex view lays it out: the 16-byte rows it still has
 /// resident, and the boundary that closes it.
 struct HexSegment {
@@ -323,6 +344,59 @@ struct RowCtx<'a> {
 }
 
 impl App {
+    /// UI overlays that own keyboard input without necessarily taking egui's
+    /// widget focus. Check this both before layout and before transmitting: an
+    /// overlay can be opened by another event in the same input batch as Tab.
+    fn keyboard_overlay_open(&self, ctx: &egui::Context) -> bool {
+        self.floating_window_open()
+            || ctx.is_context_menu_open()
+            || ctx.memory(|memory| memory.any_popup_open())
+    }
+
+    /// Reserve an unfocused live console's Tab before egui lays out focusable
+    /// widgets. Requesting a non-widget focus id prevents Tab followed by
+    /// Enter/Space in the same input batch from activating a header control.
+    pub(crate) fn claim_console_tab_before_layout(&self, ctx: &egui::Context) -> bool {
+        // Context menus use their own retained state rather than keyboard
+        // focus, and egui's older popup API likewise does not necessarily
+        // focus one of its controls. Both still own keyboard navigation while
+        // open, so neither can be inferred from `memory().focused()` below.
+        let live_console = !self.keyboard_overlay_open(ctx)
+            && !self.search_focus_request
+            && !self.merged_selected
+            && self
+                .active_index()
+                .is_some_and(|active| self.connections[active].state != ConnState::Closed);
+        let tab_pressed = ctx.input(|i| {
+            i.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::Tab,
+                        pressed: true,
+                        ..
+                    }
+                )
+            })
+        });
+        let claim = live_console && tab_pressed && ctx.memory(|m| m.focused().is_none());
+        if claim {
+            ctx.memory_mut(|m| m.request_focus(console_tab_guard_id()));
+        }
+        claim
+    }
+
+    /// Drop the temporary focus only after all widgets have seen the frame.
+    pub(crate) fn release_console_tab_after_layout(
+        &self,
+        ctx: &egui::Context,
+        console_tab_claimed: bool,
+    ) {
+        if console_tab_claimed {
+            ctx.memory_mut(|m| m.surrender_focus(console_tab_guard_id()));
+        }
+    }
+
     /// The console's monospace font. Clamped here rather than at load, so a
     /// hand-edited config with an absurd size still renders.
     pub(crate) fn console_font(&self) -> egui::FontId {
@@ -395,7 +469,7 @@ impl App {
         ctx.request_repaint();
     }
 
-    pub(crate) fn show_console(&mut self, ctx: &egui::Context) {
+    pub(crate) fn show_console(&mut self, ctx: &egui::Context, console_tab_claimed: bool) {
         let mut menu = MenuAction::default();
         let mut open_dialog = false;
         let mut font_steps = 0;
@@ -486,16 +560,24 @@ impl App {
         // Raw console input: forward the keyboard to the device whenever a live
         // tab is showing and nothing else (search box, a dialog, a floating
         // tool window) holds focus. Runs after drawing so this frame's focus
-        // state is settled. `floating_window_open` covers dialogs/windows
-        // whose controls never take egui focus, so `memory().focused()` alone
-        // wouldn't catch them; a newly added window only needs to be added
-        // there, not here.
-        if !self.floating_window_open()
-            && !self.merged_selected
-            && ctx.memory(|m| m.focused().is_none())
-        {
-            if let Some(active) = self.active_index() {
-                self.console_key_input(ctx, active);
+        // state is settled. A Tab claimed before layout temporarily belongs to
+        // `console_tab_guard_id`, which keeps egui from activating a header
+        // control if Enter/Space arrived in the same input batch.
+        // `keyboard_overlay_open` covers UI whose controls never take egui
+        // focus, so `memory().focused()` alone wouldn't catch it.
+        let focused = ctx.memory(|m| m.focused());
+        let console_owns_focus = console_tab_claimed && focused == Some(console_tab_guard_id());
+        if !self.keyboard_overlay_open(ctx) && !self.search_focus_request && !self.merged_selected {
+            // Do not steal focus traversal unless there is a live console to
+            // receive the key. With no connection (or a Closed zombie tab),
+            // Tab belongs to the remaining UI controls instead.
+            if let Some(active) = self
+                .active_index()
+                .filter(|&active| self.connections[active].state != ConnState::Closed)
+            {
+                if focused.is_none() || console_owns_focus {
+                    self.console_key_input(ctx, active);
+                }
             }
         }
     }
@@ -549,9 +631,11 @@ impl App {
                 let n = conn.search_pos.map(|p| p + 1).unwrap_or(0);
                 ui.weak(format!("{n}/{}", conn.search_matches.len()));
             }
-            if ui.small_button("Close").clicked() {
+            let close_button = ui.small_button("Close");
+            if close_button.clicked() {
                 close = true;
             }
+            surrender_search_focus_on_close(&resp, &close_button, close);
         });
         if next {
             self.search_step(1);
@@ -608,9 +692,11 @@ impl App {
                 let n = self.merged_search_pos.map(|p| p + 1).unwrap_or(0);
                 ui.weak(format!("{n}/{}", self.merged_search_matches.len()));
             }
-            if ui.small_button("Close").clicked() {
+            let close_button = ui.small_button("Close");
+            if close_button.clicked() {
                 close = true;
             }
+            surrender_search_focus_on_close(&resp, &close_button, close);
         });
         if next {
             self.search_step(1);
@@ -2057,6 +2143,64 @@ mod tests {
             wall: chrono::Utc::now(),
             micros,
         }
+    }
+
+    #[test]
+    fn closing_a_focused_search_releases_the_next_tab_to_the_console() {
+        let (mut app, _enum_tx) = test_app("search-close-tab");
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            PortIdentity::default(),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        conn.follow = false;
+        app.connections.push(conn);
+
+        let ctx = egui::Context::default();
+        let mut query = String::new();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let response = ui.text_edit_singleline(&mut query);
+                response.request_focus();
+            });
+        });
+        assert!(ctx.memory(|memory| memory.focused().is_some()));
+
+        // The field is still rendered in the frame where its Close button is
+        // handled. Without the explicit surrender, its now-stale id survives
+        // into the next input frame and makes both sides reject Tab.
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let response = ui.text_edit_singleline(&mut query);
+                assert!(response.has_focus());
+                surrender_search_focus_on_close(&response, &response, true);
+            });
+        });
+        assert!(ctx.memory(|memory| memory.focused().is_none()));
+
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        let console_tab_claimed = app.claim_console_tab_before_layout(&ctx);
+        assert!(console_tab_claimed);
+        app.show_header(&ctx);
+        app.show_console(&ctx, console_tab_claimed);
+        app.release_console_tab_after_layout(&ctx, console_tab_claimed);
+        assert!(
+            app.connections[0].follow,
+            "the Tab after closing search must reach the live console"
+        );
+        let _ = ctx.end_pass();
     }
 
     #[test]

@@ -2212,10 +2212,15 @@ impl eframe::App for App {
         // Minimal chrome: a header of tabs on top, a status footer at the
         // bottom, and the console filling everything in between. Tool panels are
         // floating windows toggled from the console's right-click menu.
+        // Claim a console-owned Tab before any focusable widgets see the frame.
+        // Otherwise egui can focus a header control, and a batched Enter/Space
+        // event can activate that control before `show_console` gives Tab back
+        // to the device.
+        let console_tab_claimed = self.claim_console_tab_before_layout(ctx);
         self.show_header(ctx);
         self.show_footer(ctx);
         self.show_plot(ctx); // bottom panel, only when enabled for the tab
-        self.show_console(ctx);
+        self.show_console(ctx, console_tab_claimed);
 
         // Floating windows.
         self.show_config_dialog(ctx);
@@ -2224,6 +2229,9 @@ impl eframe::App for App {
         self.show_update_dialog(ctx);
         self.show_font_toast(ctx);
         self.show_connect_error(ctx);
+        // Keep the guard focused until every widget has been drawn, so none of
+        // the later floating windows can claim this Tab either.
+        self.release_console_tab_after_layout(ctx, console_tab_claimed);
 
         // egui only draws when something asks it to, and nothing here animates on
         // its own clock, so an *open but silent* connection must not schedule
