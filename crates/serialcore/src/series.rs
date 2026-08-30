@@ -97,12 +97,6 @@ impl Series {
         self.buf.range(lo..hi)
     }
 
-    /// Find the point nearest to `t` within the window and return its line index
-    /// (for plot→log linking). Returns `None` if empty.
-    pub fn nearest_line(&self, t: f64) -> Option<u64> {
-        self.nearest_point(t).map(|p| p.line)
-    }
-
     /// The point nearest to time `t` (for plot→log linking).
     pub fn nearest_point(&self, t: f64) -> Option<SeriesPoint> {
         let right = self.buf.partition_point(|p| p.t < t);
@@ -202,15 +196,6 @@ mod tests {
     }
 
     #[test]
-    fn line_index_is_preserved() {
-        let mut s = Series::new("t", 100);
-        s.push(0.0, 10.0, 42);
-        s.push(1.0, 20.0, 99);
-        assert_eq!(s.nearest_line(0.9), Some(99));
-        assert_eq!(s.nearest_line(0.1), Some(42));
-    }
-
-    #[test]
     fn no_decimation_when_few_points() {
         let mut s = Series::new("t", 1000);
         for i in 0..10 {
@@ -259,7 +244,7 @@ mod tests {
         assert_eq!(s.nearest_point(0.0).unwrap().line, 1);
         assert_eq!(s.nearest_point(1.0).unwrap().line, 1);
         assert_eq!(s.nearest_point(5.0).unwrap().line, 4);
-        assert_eq!(s.nearest_line(1.1), Some(3));
+        assert_eq!(s.nearest_point(1.1).unwrap().line, 3);
     }
 
     /// The key property (spec §10): a single-sample spike survives decimation to
