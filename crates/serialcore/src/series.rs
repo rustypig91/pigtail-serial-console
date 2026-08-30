@@ -46,6 +46,20 @@ impl Series {
         self.buf.is_empty()
     }
 
+    /// Change the retention limit, evicting the oldest points immediately if
+    /// the series is now over capacity.
+    pub fn set_capacity(&mut self, capacity: usize) {
+        let capacity = capacity.max(2);
+        if capacity == self.capacity {
+            return;
+        }
+        self.capacity = capacity;
+        let excess = self.buf.len().saturating_sub(self.capacity);
+        if excess > 0 {
+            self.buf.drain(..excess);
+        }
+    }
+
     pub fn last(&self) -> Option<SeriesPoint> {
         self.buf.back().copied()
     }
@@ -193,6 +207,20 @@ mod tests {
         assert_eq!(s.len(), 3);
         assert_eq!(s.t_range(), Some((2.0, 4.0)));
         assert_eq!(s.last().unwrap().line, 4);
+    }
+
+    #[test]
+    fn lowering_capacity_evicts_oldest_immediately() {
+        let mut s = Series::new("t", 5);
+        for i in 0..5 {
+            s.push(i as f64, i as f64, i);
+        }
+        s.set_capacity(3);
+        assert_eq!(s.len(), 3);
+        assert_eq!(s.t_range(), Some((2.0, 4.0)));
+
+        s.set_capacity(10);
+        assert_eq!(s.len(), 3, "growing the limit keeps every resident point");
     }
 
     #[test]

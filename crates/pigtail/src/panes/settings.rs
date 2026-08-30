@@ -1,6 +1,6 @@
 //! Settings window (spec §7.14, §5 M5): max lines, retention, theme, updates.
 
-use crate::app::App;
+use crate::app::{history_limits, App};
 use serialcore::config::{MAX_CONSOLE_FONT_SIZE, MIN_CONSOLE_FONT_SIZE};
 
 impl App {
@@ -39,13 +39,21 @@ impl App {
                         ui.end_row();
 
                         ui.label("Max lines in memory");
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut self.config.settings.max_lines)
-                                    .speed(10_000)
-                                    .range(10_000..=10_000_000),
-                            )
-                            .on_hover_text("Full capture always remains on disk")
+                        let response = ui.add(
+                            egui::DragValue::new(&mut self.config.settings.max_lines)
+                                .speed(10_000)
+                                .range(10_000..=10_000_000),
+                        );
+                        let limits = history_limits(self.config.settings.max_lines);
+                        changed |= response
+                            .on_hover_text(format!(
+                                "Also keeps up to {} of raw bytes in Hex, {} points per plotted \
+                                 series, and preloads up to {} when reopening a tab. Full capture \
+                                 always remains on disk.",
+                                format_bytes(limits.raw_bytes),
+                                limits.series_points,
+                                format_bytes(limits.preload_bytes),
+                            ))
                             .changed();
                         ui.end_row();
 
@@ -112,5 +120,14 @@ impl App {
         if check_now {
             self.start_update_check(true);
         }
+    }
+}
+
+fn format_bytes(bytes: usize) -> String {
+    const MIB: f64 = (1024 * 1024) as f64;
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    } else {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
     }
 }

@@ -11,7 +11,7 @@ use serialcore::extract::CompiledExtract;
 use serialcore::filter::{Combine, FilterIndex, FilterRule, FilterSet};
 use serialcore::framer::Framer;
 use serialcore::reader::{self, ConnState, ErrorScope, ReaderEvent, SourceSpec};
-use serialcore::series::{Series, DEFAULT_CAPACITY};
+use serialcore::series::Series;
 use serialcore::session::{self, SessionMeta};
 use serialcore::store::{IncomingLine, LineFlags, LineStore, PortId};
 use serialcore::update;
@@ -20,9 +20,45 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Cap on how much of a prior capture is preloaded per port on startup. The
-/// store evicts down to `max_lines` anyway; this just bounds the framing work.
-const PRELOAD_TAIL_BYTES: usize = 8 * 1024 * 1024;
+/// Retention limits derived from the single user-facing memory setting.
+///
+/// The ratios preserve the old preload and plot defaults at one million lines,
+/// while giving raw bytes enough room to represent ordinary console lines. The
+/// byte caps keep a manually edited, extreme `max_lines` value from turning one
+/// connection into an unbounded allocation; every value offered by Settings
+/// still scales through the full range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HistoryLimits {
+    pub max_lines: usize,
+    pub raw_bytes: usize,
+    pub preload_bytes: usize,
+    pub series_points: usize,
+}
+
+const MIN_RAW_BYTES: usize = 1 << 20;
+const MAX_RAW_BYTES: usize = 640 * 1024 * 1024;
+const MIN_PRELOAD_BYTES: usize = 1 << 20;
+const MAX_PRELOAD_BYTES: usize = 80 * 1024 * 1024;
+const DEFAULT_HISTORY_LINES: usize = 1_000_000;
+const DEFAULT_RAW_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_PRELOAD_BYTES: usize = 8 * 1024 * 1024;
+
+fn scale_from_default(max_lines: usize, default: usize) -> usize {
+    ((max_lines as u128 * default as u128) / DEFAULT_HISTORY_LINES as u128).min(usize::MAX as u128)
+        as usize
+}
+
+pub(crate) fn history_limits(max_lines: usize) -> HistoryLimits {
+    let max_lines = max_lines.max(1);
+    HistoryLimits {
+        max_lines,
+        raw_bytes: scale_from_default(max_lines, DEFAULT_RAW_BYTES)
+            .clamp(MIN_RAW_BYTES, MAX_RAW_BYTES),
+        preload_bytes: scale_from_default(max_lines, DEFAULT_PRELOAD_BYTES)
+            .clamp(MIN_PRELOAD_BYTES, MAX_PRELOAD_BYTES),
+        series_points: (max_lines.saturating_add(9) / 10).max(2),
+    }
+}
 
 /// A plotted series plus its display state.
 pub struct SeriesEntry {
@@ -176,8 +212,8 @@ fn gather_history<'a>(
 /// a boundary marker, so a reopened tab shows the output it had before the app
 /// was last closed with new live output continuing below the last marker.
 ///
-/// History is gathered from the newest capture backwards until
-/// `PRELOAD_TAIL_BYTES` is filled, rather than from the newest one alone. A
+/// History is gathered from the newest capture backwards until `preload_bytes`
+/// is filled, rather than from the newest one alone. A
 /// single run can leave several captures behind — applying new port options
 /// respawns the reader onto a fresh one — and what the console showed at exit
 /// was itself part restored, part live, so stopping at the newest capture
@@ -187,8 +223,9 @@ fn preload_last_session(
     captures: &[(PathBuf, SessionMeta)],
     identity: &PortIdentity,
     clock: &SessionClock,
+    preload_bytes: usize,
 ) {
-    let restored = gather_history(captures, identity, PRELOAD_TAIL_BYTES);
+    let restored = gather_history(captures, identity, preload_bytes);
 
     // Re-frame the raw bytes exactly as the reader did, stamping each line with
     // the *original* wall-clock time (start of that capture plus its offset) so
@@ -268,9 +305,6 @@ fn preload_last_session(
         });
     }
 }
-
-/// Maximum raw bytes kept per connection for the hex view.
-const RAW_RING_CAP: usize = 1 << 20; // 1 MiB
 
 /// Append `bytes` to a raw ring holding at most `cap`, evicting from the front,
 /// and advance `base` by everything that did not stay.
@@ -372,6 +406,8 @@ pub struct Connection {
     pub console_layout: Option<(usize, u8)>,
     /// Bounded ring of raw bytes for hex view.
     pub raw_ring: VecDeque<u8>,
+    /// Current cap for `raw_ring`, derived from the global history setting.
+    raw_capacity: usize,
     /// Bytes dropped from the front of `raw_ring`, for translating a
     /// [`RawSession`]'s absolute start into a position in the ring.
     pub raw_base: u64,
@@ -415,6 +451,8 @@ pub struct Connection {
     pub extract_errors: Vec<String>,
     pub series: Vec<SeriesEntry>,
     pub series_index: HashMap<String, usize>,
+    /// Current per-series point cap, derived from the global history setting.
+    series_capacity: usize,
     pub plot_follow: bool,
     /// Set by the plot's Fit button, consumed by the next frame's draw: the
     /// bounds can only be set from inside the plot's own closure.
@@ -431,8 +469,25 @@ pub struct Connection {
 }
 
 impl Connection {
+    fn apply_history_limits(&mut self, limits: HistoryLimits) {
+        self.store.set_max_lines(limits.max_lines);
+        self.raw_capacity = limits.raw_bytes;
+        // An empty append applies a lower cap to bytes already resident while
+        // leaving the absolute-index accounting in one well-tested place.
+        push_raw(
+            &mut self.raw_ring,
+            &mut self.raw_base,
+            &[],
+            self.raw_capacity,
+        );
+        self.series_capacity = limits.series_points;
+        for entry in &mut self.series {
+            entry.series.set_capacity(self.series_capacity);
+        }
+    }
+
     fn drain_events(&mut self, max_lines: usize) -> bool {
-        self.store.set_max_lines(max_lines);
+        self.apply_history_limits(history_limits(max_lines));
         let mut changed = false;
         // Non-blocking drain of all pending reader events (spec §5).
         while let Ok(ev) = self.handle.events.try_recv() {
@@ -582,7 +637,12 @@ impl Connection {
 
     /// Append bytes to the hex view's ring, evicting from the front at capacity.
     pub fn push_raw_bytes(&mut self, bytes: &[u8]) {
-        push_raw(&mut self.raw_ring, &mut self.raw_base, bytes, RAW_RING_CAP);
+        push_raw(
+            &mut self.raw_ring,
+            &mut self.raw_base,
+            bytes,
+            self.raw_capacity,
+        );
     }
 
     /// Open the run of bytes this session is producing, unless it is open
@@ -698,11 +758,24 @@ impl Connection {
             extract_compiled,
             ..
         } = self;
-        extract_all(store, extract_compiled, series, series_index, &remembered);
+        extract_all(
+            store,
+            extract_compiled,
+            series,
+            series_index,
+            &remembered,
+            self.series_capacity,
+        );
     }
 
     fn push_series_point(&mut self, name: &str, t: f64, value: f64, line: u64) {
-        let idx = series_slot(&mut self.series, &mut self.series_index, None, name);
+        let idx = series_slot(
+            &mut self.series,
+            &mut self.series_index,
+            None,
+            name,
+            self.series_capacity,
+        );
         self.series[idx].series.push(t, value, line);
     }
 }
@@ -722,6 +795,7 @@ fn series_slot(
     index: &mut HashMap<String, usize>,
     remembered: Option<&HashMap<String, SeriesStyle>>,
     name: &str,
+    capacity: usize,
 ) -> usize {
     if let Some(&i) = index.get(name) {
         return i;
@@ -734,7 +808,7 @@ fn series_slot(
             own_axis: false,
         });
     series.push(SeriesEntry {
-        series: Series::new(name.to_string(), DEFAULT_CAPACITY),
+        series: Series::new(name.to_string(), capacity),
         color: style.color,
         visible: style.visible,
         own_axis: style.own_axis,
@@ -778,6 +852,7 @@ fn extract_all(
     series: &mut Vec<SeriesEntry>,
     index: &mut HashMap<String, usize>,
     remembered: &HashMap<String, SeriesStyle>,
+    capacity: usize,
 ) {
     let mut pairs: Vec<(String, f64)> = Vec::new();
     for abs in store.first_abs_index()..store.next_abs_index() {
@@ -798,7 +873,7 @@ fn extract_all(
         }
         let t = line.meta.ts.micros as f64 / 1_000_000.0;
         for (name, value) in pairs.drain(..) {
-            let idx = series_slot(series, index, Some(remembered), &name);
+            let idx = series_slot(series, index, Some(remembered), &name, capacity);
             series[idx].series.push(t, value, abs);
         }
     }
@@ -1043,7 +1118,13 @@ impl App {
             // later one succeeds and triggers the save.
             if app.open_connection_inner(saved.identity.clone(), None, saved.config) {
                 let conn = app.connections.last_mut().unwrap();
-                preload_last_session(conn, &prior_captures, &saved.identity, &clock);
+                preload_last_session(
+                    conn,
+                    &prior_captures,
+                    &saved.identity,
+                    &clock,
+                    history_limits(app.config.settings.max_lines).preload_bytes,
+                );
             }
         }
         app.active = 0;
@@ -1396,13 +1477,14 @@ impl App {
     ) -> Connection {
         let dtr = port_config.dtr_on_open;
         let rts = port_config.rts_on_open;
+        let limits = history_limits(self.config.settings.max_lines);
         Connection {
             id,
             label,
             identity,
             port_config,
             handle,
-            store: LineStore::new(self.config.settings.max_lines),
+            store: LineStore::new(limits.max_lines),
             state: ConnState::Connecting,
             follow: true,
             new_since_scroll: 0,
@@ -1412,6 +1494,7 @@ impl App {
             top_line: None,
             console_layout: None,
             raw_ring: VecDeque::new(),
+            raw_capacity: limits.raw_bytes,
             raw_base: 0,
             raw_sessions: Vec::new(),
             last_error: None,
@@ -1436,6 +1519,7 @@ impl App {
             extract_errors: Vec::new(),
             series: Vec::new(),
             series_index: HashMap::new(),
+            series_capacity: limits.series_points,
             plot_follow: true,
             plot_fit: false,
             show_plot: false,
@@ -2420,7 +2504,14 @@ pub(crate) mod tests {
     fn extracted(store: &LineStore, remembered: &HashMap<String, SeriesStyle>) -> Vec<SeriesEntry> {
         let mut series = Vec::new();
         let mut index = HashMap::new();
-        extract_all(store, &kv_rules(), &mut series, &mut index, remembered);
+        extract_all(
+            store,
+            &kv_rules(),
+            &mut series,
+            &mut index,
+            remembered,
+            history_limits(1_000_000).series_points,
+        );
         series
     }
 
@@ -2538,6 +2629,63 @@ pub(crate) mod tests {
         let (ring, base) = ring(8, &[b"ab", b"cd"]);
         assert_eq!(ring.iter().copied().collect::<Vec<u8>>(), b"abcd");
         assert_eq!(base, 0);
+    }
+
+    #[test]
+    fn memory_setting_scales_every_history_limit() {
+        assert_eq!(
+            history_limits(DEFAULT_HISTORY_LINES),
+            HistoryLimits {
+                max_lines: 1_000_000,
+                raw_bytes: 64 * 1024 * 1024,
+                preload_bytes: 8 * 1024 * 1024,
+                series_points: 100_000,
+            },
+            "the default retains the established preload and plot limits"
+        );
+        assert_eq!(
+            history_limits(10_000),
+            HistoryLimits {
+                max_lines: 10_000,
+                raw_bytes: MIN_RAW_BYTES,
+                preload_bytes: MIN_PRELOAD_BYTES,
+                series_points: 1_000,
+            },
+        );
+        assert_eq!(
+            history_limits(10_000_000),
+            HistoryLimits {
+                max_lines: 10_000_000,
+                raw_bytes: MAX_RAW_BYTES,
+                preload_bytes: MAX_PRELOAD_BYTES,
+                series_points: 1_000_000,
+            },
+            "the full Settings range scales all three derived limits"
+        );
+    }
+
+    #[test]
+    fn lowering_memory_setting_trims_open_hex_and_plot_history() {
+        let (app, _enum_tx) = test_app("lower-history-limits");
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            identity("A1"),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        conn.push_raw_bytes(&vec![0x55; 2 * 1024 * 1024]);
+        for i in 0..2_000 {
+            conn.push_series_point("temp", i as f64, i as f64, i);
+        }
+
+        conn.apply_history_limits(history_limits(10_000));
+
+        assert_eq!(conn.raw_ring.len(), MIN_RAW_BYTES);
+        assert_eq!(conn.raw_base, MIN_RAW_BYTES as u64);
+        assert_eq!(conn.series[0].series.len(), 1_000);
+        assert_eq!(conn.series[0].series.t_range(), Some((1_000.0, 1_999.0)));
     }
 
     /// A minimal `App`, built by hand rather than through `App::new` (which
