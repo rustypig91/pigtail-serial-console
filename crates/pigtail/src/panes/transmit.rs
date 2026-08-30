@@ -272,6 +272,36 @@ mod tests {
         }
     }
 
+    fn ctrl_shift_f() -> Event {
+        Event::Key {
+            key: Key::F,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Draw the focusable UI and process one complete input frame.
+    fn frame(app: &mut App, ctx: &egui::Context, events: Vec<Event>) {
+        let _ = ctx.run(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                let console_tab_claimed = app.claim_console_tab_before_layout(ctx);
+                app.show_header(ctx);
+                app.show_console(ctx, console_tab_claimed);
+                app.release_console_tab_after_layout(ctx, console_tab_claimed);
+            },
+        );
+    }
+
     fn echoed(conn: &Connection) -> Vec<String> {
         (conn.store.first_abs_index()..conn.store.next_abs_index())
             .filter_map(|i| conn.store.get(i))
@@ -624,5 +654,66 @@ mod tests {
         );
         assert!(ctx.memory(|m| m.focused().is_none()));
         let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn tab_is_not_sent_when_search_opens_in_the_same_input_batch() {
+        let (mut app, _enum_tx) = test_app("same-frame-search-tab");
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            Default::default(),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        conn.follow = false;
+        app.connections.push(conn);
+
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![ctrl_shift_f(), tab()]);
+
+        assert!(app.show_search, "the shortcut must still open search");
+        assert!(
+            !app.connections[0].follow,
+            "the pending search field, not the console, owns Tab"
+        );
+    }
+
+    #[test]
+    fn keyboard_close_of_search_releases_the_next_tab_to_the_console() {
+        let (mut app, _enum_tx) = test_app("keyboard-close-search");
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            Default::default(),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        conn.follow = false;
+        app.connections.push(conn);
+        app.show_search = true;
+        app.search_focus_request = true;
+
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, Vec::new());
+        // Text field -> Prev -> Next -> Close.
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![tab()]);
+        }
+        frame(&mut app, &ctx, vec![enter()]);
+
+        assert!(!app.show_search, "Enter on Close must hide search");
+        assert!(
+            ctx.memory(|memory| memory.focused().is_none()),
+            "the removed Close button must not retain keyboard focus"
+        );
+
+        frame(&mut app, &ctx, vec![tab()]);
+        assert!(
+            app.connections[0].follow,
+            "the first Tab after closing search must reach the console"
+        );
     }
 }

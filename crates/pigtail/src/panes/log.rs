@@ -21,13 +21,18 @@ fn console_tab_guard_id() -> egui::Id {
     egui::Id::new(("pigtail", "console_tab_guard"))
 }
 
-/// A search field is still part of the frame in which its Close button is
-/// clicked, so egui's missing-widget cleanup cannot release its focus until a
-/// later frame. Release it explicitly or a Tab arriving as the next event is
-/// rejected by both the UI traversal and the console input gates.
-fn surrender_search_focus_on_close(response: &egui::Response, close: bool) {
+/// Search controls are still part of the frame in which Close is activated, so
+/// egui's missing-widget cleanup cannot release their focus until a later
+/// frame. Release both possible owners explicitly or a Tab arriving as the
+/// next event is rejected by both the UI traversal and the console input gates.
+fn surrender_search_focus_on_close(
+    field: &egui::Response,
+    close_button: &egui::Response,
+    close: bool,
+) {
     if close {
-        response.surrender_focus();
+        field.surrender_focus();
+        close_button.surrender_focus();
     }
 }
 
@@ -562,7 +567,7 @@ impl App {
         // focus, so `memory().focused()` alone wouldn't catch it.
         let focused = ctx.memory(|m| m.focused());
         let console_owns_focus = console_tab_claimed && focused == Some(console_tab_guard_id());
-        if !self.keyboard_overlay_open(ctx) && !self.merged_selected {
+        if !self.keyboard_overlay_open(ctx) && !self.search_focus_request && !self.merged_selected {
             // Do not steal focus traversal unless there is a live console to
             // receive the key. With no connection (or a Closed zombie tab),
             // Tab belongs to the remaining UI controls instead.
@@ -626,10 +631,11 @@ impl App {
                 let n = conn.search_pos.map(|p| p + 1).unwrap_or(0);
                 ui.weak(format!("{n}/{}", conn.search_matches.len()));
             }
-            if ui.small_button("Close").clicked() {
+            let close_button = ui.small_button("Close");
+            if close_button.clicked() {
                 close = true;
             }
-            surrender_search_focus_on_close(&resp, close);
+            surrender_search_focus_on_close(&resp, &close_button, close);
         });
         if next {
             self.search_step(1);
@@ -686,10 +692,11 @@ impl App {
                 let n = self.merged_search_pos.map(|p| p + 1).unwrap_or(0);
                 ui.weak(format!("{n}/{}", self.merged_search_matches.len()));
             }
-            if ui.small_button("Close").clicked() {
+            let close_button = ui.small_button("Close");
+            if close_button.clicked() {
                 close = true;
             }
-            surrender_search_focus_on_close(&resp, close);
+            surrender_search_focus_on_close(&resp, &close_button, close);
         });
         if next {
             self.search_step(1);
@@ -2169,7 +2176,7 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let response = ui.text_edit_singleline(&mut query);
                 assert!(response.has_focus());
-                surrender_search_focus_on_close(&response, true);
+                surrender_search_focus_on_close(&response, &response, true);
             });
         });
         assert!(ctx.memory(|memory| memory.focused().is_none()));
