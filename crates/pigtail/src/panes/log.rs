@@ -135,6 +135,13 @@ const PORT_PALETTE: [egui::Color32; 6] = [
     egui::Color32::from_rgb(0x5f, 0xd6, 0xcf),
 ];
 
+/// Keep a port's merged-view colour stable even when connections before it
+/// are closed. Port ids are never reused during a run, so they are the stable
+/// identity here while a connection's position in the tab list is not.
+fn port_color(port: PortId) -> egui::Color32 {
+    PORT_PALETTE[(port.0 as usize) % PORT_PALETTE.len()]
+}
+
 /// Actions collected from the right-click menu, applied after drawing so the
 /// menu closures don't need `&mut self`.
 #[derive(Default)]
@@ -1040,7 +1047,7 @@ impl App {
                         ui.add_space(rows as f32 * row_height);
                         continue;
                     };
-                    let color = PORT_PALETTE[ci % PORT_PALETTE.len()];
+                    let color = port_color(port);
                     let rctx = RowCtx {
                         ts_format,
                         m: &m,
@@ -2163,6 +2170,17 @@ mod tests {
             wall: chrono::Utc::now(),
             micros,
         }
+    }
+
+    #[test]
+    fn merged_port_colors_survive_closing_an_earlier_tab() {
+        let mut ports = vec![PortId(3), PortId(4), PortId(5)];
+        let colors_before: Vec<_> = ports.iter().copied().map(port_color).collect();
+
+        ports.remove(0);
+        let colors_after: Vec<_> = ports.iter().copied().map(port_color).collect();
+
+        assert_eq!(colors_after, colors_before[1..]);
     }
 
     #[test]
