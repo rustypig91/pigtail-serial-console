@@ -442,6 +442,143 @@ mod tests {
         let _ = ctx.end_pass();
     }
 
+    #[test]
+    fn tab_stays_in_the_ui_while_a_context_menu_is_open() {
+        let (mut app, _enum_tx) = test_app("context-menu-tab");
+        let id = PortId(0);
+        let conn = app.make_connection(
+            id,
+            "probe".into(),
+            Default::default(),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        app.connections.push(conn);
+
+        let ctx = egui::Context::default();
+        let mut menu_anchor = egui::Rect::NOTHING;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                menu_anchor = ui.button("menu anchor").rect;
+            });
+        });
+        let pos = menu_anchor.center();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    Event::PointerMoved(pos),
+                    Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Secondary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Secondary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.button("menu anchor").context_menu(|ui| {
+                        let _ = ui.button("menu action");
+                    });
+                });
+            },
+        );
+        assert!(ctx.is_context_menu_open());
+
+        ctx.begin_pass(egui::RawInput {
+            events: vec![tab()],
+            ..Default::default()
+        });
+        let console_tab_claimed = app.claim_console_tab_before_layout(&ctx);
+
+        assert!(
+            !console_tab_claimed,
+            "an open context menu, not the console, owns Tab"
+        );
+        app.show_header(&ctx);
+        assert!(
+            ctx.memory(|memory| memory.focused().is_some()),
+            "Tab must remain available to UI focus navigation"
+        );
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn tab_is_not_sent_when_an_overlay_opens_in_the_same_frame() {
+        let (mut app, _enum_tx) = test_app("same-frame-overlay-tab");
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            Default::default(),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        conn.follow = false;
+        app.connections.push(conn);
+
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![tab()],
+            ..Default::default()
+        });
+        let console_tab_claimed = app.claim_console_tab_before_layout(&ctx);
+        assert!(
+            console_tab_claimed,
+            "the overlay is not open yet when pre-layout ownership is decided"
+        );
+
+        ctx.memory_mut(|memory| memory.open_popup(egui::Id::new("same-frame popup")));
+
+        app.show_console(&ctx, console_tab_claimed);
+        app.release_console_tab_after_layout(&ctx, console_tab_claimed);
+        assert!(
+            !app.connections[0].follow,
+            "the post-layout gate must not transmit Tab after a menu opens"
+        );
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn tab_stays_in_the_ui_while_an_egui_popup_is_open() {
+        let (mut app, _enum_tx) = test_app("popup-tab");
+        let id = PortId(0);
+        let conn = app.make_connection(
+            id,
+            "probe".into(),
+            Default::default(),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        app.connections.push(conn);
+
+        let ctx = egui::Context::default();
+        ctx.memory_mut(|memory| memory.open_popup(egui::Id::new("test popup")));
+        ctx.begin_pass(egui::RawInput {
+            events: vec![tab()],
+            ..Default::default()
+        });
+        let console_tab_claimed = app.claim_console_tab_before_layout(&ctx);
+
+        assert!(
+            !console_tab_claimed,
+            "an open popup, not the console, owns Tab"
+        );
+        app.show_header(&ctx);
+        assert!(
+            ctx.memory(|memory| memory.focused().is_some()),
+            "Tab must remain available to UI focus navigation"
+        );
+        let _ = ctx.end_pass();
+    }
+
     /// A single egui frame can contain multiple keyboard events. The Tab guard
     /// must stop a following Enter from activating the first header tab and
     /// redirecting the whole batch away from the console that was active when

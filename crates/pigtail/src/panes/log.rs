@@ -329,12 +329,25 @@ struct RowCtx<'a> {
 }
 
 impl App {
+    /// UI overlays that own keyboard input without necessarily taking egui's
+    /// widget focus. Check this both before layout and before transmitting: an
+    /// overlay can be opened by another event in the same input batch as Tab.
+    fn keyboard_overlay_open(&self, ctx: &egui::Context) -> bool {
+        self.floating_window_open()
+            || ctx.is_context_menu_open()
+            || ctx.memory(|memory| memory.any_popup_open())
+    }
+
     /// Reserve an unfocused live console's Tab before egui lays out focusable
     /// widgets. Requesting a non-widget focus id prevents Tab followed by
     /// Enter/Space in the same input batch from activating a header control.
     pub(crate) fn claim_console_tab_before_layout(&self, ctx: &egui::Context) -> bool {
-        let live_console = !self.search_focus_request
-            && !self.floating_window_open()
+        // Context menus use their own retained state rather than keyboard
+        // focus, and egui's older popup API likewise does not necessarily
+        // focus one of its controls. Both still own keyboard navigation while
+        // open, so neither can be inferred from `memory().focused()` below.
+        let live_console = !self.keyboard_overlay_open(ctx)
+            && !self.search_focus_request
             && !self.merged_selected
             && self
                 .active_index()
@@ -535,12 +548,11 @@ impl App {
         // state is settled. A Tab claimed before layout temporarily belongs to
         // `console_tab_guard_id`, which keeps egui from activating a header
         // control if Enter/Space arrived in the same input batch.
-        // `floating_window_open` covers dialogs/windows whose controls never
-        // take egui focus, so `memory().focused()` alone wouldn't catch them; a
-        // newly added window only needs to be added there, not here.
+        // `keyboard_overlay_open` covers UI whose controls never take egui
+        // focus, so `memory().focused()` alone wouldn't catch it.
         let focused = ctx.memory(|m| m.focused());
         let console_owns_focus = console_tab_claimed && focused == Some(console_tab_guard_id());
-        if !self.floating_window_open() && !self.merged_selected {
+        if !self.keyboard_overlay_open(ctx) && !self.merged_selected {
             // Do not steal focus traversal unless there is a live console to
             // receive the key. With no connection (or a Closed zombie tab),
             // Tab belongs to the remaining UI controls instead.
