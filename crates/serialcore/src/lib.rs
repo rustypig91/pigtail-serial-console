@@ -10,6 +10,7 @@ pub mod enumerate;
 pub mod extract;
 pub mod filter;
 pub mod framer;
+pub mod fs;
 pub mod reader;
 pub mod series;
 pub mod session;

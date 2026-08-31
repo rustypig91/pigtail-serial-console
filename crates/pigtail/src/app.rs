@@ -18,7 +18,9 @@ use serialcore::update;
 use serialcore::wake::Wake;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const CONFIG_WRITE_DELAY: Duration = Duration::from_secs(1);
 
 /// Retention limits derived from the single user-facing memory setting.
 ///
@@ -1019,6 +1021,11 @@ pub struct App {
     pub clock: SessionClock,
     pub config: Config,
     pub paths: AppPaths,
+    /// When the first not-yet-persisted config change was made. Keeping the
+    /// first timestamp coalesces per-frame and per-keystroke edits into at most
+    /// one write per second without postponing persistence indefinitely during
+    /// a long edit.
+    config_dirty_since: Option<Instant>,
     /// Handed to every background thread so it can pull the UI out of idle when
     /// it has something to show. See `update()`.
     pub wake: Wake,
@@ -1121,6 +1128,7 @@ impl App {
             clock: SessionClock::new(),
             config,
             paths,
+            config_dirty_since: None,
             wake,
             enum_rx,
             available: Vec::new(),
@@ -1642,19 +1650,56 @@ impl App {
         }
     }
 
-    /// Serialize config to the platform config file.
+    /// Mark the config for a debounced write from [`eframe::App::update`].
     pub fn write_config(&mut self) {
+        self.config_dirty_since.get_or_insert_with(Instant::now);
+    }
+
+    /// Serialize and atomically replace the platform config file now.
+    ///
+    /// Failed writes stay dirty so a later update or shutdown can retry them.
+    fn flush_config(&mut self) -> bool {
+        if self.config_dirty_since.is_none() {
+            return true;
+        }
         let path = &self.paths.config_file;
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        match self.config.to_toml() {
-            Ok(toml) => {
-                if let Err(e) = std::fs::write(path, toml) {
-                    tracing::warn!("writing config: {e}");
-                }
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!("creating config directory: {e}");
+                self.config_dirty_since = Some(Instant::now());
+                return false;
             }
-            Err(e) => tracing::warn!("serializing config: {e}"),
+        }
+        let result = self
+            .config
+            .to_toml()
+            .map_err(|e| e.to_string())
+            .and_then(|toml| serialcore::fs::atomic_write(path, toml).map_err(|e| e.to_string()));
+        match result {
+            Ok(()) => {
+                self.config_dirty_since = None;
+                true
+            }
+            Err(e) => {
+                tracing::warn!("writing config: {e}");
+                self.config_dirty_since = Some(Instant::now());
+                false
+            }
+        }
+    }
+
+    /// Flush a due config change, and make sure an idle UI wakes for it.
+    fn maintain_config(&mut self, ctx: &egui::Context) {
+        let Some(dirty_since) = self.config_dirty_since else {
+            return;
+        };
+        let elapsed = dirty_since.elapsed();
+        if elapsed >= CONFIG_WRITE_DELAY {
+            if !self.flush_config() {
+                ctx.request_repaint_after(CONFIG_WRITE_DELAY);
+            }
+        } else {
+            ctx.request_repaint_after(CONFIG_WRITE_DELAY - elapsed);
         }
     }
 
@@ -2428,6 +2473,15 @@ impl eframe::App for App {
         // the later floating windows can claim this Tab either.
         self.release_console_tab_after_layout(ctx, console_tab_claimed);
 
+        // A close-request frame may be the last update the app receives. Save
+        // immediately in that case; otherwise coalesce rapid edits and wake the
+        // on-demand UI when their one-second deadline arrives.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.flush_config();
+        } else {
+            self.maintain_config(ctx);
+        }
+
         // egui only draws when something asks it to, and nothing here animates on
         // its own clock, so an *open but silent* connection must not schedule
         // frames — doing so cost ~7.5% of a core redrawing an unchanged frame at
@@ -2443,6 +2497,10 @@ impl eframe::App for App {
         if any_data {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.flush_config();
     }
 }
 
@@ -2933,6 +2991,31 @@ pub(crate) mod tests {
             rx,
         );
         (app, tx)
+    }
+
+    #[test]
+    fn config_changes_are_coalesced_until_the_debounce_deadline() {
+        let (mut app, _enum_tx) = test_app("config-debounce");
+        app.config.settings.max_lines = 12_345;
+        app.write_config();
+        let first_change = app.config_dirty_since.unwrap();
+
+        app.config.settings.max_lines = 54_321;
+        app.write_config();
+
+        assert_eq!(app.config_dirty_since, Some(first_change));
+        assert!(
+            !app.paths.config_file.exists(),
+            "marking more changes must not write inline"
+        );
+
+        app.config_dirty_since = Some(Instant::now() - CONFIG_WRITE_DELAY);
+        app.maintain_config(&egui::Context::default());
+
+        assert!(app.config_dirty_since.is_none());
+        assert_eq!(load_config(&app.paths).settings.max_lines, 54_321);
+        assert!(!app.paths.config_file.with_extension("toml.tmp").exists());
+        std::fs::remove_dir_all(app.paths.config_file.parent().unwrap()).ok();
     }
 
     /// A reader handle backed by no real device, for tests that only care
