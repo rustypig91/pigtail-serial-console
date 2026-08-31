@@ -46,6 +46,37 @@ impl Series {
         self.buf.is_empty()
     }
 
+    /// Change the retention limit, evicting the oldest points immediately if
+    /// the series is now over capacity. Returns whether any points were
+    /// evicted.
+    pub fn set_capacity(&mut self, capacity: usize) -> bool {
+        let capacity = capacity.max(2);
+        if capacity == self.capacity {
+            return false;
+        }
+        self.capacity = capacity;
+        let excess = self.buf.len().saturating_sub(self.capacity);
+        if excess > 0 {
+            self.buf.drain(..excess);
+        }
+        excess > 0
+    }
+
+    /// Release backing storage no longer needed after lowering the capacity.
+    pub fn shrink_to_fit(&mut self) {
+        self.buf.shrink_to_fit();
+    }
+
+    /// Keep only points whose source line precedes `line`.
+    ///
+    /// Points are appended in source-line order, so this is used to retain the
+    /// part of a series that can no longer be rebuilt from a front-evicted line
+    /// store before replaying the resident lines.
+    pub fn retain_before_line(&mut self, line: u64) {
+        let keep = self.buf.partition_point(|point| point.line < line);
+        self.buf.truncate(keep);
+    }
+
     pub fn last(&self) -> Option<SeriesPoint> {
         self.buf.back().copied()
     }
@@ -53,11 +84,14 @@ impl Series {
     /// Push a sample, evicting the oldest when at capacity.
     ///
     /// Timestamps must be monotonically non-decreasing within a series.
-    pub fn push(&mut self, t: f64, value: f64, line: u64) {
-        if self.buf.len() == self.capacity {
+    /// Returns whether the oldest point was evicted.
+    pub fn push(&mut self, t: f64, value: f64, line: u64) -> bool {
+        let evicted = self.buf.len() == self.capacity;
+        if evicted {
             self.buf.pop_front();
         }
         self.buf.push_back(SeriesPoint { t, value, line });
+        evicted
     }
 
     /// The full value extent `(min, max)`, ignoring points that are not finite.
@@ -188,11 +222,42 @@ mod tests {
     fn ring_evicts_oldest() {
         let mut s = Series::new("t", 3);
         for i in 0..5 {
-            s.push(i as f64, i as f64, i);
+            assert_eq!(s.push(i as f64, i as f64, i), i >= 3);
         }
         assert_eq!(s.len(), 3);
         assert_eq!(s.t_range(), Some((2.0, 4.0)));
         assert_eq!(s.last().unwrap().line, 4);
+    }
+
+    #[test]
+    fn lowering_capacity_evicts_oldest_immediately() {
+        let mut s = Series::new("t", 5);
+        for i in 0..5 {
+            s.push(i as f64, i as f64, i);
+        }
+        let allocation_before = s.buf.capacity();
+        s.set_capacity(3);
+        s.shrink_to_fit();
+        assert_eq!(s.len(), 3);
+        assert_eq!(s.buf.capacity(), s.len());
+        assert!(s.buf.capacity() < allocation_before);
+        assert_eq!(s.t_range(), Some((2.0, 4.0)));
+
+        s.set_capacity(10);
+        assert_eq!(s.len(), 3, "growing the limit keeps every resident point");
+    }
+
+    #[test]
+    fn retaining_before_a_line_drops_only_the_rebuildable_suffix() {
+        let mut s = Series::new("t", 5);
+        for i in 10..15 {
+            s.push(i as f64, i as f64, i);
+        }
+
+        s.retain_before_line(13);
+
+        assert_eq!(s.len(), 3);
+        assert_eq!(s.t_range(), Some((10.0, 12.0)));
     }
 
     #[test]

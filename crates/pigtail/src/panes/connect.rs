@@ -258,11 +258,24 @@ impl App {
                     if !conn.follow && conn.new_since_scroll > 0 {
                         ui.label(format!("{} new", conn.new_since_scroll));
                     }
+                    let mut evicted = Vec::new();
                     if conn.store.evicted_any() {
+                        evicted.push("console");
+                    }
+                    if conn.raw_evicted_any {
+                        evicted.push("hex");
+                    }
+                    if conn.series_evicted_any {
+                        evicted.push("plot");
+                    }
+                    if !evicted.is_empty() {
                         ui.separator();
                         ui.colored_label(
                             egui::Color32::from_rgb(0xe5, 0xc0, 0x40),
-                            "evicted (full capture on disk)",
+                            format!(
+                                "{} history evicted (full capture on disk)",
+                                evicted.join("/")
+                            ),
                         );
                     }
                 });

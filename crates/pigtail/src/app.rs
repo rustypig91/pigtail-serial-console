@@ -11,7 +11,7 @@ use serialcore::extract::CompiledExtract;
 use serialcore::filter::{Combine, FilterIndex, FilterRule, FilterSet};
 use serialcore::framer::Framer;
 use serialcore::reader::{self, ConnState, ErrorScope, ReaderEvent, SourceSpec};
-use serialcore::series::{Series, DEFAULT_CAPACITY};
+use serialcore::series::Series;
 use serialcore::session::{self, SessionMeta};
 use serialcore::store::{IncomingLine, LineFlags, LineStore, PortId};
 use serialcore::update;
@@ -20,9 +20,45 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Cap on how much of a prior capture is preloaded per port on startup. The
-/// store evicts down to `max_lines` anyway; this just bounds the framing work.
-const PRELOAD_TAIL_BYTES: usize = 8 * 1024 * 1024;
+/// Retention limits derived from the single user-facing memory setting.
+///
+/// The ratios preserve the old preload and plot defaults at one million lines,
+/// while giving raw bytes enough room to represent ordinary console lines. The
+/// byte caps keep a manually edited, extreme `max_lines` value from turning one
+/// connection into an unbounded allocation; every value offered by Settings
+/// still scales through the full range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HistoryLimits {
+    pub max_lines: usize,
+    pub raw_bytes: usize,
+    pub preload_bytes: usize,
+    pub series_points: usize,
+}
+
+const MIN_RAW_BYTES: usize = 1 << 20;
+const MAX_RAW_BYTES: usize = 640 * 1024 * 1024;
+const MIN_PRELOAD_BYTES: usize = 1 << 20;
+const MAX_PRELOAD_BYTES: usize = 80 * 1024 * 1024;
+const DEFAULT_HISTORY_LINES: usize = 1_000_000;
+const DEFAULT_RAW_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_PRELOAD_BYTES: usize = 8 * 1024 * 1024;
+
+fn scale_from_default(max_lines: usize, default: usize) -> usize {
+    ((max_lines as u128 * default as u128) / DEFAULT_HISTORY_LINES as u128).min(usize::MAX as u128)
+        as usize
+}
+
+pub(crate) fn history_limits(max_lines: usize) -> HistoryLimits {
+    let max_lines = max_lines.max(1);
+    HistoryLimits {
+        max_lines,
+        raw_bytes: scale_from_default(max_lines, DEFAULT_RAW_BYTES)
+            .clamp(MIN_RAW_BYTES, MAX_RAW_BYTES),
+        preload_bytes: scale_from_default(max_lines, DEFAULT_PRELOAD_BYTES)
+            .clamp(MIN_PRELOAD_BYTES, MAX_PRELOAD_BYTES),
+        series_points: (max_lines.saturating_add(9) / 10).max(2),
+    }
+}
 
 /// A plotted series plus its display state.
 pub struct SeriesEntry {
@@ -176,8 +212,8 @@ fn gather_history<'a>(
 /// a boundary marker, so a reopened tab shows the output it had before the app
 /// was last closed with new live output continuing below the last marker.
 ///
-/// History is gathered from the newest capture backwards until
-/// `PRELOAD_TAIL_BYTES` is filled, rather than from the newest one alone. A
+/// History is gathered from the newest capture backwards until `preload_bytes`
+/// is filled, rather than from the newest one alone. A
 /// single run can leave several captures behind — applying new port options
 /// respawns the reader onto a fresh one — and what the console showed at exit
 /// was itself part restored, part live, so stopping at the newest capture
@@ -187,8 +223,9 @@ fn preload_last_session(
     captures: &[(PathBuf, SessionMeta)],
     identity: &PortIdentity,
     clock: &SessionClock,
+    preload_bytes: usize,
 ) {
-    let restored = gather_history(captures, identity, PRELOAD_TAIL_BYTES);
+    let restored = gather_history(captures, identity, preload_bytes);
 
     // Re-frame the raw bytes exactly as the reader did, stamping each line with
     // the *original* wall-clock time (start of that capture plus its offset) so
@@ -269,9 +306,6 @@ fn preload_last_session(
     }
 }
 
-/// Maximum raw bytes kept per connection for the hex view.
-const RAW_RING_CAP: usize = 1 << 20; // 1 MiB
-
 /// Append `bytes` to a raw ring holding at most `cap`, evicting from the front,
 /// and advance `base` by everything that did not stay.
 ///
@@ -279,14 +313,16 @@ const RAW_RING_CAP: usize = 1 << 20; // 1 MiB
 /// [`RawSession::start`] is measured on that scale — so a byte dropped here must
 /// be counted here, including the head of a push larger than the ring itself.
 /// Get that wrong and the hex view addresses the wrong bytes.
+/// Returns whether any bytes were evicted.
 ///
 /// Evicting in bulk rather than a byte at a time is what makes preloading
 /// worthwhile: a session restore can hand this several megabytes to pour
 /// through a one-megabyte ring.
-fn push_raw(ring: &mut VecDeque<u8>, base: &mut u64, bytes: &[u8], cap: usize) {
+fn push_raw(ring: &mut VecDeque<u8>, base: &mut u64, bytes: &[u8], cap: usize) -> bool {
     // Only the tail of an oversized push can survive it.
     let keep = bytes.len().min(cap);
-    *base += (bytes.len() - keep) as u64;
+    let dropped_head = bytes.len() - keep;
+    *base += dropped_head as u64;
     let bytes = &bytes[bytes.len() - keep..];
 
     let overflow = (ring.len() + keep).saturating_sub(cap);
@@ -295,6 +331,7 @@ fn push_raw(ring: &mut VecDeque<u8>, base: &mut u64, bytes: &[u8], cap: usize) {
         *base += overflow as u64;
     }
     ring.extend(bytes.iter().copied());
+    dropped_head > 0 || overflow > 0
 }
 
 /// One run's worth of bytes inside a connection's raw ring.
@@ -372,6 +409,15 @@ pub struct Connection {
     pub console_layout: Option<(usize, u8)>,
     /// Bounded ring of raw bytes for hex view.
     pub raw_ring: VecDeque<u8>,
+    /// Current cap for `raw_ring`, derived from the global history setting.
+    raw_capacity: usize,
+    /// Current console-line cap, used to detect a settings-driven decrease.
+    history_max_lines: usize,
+    /// A decrease trimmed resident history; release the old backing allocations
+    /// once the interactive edit finishes rather than reallocating every drag frame.
+    history_allocation_shrink_pending: bool,
+    /// Set once the hex history has discarded raw bytes at its capacity.
+    pub(crate) raw_evicted_any: bool,
     /// Bytes dropped from the front of `raw_ring`, for translating a
     /// [`RawSession`]'s absolute start into a position in the ring.
     pub raw_base: u64,
@@ -415,6 +461,14 @@ pub struct Connection {
     pub extract_errors: Vec<String>,
     pub series: Vec<SeriesEntry>,
     pub series_index: HashMap<String, usize>,
+    /// Current per-series point cap, derived from the global history setting.
+    series_capacity: usize,
+    /// Largest capacity whose recoverable console history has been replayed.
+    /// Kept separate from `series_capacity` so interactive increases can be
+    /// applied cheaply and coalesced into one rebuild when editing finishes.
+    series_backfilled_capacity: usize,
+    /// Set once at least one plotted series has discarded a point.
+    pub(crate) series_evicted_any: bool,
     pub plot_follow: bool,
     /// Set by the plot's Fit button, consumed by the next frame's draw: the
     /// bounds can only be set from inside the plot's own closure.
@@ -431,8 +485,60 @@ pub struct Connection {
 }
 
 impl Connection {
+    pub(crate) fn apply_history_limits(&mut self, limits: HistoryLimits) {
+        self.history_allocation_shrink_pending |= limits.max_lines < self.history_max_lines
+            || limits.raw_bytes < self.raw_capacity
+            || limits.series_points < self.series_capacity;
+        self.history_max_lines = limits.max_lines;
+        self.store.set_max_lines(limits.max_lines);
+        self.raw_capacity = limits.raw_bytes;
+        // An empty append applies a lower cap to bytes already resident while
+        // leaving the absolute-index accounting in one well-tested place.
+        self.raw_evicted_any |= push_raw(
+            &mut self.raw_ring,
+            &mut self.raw_base,
+            &[],
+            self.raw_capacity,
+        );
+        let shrank = limits.series_points < self.series_capacity;
+        self.series_capacity = limits.series_points;
+        for entry in &mut self.series {
+            self.series_evicted_any |= entry.series.set_capacity(self.series_capacity);
+        }
+        if shrank {
+            // A lower cap invalidates backfill above it, but an intermediate
+            // drag value must not claim that history missing since the last
+            // settled capacity has already been replayed.
+            self.series_backfilled_capacity =
+                self.series_backfilled_capacity.min(self.series_capacity);
+        }
+    }
+
+    /// Settle one or more history-capacity edits. This replays recoverable plot
+    /// history after increases and releases excess backing allocations after
+    /// decreases. Settings calls it only once its DragValue is no longer being
+    /// dragged, avoiding a scan or reallocation for every intermediate value.
+    /// Returns whether a decrease was settled, so app-level caches derived from
+    /// console history can be invalidated once instead of on every drag frame.
+    pub(crate) fn finish_history_capacity_change(&mut self) -> bool {
+        if self.series_capacity > self.series_backfilled_capacity {
+            self.grow_series_history();
+            self.series_backfilled_capacity = self.series_capacity;
+        }
+        let history_shrank = self.history_allocation_shrink_pending;
+        if history_shrank {
+            self.store.shrink_to_fit();
+            self.raw_ring.shrink_to_fit();
+            for entry in &mut self.series {
+                entry.series.shrink_to_fit();
+            }
+            self.history_allocation_shrink_pending = false;
+        }
+        history_shrank
+    }
+
     fn drain_events(&mut self, max_lines: usize) -> bool {
-        self.store.set_max_lines(max_lines);
+        self.apply_history_limits(history_limits(max_lines));
         let mut changed = false;
         // Non-blocking drain of all pending reader events (spec §5).
         while let Ok(ev) = self.handle.events.try_recv() {
@@ -582,7 +688,12 @@ impl Connection {
 
     /// Append bytes to the hex view's ring, evicting from the front at capacity.
     pub fn push_raw_bytes(&mut self, bytes: &[u8]) {
-        push_raw(&mut self.raw_ring, &mut self.raw_base, bytes, RAW_RING_CAP);
+        self.raw_evicted_any |= push_raw(
+            &mut self.raw_ring,
+            &mut self.raw_base,
+            bytes,
+            self.raw_capacity,
+        );
     }
 
     /// Open the run of bytes this session is producing, unless it is open
@@ -685,6 +796,7 @@ impl Connection {
             .collect();
         self.series.clear();
         self.series_index.clear();
+        self.series_backfilled_capacity = self.series_capacity;
         if self.extract_compiled.is_empty() {
             return;
         }
@@ -698,12 +810,55 @@ impl Connection {
             extract_compiled,
             ..
         } = self;
-        extract_all(store, extract_compiled, series, series_index, &remembered);
+        self.series_evicted_any |= extract_all(
+            store,
+            extract_compiled,
+            series,
+            series_index,
+            &remembered,
+            self.series_capacity,
+        );
+    }
+
+    /// Grow each series and backfill it from the resident console without
+    /// throwing away samples whose source lines have already been evicted.
+    fn grow_series_history(&mut self) {
+        let first_resident = self.store.first_abs_index();
+        for entry in &mut self.series {
+            entry.series.set_capacity(self.series_capacity);
+            // The suffix is replayed below. The prefix cannot be reconstructed
+            // from the line store, so it must survive the rebuild in place.
+            entry.series.retain_before_line(first_resident);
+        }
+        if self.extract_compiled.is_empty() {
+            return;
+        }
+        let Connection {
+            store,
+            series,
+            series_index,
+            extract_compiled,
+            ..
+        } = self;
+        self.series_evicted_any |= extract_all(
+            store,
+            extract_compiled,
+            series,
+            series_index,
+            &HashMap::new(),
+            self.series_capacity,
+        );
     }
 
     fn push_series_point(&mut self, name: &str, t: f64, value: f64, line: u64) {
-        let idx = series_slot(&mut self.series, &mut self.series_index, None, name);
-        self.series[idx].series.push(t, value, line);
+        let idx = series_slot(
+            &mut self.series,
+            &mut self.series_index,
+            None,
+            name,
+            self.series_capacity,
+        );
+        self.series_evicted_any |= self.series[idx].series.push(t, value, line);
     }
 }
 
@@ -722,6 +877,7 @@ fn series_slot(
     index: &mut HashMap<String, usize>,
     remembered: Option<&HashMap<String, SeriesStyle>>,
     name: &str,
+    capacity: usize,
 ) -> usize {
     if let Some(&i) = index.get(name) {
         return i;
@@ -734,7 +890,7 @@ fn series_slot(
             own_axis: false,
         });
     series.push(SeriesEntry {
-        series: Series::new(name.to_string(), DEFAULT_CAPACITY),
+        series: Series::new(name.to_string(), capacity),
         color: style.color,
         visible: style.visible,
         own_axis: style.own_axis,
@@ -778,8 +934,10 @@ fn extract_all(
     series: &mut Vec<SeriesEntry>,
     index: &mut HashMap<String, usize>,
     remembered: &HashMap<String, SeriesStyle>,
-) {
+    capacity: usize,
+) -> bool {
     let mut pairs: Vec<(String, f64)> = Vec::new();
+    let mut evicted = false;
     for abs in store.first_abs_index()..store.next_abs_index() {
         let Some(line) = store.get(abs) else {
             continue;
@@ -798,10 +956,11 @@ fn extract_all(
         }
         let t = line.meta.ts.micros as f64 / 1_000_000.0;
         for (name, value) in pairs.drain(..) {
-            let idx = series_slot(series, index, Some(remembered), &name);
-            series[idx].series.push(t, value, abs);
+            let idx = series_slot(series, index, Some(remembered), &name, capacity);
+            evicted |= series[idx].series.push(t, value, abs);
         }
     }
+    evicted
 }
 
 /// Working state of the modal new-connection dialog (spec-redesign: opening a
@@ -1043,7 +1202,13 @@ impl App {
             // later one succeeds and triggers the save.
             if app.open_connection_inner(saved.identity.clone(), None, saved.config) {
                 let conn = app.connections.last_mut().unwrap();
-                preload_last_session(conn, &prior_captures, &saved.identity, &clock);
+                preload_last_session(
+                    conn,
+                    &prior_captures,
+                    &saved.identity,
+                    &clock,
+                    history_limits(app.config.settings.max_lines).preload_bytes,
+                );
             }
         }
         app.active = 0;
@@ -1396,13 +1561,14 @@ impl App {
     ) -> Connection {
         let dtr = port_config.dtr_on_open;
         let rts = port_config.rts_on_open;
+        let limits = history_limits(self.config.settings.max_lines);
         Connection {
             id,
             label,
             identity,
             port_config,
             handle,
-            store: LineStore::new(self.config.settings.max_lines),
+            store: LineStore::new(limits.max_lines),
             state: ConnState::Connecting,
             follow: true,
             new_since_scroll: 0,
@@ -1412,6 +1578,10 @@ impl App {
             top_line: None,
             console_layout: None,
             raw_ring: VecDeque::new(),
+            raw_capacity: limits.raw_bytes,
+            history_max_lines: limits.max_lines,
+            history_allocation_shrink_pending: false,
+            raw_evicted_any: false,
             raw_base: 0,
             raw_sessions: Vec::new(),
             last_error: None,
@@ -1436,6 +1606,9 @@ impl App {
             extract_errors: Vec::new(),
             series: Vec::new(),
             series_index: HashMap::new(),
+            series_capacity: limits.series_points,
+            series_backfilled_capacity: limits.series_points,
+            series_evicted_any: false,
             plot_follow: true,
             plot_fit: false,
             show_plot: false,
@@ -1668,6 +1841,22 @@ impl App {
         if conn.search_pos.is_none() && !conn.search_matches.is_empty() {
             conn.search_pos = Some(conn.search_matches.len() - 1);
         }
+    }
+
+    /// Finish a coalesced history-capacity edit across every tab. A decrease can
+    /// evict console lines without a reader event, so it must also invalidate
+    /// the merged view: otherwise quiet and closed tabs leave dead blank rows in
+    /// that cache until another connection happens to produce output.
+    pub(crate) fn finish_history_capacity_changes(&mut self) -> bool {
+        let mut settled_change = false;
+        let mut history_shrank = false;
+        for conn in &mut self.connections {
+            settled_change |= conn.series_capacity > conn.series_backfilled_capacity
+                || conn.history_allocation_shrink_pending;
+            history_shrank |= conn.finish_history_capacity_change();
+        }
+        self.merged_dirty |= history_shrank;
+        settled_change
     }
 
     /// Maintain the timestamp-interleaved merged view (spec §7.12). Rebuilds on
@@ -2420,7 +2609,14 @@ pub(crate) mod tests {
     fn extracted(store: &LineStore, remembered: &HashMap<String, SeriesStyle>) -> Vec<SeriesEntry> {
         let mut series = Vec::new();
         let mut index = HashMap::new();
-        extract_all(store, &kv_rules(), &mut series, &mut index, remembered);
+        extract_all(
+            store,
+            &kv_rules(),
+            &mut series,
+            &mut index,
+            remembered,
+            history_limits(1_000_000).series_points,
+        );
         series
     }
 
@@ -2503,13 +2699,14 @@ pub(crate) mod tests {
             "a half-written line is not a sample"
         );
     }
-    fn ring(cap: usize, pushes: &[&[u8]]) -> (VecDeque<u8>, u64) {
+    fn ring(cap: usize, pushes: &[&[u8]]) -> (VecDeque<u8>, u64, bool) {
         let mut ring = VecDeque::new();
         let mut base = 0;
+        let mut evicted = false;
         for bytes in pushes {
-            push_raw(&mut ring, &mut base, bytes, cap);
+            evicted |= push_raw(&mut ring, &mut base, bytes, cap);
         }
-        (ring, base)
+        (ring, base, evicted)
     }
 
     /// `base + len` has to stay the count of every byte ever pushed: the hex
@@ -2517,27 +2714,192 @@ pub(crate) mod tests {
     /// being counted would slide every offset in the view.
     #[test]
     fn the_raw_ring_counts_every_byte_it_drops() {
-        let (ring, base) = ring(4, &[b"ab", b"cdef"]);
+        let (ring, base, evicted) = ring(4, &[b"ab", b"cdef"]);
         assert_eq!(base + ring.len() as u64, 6);
         assert_eq!(ring.iter().copied().collect::<Vec<u8>>(), b"cdef");
         assert_eq!(base, 2);
+        assert!(evicted);
     }
 
     /// A push bigger than the ring keeps its tail — and still counts the head it
     /// threw away.
     #[test]
     fn a_push_larger_than_the_ring_keeps_its_tail() {
-        let (ring, base) = ring(4, &[b"abcdefghij"]);
+        let (ring, base, evicted) = ring(4, &[b"abcdefghij"]);
         assert_eq!(ring.iter().copied().collect::<Vec<u8>>(), b"ghij");
         assert_eq!(base, 6);
         assert_eq!(base + ring.len() as u64, 10);
+        assert!(evicted);
     }
 
     #[test]
     fn a_ring_under_capacity_drops_nothing() {
-        let (ring, base) = ring(8, &[b"ab", b"cd"]);
+        let (ring, base, evicted) = ring(8, &[b"ab", b"cd"]);
         assert_eq!(ring.iter().copied().collect::<Vec<u8>>(), b"abcd");
         assert_eq!(base, 0);
+        assert!(!evicted);
+    }
+
+    #[test]
+    fn memory_setting_scales_every_history_limit() {
+        assert_eq!(
+            history_limits(DEFAULT_HISTORY_LINES),
+            HistoryLimits {
+                max_lines: 1_000_000,
+                raw_bytes: 64 * 1024 * 1024,
+                preload_bytes: 8 * 1024 * 1024,
+                series_points: 100_000,
+            },
+            "the default retains the established preload and plot limits"
+        );
+        assert_eq!(
+            history_limits(10_000),
+            HistoryLimits {
+                max_lines: 10_000,
+                raw_bytes: MIN_RAW_BYTES,
+                preload_bytes: MIN_PRELOAD_BYTES,
+                series_points: 1_000,
+            },
+        );
+        assert_eq!(
+            history_limits(10_000_000),
+            HistoryLimits {
+                max_lines: 10_000_000,
+                raw_bytes: MAX_RAW_BYTES,
+                preload_bytes: MAX_PRELOAD_BYTES,
+                series_points: 1_000_000,
+            },
+            "the full Settings range scales all three derived limits"
+        );
+    }
+
+    #[test]
+    fn lowering_memory_setting_trims_open_hex_and_plot_history() {
+        let (app, _enum_tx) = test_app("lower-history-limits");
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            identity("A1"),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        conn.push_raw_bytes(&vec![0x55; 2 * 1024 * 1024]);
+        let raw_allocation_before = conn.raw_ring.capacity();
+        for i in 0..2_000 {
+            conn.push_series_point("temp", i as f64, i as f64, i);
+        }
+
+        conn.apply_history_limits(history_limits(10_000));
+        assert_eq!(
+            conn.raw_ring.capacity(),
+            raw_allocation_before,
+            "an interactive resize defers reallocating until the edit settles"
+        );
+        assert!(conn.finish_history_capacity_change());
+
+        assert_eq!(conn.raw_ring.len(), MIN_RAW_BYTES);
+        assert_eq!(conn.raw_ring.capacity(), conn.raw_ring.len());
+        assert!(conn.raw_ring.capacity() < raw_allocation_before);
+        assert_eq!(conn.raw_base, MIN_RAW_BYTES as u64);
+        assert!(conn.raw_evicted_any);
+        assert_eq!(conn.series[0].series.len(), 1_000);
+        assert_eq!(conn.series[0].series.t_range(), Some((1_000.0, 1_999.0)));
+        assert!(conn.series_evicted_any);
+    }
+
+    #[test]
+    fn raising_plot_limit_rebuilds_points_still_in_the_console() {
+        let (app, _enum_tx) = test_app("raise-history-limits");
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            identity("A1"),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        conn.apply_history_limits(history_limits(10_000));
+        assert!(conn.finish_history_capacity_change());
+        conn.extract_compiled = kv_rules();
+        let wall = chrono::Utc::now();
+        for i in 0..2_000 {
+            conn.store.append(IncomingLine {
+                text: format!("temp:{i}"),
+                ts: Timestamp {
+                    wall,
+                    micros: i as i64,
+                },
+                port: id,
+                flags: LineFlags::default(),
+                spans: Default::default(),
+                cursor: None,
+            });
+        }
+        conn.rebuild_series();
+        assert_eq!(conn.series[0].series.len(), 1_000);
+
+        // Model a drag that overshoots and settles lower. Neither intermediate
+        // update may rebuild, and shrinking from the overshoot must not forget
+        // that history above the original 1,000-point cap is still missing.
+        conn.apply_history_limits(history_limits(30_000));
+        conn.apply_history_limits(history_limits(20_000));
+        assert_eq!(
+            conn.series[0].series.len(),
+            1_000,
+            "capacity growth stays cheap until the edit is committed"
+        );
+        assert!(conn.finish_history_capacity_change());
+
+        assert_eq!(conn.series[0].series.len(), 2_000);
+        assert_eq!(conn.series[0].series.t_range(), Some((0.0, 0.001999)));
+    }
+
+    #[test]
+    fn raising_plot_limit_preserves_sparse_points_older_than_the_console() {
+        let (app, _enum_tx) = test_app("raise-sparse-history-limit");
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            identity("A1"),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        conn.apply_history_limits(history_limits(10_000));
+        assert!(conn.finish_history_capacity_change());
+        conn.extract_compiled = kv_rules();
+        let wall = chrono::Utc::now();
+        for i in 0..20_000 {
+            let is_sample = i % 100 == 0;
+            let text = if is_sample {
+                format!("temp:{i}")
+            } else {
+                "noise".to_string()
+            };
+            let abs = conn.store.append(IncomingLine {
+                text,
+                ts: Timestamp {
+                    wall,
+                    micros: i as i64,
+                },
+                port: id,
+                flags: LineFlags::default(),
+                spans: Default::default(),
+                cursor: None,
+            });
+            if is_sample {
+                conn.push_series_point("temp", i as f64 / 1_000_000.0, i as f64, abs);
+            }
+        }
+        assert!(conn.store.first_abs_index() > 0);
+        assert_eq!(conn.series[0].series.len(), 200);
+
+        conn.apply_history_limits(history_limits(DEFAULT_HISTORY_LINES));
+        assert!(!conn.finish_history_capacity_change());
+
+        assert_eq!(conn.series[0].series.len(), 200);
+        assert_eq!(conn.series[0].series.t_range(), Some((0.0, 0.0199)));
     }
 
     /// A minimal `App`, built by hand rather than through `App::new` (which
@@ -2800,6 +3162,57 @@ pub(crate) mod tests {
         assert_eq!(app.merged_filtered[0].abs, 2);
         assert_eq!(app.merged_search_matches.len(), 1);
         assert_eq!(app.merged_search_matches[0].abs, 2);
+    }
+
+    #[test]
+    fn lowering_history_limit_rebuilds_a_silent_merged_view() {
+        let (mut app, _enum_tx) = test_app("merged-settings-eviction");
+        let id = PortId(1);
+        let mut conn = app.make_connection(
+            id,
+            "quiet".into(),
+            identity("quiet"),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        let wall = chrono::Utc::now();
+        for micros in 0..10_001 {
+            conn.store.append(IncomingLine {
+                text: String::new(),
+                ts: Timestamp { wall, micros },
+                port: id,
+                flags: LineFlags::default(),
+                spans: Default::default(),
+                cursor: None,
+            });
+        }
+        app.connections.push(conn);
+        app.merged_dirty = true;
+        app.maintain_merged();
+        assert_eq!(app.merged.len(), 10_001);
+
+        // No reader event accompanies a Settings edit. Settling the edit must
+        // therefore schedule the merged-cache maintenance itself.
+        app.connections[0].apply_history_limits(history_limits(10_000));
+        assert_eq!(app.connections[0].store.first_abs_index(), 1);
+        assert_eq!(
+            app.merged.len(),
+            10_001,
+            "the cache is stale before settling"
+        );
+        assert!(app.finish_history_capacity_changes());
+        assert!(app.merged_dirty);
+        assert!(
+            !app.finish_history_capacity_changes(),
+            "settling an unchanged capacity must not schedule another frame"
+        );
+        app.maintain_merged();
+
+        assert_eq!(app.merged.len(), 10_000);
+        assert!(app
+            .merged
+            .iter()
+            .all(|entry| app.connections[0].store.get(entry.abs).is_some()));
     }
 
     /// `save_session` must not persist a `Closed` zombie into `last_open`: if
