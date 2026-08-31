@@ -47,17 +47,19 @@ impl Series {
     }
 
     /// Change the retention limit, evicting the oldest points immediately if
-    /// the series is now over capacity.
-    pub fn set_capacity(&mut self, capacity: usize) {
+    /// the series is now over capacity. Returns whether any points were
+    /// evicted.
+    pub fn set_capacity(&mut self, capacity: usize) -> bool {
         let capacity = capacity.max(2);
         if capacity == self.capacity {
-            return;
+            return false;
         }
         self.capacity = capacity;
         let excess = self.buf.len().saturating_sub(self.capacity);
         if excess > 0 {
             self.buf.drain(..excess);
         }
+        excess > 0
     }
 
     pub fn last(&self) -> Option<SeriesPoint> {
@@ -67,11 +69,14 @@ impl Series {
     /// Push a sample, evicting the oldest when at capacity.
     ///
     /// Timestamps must be monotonically non-decreasing within a series.
-    pub fn push(&mut self, t: f64, value: f64, line: u64) {
-        if self.buf.len() == self.capacity {
+    /// Returns whether the oldest point was evicted.
+    pub fn push(&mut self, t: f64, value: f64, line: u64) -> bool {
+        let evicted = self.buf.len() == self.capacity;
+        if evicted {
             self.buf.pop_front();
         }
         self.buf.push_back(SeriesPoint { t, value, line });
+        evicted
     }
 
     /// The full value extent `(min, max)`, ignoring points that are not finite.
@@ -202,7 +207,7 @@ mod tests {
     fn ring_evicts_oldest() {
         let mut s = Series::new("t", 3);
         for i in 0..5 {
-            s.push(i as f64, i as f64, i);
+            assert_eq!(s.push(i as f64, i as f64, i), i >= 3);
         }
         assert_eq!(s.len(), 3);
         assert_eq!(s.t_range(), Some((2.0, 4.0)));
