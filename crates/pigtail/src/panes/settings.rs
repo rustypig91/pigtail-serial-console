@@ -127,8 +127,12 @@ impl App {
         // `dragged()` becomes false on the release frame. Any increases made
         // across the drag are now backfilled once at the final capacity. This
         // also settles keyboard edits and a pending change if the window closes.
-        if !history_limit_dragged {
-            self.finish_history_capacity_changes();
+        if !history_limit_dragged && self.finish_history_capacity_changes() {
+            // Capacity settling happens after the plot, console, and merged
+            // caches were drawn for this frame. A quiet connection has no
+            // reader wake to show the backfill or cache rebuild, so schedule
+            // the one follow-up frame that consumes the settled state.
+            ctx.request_repaint();
         }
         if changed {
             self.write_config();

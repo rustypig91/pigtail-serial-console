@@ -1847,12 +1847,16 @@ impl App {
     /// evict console lines without a reader event, so it must also invalidate
     /// the merged view: otherwise quiet and closed tabs leave dead blank rows in
     /// that cache until another connection happens to produce output.
-    pub(crate) fn finish_history_capacity_changes(&mut self) {
+    pub(crate) fn finish_history_capacity_changes(&mut self) -> bool {
+        let mut settled_change = false;
         let mut history_shrank = false;
         for conn in &mut self.connections {
+            settled_change |= conn.series_capacity > conn.series_backfilled_capacity
+                || conn.history_allocation_shrink_pending;
             history_shrank |= conn.finish_history_capacity_change();
         }
         self.merged_dirty |= history_shrank;
+        settled_change
     }
 
     /// Maintain the timestamp-interleaved merged view (spec §7.12). Rebuilds on
@@ -3196,8 +3200,12 @@ pub(crate) mod tests {
             10_001,
             "the cache is stale before settling"
         );
-        app.finish_history_capacity_changes();
+        assert!(app.finish_history_capacity_changes());
         assert!(app.merged_dirty);
+        assert!(
+            !app.finish_history_capacity_changes(),
+            "settling an unchanged capacity must not schedule another frame"
+        );
         app.maintain_merged();
 
         assert_eq!(app.merged.len(), 10_000);
