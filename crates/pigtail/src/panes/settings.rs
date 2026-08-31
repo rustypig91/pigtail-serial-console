@@ -7,6 +7,8 @@ impl App {
     pub(crate) fn show_settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_settings;
         let mut changed = false;
+        let mut history_limit_changed = false;
+        let mut history_limit_dragged = false;
         // Started after the window closes its borrow on `self`.
         let mut check_now = false;
         egui::Window::new("Settings")
@@ -45,7 +47,8 @@ impl App {
                                 .range(10_000..=10_000_000),
                         );
                         let limits = history_limits(self.config.settings.max_lines);
-                        changed |= response
+                        history_limit_dragged = response.dragged();
+                        history_limit_changed = response
                             .on_hover_text(format!(
                                 "Also keeps up to {} of raw bytes in Hex, {} points per plotted \
                                  series, and preloads up to {} when reopening a tab. Full capture \
@@ -55,6 +58,7 @@ impl App {
                                 format_bytes(limits.preload_bytes),
                             ))
                             .changed();
+                        changed |= history_limit_changed;
                         ui.end_row();
 
                         ui.label("Session retention (days)");
@@ -114,6 +118,20 @@ impl App {
             });
 
         self.show_settings = open;
+        if history_limit_changed {
+            let limits = history_limits(self.config.settings.max_lines);
+            for conn in &mut self.connections {
+                conn.apply_history_limits(limits);
+            }
+        }
+        // `dragged()` becomes false on the release frame. Any increases made
+        // across the drag are now backfilled once at the final capacity. This
+        // also settles keyboard edits and a pending change if the window closes.
+        if !history_limit_dragged {
+            for conn in &mut self.connections {
+                conn.finish_series_capacity_change();
+            }
+        }
         if changed {
             self.write_config();
         }

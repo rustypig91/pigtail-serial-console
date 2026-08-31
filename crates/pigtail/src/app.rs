@@ -458,6 +458,10 @@ pub struct Connection {
     pub series_index: HashMap<String, usize>,
     /// Current per-series point cap, derived from the global history setting.
     series_capacity: usize,
+    /// Largest capacity whose recoverable console history has been replayed.
+    /// Kept separate from `series_capacity` so interactive increases can be
+    /// applied cheaply and coalesced into one rebuild when editing finishes.
+    series_backfilled_capacity: usize,
     /// Set once at least one plotted series has discarded a point.
     pub(crate) series_evicted_any: bool,
     pub plot_follow: bool,
@@ -476,7 +480,7 @@ pub struct Connection {
 }
 
 impl Connection {
-    fn apply_history_limits(&mut self, limits: HistoryLimits) {
+    pub(crate) fn apply_history_limits(&mut self, limits: HistoryLimits) {
         self.store.set_max_lines(limits.max_lines);
         self.raw_capacity = limits.raw_bytes;
         // An empty append applies a lower cap to bytes already resident while
@@ -487,15 +491,29 @@ impl Connection {
             &[],
             self.raw_capacity,
         );
-        let grew = limits.series_points > self.series_capacity;
+        let shrank = limits.series_points < self.series_capacity;
         self.series_capacity = limits.series_points;
-        if grew {
-            self.grow_series_history();
-        } else {
-            for entry in &mut self.series {
-                self.series_evicted_any |= entry.series.set_capacity(self.series_capacity);
-            }
+        for entry in &mut self.series {
+            self.series_evicted_any |= entry.series.set_capacity(self.series_capacity);
         }
+        if shrank {
+            // A lower cap invalidates backfill above it, but an intermediate
+            // drag value must not claim that history missing since the last
+            // settled capacity has already been replayed.
+            self.series_backfilled_capacity =
+                self.series_backfilled_capacity.min(self.series_capacity);
+        }
+    }
+
+    /// Replay recoverable plot history after one or more capacity increases.
+    /// Settings calls this only once its DragValue is no longer being dragged,
+    /// avoiding a full console scan for every intermediate value.
+    pub(crate) fn finish_series_capacity_change(&mut self) {
+        if self.series_capacity <= self.series_backfilled_capacity {
+            return;
+        }
+        self.grow_series_history();
+        self.series_backfilled_capacity = self.series_capacity;
     }
 
     fn drain_events(&mut self, max_lines: usize) -> bool {
@@ -757,6 +775,7 @@ impl Connection {
             .collect();
         self.series.clear();
         self.series_index.clear();
+        self.series_backfilled_capacity = self.series_capacity;
         if self.extract_compiled.is_empty() {
             return;
         }
@@ -1565,6 +1584,7 @@ impl App {
             series: Vec::new(),
             series_index: HashMap::new(),
             series_capacity: limits.series_points,
+            series_backfilled_capacity: limits.series_points,
             series_evicted_any: false,
             plot_follow: true,
             plot_fit: false,
@@ -2770,7 +2790,17 @@ pub(crate) mod tests {
         conn.rebuild_series();
         assert_eq!(conn.series[0].series.len(), 1_000);
 
-        conn.apply_history_limits(history_limits(DEFAULT_HISTORY_LINES));
+        // Model a drag that overshoots and settles lower. Neither intermediate
+        // update may rebuild, and shrinking from the overshoot must not forget
+        // that history above the original 1,000-point cap is still missing.
+        conn.apply_history_limits(history_limits(30_000));
+        conn.apply_history_limits(history_limits(20_000));
+        assert_eq!(
+            conn.series[0].series.len(),
+            1_000,
+            "capacity growth stays cheap until the edit is committed"
+        );
+        conn.finish_series_capacity_change();
 
         assert_eq!(conn.series[0].series.len(), 2_000);
         assert_eq!(conn.series[0].series.t_range(), Some((0.0, 0.001999)));
@@ -2816,6 +2846,7 @@ pub(crate) mod tests {
         assert_eq!(conn.series[0].series.len(), 200);
 
         conn.apply_history_limits(history_limits(DEFAULT_HISTORY_LINES));
+        conn.finish_series_capacity_change();
 
         assert_eq!(conn.series[0].series.len(), 200);
         assert_eq!(conn.series[0].series.t_range(), Some((0.0, 0.0199)));
