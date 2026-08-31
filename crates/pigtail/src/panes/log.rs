@@ -1973,18 +1973,29 @@ fn build_job(ui: &egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> LayoutJob 
         }
         let seg = &text[a..b];
         let mut color = base;
+        let mut background = egui::Color32::TRANSPARENT;
         for s in &line.meta.spans {
             let ss = s.start as usize;
             let se = (s.start + s.len) as usize;
-            if a >= ss && b <= se && s.rgb != serialcore::store::ColorSpan::NO_COLOR {
-                color =
-                    egui::Color32::from_rgb((s.rgb >> 16) as u8, (s.rgb >> 8) as u8, s.rgb as u8);
+            if a >= ss && b <= se {
+                if s.rgb != serialcore::store::ColorSpan::NO_COLOR {
+                    color = egui::Color32::from_rgb(
+                        (s.rgb >> 16) as u8,
+                        (s.rgb >> 8) as u8,
+                        s.rgb as u8,
+                    );
+                }
+                if s.bg != serialcore::store::ColorSpan::NO_COLOR {
+                    background =
+                        egui::Color32::from_rgb((s.bg >> 16) as u8, (s.bg >> 8) as u8, s.bg as u8);
+                }
             }
         }
         let in_search = search_ranges.iter().any(|&(sa, sb)| a >= sa && b <= sb);
         let mut fmt = egui::TextFormat {
             font_id: font.clone(),
             color,
+            background,
             ..Default::default()
         };
         if in_search {
@@ -2163,13 +2174,83 @@ mod tests {
     use crate::app::tests::{inert_handle, test_app};
     use serialcore::config::{PortConfig, PortIdentity};
     use serialcore::filter::{FilterRule, FilterSet};
-    use serialcore::store::IncomingLine;
+    use serialcore::store::{ColorSpan, IncomingLine, LineMeta};
 
     fn ts(micros: i64) -> Timestamp {
         Timestamp {
             wall: chrono::Utc::now(),
             micros,
         }
+    }
+
+    #[test]
+    fn search_highlight_overrides_only_the_overlapping_device_background() {
+        let mut meta = LineMeta {
+            start: 0,
+            len: 10,
+            ts: ts(0),
+            port: PortId(1),
+            flags: LineFlags::default(),
+            spans: Default::default(),
+            cursor: None,
+        };
+        meta.spans.push(ColorSpan {
+            start: 0,
+            len: 10,
+            rgb: ColorSpan::NO_COLOR,
+            bg: 0xCD3131,
+            bold: false,
+        });
+        let line = LineRef {
+            text: "preHITpost",
+            meta: &meta,
+        };
+        let search = regex::Regex::new("HIT").unwrap();
+        let metrics = Metrics {
+            font: egui::FontId::monospace(12.0),
+            row_height: 14.0,
+            char_w: 8.0,
+            prefix_w: 0.0,
+            cols: 0,
+        };
+        let rctx = RowCtx {
+            ts_format: TimestampFormat::None,
+            m: &metrics,
+            rows: 1,
+            prev_micros: None,
+            mark: None,
+            highlight: &[],
+            search_re: Some(&search),
+            is_search_current: true,
+            port_tag: None,
+            row_id: egui::Id::new("background-search-test"),
+        };
+
+        let ctx = egui::Context::default();
+        let mut job = None;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                job = Some(build_job(ui, &line, &rctx));
+            });
+        });
+        let sections = job.unwrap().sections;
+        assert_eq!(sections.len(), 3);
+        assert_eq!(sections[0].byte_range, 0..3);
+        assert_eq!(
+            sections[0].format.background,
+            egui::Color32::from_rgb(0xCD, 0x31, 0x31)
+        );
+        assert_eq!(sections[1].byte_range, 3..6);
+        assert_eq!(
+            sections[1].format.background,
+            egui::Color32::from_rgb(0xFF, 0xD5, 0x4A)
+        );
+        assert_eq!(sections[1].format.color, egui::Color32::BLACK);
+        assert_eq!(sections[2].byte_range, 6..10);
+        assert_eq!(
+            sections[2].format.background,
+            egui::Color32::from_rgb(0xCD, 0x31, 0x31)
+        );
     }
 
     #[test]
