@@ -70,7 +70,7 @@ impl SessionWriter {
 
         let json = serde_json::to_string_pretty(meta)
             .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
-        std::fs::write(&meta_path, json)?;
+        crate::fs::atomic_write(&meta_path, json)?;
 
         let mut file = BufWriter::new(file);
         file.write_all(MAGIC)?;
@@ -122,7 +122,7 @@ impl SessionWriter {
             let mut meta = self.meta.clone();
             meta.cleared = true;
             if let Ok(json) = serde_json::to_string_pretty(&meta) {
-                std::fs::write(&self.meta_path, json)?;
+                crate::fs::atomic_write(&self.meta_path, json)?;
                 // Marked as done only once it is actually on disk: setting the
                 // flag first would make every later clear skip this block, and a
                 // single failed write would leave `cleared: false` on disk for
