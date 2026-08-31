@@ -411,6 +411,11 @@ pub struct Connection {
     pub raw_ring: VecDeque<u8>,
     /// Current cap for `raw_ring`, derived from the global history setting.
     raw_capacity: usize,
+    /// Current console-line cap, used to detect a settings-driven decrease.
+    history_max_lines: usize,
+    /// A decrease trimmed resident history; release the old backing allocations
+    /// once the interactive edit finishes rather than reallocating every drag frame.
+    history_allocation_shrink_pending: bool,
     /// Set once the hex history has discarded raw bytes at its capacity.
     pub(crate) raw_evicted_any: bool,
     /// Bytes dropped from the front of `raw_ring`, for translating a
@@ -481,6 +486,10 @@ pub struct Connection {
 
 impl Connection {
     pub(crate) fn apply_history_limits(&mut self, limits: HistoryLimits) {
+        self.history_allocation_shrink_pending |= limits.max_lines < self.history_max_lines
+            || limits.raw_bytes < self.raw_capacity
+            || limits.series_points < self.series_capacity;
+        self.history_max_lines = limits.max_lines;
         self.store.set_max_lines(limits.max_lines);
         self.raw_capacity = limits.raw_bytes;
         // An empty append applies a lower cap to bytes already resident while
@@ -505,15 +514,27 @@ impl Connection {
         }
     }
 
-    /// Replay recoverable plot history after one or more capacity increases.
-    /// Settings calls this only once its DragValue is no longer being dragged,
-    /// avoiding a full console scan for every intermediate value.
-    pub(crate) fn finish_series_capacity_change(&mut self) {
-        if self.series_capacity <= self.series_backfilled_capacity {
-            return;
+    /// Settle one or more history-capacity edits. This replays recoverable plot
+    /// history after increases and releases excess backing allocations after
+    /// decreases. Settings calls it only once its DragValue is no longer being
+    /// dragged, avoiding a scan or reallocation for every intermediate value.
+    /// Returns whether a decrease was settled, so app-level caches derived from
+    /// console history can be invalidated once instead of on every drag frame.
+    pub(crate) fn finish_history_capacity_change(&mut self) -> bool {
+        if self.series_capacity > self.series_backfilled_capacity {
+            self.grow_series_history();
+            self.series_backfilled_capacity = self.series_capacity;
         }
-        self.grow_series_history();
-        self.series_backfilled_capacity = self.series_capacity;
+        let history_shrank = self.history_allocation_shrink_pending;
+        if history_shrank {
+            self.store.shrink_to_fit();
+            self.raw_ring.shrink_to_fit();
+            for entry in &mut self.series {
+                entry.series.shrink_to_fit();
+            }
+            self.history_allocation_shrink_pending = false;
+        }
+        history_shrank
     }
 
     fn drain_events(&mut self, max_lines: usize) -> bool {
@@ -1558,6 +1579,8 @@ impl App {
             console_layout: None,
             raw_ring: VecDeque::new(),
             raw_capacity: limits.raw_bytes,
+            history_max_lines: limits.max_lines,
+            history_allocation_shrink_pending: false,
             raw_evicted_any: false,
             raw_base: 0,
             raw_sessions: Vec::new(),
@@ -1818,6 +1841,18 @@ impl App {
         if conn.search_pos.is_none() && !conn.search_matches.is_empty() {
             conn.search_pos = Some(conn.search_matches.len() - 1);
         }
+    }
+
+    /// Finish a coalesced history-capacity edit across every tab. A decrease can
+    /// evict console lines without a reader event, so it must also invalidate
+    /// the merged view: otherwise quiet and closed tabs leave dead blank rows in
+    /// that cache until another connection happens to produce output.
+    pub(crate) fn finish_history_capacity_changes(&mut self) {
+        let mut history_shrank = false;
+        for conn in &mut self.connections {
+            history_shrank |= conn.finish_history_capacity_change();
+        }
+        self.merged_dirty |= history_shrank;
     }
 
     /// Maintain the timestamp-interleaved merged view (spec §7.12). Rebuilds on
@@ -2746,13 +2781,22 @@ pub(crate) mod tests {
             inert_handle(id),
         );
         conn.push_raw_bytes(&vec![0x55; 2 * 1024 * 1024]);
+        let raw_allocation_before = conn.raw_ring.capacity();
         for i in 0..2_000 {
             conn.push_series_point("temp", i as f64, i as f64, i);
         }
 
         conn.apply_history_limits(history_limits(10_000));
+        assert_eq!(
+            conn.raw_ring.capacity(),
+            raw_allocation_before,
+            "an interactive resize defers reallocating until the edit settles"
+        );
+        assert!(conn.finish_history_capacity_change());
 
         assert_eq!(conn.raw_ring.len(), MIN_RAW_BYTES);
+        assert_eq!(conn.raw_ring.capacity(), conn.raw_ring.len());
+        assert!(conn.raw_ring.capacity() < raw_allocation_before);
         assert_eq!(conn.raw_base, MIN_RAW_BYTES as u64);
         assert!(conn.raw_evicted_any);
         assert_eq!(conn.series[0].series.len(), 1_000);
@@ -2772,6 +2816,7 @@ pub(crate) mod tests {
             inert_handle(id),
         );
         conn.apply_history_limits(history_limits(10_000));
+        assert!(conn.finish_history_capacity_change());
         conn.extract_compiled = kv_rules();
         let wall = chrono::Utc::now();
         for i in 0..2_000 {
@@ -2800,7 +2845,7 @@ pub(crate) mod tests {
             1_000,
             "capacity growth stays cheap until the edit is committed"
         );
-        conn.finish_series_capacity_change();
+        assert!(conn.finish_history_capacity_change());
 
         assert_eq!(conn.series[0].series.len(), 2_000);
         assert_eq!(conn.series[0].series.t_range(), Some((0.0, 0.001999)));
@@ -2818,6 +2863,7 @@ pub(crate) mod tests {
             inert_handle(id),
         );
         conn.apply_history_limits(history_limits(10_000));
+        assert!(conn.finish_history_capacity_change());
         conn.extract_compiled = kv_rules();
         let wall = chrono::Utc::now();
         for i in 0..20_000 {
@@ -2846,7 +2892,7 @@ pub(crate) mod tests {
         assert_eq!(conn.series[0].series.len(), 200);
 
         conn.apply_history_limits(history_limits(DEFAULT_HISTORY_LINES));
-        conn.finish_series_capacity_change();
+        assert!(!conn.finish_history_capacity_change());
 
         assert_eq!(conn.series[0].series.len(), 200);
         assert_eq!(conn.series[0].series.t_range(), Some((0.0, 0.0199)));
@@ -3112,6 +3158,53 @@ pub(crate) mod tests {
         assert_eq!(app.merged_filtered[0].abs, 2);
         assert_eq!(app.merged_search_matches.len(), 1);
         assert_eq!(app.merged_search_matches[0].abs, 2);
+    }
+
+    #[test]
+    fn lowering_history_limit_rebuilds_a_silent_merged_view() {
+        let (mut app, _enum_tx) = test_app("merged-settings-eviction");
+        let id = PortId(1);
+        let mut conn = app.make_connection(
+            id,
+            "quiet".into(),
+            identity("quiet"),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        let wall = chrono::Utc::now();
+        for micros in 0..10_001 {
+            conn.store.append(IncomingLine {
+                text: String::new(),
+                ts: Timestamp { wall, micros },
+                port: id,
+                flags: LineFlags::default(),
+                spans: Default::default(),
+                cursor: None,
+            });
+        }
+        app.connections.push(conn);
+        app.merged_dirty = true;
+        app.maintain_merged();
+        assert_eq!(app.merged.len(), 10_001);
+
+        // No reader event accompanies a Settings edit. Settling the edit must
+        // therefore schedule the merged-cache maintenance itself.
+        app.connections[0].apply_history_limits(history_limits(10_000));
+        assert_eq!(app.connections[0].store.first_abs_index(), 1);
+        assert_eq!(
+            app.merged.len(),
+            10_001,
+            "the cache is stale before settling"
+        );
+        app.finish_history_capacity_changes();
+        assert!(app.merged_dirty);
+        app.maintain_merged();
+
+        assert_eq!(app.merged.len(), 10_000);
+        assert!(app
+            .merged
+            .iter()
+            .all(|entry| app.connections[0].store.get(entry.abs).is_some()));
     }
 
     /// `save_session` must not persist a `Closed` zombie into `last_open`: if

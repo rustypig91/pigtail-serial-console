@@ -128,9 +128,7 @@ impl App {
         // across the drag are now backfilled once at the final capacity. This
         // also settles keyboard edits and a pending change if the window closes.
         if !history_limit_dragged {
-            for conn in &mut self.connections {
-                conn.finish_series_capacity_change();
-            }
+            self.finish_history_capacity_changes();
         }
         if changed {
             self.write_config();

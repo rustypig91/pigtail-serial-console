@@ -307,6 +307,12 @@ impl LineStore {
         }
     }
 
+    /// Release backing storage no longer needed after lowering the line cap.
+    pub fn shrink_to_fit(&mut self) {
+        self.lines.shrink_to_fit();
+        self.arena.shrink_to_fit();
+    }
+
     /// Evict from the front in a ~10% chunk when over capacity. Never one line
     /// at a time (that would be O(n) per line, spec §7.7). Also evicts on
     /// arena byte size alone, independent of line count: a stream of
@@ -524,12 +530,19 @@ mod tests {
             s.append(incoming(&format!("line {n}"), &clock));
         }
         assert_eq!(s.len(), 50);
+        let line_allocation_before = s.lines.capacity();
+        let arena_allocation_before = s.arena.capacity();
 
         s.set_max_lines(10);
+        s.shrink_to_fit();
         assert!(
             s.len() <= 10,
             "lowering the cap evicts without a new append"
         );
+        assert_eq!(s.lines.capacity(), s.lines.len());
+        assert_eq!(s.arena.capacity(), s.arena.len());
+        assert!(s.lines.capacity() < line_allocation_before);
+        assert!(s.arena.capacity() < arena_allocation_before);
         assert!(s.evicted_any());
         let last = s.next_abs_index() - 1;
         assert_eq!(s.get(last).unwrap().text, "line 49");

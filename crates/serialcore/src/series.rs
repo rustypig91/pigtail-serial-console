@@ -62,6 +62,11 @@ impl Series {
         excess > 0
     }
 
+    /// Release backing storage no longer needed after lowering the capacity.
+    pub fn shrink_to_fit(&mut self) {
+        self.buf.shrink_to_fit();
+    }
+
     /// Keep only points whose source line precedes `line`.
     ///
     /// Points are appended in source-line order, so this is used to retain the
@@ -230,8 +235,12 @@ mod tests {
         for i in 0..5 {
             s.push(i as f64, i as f64, i);
         }
+        let allocation_before = s.buf.capacity();
         s.set_capacity(3);
+        s.shrink_to_fit();
         assert_eq!(s.len(), 3);
+        assert_eq!(s.buf.capacity(), s.len());
+        assert!(s.buf.capacity() < allocation_before);
         assert_eq!(s.t_range(), Some((2.0, 4.0)));
 
         s.set_capacity(10);
