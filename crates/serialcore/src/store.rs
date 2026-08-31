@@ -54,6 +54,8 @@ pub struct ColorSpan {
     pub len: u32,
     /// Packed `0x00RRGGBB`, or `NO_COLOR` for "default foreground".
     pub rgb: u32,
+    /// Packed `0x00RRGGBB`, or `NO_COLOR` for "default background".
+    pub bg: u32,
     /// Parsed from SGR (`ESC[1m`) but not rendered: no bold monospace face is
     /// bundled and egui has no synthetic bold, so a run has nothing to be drawn
     /// bold *with*. Kept because the parse is correct and costs nothing, and

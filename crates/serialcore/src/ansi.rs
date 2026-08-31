@@ -27,6 +27,7 @@ pub struct Styled {
 #[derive(Clone, Copy)]
 struct SgrState {
     fg: u32,
+    bg: u32,
     bold: bool,
 }
 
@@ -34,11 +35,12 @@ impl SgrState {
     fn default_state() -> SgrState {
         SgrState {
             fg: ColorSpan::NO_COLOR,
+            bg: ColorSpan::NO_COLOR,
             bold: false,
         }
     }
     fn is_default(&self) -> bool {
-        self.fg == ColorSpan::NO_COLOR && !self.bold
+        self.fg == ColorSpan::NO_COLOR && self.bg == ColorSpan::NO_COLOR && !self.bold
     }
 }
 
@@ -93,6 +95,7 @@ pub fn parse_line(input: &str, cursor: Option<usize>) -> Styled {
                                 start: span_start,
                                 len: cur_len,
                                 rgb: state.fg,
+                                bg: state.bg,
                                 bold: state.bold,
                             });
                         }
@@ -139,6 +142,7 @@ pub fn parse_line(input: &str, cursor: Option<usize>) -> Styled {
             start: span_start,
             len: cur_len,
             rgb: state.fg,
+            bg: state.bg,
             bold: state.bold,
         });
     }
@@ -179,6 +183,9 @@ fn apply_sgr(params: &str, state: &mut SgrState) {
             30..=37 => state.fg = PALETTE[(code - 30) as usize],
             90..=97 => state.fg = PALETTE[(code - 90 + 8) as usize],
             39 => state.fg = ColorSpan::NO_COLOR,
+            40..=47 => state.bg = PALETTE[(code - 40) as usize],
+            100..=107 => state.bg = PALETTE[(code - 100 + 8) as usize],
+            49 => state.bg = ColorSpan::NO_COLOR,
             38 => {
                 // Extended colour: `38;5;n` or `38;2;r;g;b`.
                 match it.next().and_then(|s| s.parse::<i32>().ok()) {
@@ -192,6 +199,23 @@ fn apply_sgr(params: &str, state: &mut SgrState) {
                         let g = it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
                         let b = it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
                         state.fg = (r << 16) | (g << 8) | b;
+                    }
+                    _ => {}
+                }
+            }
+            48 => {
+                // Extended background: `48;5;n` or `48;2;r;g;b`.
+                match it.next().and_then(|s| s.parse::<i32>().ok()) {
+                    Some(5) => {
+                        if let Some(n) = it.next().and_then(|s| s.parse::<u32>().ok()) {
+                            state.bg = xterm256(n);
+                        }
+                    }
+                    Some(2) => {
+                        let r = it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                        let g = it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                        let b = it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                        state.bg = (r << 16) | (g << 8) | b;
                     }
                     _ => {}
                 }
@@ -257,6 +281,26 @@ mod tests {
         assert_eq!(s.spans.len(), 1);
         assert!(s.spans[0].bold);
         assert_eq!(s.spans[0].rgb, 0xFF0000);
+    }
+
+    #[test]
+    fn standard_and_bright_backgrounds_reset_independently() {
+        let s = parse_line("\x1b[41mred\x1b[104mblue\x1b[49mplain", None);
+        assert_eq!(s.text, "redblueplain");
+        assert_eq!(s.spans.len(), 2);
+        assert_eq!(s.spans[0].bg, 0xCD3131);
+        assert_eq!(s.spans[0].rgb, ColorSpan::NO_COLOR);
+        assert_eq!(s.spans[1].bg, 0x3B8EEA);
+        assert_eq!(s.spans[1].rgb, ColorSpan::NO_COLOR);
+    }
+
+    #[test]
+    fn extended_backgrounds_support_xterm_and_truecolor() {
+        let s = parse_line("\x1b[48;5;202mX\x1b[48;2;1;2;3mY", None);
+        assert_eq!(s.text, "XY");
+        assert_eq!(s.spans.len(), 2);
+        assert_eq!(s.spans[0].bg, xterm256(202));
+        assert_eq!(s.spans[1].bg, 0x010203);
     }
 
     #[test]
