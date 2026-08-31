@@ -416,9 +416,10 @@ fn show_filter_controls(
                 }
             });
             ui.horizontal(|ui| {
-                *dirty |= ui.checkbox(&mut rule.is_regex, "regex").changed()
-                    || ui.checkbox(&mut rule.case_sensitive, "case").changed()
-                    || ui.checkbox(&mut rule.invert, "invert").changed();
+                let mut changed = ui.checkbox(&mut rule.is_regex, "regex").changed();
+                changed |= ui.checkbox(&mut rule.case_sensitive, "case").changed();
+                changed |= ui.checkbox(&mut rule.invert, "invert").changed();
+                *dirty |= changed;
             });
         });
     }

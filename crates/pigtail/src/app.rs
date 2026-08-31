@@ -721,7 +721,7 @@ impl Connection {
     /// already. Called on arrival rather than at connect: restored history is
     /// pushed first, and this run's bytes begin after it.
     fn open_live_raw_session(&mut self) {
-        if self.raw_sessions.last().map_or(true, |s| s.label.is_some()) {
+        if self.raw_sessions.last().is_none_or(|s| s.label.is_some()) {
             self.raw_sessions.push(RawSession {
                 start: self.raw_next(),
                 label: None,

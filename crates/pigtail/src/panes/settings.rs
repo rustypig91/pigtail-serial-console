@@ -74,9 +74,10 @@ impl App {
 
                         ui.label("Theme");
                         let mut dark = self.config.settings.theme != "light";
-                        if ui.selectable_value(&mut dark, true, "dark").clicked()
-                            || ui.selectable_value(&mut dark, false, "light").clicked()
-                        {
+                        let mut theme_changed =
+                            ui.selectable_value(&mut dark, true, "dark").clicked();
+                        theme_changed |= ui.selectable_value(&mut dark, false, "light").clicked();
+                        if theme_changed {
                             self.config.settings.theme =
                                 if dark { "dark".into() } else { "light".into() };
                             ctx.set_visuals(if dark {

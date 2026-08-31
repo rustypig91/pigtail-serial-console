@@ -1377,17 +1377,22 @@ impl App {
     /// tag. CSV gets the tag as a separate column; text mirrors the console's
     /// `[tag] timestamp text` layout.
     pub(crate) fn export_merged_view(&mut self, as_csv: bool) {
-        let out = format_merged_export(&self.connections, self.merged_view(), as_csv);
-
         let ext = if as_csv { "csv" } else { "txt" };
-        if let Some(path) = rfd::FileDialog::new()
+        let Some(path) = rfd::FileDialog::new()
             .add_filter(ext, &[ext])
             .set_file_name(format!("merged-export.{ext}"))
             .save_file()
-        {
-            if let Err(e) = std::fs::write(&path, out) {
-                self.record_connect_error("Couldn't export", e.to_string());
-            }
+        else {
+            return;
+        };
+
+        let result = std::fs::File::create(path).and_then(|file| {
+            let mut writer = BufWriter::new(file);
+            write_merged_export(&mut writer, &self.connections, self.merged_view(), as_csv)?;
+            writer.flush()
+        });
+        if let Err(e) = result {
+            self.record_connect_error("Couldn't export", e.to_string());
         }
     }
 }
@@ -1440,14 +1445,16 @@ fn write_active_export(
     Ok(())
 }
 
-fn format_merged_export(
+/// Stream the merged view to `writer`, so its memory use does not scale with
+/// the number or size of retained lines.
+fn write_merged_export(
+    writer: &mut impl Write,
     connections: &[Connection],
     entries: &[MergedEntry],
     as_csv: bool,
-) -> String {
-    let mut out = String::new();
+) -> std::io::Result<()> {
     if as_csv {
-        out.push_str("port,wall_time,micros,flags,text\n");
+        writeln!(writer, "port,wall_time,micros,flags,text")?;
     }
     for entry in entries {
         let Some(conn) = connections.iter().find(|conn| conn.id == entry.port) else {
@@ -1458,8 +1465,9 @@ fn format_merged_export(
         };
         let tag = short_tag(&conn.label);
         if as_csv {
-            out.push_str(&format!(
-                "{},{},{},{},{}\n",
+            writeln!(
+                writer,
+                "{},{},{},{},{}",
                 csv_escape(&tag),
                 line.meta
                     .ts
@@ -1469,16 +1477,12 @@ fn format_merged_export(
                 line.meta.ts.micros,
                 line.meta.flags.0,
                 csv_escape(line.text),
-            ));
+            )?;
         } else {
-            out.push_str(&format!(
-                "{tag}  {}  {}\n",
-                wall_clock(line.meta.ts),
-                line.text
-            ));
+            writeln!(writer, "{tag}  {}  {}", wall_clock(line.meta.ts), line.text)?;
         }
     }
-    out
+    Ok(())
 }
 
 /// The right-click menu, common to rows and empty areas.
@@ -2373,12 +2377,16 @@ mod tests {
             },
         ];
 
-        let text = format_merged_export(&connections, &entries, false);
+        let mut text = Vec::new();
+        write_merged_export(&mut text, &connections, &entries, false).unwrap();
+        let text = String::from_utf8(text).unwrap();
         let mut lines = text.lines();
         assert!(lines.next().unwrap().starts_with("[beta  ]"));
         assert!(lines.next().unwrap().starts_with("[alpha ]"));
 
-        let csv = format_merged_export(&connections, &entries, true);
+        let mut csv = Vec::new();
+        write_merged_export(&mut csv, &connections, &entries, true).unwrap();
+        let csv = String::from_utf8(csv).unwrap();
         assert!(csv.starts_with("port,wall_time,micros,flags,text\n"));
         assert!(csv.contains("[beta  ]"));
         assert!(csv.contains("\"alarm, now\""));
