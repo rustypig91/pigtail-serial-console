@@ -62,6 +62,16 @@ impl Series {
         excess > 0
     }
 
+    /// Keep only points whose source line precedes `line`.
+    ///
+    /// Points are appended in source-line order, so this is used to retain the
+    /// part of a series that can no longer be rebuilt from a front-evicted line
+    /// store before replaying the resident lines.
+    pub fn retain_before_line(&mut self, line: u64) {
+        let keep = self.buf.partition_point(|point| point.line < line);
+        self.buf.truncate(keep);
+    }
+
     pub fn last(&self) -> Option<SeriesPoint> {
         self.buf.back().copied()
     }
@@ -226,6 +236,19 @@ mod tests {
 
         s.set_capacity(10);
         assert_eq!(s.len(), 3, "growing the limit keeps every resident point");
+    }
+
+    #[test]
+    fn retaining_before_a_line_drops_only_the_rebuildable_suffix() {
+        let mut s = Series::new("t", 5);
+        for i in 10..15 {
+            s.push(i as f64, i as f64, i);
+        }
+
+        s.retain_before_line(13);
+
+        assert_eq!(s.len(), 3);
+        assert_eq!(s.t_range(), Some((10.0, 12.0)));
     }
 
     #[test]

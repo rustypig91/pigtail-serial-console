@@ -490,10 +490,7 @@ impl Connection {
         let grew = limits.series_points > self.series_capacity;
         self.series_capacity = limits.series_points;
         if grew {
-            // Unlike raw bytes, plot points can be recovered from source lines
-            // that are still in the console, so make a larger limit effective
-            // for existing history as well as future samples.
-            self.rebuild_series();
+            self.grow_series_history();
         } else {
             for entry in &mut self.series {
                 self.series_evicted_any |= entry.series.set_capacity(self.series_capacity);
@@ -779,6 +776,36 @@ impl Connection {
             series,
             series_index,
             &remembered,
+            self.series_capacity,
+        );
+    }
+
+    /// Grow each series and backfill it from the resident console without
+    /// throwing away samples whose source lines have already been evicted.
+    fn grow_series_history(&mut self) {
+        let first_resident = self.store.first_abs_index();
+        for entry in &mut self.series {
+            entry.series.set_capacity(self.series_capacity);
+            // The suffix is replayed below. The prefix cannot be reconstructed
+            // from the line store, so it must survive the rebuild in place.
+            entry.series.retain_before_line(first_resident);
+        }
+        if self.extract_compiled.is_empty() {
+            return;
+        }
+        let Connection {
+            store,
+            series,
+            series_index,
+            extract_compiled,
+            ..
+        } = self;
+        self.series_evicted_any |= extract_all(
+            store,
+            extract_compiled,
+            series,
+            series_index,
+            &HashMap::new(),
             self.series_capacity,
         );
     }
@@ -2747,6 +2774,51 @@ pub(crate) mod tests {
 
         assert_eq!(conn.series[0].series.len(), 2_000);
         assert_eq!(conn.series[0].series.t_range(), Some((0.0, 0.001999)));
+    }
+
+    #[test]
+    fn raising_plot_limit_preserves_sparse_points_older_than_the_console() {
+        let (app, _enum_tx) = test_app("raise-sparse-history-limit");
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            identity("A1"),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        conn.apply_history_limits(history_limits(10_000));
+        conn.extract_compiled = kv_rules();
+        let wall = chrono::Utc::now();
+        for i in 0..20_000 {
+            let is_sample = i % 100 == 0;
+            let text = if is_sample {
+                format!("temp:{i}")
+            } else {
+                "noise".to_string()
+            };
+            let abs = conn.store.append(IncomingLine {
+                text,
+                ts: Timestamp {
+                    wall,
+                    micros: i as i64,
+                },
+                port: id,
+                flags: LineFlags::default(),
+                spans: Default::default(),
+                cursor: None,
+            });
+            if is_sample {
+                conn.push_series_point("temp", i as f64 / 1_000_000.0, i as f64, abs);
+            }
+        }
+        assert!(conn.store.first_abs_index() > 0);
+        assert_eq!(conn.series[0].series.len(), 200);
+
+        conn.apply_history_limits(history_limits(DEFAULT_HISTORY_LINES));
+
+        assert_eq!(conn.series[0].series.len(), 200);
+        assert_eq!(conn.series[0].series.t_range(), Some((0.0, 0.0199)));
     }
 
     /// A minimal `App`, built by hand rather than through `App::new` (which
