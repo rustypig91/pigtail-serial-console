@@ -3,7 +3,7 @@
 //! device (see `transmit`) — with an optional search bar and a right-click menu
 //! that toggles everything else so the main view stays clean.
 
-use crate::app::{App, CompiledHighlight, Connection, MergedEntry, RawSession};
+use crate::app::{compile_search, App, CompiledHighlight, Connection, MergedEntry, RawSession};
 use crate::wrap::{rows_for, WrapIndex};
 use egui::text::LayoutJob;
 use serialcore::clock::Timestamp;
@@ -607,6 +607,14 @@ impl App {
                 conn.search_dirty = true;
                 conn.search_pos = None;
             }
+            if ui
+                .checkbox(&mut conn.search_case_sensitive, "case")
+                .on_hover_text("Match uppercase and lowercase exactly")
+                .changed()
+            {
+                conn.search_dirty = true;
+                conn.search_pos = None;
+            }
             // Focus only when explicitly requested (opening), not every frame —
             // otherwise the search box would keep grabbing focus.
             if focus {
@@ -671,6 +679,14 @@ impl App {
                     .desired_width(240.0),
             );
             if resp.changed() {
+                self.merged_search_dirty = true;
+                self.merged_search_pos = None;
+            }
+            if ui
+                .checkbox(&mut self.merged_search_case_sensitive, "case")
+                .on_hover_text("Match uppercase and lowercase exactly")
+                .changed()
+            {
                 self.merged_search_dirty = true;
                 self.merged_search_pos = None;
             }
@@ -762,7 +778,7 @@ impl App {
             .iter()
             .all(|r| !r.enabled || r.pattern.is_empty());
 
-        let search_re = compile_search(&conn.search_query);
+        let search_re = compile_search(&conn.search_query, conn.search_case_sensitive);
         let cur_match_abs = conn
             .search_pos
             .and_then(|p| conn.search_matches.get(p))
@@ -947,7 +963,8 @@ impl App {
         let filter_active = self.merged_filter_active();
         let view_generation = self.merged_view_generation();
         let goto = self.merged_scroll_to.take();
-        let search_re = compile_search(&self.merged_search_query);
+        let search_re =
+            compile_search(&self.merged_search_query, self.merged_search_case_sensitive);
         let cur_match_seq = self
             .merged_search_pos
             .and_then(|pos| self.merged_search_matches.get(pos))
@@ -2017,21 +2034,6 @@ fn build_job(ui: &egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> LayoutJob 
         job.append("▏", 0.0, caret_fmt);
     }
     job
-}
-
-fn compile_search(query: &str) -> Option<regex::Regex> {
-    if query.is_empty() {
-        return None;
-    }
-    regex::RegexBuilder::new(query)
-        .case_insensitive(true)
-        .build()
-        .or_else(|_| {
-            regex::RegexBuilder::new(&regex::escape(query))
-                .case_insensitive(true)
-                .build()
-        })
-        .ok()
 }
 
 fn draw_search_ticks(

@@ -91,6 +91,24 @@ pub struct CompiledHighlight {
     pub color: egui::Color32,
 }
 
+/// Compile a search exactly as both indexing and row highlighting understand
+/// it. An invalid regex is treated as literal text, preserving the search
+/// bar's existing forgiving behaviour.
+pub(crate) fn compile_search(query: &str, case_sensitive: bool) -> Option<regex::Regex> {
+    if query.is_empty() {
+        return None;
+    }
+    regex::RegexBuilder::new(query)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .or_else(|_| {
+            regex::RegexBuilder::new(&regex::escape(query))
+                .case_insensitive(!case_sensitive)
+                .build()
+        })
+        .ok()
+}
+
 /// One entry in the timestamp-interleaved merged view.
 #[derive(Clone, Copy)]
 pub struct MergedEntry {
@@ -442,6 +460,7 @@ pub struct Connection {
     pub filter_errors: Vec<(usize, String)>,
     // Search (spec §7.8).
     pub search_query: String,
+    pub search_case_sensitive: bool,
     pub search_matches: Vec<u64>,
     pub search_pos: Option<usize>,
     pub search_dirty: bool,
@@ -1047,6 +1066,7 @@ pub struct App {
     /// Search state owned by the merged pseudo-tab. Matches keep the complete
     /// merged key so navigation can identify both the port and its line.
     pub merged_search_query: String,
+    pub merged_search_case_sensitive: bool,
     pub merged_search_matches: Vec<MergedEntry>,
     pub merged_search_pos: Option<usize>,
     pub merged_search_dirty: bool,
@@ -1125,6 +1145,7 @@ impl App {
             merged_filter_source_generation: 0,
             merged_filter_upto_seq: 0,
             merged_search_query: String::new(),
+            merged_search_case_sensitive: false,
             merged_search_matches: Vec::new(),
             merged_search_pos: None,
             merged_search_dirty: true,
@@ -1593,6 +1614,7 @@ impl App {
             filter_dirty: false,
             filter_errors: Vec::new(),
             search_query: String::new(),
+            search_case_sensitive: false,
             search_matches: Vec::new(),
             search_pos: None,
             search_dirty: false,
@@ -1730,7 +1752,7 @@ impl App {
                 continue;
             }
             let Ok(re) = regex::RegexBuilder::new(&rule.pattern)
-                .case_insensitive(true)
+                .case_insensitive(!rule.case_sensitive)
                 .build()
             else {
                 continue;
@@ -1771,16 +1793,7 @@ impl App {
             conn.search_tested_upto = conn.store.next_abs_index();
             return;
         }
-        // Compile query as regex, falling back to a literal search.
-        let re = regex::RegexBuilder::new(&conn.search_query)
-            .case_insensitive(true)
-            .build()
-            .or_else(|_| {
-                regex::RegexBuilder::new(&regex::escape(&conn.search_query))
-                    .case_insensitive(true)
-                    .build()
-            });
-        let Ok(re) = re else {
+        let Some(re) = compile_search(&conn.search_query, conn.search_case_sensitive) else {
             return;
         };
 
@@ -2081,15 +2094,8 @@ impl App {
             self.merged_search_upto_seq = self.merged_seq;
             return;
         }
-        let re = regex::RegexBuilder::new(&self.merged_search_query)
-            .case_insensitive(true)
-            .build()
-            .or_else(|_| {
-                regex::RegexBuilder::new(&regex::escape(&self.merged_search_query))
-                    .case_insensitive(true)
-                    .build()
-            });
-        let Ok(re) = re else {
+        let Some(re) = compile_search(&self.merged_search_query, self.merged_search_case_sensitive)
+        else {
             return;
         };
 
@@ -2985,6 +2991,68 @@ pub(crate) mod tests {
         }
         app.connections.push(conn);
         app.merged_dirty = true;
+    }
+
+    #[test]
+    fn search_case_sensitivity_applies_to_single_and_merged_views() {
+        let (mut app, _enum_tx) = test_app("search-case-sensitive");
+        add_merged_test_connection(
+            &mut app,
+            PortId(1),
+            "probe",
+            &[
+                ("ERROR exact", 1, LineFlags::default()),
+                ("error folded", 2, LineFlags::default()),
+            ],
+        );
+        app.maintain_merged();
+
+        app.connections[0].search_query = "ERROR".into();
+        app.connections[0].search_dirty = true;
+        app.maintain_search();
+        assert_eq!(app.connections[0].search_matches, [0, 1]);
+
+        app.connections[0].search_case_sensitive = true;
+        app.connections[0].search_dirty = true;
+        app.maintain_search();
+        assert_eq!(app.connections[0].search_matches, [0]);
+
+        app.merged_search_query = "ERROR".into();
+        app.merged_search_dirty = true;
+        app.maintain_merged_search(false);
+        assert_eq!(app.merged_search_matches.len(), 2);
+
+        app.merged_search_case_sensitive = true;
+        app.merged_search_dirty = true;
+        app.maintain_merged_search(false);
+        assert_eq!(app.merged_search_matches.len(), 1);
+        assert_eq!(app.merged_search_matches[0].abs, 0);
+    }
+
+    #[test]
+    fn search_case_sensitivity_also_applies_to_literal_fallback() {
+        let insensitive = compile_search("[A", false).unwrap();
+        assert!(insensitive.is_match("prefix [a suffix"));
+
+        let sensitive = compile_search("[A", true).unwrap();
+        assert!(sensitive.is_match("prefix [A suffix"));
+        assert!(!sensitive.is_match("prefix [a suffix"));
+    }
+
+    #[test]
+    fn highlight_rules_honor_case_sensitivity() {
+        let (mut app, _enum_tx) = test_app("highlight-case-sensitive");
+        let rule = &mut app.config.highlight[0];
+        rule.enabled = true;
+        rule.case_sensitive = true;
+        app.rebuild_highlight_if_dirty();
+        assert!(app.highlight_cache[0].re.is_match("ERROR"));
+        assert!(!app.highlight_cache[0].re.is_match("error"));
+
+        app.config.highlight[0].case_sensitive = false;
+        app.highlight_dirty = true;
+        app.rebuild_highlight_if_dirty();
+        assert!(app.highlight_cache[0].re.is_match("error"));
     }
 
     #[test]
