@@ -306,6 +306,10 @@ pub struct HighlightRule {
     pub pattern: String,
     /// `#rrggbb`.
     pub color: String,
+    /// Match the pattern with exact letter case. Missing in older configs,
+    /// where highlights were always case-insensitive.
+    #[serde(default)]
+    pub case_sensitive: bool,
     /// Not rendered, and no longer offered in the UI.
     ///
     /// egui has no synthetic bold and no bold monospace face is bundled, so
@@ -465,18 +469,21 @@ fn default_highlight_rules() -> Vec<HighlightRule> {
         HighlightRule {
             pattern: "ERROR".into(),
             color: "#ff5555".into(),
+            case_sensitive: false,
             bold: false,
             enabled: false,
         },
         HighlightRule {
             pattern: "WARNING".into(),
             color: "#e5c040".into(),
+            case_sensitive: false,
             bold: false,
             enabled: false,
         },
         HighlightRule {
             pattern: "INFO".into(),
             color: "#6cb6ff".into(),
+            case_sensitive: false,
             bold: false,
             enabled: false,
         },
@@ -567,6 +574,28 @@ enabled = true
             back.highlight[0].bold,
             "and survives a round trip through save"
         );
+    }
+
+    #[test]
+    fn highlight_case_sensitivity_is_backward_compatible_and_round_trips() {
+        let old = Config::from_toml(
+            r##"
+[[highlight]]
+pattern = "ERROR"
+color = "#ff0000"
+enabled = true
+"##,
+        )
+        .expect("a config from before case sensitivity was added still parses");
+        assert!(
+            !old.highlight[0].case_sensitive,
+            "existing highlights keep their case-insensitive behaviour"
+        );
+
+        let mut cfg = old;
+        cfg.highlight[0].case_sensitive = true;
+        let back = Config::from_toml(&cfg.to_toml().unwrap()).unwrap();
+        assert!(back.highlight[0].case_sensitive);
     }
 
     #[test]

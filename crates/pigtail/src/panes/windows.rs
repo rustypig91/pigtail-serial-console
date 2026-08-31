@@ -130,6 +130,10 @@ impl App {
                                     .hint_text("#rrggbb"),
                             )
                             .changed();
+                        changed |= ui
+                            .checkbox(&mut rule.case_sensitive, "case")
+                            .on_hover_text("Match uppercase and lowercase exactly")
+                            .changed();
                         if let Some(c) = crate::app::parse_hex_color(&rule.color) {
                             ui.colored_label(c, "■");
                         }
@@ -146,6 +150,7 @@ impl App {
                     self.config.highlight.push(HighlightRule {
                         pattern: "ERROR|FATAL".into(),
                         color: "#ff5555".into(),
+                        case_sensitive: false,
                         // Nothing draws bold (see `HighlightRule::bold`), so a
                         // new rule no longer arrives with it set.
                         bold: false,

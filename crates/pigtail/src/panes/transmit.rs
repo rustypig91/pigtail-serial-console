@@ -698,8 +698,8 @@ mod tests {
 
         let ctx = egui::Context::default();
         frame(&mut app, &ctx, Vec::new());
-        // Text field -> Prev -> Next -> Close.
-        for _ in 0..3 {
+        // Text field -> case -> Prev -> Next -> Close.
+        for _ in 0..4 {
             frame(&mut app, &ctx, vec![tab()]);
         }
         frame(&mut app, &ctx, vec![enter()]);
