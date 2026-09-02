@@ -1,7 +1,7 @@
 //! Minimal chrome: the header (tabs + new/save/settings), the status footer,
 //! and the modal new-connection dialog with preset management.
 
-use crate::app::{App, ConfigDialog};
+use crate::app::{available_port_is_added, App, ConfigDialog};
 use serialcore::config::{
     DataBits, FlowControl, LineEnding, NamedConfig, Parity, PortConfig, StopBits, TerminalMode,
 };
@@ -58,22 +58,24 @@ impl App {
                     for (i, conn) in self.connections.iter().enumerate() {
                         let selected = !self.merged_selected && self.active == i;
                         let display_label = conn.display_label();
-                        let label =
-                            format!("{} {}", state_dot(conn.state), short_label(display_label));
-                        let device_label = if conn.name.is_some() {
+                        let label = egui::RichText::new(short_label(display_label))
+                            .color(state_color(conn.state))
+                            .strong();
+                        let device_details = if conn.name.is_some() {
                             format!("{}\n{}", display_label, conn.label)
                         } else {
                             conn.label.clone()
                         };
+                        let tooltip = format!("Status: {}\n{}", conn.state, device_details);
                         // `on_hover_text` only fires on an *enabled* widget,
                         // so a disabled tab needs its own tooltip to keep the
                         // detected device name and port available.
                         let resp = ui
                             .selectable_label(selected, label)
-                            .on_hover_text(&device_label)
+                            .on_hover_text(&tooltip)
                             .on_disabled_hover_text(format!(
                                 "{}\n(finish or cancel the open dialog first)",
-                                device_label
+                                tooltip
                             ));
                         if resp.clicked() {
                             set_active = Some(i);
@@ -142,6 +144,23 @@ impl App {
         }
         if select_merged {
             self.merged_selected = true;
+            let selected_is_live = self.merged_tx_port.is_some_and(|id| {
+                self.connections
+                    .iter()
+                    .any(|conn| conn.id == id && conn.state != ConnState::Closed)
+            });
+            if !selected_is_live {
+                self.merged_tx_port = self
+                    .connections
+                    .get(self.active)
+                    .filter(|conn| conn.state != ConnState::Closed)
+                    .or_else(|| {
+                        self.connections
+                            .iter()
+                            .find(|conn| conn.state != ConnState::Closed)
+                    })
+                    .map(|conn| conn.id);
+            }
         }
         if let Some(i) = to_close {
             self.close_connection(i);
@@ -170,6 +189,7 @@ impl App {
         let mut toggle_pin = false;
         let mut toggle_plot = false;
         let mut toggle_hex = false;
+        let mut merged_tx_port = self.merged_tx_port;
         let mut open_error_win: Option<serialcore::store::PortId> = None;
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -185,6 +205,38 @@ impl App {
                         let n = self.merged_search_pos.map(|p| p + 1).unwrap_or(0);
                         ui.label(format!("match {n}/{}", self.merged_search_matches.len()));
                     }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let label = if self.merged_follow { "Pinned" } else { "Pin" };
+                        if ui
+                            .selectable_label(self.merged_follow, label)
+                            .on_hover_text("Pin the merged view to the bottom and autoscroll")
+                            .clicked()
+                        {
+                            toggle_pin = true;
+                        }
+                        let selected_label = merged_tx_port
+                            .and_then(|id| self.connections.iter().find(|conn| conn.id == id))
+                            .map(|conn| short_label(conn.display_label()))
+                            .unwrap_or_else(|| "Select device".to_string());
+                        egui::ComboBox::from_id_salt("merged_tx_device")
+                            .selected_text(format!("Send to: {selected_label}"))
+                            .show_ui(ui, |ui| {
+                                for conn in &self.connections {
+                                    let text = short_label(conn.display_label());
+                                    ui.add_enabled_ui(conn.state != ConnState::Closed, |ui| {
+                                        ui.selectable_value(
+                                            &mut merged_tx_port,
+                                            Some(conn.id),
+                                            text,
+                                        );
+                                    });
+                                }
+                            });
+                        if !self.merged_follow && self.merged_new_since_scroll > 0 {
+                            ui.label(format!("{} new", self.merged_new_since_scroll));
+                            ui.separator();
+                        }
+                    });
                     return;
                 }
                 let Some(active) = self.active_index() else {
@@ -291,7 +343,14 @@ impl App {
             });
         });
 
-        if toggle_pin || toggle_plot || toggle_hex {
+        self.merged_tx_port = merged_tx_port;
+        if toggle_pin && self.merged_selected {
+            self.merged_follow = !self.merged_follow;
+            if self.merged_follow {
+                self.merged_new_since_scroll = 0;
+            }
+        }
+        if (!self.merged_selected && toggle_pin) || toggle_plot || toggle_hex {
             if let Some(active) = self.active_index() {
                 let conn = &mut self.connections[active];
                 if toggle_pin {
@@ -334,12 +393,14 @@ impl App {
             let App {
                 config_dialog,
                 available,
+                connections,
                 config,
                 ..
             } = self;
             let dialog: &mut ConfigDialog = config_dialog.as_mut().unwrap();
             let mut load_preset: Option<usize> = None;
-            let editing = dialog.editing.is_some();
+            let editing_port = dialog.editing;
+            let editing = editing_port.is_some();
             let title = if editing {
                 "Port options"
             } else {
@@ -361,17 +422,29 @@ impl App {
                                 .unwrap_or_else(|| "select a port…".into()),
                         )
                         .show_ui(ui, |ui| {
-                            for p in available.iter() {
-                                let text = format!("{}  {}", p.path, p.identity.label());
-                                ui.selectable_value(
-                                    &mut dialog.selected_path,
-                                    Some(p.path.clone()),
-                                    text,
+                            for (index, p) in available.iter().enumerate() {
+                                let added = available_port_is_added(
+                                    index,
+                                    available,
+                                    connections,
+                                    editing_port,
                                 );
+                                let text = port_choice_text(&p.path, &p.identity.label(), added);
+                                ui.add_enabled_ui(!added, |ui| {
+                                    ui.selectable_value(
+                                        &mut dialog.selected_path,
+                                        Some(p.path.clone()),
+                                        text,
+                                    );
+                                });
                             }
                         });
                     if available.is_empty() {
                         ui.weak("No serial ports detected.");
+                    } else if available.iter().enumerate().all(|(index, _)| {
+                        available_port_is_added(index, available, connections, editing_port)
+                    }) {
+                        ui.weak("All detected ports have already been added.");
                     }
 
                     ui.separator();
@@ -660,9 +733,6 @@ fn flow_label(f: FlowControl) -> &'static str {
 }
 
 fn state_dot(state: ConnState) -> char {
-    // Use characters the bundled font actually has: the Geometric-Shapes block
-    // (●/○/▼) is mostly missing, so use a bullet vs a middle-dot; colour carries
-    // the finer state distinctions.
     match state {
         ConnState::Connected | ConnState::Connecting | ConnState::Reconnecting => '•',
         ConnState::Lost | ConnState::Disconnected | ConnState::Closed => '·',
@@ -686,5 +756,67 @@ fn short_label(label: &str) -> String {
         format!("{s}…")
     } else {
         label.to_string()
+    }
+}
+
+/// Text for one detected-port choice. Path-only devices use their path as the
+/// identity label too; repeating it adds no information and is especially
+/// noisy for ordinary `/dev/tty*` and Windows `COM*` ports.
+fn port_choice_text(path: &str, device_label: &str, added: bool) -> String {
+    let suffix = if added { "  (added)" } else { "" };
+    if same_displayed_port(path, device_label) {
+        format!("{path}{suffix}")
+    } else {
+        format!("{path}  {device_label}{suffix}")
+    }
+}
+
+fn same_displayed_port(path: &str, device_label: &str) -> bool {
+    path == device_label
+        || windows_com_name(path).is_some_and(|path| {
+            windows_com_name(device_label).is_some_and(|label| path.eq_ignore_ascii_case(label))
+        })
+}
+
+/// Return the canonical `COM<number>` part of both normal (`COM3`) and Win32
+/// device-namespace (`\\.\COM10`) spellings.
+fn windows_com_name(value: &str) -> Option<&str> {
+    let value = value.strip_prefix(r"\\.\").unwrap_or(value);
+    let digits = value.get(3..)?;
+    (value.get(..3)?.eq_ignore_ascii_case("COM")
+        && !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit()))
+    .then_some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::port_choice_text;
+
+    #[test]
+    fn duplicate_unix_path_label_is_shown_once() {
+        assert_eq!(
+            port_choice_text("/dev/ttyUSB0", "/dev/ttyUSB0", false),
+            "/dev/ttyUSB0"
+        );
+        assert_eq!(
+            port_choice_text("/dev/ttyUSB0", "/dev/ttyUSB0", true),
+            "/dev/ttyUSB0  (added)"
+        );
+    }
+
+    #[test]
+    fn duplicate_windows_port_label_is_shown_once() {
+        assert_eq!(port_choice_text("COM3", "COM3", false), "COM3");
+        assert_eq!(port_choice_text("COM3", "com3", true), "COM3  (added)");
+        assert_eq!(port_choice_text(r"\\.\COM10", "COM10", false), r"\\.\COM10");
+    }
+
+    #[test]
+    fn useful_device_name_is_kept() {
+        assert_eq!(
+            port_choice_text("COM3", "ST-Link Virtual COM Port", false),
+            "COM3  ST-Link Virtual COM Port"
+        );
     }
 }

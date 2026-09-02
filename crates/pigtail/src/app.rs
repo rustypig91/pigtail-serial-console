@@ -6,7 +6,9 @@ use crate::wrap::WrapIndex;
 use crossbeam_channel::Receiver;
 use serialcore::clock::{SessionClock, Timestamp};
 use serialcore::config::{Config, ExtractRule, PortConfig, PortIdentity, SavedConnection};
-use serialcore::enumerate::{spawn_enumerator, DiscoveredPort, EnumEvent};
+use serialcore::enumerate::{
+    match_identity, spawn_enumerator, DiscoveredPort, EnumEvent, MatchResult,
+};
 use serialcore::extract::CompiledExtract;
 use serialcore::filter::{Combine, FilterIndex, FilterRule, FilterSet};
 use serialcore::framer::Framer;
@@ -1039,6 +1041,54 @@ pub struct ConnectError {
     pub message: String,
 }
 
+/// Whether one enumerated port is already represented by an open tab other
+/// than `except`.
+///
+/// A serial-numbered device can be recognized after its OS path changes. When
+/// several indistinguishable serial-less devices are present, identity
+/// matching is deliberately ambiguous, so their current paths disambiguate
+/// them instead of adding one device disabling every identical sibling.
+pub(crate) fn available_port_is_added(
+    index: usize,
+    available: &[DiscoveredPort],
+    connections: &[Connection],
+    except: Option<PortId>,
+) -> bool {
+    connections
+        .iter()
+        .filter(|conn| Some(conn.id) != except)
+        .any(|conn| match match_identity(&conn.identity, available) {
+            MatchResult::Definite(found) => found == index,
+            MatchResult::Ambiguous(candidates) => {
+                candidates.contains(&index) && available[index].path == conn.identity.path_fallback
+            }
+            MatchResult::None => false,
+        })
+}
+
+fn detected_connection_label(identity: &PortIdentity, path: &str) -> String {
+    let device = identity.label();
+    if device == path {
+        path.to_owned()
+    } else {
+        format!("{device} ({path})")
+    }
+}
+
+fn resolved_port<'a>(
+    identity: &PortIdentity,
+    available: &'a [DiscoveredPort],
+) -> Option<&'a DiscoveredPort> {
+    match match_identity(identity, available) {
+        MatchResult::Definite(index) => available.get(index),
+        MatchResult::Ambiguous(candidates) => candidates
+            .into_iter()
+            .filter_map(|index| available.get(index))
+            .find(|port| port.path == identity.path_fallback),
+        MatchResult::None => None,
+    }
+}
+
 pub struct UpdateDialog {
     pub title: String,
     pub message: String,
@@ -1114,6 +1164,17 @@ pub struct App {
     pub merged_search_source_generation: u64,
     pub merged_search_upto_seq: u64,
     pub merged_scroll_to: Option<MergedEntry>,
+    /// Follow the tail of the merged console. Kept separately from each
+    /// connection's pin so browsing the aggregate does not disturb any tab's
+    /// own scroll position.
+    pub merged_follow: bool,
+    /// Entries added while the merged console is not following its tail.
+    pub merged_new_since_scroll: u64,
+    /// Last measured viewport height, used by the merged view's explicit
+    /// bottom-pin calculation.
+    pub merged_pin_view_h: f32,
+    /// Device that receives raw keyboard input while the merged tab is open.
+    pub merged_tx_port: Option<PortId>,
     /// True when the merged pseudo-tab is active.
     pub merged_selected: bool,
     // Floating tool windows, toggled from the console right-click menu, so the
@@ -1195,6 +1256,10 @@ impl App {
             merged_search_source_generation: 0,
             merged_search_upto_seq: 0,
             merged_scroll_to: None,
+            merged_follow: true,
+            merged_new_since_scroll: 0,
+            merged_pin_view_h: 0.0,
+            merged_tx_port: None,
             merged_selected: false,
             show_settings: false,
             show_filters_win: false,
@@ -1292,7 +1357,15 @@ impl App {
         if self.config_dialog.is_some() || self.rename_dialog.is_some() {
             return;
         }
-        let selected_path = self.available.first().map(|p| p.path.clone());
+        let selected_path = self
+            .available
+            .iter()
+            .enumerate()
+            .find(|(index, _)| {
+                !available_port_is_added(*index, &self.available, &self.connections, None)
+            })
+            .map(|(_, port)| port)
+            .map(|p| p.path.clone());
         self.config_dialog = Some(ConfigDialog {
             selected_path,
             config: PortConfig::default(),
@@ -1314,11 +1387,7 @@ impl App {
         };
         let config = conn.port_config.clone();
         // Pre-select the device's current path if it's present right now.
-        let selected_path = self
-            .available
-            .iter()
-            .find(|p| p.identity == conn.identity)
-            .map(|p| p.path.clone());
+        let selected_path = resolved_port(&conn.identity, &self.available).map(|p| p.path.clone());
         self.config_dialog = Some(ConfigDialog {
             selected_path,
             config,
@@ -1499,7 +1568,7 @@ impl App {
             };
 
         let path_label = initial_path.unwrap_or_else(|| identity.label());
-        let label = format!("{} ({})", identity.label(), path_label);
+        let label = detected_connection_label(&identity, &path_label);
         let dtr = config.dtr_on_open;
         let rts = config.rts_on_open;
         // Marker delineating the settings change in the preserved log.
@@ -1601,7 +1670,7 @@ impl App {
         let id = PortId(self.next_port_id);
         self.next_port_id += 1;
         let path_label = initial_path.clone().unwrap_or_else(|| identity.label());
-        let label = format!("{} ({})", identity.label(), path_label);
+        let label = detected_connection_label(&identity, &path_label);
 
         let handle = match self.spawn_serial_reader(id, &identity, &port_config, initial_path) {
             Ok(handle) => handle,
@@ -1832,6 +1901,9 @@ impl App {
             return;
         }
         let conn = self.connections.remove(index);
+        if self.merged_tx_port == Some(conn.id) {
+            self.merged_tx_port = None;
+        }
         conn.handle.shutdown();
         if self.active >= self.connections.len() {
             self.active = self.connections.len().saturating_sub(1);
@@ -1844,6 +1916,15 @@ impl App {
         while let Ok(ev) = self.enum_rx.try_recv() {
             if let EnumEvent::Snapshot(snap) = ev {
                 self.available = snap;
+                // Restored tabs are opened before the enumerator's first
+                // snapshot, so they initially know only their saved identity.
+                // Once the current device is resolved, include its live OS path
+                // in the detected label used by the tab tooltip.
+                for conn in &mut self.connections {
+                    if let Some(port) = resolved_port(&conn.identity, &self.available) {
+                        conn.label = detected_connection_label(&conn.identity, &port.path);
+                    }
+                }
             }
         }
     }
@@ -1983,9 +2064,14 @@ impl App {
     /// Maintain the timestamp-interleaved merged view (spec §7.12). Rebuilds on
     /// connect/close; otherwise a fast append of each port's new tail.
     fn maintain_merged(&mut self) {
+        let rebuilding = self.merged_dirty;
         if self.merged_dirty {
             self.merged_dirty = false;
             self.merged.clear();
+            // A rebuild can remove entries (for example when a tab closes or
+            // history is trimmed), so the old aggregate unread count no longer
+            // describes the rebuilt view.
+            self.merged_new_since_scroll = 0;
             self.merged_seq = 0;
             self.merged_generation += 1;
             self.merged_pruned_before.clear();
@@ -2016,6 +2102,11 @@ impl App {
         self.prune_merged();
         if fresh.is_empty() {
             return;
+        }
+        if !rebuilding && !self.merged_follow {
+            self.merged_new_since_scroll = self
+                .merged_new_since_scroll
+                .saturating_add(fresh.len() as u64);
         }
         fresh.sort_by_key(|e| e.micros);
         for e in &mut fresh {
@@ -3517,6 +3608,187 @@ pub(crate) mod tests {
         assert_eq!(dialog.config.baud, 4800, "edits survive a second open");
     }
 
+    #[test]
+    fn new_connection_dialog_preselects_only_a_device_not_already_added() {
+        let (mut app, _enum_tx) = test_app("dialog-unused-device");
+        let added_identity = identity("A1");
+        let unused_identity = identity("B2");
+        app.available = vec![
+            DiscoveredPort {
+                path: "/dev/ttyUSB0".into(),
+                identity: added_identity.clone(),
+            },
+            DiscoveredPort {
+                path: "/dev/ttyUSB1".into(),
+                identity: unused_identity,
+            },
+        ];
+        let id = PortId(0);
+        app.connections.push(app.make_connection(
+            id,
+            "probe A1".into(),
+            added_identity,
+            PortConfig::default(),
+            inert_handle(id),
+        ));
+
+        app.open_config_dialog();
+
+        assert_eq!(
+            app.config_dialog.as_ref().unwrap().selected_path.as_deref(),
+            Some("/dev/ttyUSB1")
+        );
+    }
+
+    #[test]
+    fn first_enumerator_snapshot_adds_the_live_path_to_a_restored_tab_label() {
+        let (mut app, enum_tx) = test_app("restored-tab-path");
+        let mut saved_identity = identity("A1");
+        saved_identity.product = Some("Debug probe".into());
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            saved_identity.label(),
+            saved_identity.clone(),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        conn.name = Some("left target".into());
+        app.connections.push(conn);
+
+        let mut detected_identity = saved_identity;
+        detected_identity.path_fallback = "/dev/ttyUSB7".into();
+        enum_tx
+            .send(EnumEvent::Snapshot(vec![DiscoveredPort {
+                path: "/dev/ttyUSB7".into(),
+                identity: detected_identity,
+            }]))
+            .unwrap();
+        app.poll_enumerator();
+
+        let conn = &app.connections[0];
+        assert_eq!(conn.display_label(), "left target");
+        assert_eq!(conn.label, "Debug probe (/dev/ttyUSB7)");
+    }
+
+    #[test]
+    fn a_path_only_tab_label_does_not_repeat_the_path() {
+        let identity = PortIdentity {
+            path_fallback: "COM3".into(),
+            ..Default::default()
+        };
+        assert_eq!(detected_connection_label(&identity, "COM3"), "COM3");
+    }
+
+    #[test]
+    fn one_added_serialless_device_does_not_hide_its_identical_sibling() {
+        let (mut app, _enum_tx) = test_app("dialog-identical-devices");
+        let twin = |path: &str| PortIdentity {
+            vid: Some(0x1234),
+            pid: Some(0x5678),
+            path_fallback: path.into(),
+            ..Default::default()
+        };
+        app.available = vec![
+            DiscoveredPort {
+                path: "/dev/ttyUSB0".into(),
+                identity: twin("/dev/ttyUSB0"),
+            },
+            DiscoveredPort {
+                path: "/dev/ttyUSB1".into(),
+                identity: twin("/dev/ttyUSB1"),
+            },
+        ];
+        let id = PortId(0);
+        let conn = app.make_connection(
+            id,
+            "first twin".into(),
+            twin("/dev/ttyUSB0"),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        app.connections.push(conn);
+
+        assert!(available_port_is_added(
+            0,
+            &app.available,
+            &app.connections,
+            None
+        ));
+        assert!(!available_port_is_added(
+            1,
+            &app.available,
+            &app.connections,
+            None
+        ));
+    }
+
+    #[test]
+    fn port_options_allow_the_edited_device_but_not_another_tabs_device() {
+        let (mut app, _enum_tx) = test_app("dialog-edit-added-devices");
+        app.available = ["A1", "B2"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, serial)| DiscoveredPort {
+                path: format!("/dev/ttyUSB{index}"),
+                identity: identity(serial),
+            })
+            .collect();
+        for (index, port) in app.available.clone().into_iter().enumerate() {
+            let id = PortId(index as u32);
+            let conn = app.make_connection(
+                id,
+                port.identity.label(),
+                port.identity,
+                PortConfig::default(),
+                inert_handle(id),
+            );
+            app.connections.push(conn);
+        }
+
+        let editing = Some(PortId(0));
+        assert!(!available_port_is_added(
+            0,
+            &app.available,
+            &app.connections,
+            editing
+        ));
+        assert!(available_port_is_added(
+            1,
+            &app.available,
+            &app.connections,
+            editing
+        ));
+    }
+
+    #[test]
+    fn port_options_preselect_the_live_path_after_a_serial_device_moves() {
+        let (mut app, _enum_tx) = test_app("dialog-edit-moved-device");
+        let id = PortId(0);
+        let saved = identity("A1");
+        let mut live = saved.clone();
+        live.path_fallback = "/dev/ttyUSB7".into();
+        app.available.push(DiscoveredPort {
+            path: "/dev/ttyUSB7".into(),
+            identity: live,
+        });
+        let conn = app.make_connection(
+            id,
+            saved.label(),
+            saved,
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        app.connections.push(conn);
+
+        app.open_port_options(0);
+
+        assert_eq!(
+            app.config_dialog.unwrap().selected_path.as_deref(),
+            Some("/dev/ttyUSB7")
+        );
+    }
+
     /// Same for "Port options…" on a tab: it must not discard a dialog that
     /// is already up, whichever tab that dialog belongs to.
     #[test]
@@ -4186,5 +4458,44 @@ pub(crate) mod tests {
                  on a different match in its old slot"
             );
         }
+    }
+
+    #[test]
+    fn merged_unread_count_tracks_new_entries_and_resets_on_rebuild() {
+        let (mut app, _enum_tx) = test_app("merged-unread");
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            Default::default(),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        let line = |text: &str, micros| IncomingLine {
+            text: text.into(),
+            ts: Timestamp {
+                wall: chrono::Utc::now(),
+                micros,
+            },
+            port: id,
+            flags: LineFlags::default(),
+            spans: Default::default(),
+            cursor: None,
+        };
+        conn.store.append(line("old", 1));
+        app.connections.push(conn);
+        app.merged_follow = false;
+        app.merged_dirty = true;
+
+        app.maintain_merged();
+        assert_eq!(app.merged_new_since_scroll, 0);
+
+        app.connections[0].store.append(line("new", 2));
+        app.maintain_merged();
+        assert_eq!(app.merged_new_since_scroll, 1);
+
+        app.merged_dirty = true;
+        app.maintain_merged();
+        assert_eq!(app.merged_new_since_scroll, 0);
     }
 }

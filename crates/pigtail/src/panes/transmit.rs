@@ -20,11 +20,12 @@ use serialcore::store::{IncomingLine, LineFlags};
 
 impl App {
     /// Translate this frame's keyboard input into bytes for the device. Called
-    /// only when a live console tab is active and no widget holds focus.
-    pub(crate) fn console_key_input(&mut self, ctx: &egui::Context, active: usize) {
+    /// only when a live device is selected (directly or as the merged view's
+    /// send target) and no widget holds focus. Returns whether input was sent.
+    pub(crate) fn console_key_input(&mut self, ctx: &egui::Context, active: usize) -> bool {
         let events = ctx.input(|i| i.events.clone());
         if events.is_empty() {
-            return;
+            return false;
         }
         // egui-winit maps Ctrl+C/X/V to Copy/Cut/Paste events regardless of
         // Shift, so Shift has to be read separately to tell plain Ctrl+C/V
@@ -32,7 +33,7 @@ impl App {
         let shift = ctx.input(|i| i.modifiers.shift);
         let now = self.clock.now();
         let Some(conn) = self.connections.get_mut(active) else {
-            return;
+            return false;
         };
         // A `Closed` tab (a dead reader left by a failed reconnect, see
         // `App::reconnect_with_config`) has no channel on the other end:
@@ -40,7 +41,7 @@ impl App {
         // showed it as sent, so it's excluded here rather than left to look
         // like it worked.
         if conn.state == ConnState::Closed {
-            return;
+            return false;
         }
         let ending = conn.port_config.line_ending;
         let local_echo = conn.port_config.local_echo;
@@ -151,7 +152,7 @@ impl App {
         // `tx_input` had already been taken and pushed to history, so the input
         // was consumed and only its echo went missing (issue #43).
         if out.is_empty() && echo_lines.is_empty() {
-            return;
+            return false;
         }
         if !out.is_empty() {
             conn.handle.transmit(out);
@@ -169,6 +170,7 @@ impl App {
         // Typing re-engages autoscroll so the cursor stays in view.
         conn.follow = true;
         conn.new_since_scroll = 0;
+        true
     }
 }
 
@@ -654,6 +656,37 @@ mod tests {
         );
         assert!(ctx.memory(|m| m.focused().is_none()));
         let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn merged_console_sends_keyboard_input_to_its_selected_device() {
+        let (mut app, _enum_tx) = test_app("merged-send-target");
+        for id in [PortId(0), PortId(1)] {
+            let mut conn = app.make_connection(
+                id,
+                format!("probe-{}", id.0),
+                Default::default(),
+                PortConfig::default(),
+                inert_handle(id),
+            );
+            conn.follow = false;
+            app.connections.push(conn);
+        }
+        app.merged_selected = true;
+        app.merged_tx_port = Some(PortId(1));
+        app.merged_follow = false;
+
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![Event::Text("x".into())]);
+
+        assert!(app.connections[0].tx_input.is_empty());
+        assert_eq!(app.connections[1].tx_input, "x");
+        assert!(!app.connections[0].follow);
+        assert!(app.connections[1].follow);
+        assert!(
+            app.merged_follow,
+            "sending should re-pin the visible console"
+        );
     }
 
     #[test]
