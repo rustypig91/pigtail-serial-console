@@ -1982,16 +1982,21 @@ fn build_job(ui: &egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> LayoutJob 
     // Keep every match as a separate text run. Rules remain ordered so that
     // the first rule wins only where matches overlap, rather than tinting the
     // entire line because it matched somewhere.
-    let highlight_ranges: Vec<(usize, usize, egui::Color32)> = rctx
-        .highlight
-        .iter()
-        .flat_map(|hl| {
-            hl.re
-                .find_iter(text)
-                .filter(|m| !m.is_empty())
-                .map(move |m| (m.start(), m.end(), hl.color))
-        })
-        .collect();
+    let preserve_semantic_color = line.meta.flags.contains(LineFlags::TX_ECHO)
+        || line.meta.flags.contains(LineFlags::INVALID_UTF8);
+    let highlight_ranges: Vec<(usize, usize, egui::Color32)> = if preserve_semantic_color {
+        Vec::new()
+    } else {
+        rctx.highlight
+            .iter()
+            .flat_map(|hl| {
+                hl.re
+                    .find_iter(text)
+                    .filter(|m| !m.is_empty())
+                    .map(move |m| (m.start(), m.end(), hl.color))
+            })
+            .collect()
+    };
     let search_ranges: Vec<(usize, usize)> = match rctx.search_re {
         Some(re) => re.find_iter(text).map(|m| (m.start(), m.end())).collect(),
         None => Vec::new(),
@@ -2409,6 +2414,76 @@ mod tests {
         assert_eq!(sections[1].format.color, highlight_color);
         assert_eq!(sections[2].byte_range, 6..10);
         assert_eq!(sections[2].format.color, device_color);
+    }
+
+    #[test]
+    fn rule_highlight_preserves_semantic_line_colors() {
+        let highlight_color = egui::Color32::from_rgb(0xff, 0x55, 0x55);
+        let highlights = [CompiledHighlight {
+            re: regex::Regex::new("HIT").unwrap(),
+            color: highlight_color,
+        }];
+        let metrics = Metrics {
+            font: egui::FontId::monospace(12.0),
+            row_height: 14.0,
+            char_w: 8.0,
+            prefix_w: 0.0,
+            cols: 0,
+        };
+
+        for (case, (flags, expected_color)) in [
+            (
+                LineFlags::TX_ECHO,
+                egui::Color32::from_rgb(0x88, 0xbb, 0xff),
+            ),
+            (
+                LineFlags::INVALID_UTF8,
+                egui::Color32::from_rgb(0xcc, 0x99, 0x66),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let meta = LineMeta {
+                start: 0,
+                len: 3,
+                ts: ts(0),
+                port: PortId(1),
+                flags,
+                spans: Default::default(),
+                cursor: None,
+            };
+            let line = LineRef {
+                text: "HIT",
+                meta: &meta,
+            };
+            let rctx = RowCtx {
+                ts_format: TimestampFormat::None,
+                m: &metrics,
+                rows: 1,
+                prev_micros: None,
+                mark: None,
+                highlight: &highlights,
+                search_re: None,
+                is_search_current: false,
+                port_tag: None,
+                row_id: egui::Id::new(("rule-highlight-semantic-color-test", case)),
+            };
+
+            let ctx = egui::Context::default();
+            let mut job = None;
+            let _ = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    job = Some(build_job(ui, &line, &rctx));
+                });
+            });
+
+            let sections = job.unwrap().sections;
+            assert_eq!(sections.len(), 1);
+            assert_eq!(sections[0].byte_range, 0..3);
+            assert_eq!(sections[0].format.color, expected_color);
+            assert_ne!(sections[0].format.color, highlight_color);
+        }
     }
 
     #[test]
