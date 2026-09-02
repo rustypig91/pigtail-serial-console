@@ -1124,6 +1124,9 @@ pub struct App {
     /// Compiled global highlight rules; rebuilt when `highlight_dirty`.
     pub highlight_cache: Vec<CompiledHighlight>,
     pub highlight_dirty: bool,
+    /// Runtime master switch for rendering highlights. Individual rule states
+    /// stay untouched so they can be restored with one click from the footer.
+    pub highlights_visible: bool,
     /// Timestamp-interleaved merged view across all ports (spec §7.12).
     pub merged: Vec<MergedEntry>,
     pub merged_dirty: bool,
@@ -1234,6 +1237,7 @@ impl App {
             rename_dialog: None,
             highlight_cache: Vec::new(),
             highlight_dirty: true,
+            highlights_visible: true,
             merged: Vec::new(),
             merged_seq: 0,
             merged_dirty: false,

@@ -134,8 +134,16 @@ impl App {
                             .checkbox(&mut rule.case_sensitive, "case")
                             .on_hover_text("Match uppercase and lowercase exactly")
                             .changed();
-                        if let Some(c) = crate::app::parse_hex_color(&rule.color) {
-                            ui.colored_label(c, "■");
+                        let color = crate::app::parse_hex_color(&rule.color)
+                            .unwrap_or(egui::Color32::from_rgb(0xff, 0x55, 0x55));
+                        let mut rgb = [color.r(), color.g(), color.b()];
+                        if ui
+                            .color_edit_button_srgb(&mut rgb)
+                            .on_hover_text("Choose a highlight color")
+                            .changed()
+                        {
+                            rule.color = format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
+                            changed = true;
                         }
                         if ui.small_button("🗑").clicked() {
                             remove = Some(i);

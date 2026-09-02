@@ -773,8 +773,14 @@ impl App {
         let App {
             connections,
             highlight_cache,
+            highlights_visible,
             ..
         } = self;
+        let highlights = if *highlights_visible {
+            highlight_cache.as_slice()
+        } else {
+            &[]
+        };
         let conn = &mut connections[active];
         let follow = conn.follow;
         // Whether the *user* set a mark, which is what the menu offers to clear.
@@ -928,7 +934,7 @@ impl App {
                         rows: conn.wrap_index.rows(entry),
                         prev_micros,
                         mark,
-                        highlight: highlight_cache,
+                        highlight: highlights,
                         search_re: search_re.as_ref(),
                         is_search_current: cur_match_abs == Some(abs),
                         port_tag: None,
@@ -994,11 +1000,17 @@ impl App {
         let App {
             connections,
             highlight_cache,
+            highlights_visible,
             merged,
             merged_filtered,
             merged_wrap,
             ..
         } = self;
+        let highlights = if *highlights_visible {
+            highlight_cache.as_slice()
+        } else {
+            &[]
+        };
         let view = if filter_active {
             merged_filtered.as_slice()
         } else {
@@ -1098,7 +1110,7 @@ impl App {
                         rows,
                         prev_micros: None,
                         mark: session_start,
-                        highlight: highlight_cache,
+                        highlight: highlights,
                         search_re: search_re.as_ref(),
                         is_search_current: cur_match_seq == Some(seq),
                         port_tag: Some((short_tag(conn.merged_label(), tag_chars), color)),
@@ -1964,16 +1976,27 @@ fn build_job(ui: &egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> LayoutJob 
         base = egui::Color32::from_rgb(0x88, 0xbb, 0xff);
     } else if line.meta.flags.contains(LineFlags::INVALID_UTF8) {
         base = egui::Color32::from_rgb(0xcc, 0x99, 0x66);
-    } else {
-        for hl in rctx.highlight {
-            if hl.re.is_match(text) {
-                base = hl.color;
-                break;
-            }
-        }
     }
 
     let mut job = LayoutJob::default();
+    // Keep every match as a separate text run. Rules remain ordered so that
+    // the first rule wins only where matches overlap, rather than tinting the
+    // entire line because it matched somewhere.
+    let preserve_semantic_color = line.meta.flags.contains(LineFlags::TX_ECHO)
+        || line.meta.flags.contains(LineFlags::INVALID_UTF8);
+    let highlight_ranges: Vec<(usize, usize, egui::Color32)> = if preserve_semantic_color {
+        Vec::new()
+    } else {
+        rctx.highlight
+            .iter()
+            .flat_map(|hl| {
+                hl.re
+                    .find_iter(text)
+                    .filter(|m| !m.is_empty())
+                    .map(move |m| (m.start(), m.end(), hl.color))
+            })
+            .collect()
+    };
     let search_ranges: Vec<(usize, usize)> = match rctx.search_re {
         Some(re) => re.find_iter(text).map(|m| (m.start(), m.end())).collect(),
         None => Vec::new(),
@@ -1996,6 +2019,10 @@ fn build_job(ui: &egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> LayoutJob 
         cuts.push((s.start + s.len) as usize);
     }
     for (a, b) in &search_ranges {
+        cuts.push(*a);
+        cuts.push(*b);
+    }
+    for (a, b, _) in &highlight_ranges {
         cuts.push(*a);
         cuts.push(*b);
     }
@@ -2044,6 +2071,15 @@ fn build_job(ui: &egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> LayoutJob 
                         egui::Color32::from_rgb((s.bg >> 16) as u8, (s.bg >> 8) as u8, s.bg as u8);
                 }
             }
+        }
+        // Highlight is a UI override and therefore deliberately comes after
+        // device-provided ANSI foreground colors. The next run starts from
+        // its ANSI color again, effectively resetting after the matched text.
+        if let Some((_, _, highlight_color)) = highlight_ranges
+            .iter()
+            .find(|&&(ha, hb, _)| a >= ha && b <= hb)
+        {
+            color = *highlight_color;
         }
         let in_search = search_ranges.iter().any(|&(sa, sb)| a >= sa && b <= sb);
         let mut fmt = egui::TextFormat {
@@ -2311,6 +2347,143 @@ mod tests {
             sections[2].format.background,
             egui::Color32::from_rgb(0xCD, 0x31, 0x31)
         );
+    }
+
+    #[test]
+    fn rule_highlight_colors_only_the_match_and_then_restores_device_color() {
+        let mut meta = LineMeta {
+            start: 0,
+            len: 10,
+            ts: ts(0),
+            port: PortId(1),
+            flags: LineFlags::default(),
+            spans: Default::default(),
+            cursor: None,
+        };
+        let device_color = 0x34_98_db;
+        meta.spans.push(ColorSpan {
+            start: 0,
+            len: 10,
+            rgb: device_color,
+            bg: ColorSpan::NO_COLOR,
+            bold: false,
+        });
+        let line = LineRef {
+            text: "preHITpost",
+            meta: &meta,
+        };
+        let highlight_color = egui::Color32::from_rgb(0xff, 0x55, 0x55);
+        let highlights = [CompiledHighlight {
+            re: regex::Regex::new("HIT").unwrap(),
+            color: highlight_color,
+        }];
+        let metrics = Metrics {
+            font: egui::FontId::monospace(12.0),
+            row_height: 14.0,
+            char_w: 8.0,
+            prefix_w: 0.0,
+            cols: 0,
+        };
+        let rctx = RowCtx {
+            ts_format: TimestampFormat::None,
+            m: &metrics,
+            rows: 1,
+            prev_micros: None,
+            mark: None,
+            highlight: &highlights,
+            search_re: None,
+            is_search_current: false,
+            port_tag: None,
+            row_id: egui::Id::new("rule-highlight-device-color-test"),
+        };
+
+        let ctx = egui::Context::default();
+        let mut job = None;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                job = Some(build_job(ui, &line, &rctx));
+            });
+        });
+
+        let sections = job.unwrap().sections;
+        let device_color = egui::Color32::from_rgb(0x34, 0x98, 0xdb);
+        assert_eq!(sections.len(), 3);
+        assert_eq!(sections[0].byte_range, 0..3);
+        assert_eq!(sections[0].format.color, device_color);
+        assert_eq!(sections[1].byte_range, 3..6);
+        assert_eq!(sections[1].format.color, highlight_color);
+        assert_eq!(sections[2].byte_range, 6..10);
+        assert_eq!(sections[2].format.color, device_color);
+    }
+
+    #[test]
+    fn rule_highlight_preserves_semantic_line_colors() {
+        let highlight_color = egui::Color32::from_rgb(0xff, 0x55, 0x55);
+        let highlights = [CompiledHighlight {
+            re: regex::Regex::new("HIT").unwrap(),
+            color: highlight_color,
+        }];
+        let metrics = Metrics {
+            font: egui::FontId::monospace(12.0),
+            row_height: 14.0,
+            char_w: 8.0,
+            prefix_w: 0.0,
+            cols: 0,
+        };
+
+        for (case, (flags, expected_color)) in [
+            (
+                LineFlags::TX_ECHO,
+                egui::Color32::from_rgb(0x88, 0xbb, 0xff),
+            ),
+            (
+                LineFlags::INVALID_UTF8,
+                egui::Color32::from_rgb(0xcc, 0x99, 0x66),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let meta = LineMeta {
+                start: 0,
+                len: 3,
+                ts: ts(0),
+                port: PortId(1),
+                flags,
+                spans: Default::default(),
+                cursor: None,
+            };
+            let line = LineRef {
+                text: "HIT",
+                meta: &meta,
+            };
+            let rctx = RowCtx {
+                ts_format: TimestampFormat::None,
+                m: &metrics,
+                rows: 1,
+                prev_micros: None,
+                mark: None,
+                highlight: &highlights,
+                search_re: None,
+                is_search_current: false,
+                port_tag: None,
+                row_id: egui::Id::new(("rule-highlight-semantic-color-test", case)),
+            };
+
+            let ctx = egui::Context::default();
+            let mut job = None;
+            let _ = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    job = Some(build_job(ui, &line, &rctx));
+                });
+            });
+
+            let sections = job.unwrap().sections;
+            assert_eq!(sections.len(), 1);
+            assert_eq!(sections[0].byte_range, 0..3);
+            assert_eq!(sections[0].format.color, expected_color);
+            assert_ne!(sections[0].format.color, highlight_color);
+        }
     }
 
     #[test]

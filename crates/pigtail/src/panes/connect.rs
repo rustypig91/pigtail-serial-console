@@ -189,6 +189,8 @@ impl App {
         let mut toggle_pin = false;
         let mut toggle_plot = false;
         let mut toggle_hex = false;
+        let mut toggle_highlights = false;
+        let has_highlights = self.config.highlight.iter().any(|rule| rule.enabled);
         let mut merged_tx_port = self.merged_tx_port;
         let mut open_error_win: Option<serialcore::store::PortId> = None;
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
@@ -235,6 +237,14 @@ impl App {
                         if !self.merged_follow && self.merged_new_since_scroll > 0 {
                             ui.label(format!("{} new", self.merged_new_since_scroll));
                             ui.separator();
+                        }
+                        if has_highlights
+                            && ui
+                                .selectable_label(self.highlights_visible, "Highlights")
+                                .on_hover_text("Enable or disable all highlights")
+                                .clicked()
+                        {
+                            toggle_highlights = true;
                         }
                     });
                     return;
@@ -315,6 +325,14 @@ impl App {
                     {
                         toggle_hex = true;
                     }
+                    if has_highlights
+                        && ui
+                            .selectable_label(self.highlights_visible, "Highlights")
+                            .on_hover_text("Enable or disable all highlights")
+                            .clicked()
+                    {
+                        toggle_highlights = true;
+                    }
                     ui.separator();
                     if !conn.follow && conn.new_since_scroll > 0 {
                         ui.label(format!("{} new", conn.new_since_scroll));
@@ -344,6 +362,9 @@ impl App {
         });
 
         self.merged_tx_port = merged_tx_port;
+        if toggle_highlights {
+            self.highlights_visible = !self.highlights_visible;
+        }
         if toggle_pin && self.merged_selected {
             self.merged_follow = !self.merged_follow;
             if self.merged_follow {
