@@ -399,7 +399,8 @@ impl App {
             } = self;
             let dialog: &mut ConfigDialog = config_dialog.as_mut().unwrap();
             let mut load_preset: Option<usize> = None;
-            let editing = dialog.editing.is_some();
+            let editing_port = dialog.editing;
+            let editing = editing_port.is_some();
             let title = if editing {
                 "Port options"
             } else {
@@ -422,8 +423,12 @@ impl App {
                         )
                         .show_ui(ui, |ui| {
                             for (index, p) in available.iter().enumerate() {
-                                let added = !editing
-                                    && available_port_is_added(index, available, connections);
+                                let added = available_port_is_added(
+                                    index,
+                                    available,
+                                    connections,
+                                    editing_port,
+                                );
                                 let text = port_choice_text(&p.path, &p.identity.label(), added);
                                 ui.add_enabled_ui(!added, |ui| {
                                     ui.selectable_value(
@@ -436,11 +441,9 @@ impl App {
                         });
                     if available.is_empty() {
                         ui.weak("No serial ports detected.");
-                    } else if !editing
-                        && available.iter().enumerate().all(|(index, _)| {
-                            available_port_is_added(index, available, connections)
-                        })
-                    {
+                    } else if available.iter().enumerate().all(|(index, _)| {
+                        available_port_is_added(index, available, connections, editing_port)
+                    }) {
                         ui.weak("All detected ports have already been added.");
                     }
 

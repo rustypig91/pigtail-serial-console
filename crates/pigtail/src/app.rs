@@ -1041,7 +1041,8 @@ pub struct ConnectError {
     pub message: String,
 }
 
-/// Whether one enumerated port is already represented by an open tab.
+/// Whether one enumerated port is already represented by an open tab other
+/// than `except`.
 ///
 /// A serial-numbered device can be recognized after its OS path changes. When
 /// several indistinguishable serial-less devices are present, identity
@@ -1051,9 +1052,11 @@ pub(crate) fn available_port_is_added(
     index: usize,
     available: &[DiscoveredPort],
     connections: &[Connection],
+    except: Option<PortId>,
 ) -> bool {
     connections
         .iter()
+        .filter(|conn| Some(conn.id) != except)
         .any(|conn| match match_identity(&conn.identity, available) {
             MatchResult::Definite(found) => found == index,
             MatchResult::Ambiguous(candidates) => {
@@ -1358,7 +1361,9 @@ impl App {
             .available
             .iter()
             .enumerate()
-            .find(|(index, _)| !available_port_is_added(*index, &self.available, &self.connections))
+            .find(|(index, _)| {
+                !available_port_is_added(*index, &self.available, &self.connections, None)
+            })
             .map(|(_, port)| port)
             .map(|p| p.path.clone());
         self.config_dialog = Some(ConfigDialog {
@@ -1382,11 +1387,7 @@ impl App {
         };
         let config = conn.port_config.clone();
         // Pre-select the device's current path if it's present right now.
-        let selected_path = self
-            .available
-            .iter()
-            .find(|p| p.identity == conn.identity)
-            .map(|p| p.path.clone());
+        let selected_path = resolved_port(&conn.identity, &self.available).map(|p| p.path.clone());
         self.config_dialog = Some(ConfigDialog {
             selected_path,
             config,
@@ -3708,12 +3709,84 @@ pub(crate) mod tests {
         );
         app.connections.push(conn);
 
-        assert!(available_port_is_added(0, &app.available, &app.connections));
+        assert!(available_port_is_added(
+            0,
+            &app.available,
+            &app.connections,
+            None
+        ));
         assert!(!available_port_is_added(
             1,
             &app.available,
-            &app.connections
+            &app.connections,
+            None
         ));
+    }
+
+    #[test]
+    fn port_options_allow_the_edited_device_but_not_another_tabs_device() {
+        let (mut app, _enum_tx) = test_app("dialog-edit-added-devices");
+        app.available = ["A1", "B2"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, serial)| DiscoveredPort {
+                path: format!("/dev/ttyUSB{index}"),
+                identity: identity(serial),
+            })
+            .collect();
+        for (index, port) in app.available.clone().into_iter().enumerate() {
+            let id = PortId(index as u32);
+            let conn = app.make_connection(
+                id,
+                port.identity.label(),
+                port.identity,
+                PortConfig::default(),
+                inert_handle(id),
+            );
+            app.connections.push(conn);
+        }
+
+        let editing = Some(PortId(0));
+        assert!(!available_port_is_added(
+            0,
+            &app.available,
+            &app.connections,
+            editing
+        ));
+        assert!(available_port_is_added(
+            1,
+            &app.available,
+            &app.connections,
+            editing
+        ));
+    }
+
+    #[test]
+    fn port_options_preselect_the_live_path_after_a_serial_device_moves() {
+        let (mut app, _enum_tx) = test_app("dialog-edit-moved-device");
+        let id = PortId(0);
+        let saved = identity("A1");
+        let mut live = saved.clone();
+        live.path_fallback = "/dev/ttyUSB7".into();
+        app.available.push(DiscoveredPort {
+            path: "/dev/ttyUSB7".into(),
+            identity: live,
+        });
+        let conn = app.make_connection(
+            id,
+            saved.label(),
+            saved,
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        app.connections.push(conn);
+
+        app.open_port_options(0);
+
+        assert_eq!(
+            app.config_dialog.unwrap().selected_path.as_deref(),
+            Some("/dev/ttyUSB7")
+        );
     }
 
     /// Same for "Port options…" on a tab: it must not discard a dialog that
