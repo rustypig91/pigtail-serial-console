@@ -8,6 +8,8 @@
 //! Ctrl+C and Ctrl+V to always reach the device (interrupt / SYN) regardless
 //! of whether text happens to be selected in the log, and Ctrl+Shift+F opens
 //! search (see `log::show_console`), freeing plain Ctrl+F to reach the device.
+//! Any Ctrl+Shift+digit chord assigned to a transmit macro is also consumed
+//! before this module sees the frame's raw input.
 //!
 //! `PortConfig` still governs the send line ending, optional local echo (for
 //! devices that don't echo), and whether Up/Down recall local history instead

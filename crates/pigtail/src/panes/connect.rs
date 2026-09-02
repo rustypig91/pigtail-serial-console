@@ -4,6 +4,7 @@
 use crate::app::{available_port_is_added, App, ConfigDialog};
 use serialcore::config::{
     DataBits, FlowControl, LineEnding, NamedConfig, Parity, PortConfig, StopBits, TerminalMode,
+    TransmitMacro,
 };
 use serialcore::reader::ConnState;
 
@@ -38,6 +39,7 @@ impl App {
         let mut save_text = false;
         let mut port_options: Option<usize> = None;
         let mut rename_tab: Option<usize> = None;
+        let macros_tooltip = macro_tooltip(&self.config.macros);
 
         // The config dialog is meant to be modal, but an `egui::Window` does
         // not block input to what it covers, so the header would keep acting
@@ -122,6 +124,9 @@ impl App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("⚙").on_hover_text("Settings").clicked() {
                         self.show_settings = true;
+                    }
+                    if ui.button("Macros").on_hover_text(&macros_tooltip).clicked() {
+                        self.show_macros_win = true;
                     }
                     if ui
                         .add_enabled(self.active_index().is_some(), egui::Button::new("💾"))
@@ -780,6 +785,40 @@ fn short_label(label: &str) -> String {
     }
 }
 
+/// A compact catalog for the Macros header button. Keeping every field labeled
+/// makes several macros easy to scan without opening the editor.
+fn macro_tooltip(macros: &[TransmitMacro]) -> String {
+    if macros.is_empty() {
+        return "No macros configured. Click to add one.".to_owned();
+    }
+
+    let mut tooltip = String::from("Transmit macros\n");
+    for (index, macro_def) in macros.iter().enumerate() {
+        if index > 0 {
+            tooltip.push('\n');
+        }
+        let name = if macro_def.name.trim().is_empty() {
+            "(unnamed)"
+        } else {
+            macro_def.name.trim()
+        };
+        let description = if macro_def.description.trim().is_empty() {
+            "—"
+        } else {
+            macro_def.description.trim()
+        };
+        let shortcut = macro_def.shortcut.filter(|digit| *digit <= 9).map_or_else(
+            || "Unassigned".to_owned(),
+            |digit| format!("Ctrl+Shift+{digit}"),
+        );
+        tooltip.push_str(&format!(
+            "Name: {name}\nDescription: {description}\nShortcut: {shortcut}\n"
+        ));
+    }
+    tooltip.push_str("\nClick to edit or run macros.");
+    tooltip
+}
+
 /// Text for one detected-port choice. Path-only devices use their path as the
 /// identity label too; repeating it adds no information and is especially
 /// noisy for ordinary `/dev/tty*` and Windows `COM*` ports.
@@ -812,7 +851,8 @@ fn windows_com_name(value: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::port_choice_text;
+    use super::{macro_tooltip, port_choice_text};
+    use serialcore::config::TransmitMacro;
 
     #[test]
     fn duplicate_unix_path_label_is_shown_once() {
@@ -839,5 +879,28 @@ mod tests {
             port_choice_text("COM3", "ST-Link Virtual COM Port", false),
             "COM3  ST-Link Virtual COM Port"
         );
+    }
+
+    #[test]
+    fn macro_tooltip_lists_every_macro_and_field() {
+        let tooltip = macro_tooltip(&[
+            TransmitMacro {
+                name: "Boot".into(),
+                description: "Restart the target".into(),
+                shortcut: Some(2),
+                ..Default::default()
+            },
+            TransmitMacro {
+                name: "Status".into(),
+                description: String::new(),
+                shortcut: None,
+                ..Default::default()
+            },
+        ]);
+
+        assert!(
+            tooltip.contains("Name: Boot\nDescription: Restart the target\nShortcut: Ctrl+Shift+2")
+        );
+        assert!(tooltip.contains("Name: Status\nDescription: —\nShortcut: Unassigned"));
     }
 }

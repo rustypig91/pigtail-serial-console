@@ -144,6 +144,23 @@ pub fn load_config(paths: &AppPaths) -> Config {
     }
 }
 
+/// egui already embeds Hack for monospace text, and it covers common UI
+/// symbols that its proportional Ubuntu font does not (including ↑ and ↓).
+/// Reuse it as the final proportional fallback instead of bundling a second
+/// copy of another font solely for those glyphs.
+fn app_font_definitions() -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    if fonts.font_data.contains_key("Hack") {
+        let proportional = fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default();
+        proportional.retain(|font| font != "Hack");
+        proportional.push("Hack".to_owned());
+    }
+    fonts
+}
+
 /// List the session captures already on disk, paired with their metadata, so a
 /// reopened tab can be preloaded from the most recent one for its device.
 fn snapshot_captures(sessions_dir: &std::path::Path) -> Vec<(PathBuf, SessionMeta)> {
@@ -1099,6 +1116,15 @@ pub struct UpdateDialog {
     pub skip_version: Option<String>,
 }
 
+/// One in-flight macro execution. The definition is copied when it starts so
+/// editing or deleting a macro cannot change a sequence halfway through.
+pub(crate) struct MacroRun {
+    pub(crate) port: PortId,
+    pub(crate) steps: Vec<serialcore::config::MacroStep>,
+    pub(crate) next_step: usize,
+    pub(crate) next_at: Instant,
+}
+
 pub struct App {
     pub clock: SessionClock,
     pub config: Config,
@@ -1183,6 +1209,10 @@ pub struct App {
     // Floating tool windows, toggled from the console right-click menu, so the
     // main window stays uncluttered.
     pub show_settings: bool,
+    pub show_macros_win: bool,
+    /// Macro and step selected in the editor, used as the insertion point for
+    /// an explicit delay step.
+    pub(crate) macro_step_selection: Option<(usize, usize)>,
     pub show_filters_win: bool,
     pub show_highlight_win: bool,
     pub show_extract_win: bool,
@@ -1206,6 +1236,8 @@ pub struct App {
     /// it was set. Ctrl+wheel has nothing else to show for itself: the change
     /// it makes is legible only if you already know what you are looking for.
     pub font_toast: Option<(u8, f64)>,
+    /// Command sequences waiting for their next non-blocking delayed send.
+    pub(crate) macro_runs: Vec<MacroRun>,
     /// Background operations that failed outright — opening or reconnecting a
     /// port, starting the enumerator — rather than through the normal
     /// per-connection error path (e.g. the OS refused to spawn a thread).
@@ -1266,6 +1298,8 @@ impl App {
             merged_tx_port: None,
             merged_selected: false,
             show_settings: false,
+            show_macros_win: false,
+            macro_step_selection: None,
             show_filters_win: false,
             show_highlight_win: false,
             show_extract_win: false,
@@ -1276,11 +1310,14 @@ impl App {
             update_manual: false,
             update_dialog: None,
             font_toast: None,
+            macro_runs: Vec::new(),
             connect_errors: VecDeque::new(),
         }
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>, paths: AppPaths, config: Config) -> App {
+        cc.egui_ctx.set_fonts(app_font_definitions());
+
         // Theme from settings.
         let dark = config.settings.theme != "light";
         cc.egui_ctx.set_visuals(if dark {
@@ -2506,6 +2543,7 @@ impl App {
             || !self.connect_errors.is_empty()
             || self.update_dialog.is_some()
             || self.show_settings
+            || self.show_macros_win
             || self.show_filters_win
             || self.show_highlight_win
             || self.show_extract_win
@@ -2587,6 +2625,11 @@ impl eframe::App for App {
         self.poll_enumerator();
         self.poll_update_check();
 
+        // Macro shortcuts belong to the unfocused console, just like raw
+        // keyboard input. Consume an assigned chord before it can become bytes
+        // for the device or activate a widget during layout.
+        self.consume_macro_shortcut(ctx);
+
         let max_lines = self.config.settings.max_lines;
         let mut any_data = false;
         for conn in &mut self.connections {
@@ -2625,6 +2668,7 @@ impl eframe::App for App {
         self.show_config_dialog(ctx);
         self.show_rename_dialog(ctx);
         self.show_tool_windows(ctx);
+        self.show_macros_window(ctx);
         self.show_settings_window(ctx);
         self.show_update_dialog(ctx);
         self.show_font_toast(ctx);
@@ -2632,6 +2676,11 @@ impl eframe::App for App {
         // Keep the guard focused until every widget has been drawn, so none of
         // the later floating windows can claim this Tab either.
         self.release_console_tab_after_layout(ctx, console_tab_claimed);
+
+        // Sends every command whose deadline has arrived and schedules only
+        // the next deadline, keeping an otherwise idle console asleep between
+        // macro steps.
+        self.maintain_macro_runs(ctx);
 
         // A close-request frame may be the last update the app receives. Save
         // immediately in that case; otherwise coalesce rapid edits and wake the
@@ -3131,6 +3180,29 @@ pub(crate) mod tests {
     /// swapped for one this test controls.
     pub(crate) fn test_app(name: &str) -> (App, crossbeam_channel::Sender<EnumEvent>) {
         test_app_with_config(name, Config::default())
+    }
+
+    #[test]
+    fn bundled_hack_font_is_the_final_proportional_fallback() {
+        let fonts = app_font_definitions();
+        assert!(fonts.font_data.contains_key("Hack"));
+        assert_eq!(
+            fonts
+                .families
+                .get(&egui::FontFamily::Proportional)
+                .and_then(|family| family.last())
+                .map(String::as_str),
+            Some("Hack")
+        );
+
+        let ctx = egui::Context::default();
+        ctx.set_fonts(fonts);
+        ctx.begin_pass(Default::default());
+        assert!(ctx.fonts(|fonts| {
+            let ui_font = egui::FontId::proportional(12.0);
+            fonts.has_glyph(&ui_font, '↑') && fonts.has_glyph(&ui_font, '↓')
+        }));
+        let _ = ctx.end_pass();
     }
 
     /// Like `test_app`, but seeded with a config the test provides.
