@@ -412,6 +412,9 @@ pub struct NamedConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedConnection {
     pub identity: PortIdentity,
+    /// Optional user-assigned name shown in the tab and merged view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(flatten)]
     pub config: PortConfig,
 }
@@ -694,11 +697,34 @@ bold = true
                     pid: Some(4),
                     ..Default::default()
                 },
+                name: Some("debug probe".into()),
                 config: PortConfig::default(),
             }],
         };
         let s = cfg.to_toml().unwrap();
         let back = Config::from_toml(&s).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn saved_connection_name_is_backward_compatible() {
+        let cfg = Config::from_toml(
+            r#"
+                [[last_open]]
+                baud = 115200
+                data_bits = 8
+                parity = "none"
+                stop_bits = 1
+                flow_control = "none"
+                dtr_on_open = true
+                rts_on_open = false
+                [last_open.identity]
+                path_fallback = "/dev/ttyS0"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.last_open.len(), 1);
+        assert_eq!(cfg.last_open[0].name, None);
     }
 }

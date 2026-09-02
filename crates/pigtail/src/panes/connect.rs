@@ -37,6 +37,7 @@ impl App {
         let mut new_tab = false;
         let mut save_text = false;
         let mut port_options: Option<usize> = None;
+        let mut rename_tab: Option<usize> = None;
 
         // The config dialog is meant to be modal, but an `egui::Window` does
         // not block input to what it covers, so the header would keep acting
@@ -46,7 +47,7 @@ impl App {
         // `editing` pointing at a tab that no longer exists (issue #16).
         // Disabled rather than merely ignored so the greying-out shows *why*
         // the clicks do nothing.
-        let modal_open = self.config_dialog.is_some();
+        let modal_open = self.config_dialog.is_some() || self.rename_dialog.is_some();
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -56,22 +57,23 @@ impl App {
                 ui.add_enabled_ui(!modal_open, |ui| {
                     for (i, conn) in self.connections.iter().enumerate() {
                         let selected = !self.merged_selected && self.active == i;
+                        let display_label = conn.display_label();
                         let label =
-                            format!("{} {}", state_dot(conn.state), short_label(&conn.label));
+                            format!("{} {}", state_dot(conn.state), short_label(display_label));
+                        let device_label = if conn.name.is_some() {
+                            format!("{}\n{}", display_label, conn.label)
+                        } else {
+                            conn.label.clone()
+                        };
                         // `on_hover_text` only fires on an *enabled* widget,
-                        // so a disabled tab needs its own tooltip — without
-                        // one the header would be reduced to truncated
-                        // `short_label`s with no way to tell which device a
-                        // tab is while the dialog is up.
+                        // so a disabled tab needs its own tooltip to keep the
+                        // detected device name and port available.
                         let resp = ui
                             .selectable_label(selected, label)
-                            .on_hover_text(format!(
-                                "{}\n(middle-click or right-click to close)",
-                                conn.label
-                            ))
+                            .on_hover_text(&device_label)
                             .on_disabled_hover_text(format!(
                                 "{}\n(finish or cancel the open dialog first)",
-                                conn.label
+                                device_label
                             ));
                         if resp.clicked() {
                             set_active = Some(i);
@@ -82,6 +84,10 @@ impl App {
                         }
                         // Right-click menu on the tab.
                         resp.context_menu(|ui| {
+                            if ui.button("Rename…").clicked() {
+                                rename_tab = Some(i);
+                                ui.close_menu();
+                            }
                             if ui.button("Port options…").clicked() {
                                 port_options = Some(i);
                                 ui.close_menu();
@@ -142,6 +148,9 @@ impl App {
         }
         if let Some(i) = port_options {
             self.open_port_options(i);
+        }
+        if let Some(i) = rename_tab {
+            self.open_rename_dialog(i);
         }
         if new_tab {
             self.open_config_dialog();
@@ -450,6 +459,62 @@ impl App {
                 }
                 None => self.connect_from_dialog(),
             }
+        }
+    }
+
+    /// Modal editor for a tab's user-facing name. This does not reconnect the
+    /// serial port; it only updates display state and the remembered session.
+    pub(crate) fn show_rename_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.rename_dialog.as_ref() else {
+            return;
+        };
+        if self.defer_to_connect_error() {
+            return;
+        }
+
+        let detected_label = self
+            .connections
+            .iter()
+            .find(|conn| conn.id == dialog.port)
+            .map(|conn| conn.label.clone())
+            .unwrap_or_default();
+        let mut save = false;
+        let mut cancel = false;
+
+        let dialog = self.rename_dialog.as_mut().unwrap();
+        egui::Window::new("Rename tab")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label("Tab name");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut dialog.name)
+                        .hint_text(&detected_label)
+                        .desired_width(280.0),
+                );
+                ui.weak("Leave empty to use the detected device name.");
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    save = true;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+            });
+
+        if save {
+            let dialog = self.rename_dialog.take().unwrap();
+            self.rename_connection(dialog.port, &dialog.name);
+        } else if cancel {
+            self.rename_dialog = None;
         }
     }
 }

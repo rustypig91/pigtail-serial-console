@@ -394,7 +394,11 @@ impl TabError {
 /// One open connection (a tab).
 pub struct Connection {
     pub id: PortId,
+    /// Automatically detected device/path label. Kept even when `name` is set
+    /// so clearing a custom name can restore it without re-enumerating.
     pub label: String,
+    /// User-assigned display name, if any.
+    pub name: Option<String>,
     pub identity: PortIdentity,
     pub port_config: PortConfig,
     pub handle: reader::ReaderHandle,
@@ -505,7 +509,28 @@ pub struct Connection {
     pub rts: bool,
 }
 
+fn normalized_tab_name(name: &str) -> Option<String> {
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 impl Connection {
+    /// Label presented to the user, preferring their custom name over the
+    /// automatically detected device/path description.
+    pub fn display_label(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.label)
+    }
+
+    /// Compact source name used before each row in the merged console.
+    /// Automatic labels include a path in parentheses, for which the first
+    /// token remains the useful compact identifier; custom names are kept
+    /// intact so a name such as "left sensor" remains recognizable.
+    pub fn merged_label(&self) -> &str {
+        self.name
+            .as_deref()
+            .unwrap_or_else(|| self.label.split_whitespace().next().unwrap_or(&self.label))
+    }
+
     pub(crate) fn apply_history_limits(&mut self, limits: HistoryLimits) {
         self.history_allocation_shrink_pending |= limits.max_lines < self.history_max_lines
             || limits.raw_bytes < self.raw_capacity
@@ -997,6 +1022,13 @@ pub struct ConfigDialog {
     pub editing: Option<PortId>,
 }
 
+/// Working state of the modal used to name an existing connection tab.
+pub struct RenameDialog {
+    pub port: PortId,
+    /// Empty means "use the detected device label" when saved.
+    pub name: String,
+}
+
 /// The update notice: what it says, and what its buttons do.
 /// A background failure with nowhere else to show itself (see
 /// `App::connect_errors`): a title naming what was being attempted, and the
@@ -1037,6 +1069,8 @@ pub struct App {
     pub next_port_id: u32,
     /// `Some` while the modal new-connection dialog is open.
     pub config_dialog: Option<ConfigDialog>,
+    /// `Some` while the modal tab-name dialog is open.
+    pub rename_dialog: Option<RenameDialog>,
     /// Compiled global highlight rules; rebuilt when `highlight_dirty`.
     pub highlight_cache: Vec<CompiledHighlight>,
     pub highlight_dirty: bool,
@@ -1136,6 +1170,7 @@ impl App {
             active: 0,
             next_port_id: 0,
             config_dialog: None,
+            rename_dialog: None,
             highlight_cache: Vec::new(),
             highlight_dirty: true,
             merged: Vec::new(),
@@ -1229,7 +1264,7 @@ impl App {
             // rewrite it from `self.connections` mid-restore, permanently
             // dropping any earlier entry that failed transiently before a
             // later one succeeds and triggers the save.
-            if app.open_connection_inner(saved.identity.clone(), None, saved.config) {
+            if app.open_connection_inner(saved.identity.clone(), None, saved.config, saved.name) {
                 let conn = app.connections.last_mut().unwrap();
                 preload_last_session(
                     conn,
@@ -1254,7 +1289,7 @@ impl App {
     /// guard lives here so every entry point — including the empty-console
     /// "+ New connection" button — is covered by construction.
     pub fn open_config_dialog(&mut self) {
-        if self.config_dialog.is_some() {
+        if self.config_dialog.is_some() || self.rename_dialog.is_some() {
             return;
         }
         let selected_path = self.available.first().map(|p| p.path.clone());
@@ -1271,7 +1306,7 @@ impl App {
     /// Like `open_config_dialog`, this leaves an already-open dialog alone
     /// rather than discarding its in-progress edits.
     pub fn open_port_options(&mut self, index: usize) {
-        if self.config_dialog.is_some() {
+        if self.config_dialog.is_some() || self.rename_dialog.is_some() {
             return;
         }
         let Some(conn) = self.connections.get(index) else {
@@ -1290,6 +1325,30 @@ impl App {
             preset_name: String::new(),
             editing: Some(conn.id),
         });
+    }
+
+    /// Open the modal for assigning a display name to an existing tab.
+    pub fn open_rename_dialog(&mut self, index: usize) {
+        if self.config_dialog.is_some() || self.rename_dialog.is_some() {
+            return;
+        }
+        let Some(conn) = self.connections.get(index) else {
+            return;
+        };
+        self.rename_dialog = Some(RenameDialog {
+            port: conn.id,
+            name: conn.name.clone().unwrap_or_default(),
+        });
+    }
+
+    /// Apply a custom tab name. Whitespace-only input restores the detected
+    /// device label, and the remembered session is updated immediately.
+    pub fn rename_connection(&mut self, port: PortId, name: &str) {
+        let Some(conn) = self.connections.iter_mut().find(|conn| conn.id == port) else {
+            return;
+        };
+        conn.name = normalized_tab_name(name);
+        self.save_session();
     }
 
     /// Spawn a reader for a live serial device (shared by open and reconnect).
@@ -1523,7 +1582,7 @@ impl App {
         initial_path: Option<String>,
         port_config: PortConfig,
     ) {
-        if self.open_connection_inner(identity, initial_path, port_config) {
+        if self.open_connection_inner(identity, initial_path, port_config, None) {
             self.save_session();
         }
     }
@@ -1537,6 +1596,7 @@ impl App {
         identity: PortIdentity,
         initial_path: Option<String>,
         port_config: PortConfig,
+        name: Option<String>,
     ) -> bool {
         let id = PortId(self.next_port_id);
         self.next_port_id += 1;
@@ -1554,7 +1614,8 @@ impl App {
                 return false;
             }
         };
-        let conn = self.make_connection(id, label, identity, port_config, handle);
+        let mut conn = self.make_connection(id, label, identity, port_config, handle);
+        conn.name = name.and_then(|name| normalized_tab_name(&name));
         self.connections.push(conn);
         self.active = self.connections.len() - 1;
         self.merged_selected = false;
@@ -1574,6 +1635,7 @@ impl App {
             .filter(|c| c.state != ConnState::Closed)
             .map(|c| SavedConnection {
                 identity: c.identity.clone(),
+                name: c.name.clone(),
                 config: c.port_config.clone(),
             })
             .collect();
@@ -1594,6 +1656,7 @@ impl App {
         Connection {
             id,
             label,
+            name: None,
             identity,
             port_config,
             handle,
@@ -2344,6 +2407,7 @@ impl App {
     /// fields, so a newly added window only needs to be listed here once.
     pub fn floating_window_open(&self) -> bool {
         self.config_dialog.is_some()
+            || self.rename_dialog.is_some()
             || !self.connect_errors.is_empty()
             || self.update_dialog.is_some()
             || self.show_settings
@@ -2464,6 +2528,7 @@ impl eframe::App for App {
 
         // Floating windows.
         self.show_config_dialog(ctx);
+        self.show_rename_dialog(ctx);
         self.show_tool_windows(ctx);
         self.show_settings_window(ctx);
         self.show_update_dialog(ctx);
@@ -3364,6 +3429,33 @@ pub(crate) mod tests {
             .merged
             .iter()
             .all(|entry| app.connections[0].store.get(entry.abs).is_some()));
+    }
+
+    #[test]
+    fn a_tab_name_is_trimmed_persisted_and_can_be_cleared() {
+        let (mut app, _enum_tx) = test_app("tab-name");
+        let id = PortId(1);
+        let conn = app.make_connection(
+            id,
+            "Detected device (/dev/ttyUSB0)".into(),
+            identity("named"),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        app.connections.push(conn);
+
+        app.rename_connection(id, "  left sensor  ");
+        assert_eq!(app.connections[0].display_label(), "left sensor");
+        assert_eq!(app.connections[0].merged_label(), "left sensor");
+        assert_eq!(app.config.last_open[0].name.as_deref(), Some("left sensor"));
+
+        app.rename_connection(id, "   ");
+        assert_eq!(
+            app.connections[0].display_label(),
+            "Detected device (/dev/ttyUSB0)"
+        );
+        assert_eq!(app.connections[0].merged_label(), "Detected");
+        assert_eq!(app.config.last_open[0].name, None);
     }
 
     /// `save_session` must not persist a `Closed` zombie into `last_open`: if
