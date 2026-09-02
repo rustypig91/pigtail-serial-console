@@ -237,7 +237,7 @@ impl Metrics {
         font: egui::FontId,
         ts: TimestampFormat,
         wrap: bool,
-        port_tag: bool,
+        port_tag_chars: usize,
         tx_marker: bool,
     ) -> Metrics {
         let (row_height, advance) = ui.fonts(|f| (f.row_height(&font), f.glyph_width(&font, '0')));
@@ -254,8 +254,9 @@ impl Metrics {
         // moves. Kept as narrow as it can be: this is dead space on the majority
         // of rows, which carry no marker at all.
         let mut prefix_w = 0.0;
-        if port_tag {
-            prefix_w += 8.0 * char_w + ROW_GAP; // "[abcdef]"
+        if port_tag_chars > 0 {
+            // Two more columns for the brackets around the source name.
+            prefix_w += (port_tag_chars + 2) as f32 * char_w + ROW_GAP;
         }
         let ts_cols = match ts {
             TimestampFormat::None => 0,
@@ -519,7 +520,7 @@ impl App {
                     // (issue #16, same as the header's "+").
                     if ui
                         .add_enabled(
-                            self.config_dialog.is_none(),
+                            self.config_dialog.is_none() && self.rename_dialog.is_none(),
                             egui::Button::new("+ New connection"),
                         )
                         .clicked()
@@ -742,7 +743,7 @@ impl App {
             self.console_font(),
             ts_format,
             self.config.settings.wrap_lines,
-            false,
+            0,
             tx_marker(&self.connections[active]),
         );
         // Bring the row index up to date before anything asks how tall the
@@ -969,12 +970,13 @@ impl App {
             .merged_search_pos
             .and_then(|pos| self.merged_search_matches.get(pos))
             .map(|entry| entry.seq);
+        let tag_chars = merged_tag_width(&self.connections);
         let m = Metrics::new(
             ui,
             self.console_font(),
             ts_format,
             self.config.settings.wrap_lines,
-            true,
+            tag_chars,
             self.connections.iter().any(tx_marker),
         );
         let App {
@@ -1074,7 +1076,7 @@ impl App {
                         highlight: highlight_cache,
                         search_re: search_re.as_ref(),
                         is_search_current: cur_match_seq == Some(seq),
-                        port_tag: Some((short_tag(&conn.label), color)),
+                        port_tag: Some((short_tag(conn.merged_label(), tag_chars), color)),
                         row_id: egui::Id::new(("merged_row", port, abs)),
                     };
                     let resp = render_row(ui, &line, &rctx);
@@ -1083,7 +1085,7 @@ impl App {
                         console_menu(
                             ui,
                             menu,
-                            Some(MenuTarget::row(port, &conn.label, abs)),
+                            Some(MenuTarget::row(port, conn.display_label(), abs)),
                             ts_format,
                             has_mark,
                             true,
@@ -1124,7 +1126,7 @@ impl App {
             self.console_font(),
             TimestampFormat::None,
             false,
-            false,
+            0,
             false,
         );
         let font = m.font.clone();
@@ -1453,6 +1455,7 @@ fn write_merged_export(
     entries: &[MergedEntry],
     as_csv: bool,
 ) -> std::io::Result<()> {
+    let tag_chars = merged_tag_width(connections);
     if as_csv {
         writeln!(writer, "port,wall_time,micros,flags,text")?;
     }
@@ -1463,7 +1466,7 @@ fn write_merged_export(
         let Some(line) = conn.store.get(entry.abs) else {
             continue;
         };
-        let tag = short_tag(&conn.label);
+        let tag = short_tag(conn.merged_label(), tag_chars);
         if as_csv {
             writeln!(
                 writer,
@@ -2079,11 +2082,29 @@ fn csv_escape(s: &str) -> String {
     }
 }
 
-fn short_tag(label: &str) -> String {
+const MIN_MERGED_TAG_CHARS: usize = 6;
+const MAX_MERGED_TAG_CHARS: usize = 24;
+
+fn merged_tag_width(connections: &[Connection]) -> usize {
+    connections
+        .iter()
+        .map(|conn| conn.merged_label().chars().count())
+        .max()
+        .unwrap_or(MIN_MERGED_TAG_CHARS)
+        .clamp(MIN_MERGED_TAG_CHARS, MAX_MERGED_TAG_CHARS)
+}
+
+fn short_tag(label: &str, width: usize) -> String {
     let base = label.trim_start_matches(['▶', ' ']);
-    let base = base.split_whitespace().next().unwrap_or(base);
-    let mut t: String = base.chars().take(6).collect();
-    while t.chars().count() < 6 {
+    let count = base.chars().count();
+    let mut t = if count > width {
+        let mut truncated: String = base.chars().take(width.saturating_sub(1)).collect();
+        truncated.push('…');
+        truncated
+    } else {
+        base.to_owned()
+    };
+    while t.chars().count() < width {
         t.push(' ');
     }
     format!("[{t}]")
@@ -2393,6 +2414,39 @@ mod tests {
     }
 
     #[test]
+    fn merged_export_uses_the_full_custom_device_name() {
+        let (app, _enum_tx) = test_app("named-merged-export");
+        let id = PortId(1);
+        let mut conn = app.make_connection(
+            id,
+            "detected (/dev/ttyUSB0)".into(),
+            PortIdentity::default(),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        conn.name = Some("left sensor".into());
+        conn.store.append(IncomingLine {
+            text: "ready".into(),
+            ts: ts(1),
+            port: id,
+            flags: LineFlags::default(),
+            spans: Default::default(),
+            cursor: None,
+        });
+        let entries = [MergedEntry {
+            micros: 1,
+            port: id,
+            abs: 0,
+            seq: 0,
+        }];
+
+        let mut text = Vec::new();
+        write_merged_export(&mut text, &[conn], &entries, false).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.starts_with("[left sensor]"));
+    }
+
+    #[test]
     fn active_export_writes_only_the_filtered_view() {
         let (app, _enum_tx) = test_app("active-export");
         let id = PortId(1);
@@ -2681,7 +2735,7 @@ mod tests {
                         egui::FontId::monospace(12.0),
                         TimestampFormat::None,
                         false,
-                        false,
+                        0,
                         false,
                     );
                     let row_height = m.row_height;

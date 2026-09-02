@@ -14,7 +14,8 @@ Most serial terminals just show you text. Pigtail is built around the parts of f
 - Auto-reconnect by USB VID/PID/serial number, with a visible marker showing exactly where a gap occurred
 - Regex or plain-text filtering and search over full scrollback
 - Highlight rules (color/bold by pattern)
-- Multiple ports as tabs, plus a merged view interleaving all ports by timestamp
+- Multiple ports as persistent, user-named tabs, plus a merged view that labels
+  and interleaves every device by timestamp
 - Hex view alongside the text view
 - Transmit with configurable line endings, send history, and hex input
 - DTR/RTS toggles and break signal
