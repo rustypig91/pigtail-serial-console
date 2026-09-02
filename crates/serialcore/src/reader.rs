@@ -156,6 +156,8 @@ pub enum SourceSpec {
     },
     /// A prebuilt one-shot source (e.g. a scripted test fixture); no reconnect.
     OneShot(Box<dyn ByteSource>),
+    #[cfg(debug_assertions)]
+    VirtualEcho,
 }
 
 /// Configuration for spawning a reader.
@@ -410,18 +412,42 @@ fn run(
             config: pcfg,
             initial_path,
         } => {
-            let mut first = true;
-            let opener: Opener = Box::new(move || {
-                let path = resolve_path(&identity, &pcfg, &mut first, &initial_path)?;
-                Ok(Box::new(SerialSource::open(&path, &pcfg)?) as Box<dyn ByteSource>)
-            });
-            (opener, true)
+            #[cfg(debug_assertions)]
+            if crate::source::is_debug_echo_path(&identity.path_fallback) {
+                let opener: Opener = Box::new(|| {
+                    Ok(Box::new(crate::source::VirtualEchoSource::new()) as Box<dyn ByteSource>)
+                });
+                (opener, false)
+            } else {
+                let mut first = true;
+                let opener: Opener = Box::new(move || {
+                    let path = resolve_path(&identity, &pcfg, &mut first, &initial_path)?;
+                    Ok(Box::new(SerialSource::open(&path, &pcfg)?) as Box<dyn ByteSource>)
+                });
+                (opener, true)
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                let mut first = true;
+                let opener: Opener = Box::new(move || {
+                    let path = resolve_path(&identity, &pcfg, &mut first, &initial_path)?;
+                    Ok(Box::new(SerialSource::open(&path, &pcfg)?) as Box<dyn ByteSource>)
+                });
+                (opener, true)
+            }
         }
         SourceSpec::OneShot(src) => {
             let mut slot = Some(src);
             let opener: Opener = Box::new(move || {
                 slot.take()
                     .ok_or_else(|| SourceError::Disconnected("source exhausted".into()))
+            });
+            (opener, false)
+        }
+        #[cfg(debug_assertions)]
+        SourceSpec::VirtualEcho => {
+            let opener: Opener = Box::new(|| {
+                Ok(Box::new(crate::source::VirtualEchoSource::new()) as Box<dyn ByteSource>)
             });
             (opener, false)
         }
