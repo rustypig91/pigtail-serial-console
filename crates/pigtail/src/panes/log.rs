@@ -353,6 +353,21 @@ struct RowCtx<'a> {
 }
 
 impl App {
+    /// Connection that currently receives keyboard input from the visible
+    /// console. The merged pseudo-tab has an explicit device target instead of
+    /// falling back to whichever ordinary tab was active last.
+    fn console_input_index(&self) -> Option<usize> {
+        if self.merged_selected {
+            let id = self.merged_tx_port?;
+            self.connections
+                .iter()
+                .position(|conn| conn.id == id && conn.state != ConnState::Closed)
+        } else {
+            self.active_index()
+                .filter(|&active| self.connections[active].state != ConnState::Closed)
+        }
+    }
+
     /// UI overlays that own keyboard input without necessarily taking egui's
     /// widget focus. Check this both before layout and before transmitting: an
     /// overlay can be opened by another event in the same input batch as Tab.
@@ -372,10 +387,7 @@ impl App {
         // open, so neither can be inferred from `memory().focused()` below.
         let live_console = !self.keyboard_overlay_open(ctx)
             && !self.search_focus_request
-            && !self.merged_selected
-            && self
-                .active_index()
-                .is_some_and(|active| self.connections[active].state != ConnState::Closed);
+            && self.console_input_index().is_some();
         let tab_pressed = ctx.input(|i| {
             i.events.iter().any(|event| {
                 matches!(
@@ -576,16 +588,16 @@ impl App {
         // focus, so `memory().focused()` alone wouldn't catch it.
         let focused = ctx.memory(|m| m.focused());
         let console_owns_focus = console_tab_claimed && focused == Some(console_tab_guard_id());
-        if !self.keyboard_overlay_open(ctx) && !self.search_focus_request && !self.merged_selected {
+        if !self.keyboard_overlay_open(ctx) && !self.search_focus_request {
             // Do not steal focus traversal unless there is a live console to
             // receive the key. With no connection (or a Closed zombie tab),
             // Tab belongs to the remaining UI controls instead.
-            if let Some(active) = self
-                .active_index()
-                .filter(|&active| self.connections[active].state != ConnState::Closed)
-            {
-                if focused.is_none() || console_owns_focus {
-                    self.console_key_input(ctx, active);
+            if let Some(active) = self.console_input_index() {
+                let input_sent = (focused.is_none() || console_owns_focus)
+                    && self.console_key_input(ctx, active);
+                if input_sent && self.merged_selected {
+                    self.merged_follow = true;
+                    self.merged_new_since_scroll = 0;
                 }
             }
         }
@@ -1024,6 +1036,12 @@ impl App {
             Some(merged_wrap.start_row(entry) as f32 * row_height - ui.available_height() * 0.5)
         });
 
+        let user_scrolled = ui.input(user_scrolled);
+        if scroll_offset.is_some() || (self.merged_follow && user_scrolled) {
+            self.merged_follow = false;
+        }
+        let following = self.merged_follow && scroll_offset.is_none();
+
         let bg = ui.interact(
             ui.available_rect_before_wrap(),
             ui.id().with("merged_bg"),
@@ -1038,12 +1056,19 @@ impl App {
 
         let mut area = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .drag_to_scroll(false)
-            .stick_to_bottom(true);
+            .drag_to_scroll(false);
         if let Some(offset) = scroll_offset {
             area = area.vertical_scroll_offset(offset.max(0.0));
+        } else if following {
+            let view_h = if self.merged_pin_view_h > 0.0 {
+                self.merged_pin_view_h
+            } else {
+                ui.available_height()
+            };
+            let bottom = ((n_rows as f32) * row_height - view_h).max(0.0);
+            area = area.vertical_scroll_offset(bottom);
         }
-        area.show_viewport(ui, |ui, viewport| {
+        let output = area.show_viewport(ui, |ui, viewport| {
             ui.set_width(ui.available_width());
             ui.set_height(n_rows as f32 * row_height);
             let (first_entry, rect) = viewport_entries(ui, viewport, merged_wrap, row_height);
@@ -1094,6 +1119,11 @@ impl App {
                 }
             });
         });
+        rearm_follow_at_bottom(&mut self.merged_follow, user_scrolled, &output, row_height);
+        if self.merged_follow {
+            self.merged_new_since_scroll = 0;
+        }
+        self.merged_pin_view_h = output.inner_rect.height();
     }
 
     fn show_hex_rows(&mut self, ui: &mut egui::Ui, active: usize, menu: &mut MenuAction) {
@@ -2082,7 +2112,7 @@ fn csv_escape(s: &str) -> String {
     }
 }
 
-const MIN_MERGED_TAG_CHARS: usize = 6;
+/// Keep an unusually long custom device name from consuming the merged row.
 const MAX_MERGED_TAG_CHARS: usize = 24;
 
 fn merged_tag_width(connections: &[Connection]) -> usize {
@@ -2090,11 +2120,14 @@ fn merged_tag_width(connections: &[Connection]) -> usize {
         .iter()
         .map(|conn| conn.merged_label().chars().count())
         .max()
-        .unwrap_or(MIN_MERGED_TAG_CHARS)
-        .clamp(MIN_MERGED_TAG_CHARS, MAX_MERGED_TAG_CHARS)
+        .unwrap_or(0)
+        .min(MAX_MERGED_TAG_CHARS)
 }
 
 fn short_tag(label: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
     let base = label.trim_start_matches(['▶', ' ']);
     let count = base.chars().count();
     let mut t = if count > width {
@@ -2402,14 +2435,14 @@ mod tests {
         write_merged_export(&mut text, &connections, &entries, false).unwrap();
         let text = String::from_utf8(text).unwrap();
         let mut lines = text.lines();
-        assert!(lines.next().unwrap().starts_with("[beta  ]"));
-        assert!(lines.next().unwrap().starts_with("[alpha ]"));
+        assert!(lines.next().unwrap().starts_with("[beta ]"));
+        assert!(lines.next().unwrap().starts_with("[alpha]"));
 
         let mut csv = Vec::new();
         write_merged_export(&mut csv, &connections, &entries, true).unwrap();
         let csv = String::from_utf8(csv).unwrap();
         assert!(csv.starts_with("port,wall_time,micros,flags,text\n"));
-        assert!(csv.contains("[beta  ]"));
+        assert!(csv.contains("[beta ]"));
         assert!(csv.contains("\"alarm, now\""));
     }
 
@@ -2444,6 +2477,13 @@ mod tests {
         write_merged_export(&mut text, &[conn], &entries, false).unwrap();
         let text = String::from_utf8(text).unwrap();
         assert!(text.starts_with("[left sensor]"));
+    }
+
+    #[test]
+    fn merged_tag_still_caps_an_unusually_long_name() {
+        let tag = short_tag("abcdefghijklmnopqrstuvwxyz", MAX_MERGED_TAG_CHARS);
+        assert_eq!(tag, "[abcdefghijklmnopqrstuvw…]");
+        assert_eq!(tag.chars().count(), MAX_MERGED_TAG_CHARS + 2);
     }
 
     #[test]
