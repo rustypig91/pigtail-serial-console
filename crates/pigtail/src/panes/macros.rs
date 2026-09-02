@@ -415,6 +415,19 @@ impl App {
         let mut pending = Vec::with_capacity(self.macro_runs.len());
         let mut advanced_any = false;
         for mut run in std::mem::take(&mut self.macro_runs) {
+            // A run waiting in a long delay should disappear as soon as its
+            // tab is closed (or a failed reconnect leaves it inert), rather
+            // than lingering in the UI and scheduling a useless wake at the
+            // old deadline. Lost/reconnecting connections remain valid
+            // targets, matching interactive transmission behavior.
+            if !self
+                .connections
+                .iter()
+                .any(|conn| conn.id == run.port && conn.state != ConnState::Closed)
+            {
+                advanced_any = true;
+                continue;
+            }
             let mut target_exists = true;
             while run.next_step < run.steps.len() && run.next_at <= now {
                 let step = run.steps[run.next_step].clone();
@@ -796,5 +809,23 @@ mod tests {
 
         assert_eq!(echoed(&app), ["first", "second"]);
         assert!(app.connections[1].store.is_empty());
+    }
+
+    #[test]
+    fn a_delayed_macro_stops_as_soon_as_its_target_closes() {
+        let mut app = app_with_macro(60_000);
+        let started = Instant::now();
+        app.start_macro(0, started);
+        app.maintain_macro_runs_at(started, &egui::Context::default());
+        assert_eq!(app.macro_runs.len(), 1);
+
+        app.connections[0].state = ConnState::Closed;
+        app.maintain_macro_runs_at(
+            started + Duration::from_millis(1),
+            &egui::Context::default(),
+        );
+
+        assert!(app.macro_runs.is_empty());
+        assert_eq!(echoed(&app), ["first"]);
     }
 }
