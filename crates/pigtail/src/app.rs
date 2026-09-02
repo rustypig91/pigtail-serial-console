@@ -2067,6 +2067,10 @@ impl App {
         if self.merged_dirty {
             self.merged_dirty = false;
             self.merged.clear();
+            // A rebuild can remove entries (for example when a tab closes or
+            // history is trimmed), so the old aggregate unread count no longer
+            // describes the rebuilt view.
+            self.merged_new_since_scroll = 0;
             self.merged_seq = 0;
             self.merged_generation += 1;
             self.merged_pruned_before.clear();
@@ -4384,7 +4388,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn merged_unread_count_tracks_new_entries_but_not_a_rebuild() {
+    fn merged_unread_count_tracks_new_entries_and_resets_on_rebuild() {
         let (mut app, _enum_tx) = test_app("merged-unread");
         let id = PortId(0);
         let mut conn = app.make_connection(
@@ -4416,5 +4420,9 @@ pub(crate) mod tests {
         app.connections[0].store.append(line("new", 2));
         app.maintain_merged();
         assert_eq!(app.merged_new_since_scroll, 1);
+
+        app.merged_dirty = true;
+        app.maintain_merged();
+        assert_eq!(app.merged_new_since_scroll, 0);
     }
 }
