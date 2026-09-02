@@ -94,6 +94,13 @@ impl VirtualEchoSource {
 }
 
 #[cfg(debug_assertions)]
+impl Default for VirtualEchoSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(debug_assertions)]
 impl ByteSource for VirtualEchoSource {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, SourceError> {
         let (queue, wake) = &*self.queue;
