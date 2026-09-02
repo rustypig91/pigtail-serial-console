@@ -298,13 +298,18 @@ impl App {
                                     (macro_index == index
                                         && macro_def.steps.get(step_index).is_some())
                                     .then_some(step_index)
-                                });
+                            });
                             ui.horizontal(|ui| {
                                 if ui.small_button("+ Add command").clicked() {
-                                    macro_def.steps.push(MacroStep::Command {
-                                        text: String::new(),
-                                    });
-                                    step_selection = Some((index, macro_def.steps.len() - 1));
+                                    let insert_at = selected_step
+                                        .map_or(macro_def.steps.len(), |step_index| step_index + 1);
+                                    macro_def.steps.insert(
+                                        insert_at,
+                                        MacroStep::Command {
+                                            text: String::new(),
+                                        },
+                                    );
+                                    step_selection = Some((index, insert_at));
                                     changed = true;
                                 }
                                 let add_delay = ui
@@ -455,6 +460,12 @@ impl App {
 
     /// Send one macro command using the same per-port line ending, local echo,
     /// history, and follow behavior as an interactively entered command.
+    ///
+    /// Raw console text has already reached the device one character at a time.
+    /// If a macro completes that partly typed line, its command is therefore a
+    /// suffix of the same real device line rather than a separate line. Commit
+    /// the combined text here so local echo, history, and `tx_input` continue to
+    /// describe the bytes that were actually sent.
     fn send_macro_command(&mut self, port: PortId, command: &str) -> bool {
         let now = self.clock.now();
         let Some(conn) = self
@@ -470,13 +481,15 @@ impl App {
         if !bytes.is_empty() {
             conn.handle.transmit(bytes);
         }
-        if !command.is_empty() && conn.tx_history.last().map(String::as_str) != Some(command) {
-            conn.tx_history.push(command.to_owned());
+        let mut line = std::mem::take(&mut conn.tx_input);
+        line.push_str(command);
+        if !line.is_empty() && conn.tx_history.last().map(String::as_str) != Some(line.as_str()) {
+            conn.tx_history.push(line.clone());
         }
         conn.tx_history_pos = None;
-        if conn.port_config.local_echo && !command.is_empty() {
+        if conn.port_config.local_echo && !line.is_empty() {
             conn.store.append(IncomingLine {
-                text: command.to_owned(),
+                text: line,
                 ts: now,
                 port: conn.id,
                 flags: LineFlags::TX_ECHO,
@@ -676,6 +689,22 @@ mod tests {
         assert_eq!(echoed(&app), ["first", "second"]);
         app.maintain_macro_runs_at(started + Duration::from_millis(350), &ctx);
         assert_eq!(echoed(&app), ["first", "second", "third"]);
+    }
+
+    #[test]
+    fn macro_command_commits_a_partly_typed_console_line_consistently() {
+        let mut app = app_with_macro(100);
+        // Raw console input is transmitted as it is typed, so this prefix is
+        // already present on the device before the macro starts.
+        app.connections[0].tx_input = "prefix-".into();
+        let started = Instant::now();
+        app.start_macro(0, started);
+
+        app.maintain_macro_runs_at(started, &egui::Context::default());
+
+        assert_eq!(echoed(&app), ["prefix-first"]);
+        assert_eq!(app.connections[0].tx_history, ["prefix-first"]);
+        assert!(app.connections[0].tx_input.is_empty());
     }
 
     #[test]
