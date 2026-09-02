@@ -48,7 +48,8 @@ fn usb_interface(_usb: &serialport::UsbPortInfo) -> Option<u8> {
 
 /// Enumerate all currently present ports.
 pub fn enumerate_ports() -> Vec<DiscoveredPort> {
-    match serialport::available_ports() {
+    #[allow(unused_mut)]
+    let mut discovered = match serialport::available_ports() {
         Ok(ports) => ports
             .iter()
             .map(|info| DiscoveredPort {
@@ -57,7 +58,25 @@ pub fn enumerate_ports() -> Vec<DiscoveredPort> {
             })
             .collect(),
         Err(_) => Vec::new(),
+    };
+    #[cfg(debug_assertions)]
+    for (path, product) in [
+        (crate::source::DEBUG_ECHO_PATH, "pigtail debug echo port -1"),
+        (
+            crate::source::DEBUG_ECHO_PATH_2,
+            "pigtail debug echo port -2",
+        ),
+    ] {
+        discovered.push(DiscoveredPort {
+            path: path.into(),
+            identity: PortIdentity {
+                path_fallback: path.into(),
+                product: Some(product.into()),
+                ..Default::default()
+            },
+        });
     }
+    discovered
 }
 
 /// The outcome of matching a saved identity against discovered ports.

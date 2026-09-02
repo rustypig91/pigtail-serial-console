@@ -6,8 +6,22 @@
 //! (spec §10).
 
 use crate::config::PortConfig;
+#[cfg(debug_assertions)]
+use std::collections::VecDeque;
 use std::io::{Read, Write};
+#[cfg(debug_assertions)]
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+
+#[cfg(debug_assertions)]
+pub const DEBUG_ECHO_PATH: &str = "pigtail://debug-echo-1";
+#[cfg(debug_assertions)]
+pub const DEBUG_ECHO_PATH_2: &str = "pigtail://debug-echo-2";
+
+#[cfg(debug_assertions)]
+pub fn is_debug_echo_path(path: &str) -> bool {
+    matches!(path, DEBUG_ECHO_PATH | DEBUG_ECHO_PATH_2)
+}
 
 /// Errors a source can surface. A `Disconnected` is the signal the reader uses
 /// to transition to the `Lost` state and begin reconnecting.
@@ -60,6 +74,54 @@ pub trait ByteSource: Send {
 
     /// Send a serial break. No-op for non-serial sources.
     fn send_break(&mut self) -> Result<(), SourceError> {
+        Ok(())
+    }
+}
+
+/// An in-process echo device for exercising the console without hardware.
+#[cfg(debug_assertions)]
+pub struct VirtualEchoSource {
+    queue: Arc<(Mutex<VecDeque<u8>>, Condvar)>,
+}
+
+#[cfg(debug_assertions)]
+impl VirtualEchoSource {
+    pub fn new() -> Self {
+        Self {
+            queue: Arc::new((Mutex::new(VecDeque::new()), Condvar::new())),
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl ByteSource for VirtualEchoSource {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, SourceError> {
+        let (queue, wake) = &*self.queue;
+        let mut queue = queue.lock().expect("virtual tty queue poisoned");
+        if queue.is_empty() {
+            let (guard, _) = wake
+                .wait_timeout(queue, READ_TIMEOUT)
+                .expect("virtual tty queue poisoned");
+            queue = guard;
+        }
+        let n = buf.len().min(queue.len());
+        for slot in &mut buf[..n] {
+            *slot = queue.pop_front().expect("queue length checked");
+        }
+        Ok(n)
+    }
+
+    fn description(&self) -> String {
+        "virtual echo tty".into()
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<(), SourceError> {
+        let (queue, wake) = &*self.queue;
+        queue
+            .lock()
+            .expect("virtual tty queue poisoned")
+            .extend(bytes);
+        wake.notify_one();
         Ok(())
     }
 }
