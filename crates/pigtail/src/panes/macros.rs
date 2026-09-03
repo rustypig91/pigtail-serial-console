@@ -1,6 +1,6 @@
 //! User-defined transmit macros and their non-blocking execution scheduler.
 
-use crate::app::{App, MacroRun};
+use crate::app::{App, MacroEditor, MacroRun};
 use serialcore::config::{MacroStep, TransmitMacro};
 use serialcore::reader::ConnState;
 use serialcore::store::{IncomingLine, LineFlags, PortId};
@@ -74,25 +74,28 @@ impl App {
     }
 
     pub(crate) fn show_macros_window(&mut self, ctx: &egui::Context) {
-        if !self.show_macros_win {
-            return;
+        if self.show_macros_win {
+            self.show_macro_catalog(ctx);
         }
+        self.show_macro_editor(ctx);
+    }
 
+    /// Read-only macro catalog. Definitions are changed only in the separate
+    /// add/edit window so an accidental click cannot rewrite configuration.
+    fn show_macro_catalog(&mut self, ctx: &egui::Context) {
         let mut open = self.show_macros_win;
         let can_run = self.macro_target_port().is_some();
-        let mut changed = false;
+        let editor_open = self.macro_editor.is_some();
         let mut run = None;
+        let mut edit = None;
         let mut remove = None;
-        let mut shortcut_change = None;
-        let mut add_macro = false;
+        let mut add = false;
         let mut stop_all = false;
-        let mut step_selection = self.macro_step_selection;
-        let shortcut_owners = shortcut_owners(&self.config.macros);
 
         egui::Window::new("Transmit macros")
             .open(&mut open)
-            .default_width(520.0)
-            .default_height(420.0)
+            .default_width(460.0)
+            .default_height(360.0)
             .show(ctx, |ui| {
                 ui.weak(
                     "Each command uses the selected device's line ending. Shortcuts run only \
@@ -113,263 +116,252 @@ impl App {
                 ui.separator();
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (index, macro_def) in self.config.macros.iter_mut().enumerate() {
+                    if self.config.macros.is_empty() {
+                        ui.weak("No macros configured.");
+                    }
+                    for (index, macro_def) in self.config.macros.iter().enumerate() {
                         ui.group(|ui| {
                             ui.horizontal(|ui| {
-                                changed |= ui
-                                    .add(
-                                        egui::TextEdit::singleline(&mut macro_def.name)
-                                            .hint_text("Macro name")
-                                            .desired_width(260.0),
-                                    )
-                                    .changed();
-                                if ui
-                                    .add_enabled(
-                                        can_run && macro_has_command(macro_def),
-                                        egui::Button::new("Run"),
-                                    )
-                                    .clicked()
-                                {
-                                    run = Some(index);
-                                }
-                                if ui.small_button("Delete").clicked() {
-                                    remove = Some(index);
-                                }
-                            });
-
-                            egui::Grid::new(("macro-fields", index))
-                                .num_columns(2)
-                                .spacing([12.0, 6.0])
-                                .show(ui, |ui| {
-                                    ui.label("Description");
-                                    changed |= ui
-                                        .add(
-                                            egui::TextEdit::singleline(&mut macro_def.description)
-                                                .hint_text("What this sequence does")
-                                                .desired_width(340.0),
-                                        )
-                                        .changed();
-                                    ui.end_row();
-
-                                    ui.label("Shortcut");
-                                    let mut shortcut =
-                                        macro_def.shortcut.filter(|digit| *digit <= 9);
-                                    egui::ComboBox::from_id_salt(("macro-shortcut", index))
-                                        .selected_text(shortcut_label(shortcut))
-                                        .show_ui(ui, |ui| {
-                                            ui.selectable_value(&mut shortcut, None, "Unassigned");
-                                            for digit in 0..=9 {
-                                                let available = shortcut_owners[digit as usize]
-                                                    .is_none_or(|owner| owner == index);
-                                                let response = ui.add_enabled(
-                                                    available,
-                                                    egui::SelectableLabel::new(
-                                                        shortcut == Some(digit),
-                                                        shortcut_label(Some(digit)),
-                                                    ),
-                                                );
-                                                if response
-                                                    .on_disabled_hover_text(
-                                                        "Already assigned to another macro",
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    shortcut = Some(digit);
-                                                }
-                                            }
-                                        });
-                                    if shortcut != macro_def.shortcut {
-                                        shortcut_change = Some((index, shortcut));
-                                    }
-                                    ui.end_row();
-                                });
-
-                            ui.horizontal(|ui| {
-                                ui.label("Steps");
-                                ui.weak(
-                                    "Select a step to insert after it; use ↑/↓ to rearrange.",
+                                let name = if macro_def.name.trim().is_empty() {
+                                    "(unnamed)"
+                                } else {
+                                    macro_def.name.trim()
+                                };
+                                ui.strong(name);
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .add_enabled(!editor_open, egui::Button::new("Delete"))
+                                            .clicked()
+                                        {
+                                            remove = Some(index);
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                !editor_open,
+                                                egui::Button::new("Edit macro"),
+                                            )
+                                            .clicked()
+                                        {
+                                            edit = Some(index);
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                !editor_open
+                                                    && can_run
+                                                    && macro_has_command(macro_def),
+                                                egui::Button::new("Run"),
+                                            )
+                                            .clicked()
+                                        {
+                                            run = Some(index);
+                                        }
+                                    },
                                 );
                             });
-                            let mut remove_step = None;
-                            let mut move_step_to = None;
-                            let step_count = macro_def.steps.len();
-                            let row_height = ui.spacing().interact_size.y;
-                            for (step_index, step) in macro_def.steps.iter_mut().enumerate() {
-                                ui.horizontal(|ui| {
-                                    let selected = step_selection == Some((index, step_index));
-                                    let kind = match step {
-                                        MacroStep::Command { .. } => "Command",
-                                        MacroStep::Delay { .. } => "Delay",
-                                    };
-                                    if ui
-                                        .add_sized(
-                                            [72.0, row_height],
-                                            egui::SelectableLabel::new(selected, kind),
-                                        )
-                                        .clicked()
-                                    {
-                                        step_selection = Some((index, step_index));
-                                    }
-                                    match step {
-                                        MacroStep::Command { text } => {
-                                            let edit = ui.add_sized(
-                                                [300.0, row_height],
-                                                egui::TextEdit::singleline(text)
-                                                    .hint_text("command")
-                                                    .font(egui::TextStyle::Monospace),
-                                            );
-                                            changed |= edit.changed();
-                                            if edit.clicked() {
-                                                step_selection = Some((index, step_index));
-                                            }
-                                        }
-                                        MacroStep::Delay { delay_ms } => {
-                                            let edit = ui
-                                                .add_sized(
-                                                    [300.0, row_height],
-                                                    egui::DragValue::new(delay_ms)
-                                                        .range(0..=MAX_DELAY_MS)
-                                                        .suffix(" ms"),
-                                                )
-                                                .on_hover_text(
-                                                    "Wait before advancing to the next step",
-                                                );
-                                            changed |= edit.changed();
-                                            if edit.clicked() {
-                                                step_selection = Some((index, step_index));
-                                            }
-                                        }
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            step_index > 0,
-                                            egui::Button::new("↑").small(),
-                                        )
-                                        .on_hover_text("Move this step up")
-                                        .clicked()
-                                    {
-                                        move_step_to = Some((step_index, step_index - 1));
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            step_index + 1 < step_count,
-                                            egui::Button::new("↓").small(),
-                                        )
-                                        .on_hover_text("Move this step down")
-                                        .clicked()
-                                    {
-                                        move_step_to = Some((step_index, step_index + 1));
-                                    }
-                                    if ui.small_button("−").clicked() {
-                                        remove_step = Some(step_index);
-                                    }
+                            let description = if macro_def.description.trim().is_empty() {
+                                "—"
+                            } else {
+                                macro_def.description.trim()
+                            };
+                            egui::Grid::new(("macro-summary", index))
+                                .num_columns(2)
+                                .spacing([12.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label("Description");
+                                    ui.label(description);
+                                    ui.end_row();
+                                    ui.label("Shortcut");
+                                    ui.label(shortcut_label(
+                                        macro_def.shortcut.filter(|digit| *digit <= 9),
+                                    ));
+                                    ui.end_row();
                                 });
-                            }
-
-                            if let Some(step_index) = remove_step {
-                                macro_def.steps.remove(step_index);
-                                step_selection =
-                                    selection_after_remove(step_selection, index, step_index);
-                                changed = true;
-                            } else if let Some((from, requested_destination)) = move_step_to {
-                                let destination =
-                                    move_step(&mut macro_def.steps, from, requested_destination);
-                                step_selection =
-                                    selection_after_move(step_selection, index, from, destination);
-                                changed |= destination != from;
-                            }
-
-                            let selected_step =
-                                step_selection.and_then(|(macro_index, step_index)| {
-                                    (macro_index == index
-                                        && macro_def.steps.get(step_index).is_some())
-                                    .then_some(step_index)
-                            });
-                            ui.horizontal(|ui| {
-                                if ui.small_button("+ Add command").clicked() {
-                                    let insert_at = selected_step
-                                        .map_or(macro_def.steps.len(), |step_index| step_index + 1);
-                                    macro_def.steps.insert(
-                                        insert_at,
-                                        MacroStep::Command {
-                                            text: String::new(),
-                                        },
-                                    );
-                                    step_selection = Some((index, insert_at));
-                                    changed = true;
-                                }
-                                let add_delay = ui
-                                    .add(egui::Button::new("+ Add delay").small())
-                                    .on_hover_text(
-                                        "Insert after the selected step, or append when none is selected",
-                                    );
-                                if add_delay.clicked() {
-                                    let insert_at = selected_step
-                                        .map_or(macro_def.steps.len(), |step_index| step_index + 1);
-                                    macro_def.steps.insert(
-                                        insert_at,
-                                        MacroStep::Delay {
-                                            delay_ms: DEFAULT_DELAY_MS,
-                                        },
-                                    );
-                                    step_selection = Some((index, insert_at));
-                                    changed = true;
-                                }
-                            });
                         });
                         ui.add_space(6.0);
                     }
                 });
 
-                if ui.button("+ New macro").clicked() {
-                    add_macro = true;
+                if ui
+                    .add_enabled(!editor_open, egui::Button::new("+ Add macro"))
+                    .clicked()
+                {
+                    add = true;
                 }
             });
 
         self.show_macros_win = open;
-        self.macro_step_selection = step_selection;
         if stop_all {
             self.macro_runs.clear();
         }
-        if let Some((index, shortcut)) = shortcut_change {
-            changed |= assign_shortcut(&mut self.config.macros, index, shortcut);
-        }
         if let Some(index) = remove {
             self.config.macros.remove(index);
-            self.macro_step_selection =
-                self.macro_step_selection
-                    .and_then(|(macro_index, step_index)| match macro_index.cmp(&index) {
-                        std::cmp::Ordering::Less => Some((macro_index, step_index)),
-                        std::cmp::Ordering::Equal => None,
-                        std::cmp::Ordering::Greater => Some((macro_index - 1, step_index)),
-                    });
-            changed = true;
-            // `run` can only name the same card if Run and Delete somehow land
-            // in one input frame. Deletion wins rather than shifting the index
-            // onto the next macro.
+            self.write_config();
             if run == Some(index) {
                 run = None;
             } else if run.is_some_and(|run_index| run_index > index) {
                 run = run.map(|run_index| run_index - 1);
             }
         }
-        if add_macro {
-            let index = self.config.macros.len();
-            self.config.macros.push(TransmitMacro {
+        if let Some(index) = edit {
+            self.open_macro_editor(Some(index));
+        } else if add {
+            self.open_macro_editor(None);
+        }
+        if let Some(index) = run {
+            self.start_macro(index, Instant::now());
+        }
+    }
+
+    fn open_macro_editor(&mut self, index: Option<usize>) {
+        let mut draft = index
+            .and_then(|index| self.config.macros.get(index).cloned())
+            .unwrap_or_else(|| TransmitMacro {
                 name: "New macro".into(),
                 steps: vec![MacroStep::Command {
                     text: String::new(),
                 }],
                 ..Default::default()
             });
-            self.macro_step_selection = Some((index, 0));
-            changed = true;
+        draft.shortcut = draft.shortcut.filter(|digit| *digit <= 9);
+        self.macro_editor = Some(MacroEditor {
+            index,
+            step_selection: (!draft.steps.is_empty()).then_some(0),
+            draft,
+            shortcut_conflict: None,
+        });
+    }
+
+    fn show_macro_editor(&mut self, ctx: &egui::Context) {
+        let Some(mut editor) = self.macro_editor.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        let title = if editor.index.is_some() {
+            "Edit macro"
+        } else {
+            "Add macro"
+        };
+
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(520.0)
+            .default_height(420.0)
+            .show(ctx, |ui| {
+                egui::Grid::new("macro-editor-fields")
+                    .num_columns(2)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Name");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut editor.draft.name)
+                                .hint_text("Macro name")
+                                .desired_width(340.0),
+                        );
+                        ui.end_row();
+
+                        ui.label("Description");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut editor.draft.description)
+                                .hint_text("What this sequence does")
+                                .desired_width(340.0),
+                        );
+                        ui.end_row();
+
+                        ui.label("Shortcut");
+                        let current = editor.draft.shortcut;
+                        let mut selected = current;
+                        egui::ComboBox::from_id_salt("macro-editor-shortcut")
+                            .selected_text(shortcut_label(current))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut selected, None, "Unassigned");
+                                for digit in 0..=9 {
+                                    let owner =
+                                        shortcut_owner(&self.config.macros, digit, editor.index);
+                                    let label = owner.map_or_else(
+                                        || shortcut_label(Some(digit)),
+                                        |owner| {
+                                            format!(
+                                                "{} — used by {}",
+                                                shortcut_label(Some(digit)),
+                                                macro_display_name(&self.config.macros[owner])
+                                            )
+                                        },
+                                    );
+                                    ui.selectable_value(&mut selected, Some(digit), label);
+                                }
+                            });
+                        if selected != current {
+                            if let Some(digit) = selected {
+                                if let Some(owner) =
+                                    shortcut_owner(&self.config.macros, digit, editor.index)
+                                {
+                                    editor.shortcut_conflict = Some((digit, owner));
+                                } else {
+                                    editor.draft.shortcut = Some(digit);
+                                }
+                            } else {
+                                editor.draft.shortcut = None;
+                            }
+                        }
+                        ui.end_row();
+                    });
+
+                ui.separator();
+                show_macro_steps(ui, &mut editor);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    save = ui
+                        .add_enabled(
+                            editor.shortcut_conflict.is_none(),
+                            egui::Button::new("Save"),
+                        )
+                        .clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+
+        if let Some((digit, owner)) = editor.shortcut_conflict {
+            let owner_name = self
+                .config
+                .macros
+                .get(owner)
+                .map(macro_display_name)
+                .unwrap_or_else(|| "another macro".to_owned());
+            let mut move_shortcut = false;
+            let mut keep_shortcut = false;
+            egui::Window::new("Shortcut already used")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "{} is already used by \"{owner_name}\".",
+                        shortcut_label(Some(digit))
+                    ));
+                    ui.label("Move this shortcut to the macro being edited?");
+                    ui.horizontal(|ui| {
+                        move_shortcut = ui.button("Yes, move it").clicked();
+                        keep_shortcut = ui.button("No").clicked();
+                    });
+                });
+            if move_shortcut {
+                editor.draft.shortcut = Some(digit);
+                editor.shortcut_conflict = None;
+            } else if keep_shortcut {
+                editor.shortcut_conflict = None;
+            }
         }
-        if changed {
+
+        if save {
+            save_macro(&mut self.config.macros, editor);
             self.write_config();
-        }
-        if let Some(index) = run {
-            self.start_macro(index, Instant::now());
+        } else if open && !cancel {
+            self.macro_editor = Some(editor);
         }
     }
 
@@ -514,6 +506,122 @@ fn macro_has_command(macro_def: &TransmitMacro) -> bool {
         .any(|step| matches!(step, MacroStep::Command { .. }))
 }
 
+fn show_macro_steps(ui: &mut egui::Ui, editor: &mut MacroEditor) {
+    ui.horizontal(|ui| {
+        ui.label("Steps");
+        ui.weak("Select a step to insert after it; use ↑/↓ to rearrange.");
+    });
+
+    let mut remove_step = None;
+    let mut move_step_to = None;
+    let step_count = editor.draft.steps.len();
+    let row_height = ui.spacing().interact_size.y;
+    egui::ScrollArea::vertical()
+        .max_height(250.0)
+        .show(ui, |ui| {
+            for (step_index, step) in editor.draft.steps.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    let selected = editor.step_selection == Some(step_index);
+                    let kind = match step {
+                        MacroStep::Command { .. } => "Command",
+                        MacroStep::Delay { .. } => "Delay",
+                    };
+                    if ui
+                        .add_sized(
+                            [72.0, row_height],
+                            egui::SelectableLabel::new(selected, kind),
+                        )
+                        .clicked()
+                    {
+                        editor.step_selection = Some(step_index);
+                    }
+                    match step {
+                        MacroStep::Command { text } => {
+                            let edit = ui.add_sized(
+                                [300.0, row_height],
+                                egui::TextEdit::singleline(text)
+                                    .hint_text("command")
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                            if edit.clicked() {
+                                editor.step_selection = Some(step_index);
+                            }
+                        }
+                        MacroStep::Delay { delay_ms } => {
+                            let edit = ui
+                                .add_sized(
+                                    [300.0, row_height],
+                                    egui::DragValue::new(delay_ms)
+                                        .range(0..=MAX_DELAY_MS)
+                                        .suffix(" ms"),
+                                )
+                                .on_hover_text("Wait before advancing to the next step");
+                            if edit.clicked() {
+                                editor.step_selection = Some(step_index);
+                            }
+                        }
+                    }
+                    if ui
+                        .add_enabled(step_index > 0, egui::Button::new("↑").small())
+                        .on_hover_text("Move this step up")
+                        .clicked()
+                    {
+                        move_step_to = Some((step_index, step_index - 1));
+                    }
+                    if ui
+                        .add_enabled(step_index + 1 < step_count, egui::Button::new("↓").small())
+                        .on_hover_text("Move this step down")
+                        .clicked()
+                    {
+                        move_step_to = Some((step_index, step_index + 1));
+                    }
+                    if ui.small_button("−").clicked() {
+                        remove_step = Some(step_index);
+                    }
+                });
+            }
+        });
+
+    if let Some(step_index) = remove_step {
+        editor.draft.steps.remove(step_index);
+        editor.step_selection = selection_after_remove(editor.step_selection, step_index);
+    } else if let Some((from, requested_destination)) = move_step_to {
+        let destination = move_step(&mut editor.draft.steps, from, requested_destination);
+        editor.step_selection = selection_after_move(editor.step_selection, from, destination);
+    }
+
+    let selected_step = editor
+        .step_selection
+        .filter(|step_index| editor.draft.steps.get(*step_index).is_some());
+    ui.horizontal(|ui| {
+        if ui.small_button("+ Add command").clicked() {
+            let insert_at =
+                selected_step.map_or(editor.draft.steps.len(), |step_index| step_index + 1);
+            editor.draft.steps.insert(
+                insert_at,
+                MacroStep::Command {
+                    text: String::new(),
+                },
+            );
+            editor.step_selection = Some(insert_at);
+        }
+        let add_delay = ui
+            .add(egui::Button::new("+ Add delay").small())
+            .on_hover_text("Insert after the selected step, or append when none is selected");
+        if add_delay.clicked() {
+            let insert_at =
+                selected_step.map_or(editor.draft.steps.len(), |step_index| step_index + 1);
+            editor.draft.steps.insert(
+                insert_at,
+                MacroStep::Delay {
+                    delay_ms: DEFAULT_DELAY_MS,
+                },
+            );
+            editor.step_selection = Some(insert_at);
+        }
+    });
+}
+
 /// Consume a shortcut by its digit key even when Shift changes its logical key.
 ///
 /// Winit reports, for example, Shift+2 as `Quote` on several keyboard layouts,
@@ -560,33 +668,25 @@ fn move_step(steps: &mut Vec<MacroStep>, from: usize, destination: usize) -> usi
     destination
 }
 
-fn selection_after_remove(
-    selection: Option<(usize, usize)>,
-    macro_index: usize,
-    removed: usize,
-) -> Option<(usize, usize)> {
-    selection.and_then(|(selected_macro, selected_step)| {
-        if selected_macro != macro_index || selected_step < removed {
-            Some((selected_macro, selected_step))
+fn selection_after_remove(selection: Option<usize>, removed: usize) -> Option<usize> {
+    selection.and_then(|selected_step| {
+        if selected_step < removed {
+            Some(selected_step)
         } else if selected_step == removed {
             None
         } else {
-            Some((selected_macro, selected_step - 1))
+            Some(selected_step - 1)
         }
     })
 }
 
 fn selection_after_move(
-    selection: Option<(usize, usize)>,
-    macro_index: usize,
+    selection: Option<usize>,
     from: usize,
     destination: usize,
-) -> Option<(usize, usize)> {
-    selection.map(|(selected_macro, selected_step)| {
-        if selected_macro != macro_index {
-            return (selected_macro, selected_step);
-        }
-        let selected_step = if selected_step == from {
+) -> Option<usize> {
+    selection.map(|selected_step| {
+        if selected_step == from {
             destination
         } else if from < destination && selected_step > from && selected_step <= destination {
             selected_step - 1
@@ -594,8 +694,7 @@ fn selection_after_move(
             selected_step + 1
         } else {
             selected_step
-        };
-        (selected_macro, selected_step)
+        }
     })
 }
 
@@ -606,33 +705,49 @@ fn shortcut_label(shortcut: Option<u8>) -> String {
     )
 }
 
-fn shortcut_owners(macros: &[TransmitMacro]) -> [Option<usize>; 10] {
-    let mut owners = [None; 10];
-    for (index, macro_def) in macros.iter().enumerate() {
-        if let Some(digit) = macro_def.shortcut.filter(|digit| *digit <= 9) {
-            owners[digit as usize].get_or_insert(index);
-        }
+fn macro_display_name(macro_def: &TransmitMacro) -> String {
+    let name = macro_def.name.trim();
+    if name.is_empty() {
+        "(unnamed)".to_owned()
+    } else {
+        name.to_owned()
     }
-    owners
 }
 
-/// Assign a shortcut without taking it away from another macro.
-fn assign_shortcut(macros: &mut [TransmitMacro], index: usize, shortcut: Option<u8>) -> bool {
-    let Some(macro_def) = macros.get(index) else {
-        return false;
-    };
-    if macro_def.shortcut == shortcut
-        || shortcut.is_some_and(|digit| {
-            digit > 9
-                || macros.iter().enumerate().any(|(other_index, other)| {
-                    other_index != index && other.shortcut == Some(digit)
-                })
+fn shortcut_owner(
+    macros: &[TransmitMacro],
+    digit: u8,
+    edited_index: Option<usize>,
+) -> Option<usize> {
+    macros
+        .iter()
+        .enumerate()
+        .find(|(index, macro_def)| {
+            Some(*index) != edited_index && macro_def.shortcut == Some(digit)
         })
-    {
-        return false;
+        .map(|(index, _)| index)
+}
+
+/// Save a draft and enforce exclusive shortcut ownership. A confirmed occupied
+/// shortcut is transferred by clearing every previous owner before the draft is
+/// inserted or replaces its original definition.
+fn save_macro(macros: &mut Vec<TransmitMacro>, mut editor: MacroEditor) -> usize {
+    editor.draft.shortcut = editor.draft.shortcut.filter(|digit| *digit <= 9);
+    let target = editor.index.filter(|index| *index < macros.len());
+    if let Some(shortcut) = editor.draft.shortcut {
+        for (index, macro_def) in macros.iter_mut().enumerate() {
+            if Some(index) != target && macro_def.shortcut == Some(shortcut) {
+                macro_def.shortcut = None;
+            }
+        }
     }
-    macros[index].shortcut = shortcut;
-    true
+    if let Some(index) = target {
+        macros[index] = editor.draft;
+        index
+    } else {
+        macros.push(editor.draft);
+        macros.len() - 1
+    }
 }
 
 #[cfg(test)]
@@ -760,7 +875,7 @@ mod tests {
                 MacroStep::Delay { delay_ms: 50 },
             ]
         );
-        assert_eq!(selection_after_move(Some((0, 2)), 0, 2, 1), Some((0, 1)));
+        assert_eq!(selection_after_move(Some(2), 2, 1), Some(1));
     }
 
     #[test]
@@ -814,20 +929,59 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_cannot_be_assigned_to_two_macros() {
+    fn saving_an_edit_moves_an_occupied_shortcut() {
         let mut app = app_with_macro(100);
         app.config.macros.push(TransmitMacro {
             name: "Second".into(),
             ..Default::default()
         });
 
-        assert!(!assign_shortcut(&mut app.config.macros, 1, Some(7)));
-        assert_eq!(app.config.macros[0].shortcut, Some(7));
-        assert_eq!(app.config.macros[1].shortcut, None);
+        let editor = MacroEditor {
+            index: Some(1),
+            draft: TransmitMacro {
+                name: "Second".into(),
+                shortcut: Some(7),
+                ..Default::default()
+            },
+            step_selection: None,
+            shortcut_conflict: None,
+        };
+        assert_eq!(save_macro(&mut app.config.macros, editor), 1);
 
-        assert!(assign_shortcut(&mut app.config.macros, 1, Some(6)));
-        assert_eq!(app.config.macros[0].shortcut, Some(7));
-        assert_eq!(app.config.macros[1].shortcut, Some(6));
+        assert_eq!(app.config.macros[0].shortcut, None);
+        assert_eq!(app.config.macros[1].shortcut, Some(7));
+    }
+
+    #[test]
+    fn editing_uses_a_draft_until_save() {
+        let mut app = app_with_macro(100);
+        app.open_macro_editor(Some(0));
+        app.macro_editor.as_mut().unwrap().draft.name = "Changed".into();
+
+        assert_eq!(app.config.macros[0].name, "Setup");
+
+        let editor = app.macro_editor.take().unwrap();
+        save_macro(&mut app.config.macros, editor);
+        assert_eq!(app.config.macros[0].name, "Changed");
+    }
+
+    #[test]
+    fn saving_a_new_macro_moves_an_occupied_shortcut() {
+        let mut app = app_with_macro(100);
+        let editor = MacroEditor {
+            index: None,
+            draft: TransmitMacro {
+                name: "Second".into(),
+                shortcut: Some(7),
+                ..Default::default()
+            },
+            step_selection: None,
+            shortcut_conflict: None,
+        };
+
+        assert_eq!(save_macro(&mut app.config.macros, editor), 1);
+        assert_eq!(app.config.macros[0].shortcut, None);
+        assert_eq!(app.config.macros[1].shortcut, Some(7));
     }
 
     #[test]

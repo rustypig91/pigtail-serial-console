@@ -5,7 +5,9 @@ use crate::paths::AppPaths;
 use crate::wrap::WrapIndex;
 use crossbeam_channel::Receiver;
 use serialcore::clock::{SessionClock, Timestamp};
-use serialcore::config::{Config, ExtractRule, PortConfig, PortIdentity, SavedConnection};
+use serialcore::config::{
+    Config, ExtractRule, PortConfig, PortIdentity, SavedConnection, TransmitMacro,
+};
 use serialcore::enumerate::{
     match_identity, spawn_enumerator, DiscoveredPort, EnumEvent, MatchResult,
 };
@@ -1125,6 +1127,16 @@ pub(crate) struct MacroRun {
     pub(crate) next_at: Instant,
 }
 
+/// Draft owned by the separate add/edit window. Config is changed only when
+/// the user saves, so closing the editor can discard every in-progress change.
+pub(crate) struct MacroEditor {
+    pub(crate) index: Option<usize>,
+    pub(crate) draft: TransmitMacro,
+    pub(crate) step_selection: Option<usize>,
+    /// Requested shortcut and the other macro that currently owns it.
+    pub(crate) shortcut_conflict: Option<(u8, usize)>,
+}
+
 pub struct App {
     pub clock: SessionClock,
     pub config: Config,
@@ -1210,9 +1222,7 @@ pub struct App {
     // main window stays uncluttered.
     pub show_settings: bool,
     pub show_macros_win: bool,
-    /// Macro and step selected in the editor, used as the insertion point for
-    /// an explicit delay step.
-    pub(crate) macro_step_selection: Option<(usize, usize)>,
+    pub(crate) macro_editor: Option<MacroEditor>,
     pub show_filters_win: bool,
     pub show_highlight_win: bool,
     pub show_extract_win: bool,
@@ -1299,7 +1309,7 @@ impl App {
             merged_selected: false,
             show_settings: false,
             show_macros_win: false,
-            macro_step_selection: None,
+            macro_editor: None,
             show_filters_win: false,
             show_highlight_win: false,
             show_extract_win: false,
@@ -2544,6 +2554,7 @@ impl App {
             || self.update_dialog.is_some()
             || self.show_settings
             || self.show_macros_win
+            || self.macro_editor.is_some()
             || self.show_filters_win
             || self.show_highlight_win
             || self.show_extract_win
