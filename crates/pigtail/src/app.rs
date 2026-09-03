@@ -5,7 +5,9 @@ use crate::paths::AppPaths;
 use crate::wrap::WrapIndex;
 use crossbeam_channel::Receiver;
 use serialcore::clock::{SessionClock, Timestamp};
-use serialcore::config::{Config, ExtractRule, PortConfig, PortIdentity, SavedConnection};
+use serialcore::config::{
+    Config, ExtractRule, PortConfig, PortIdentity, SavedConnection, TransmitMacro,
+};
 use serialcore::enumerate::{
     match_identity, spawn_enumerator, DiscoveredPort, EnumEvent, MatchResult,
 };
@@ -142,6 +144,23 @@ pub fn load_config(paths: &AppPaths) -> Config {
         },
         Err(_) => Config::default(),
     }
+}
+
+/// egui already embeds Hack for monospace text, and it covers common UI
+/// symbols that its proportional Ubuntu font does not (including ↑ and ↓).
+/// Reuse it as the final proportional fallback instead of bundling a second
+/// copy of another font solely for those glyphs.
+fn app_font_definitions() -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    if fonts.font_data.contains_key("Hack") {
+        let proportional = fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default();
+        proportional.retain(|font| font != "Hack");
+        proportional.push("Hack".to_owned());
+    }
+    fonts
 }
 
 /// List the session captures already on disk, paired with their metadata, so a
@@ -406,6 +425,10 @@ pub struct Connection {
     pub handle: reader::ReaderHandle,
     pub store: LineStore,
     pub state: ConnState,
+    /// Advances whenever a connected port leaves `Connected`. Macro runs copy
+    /// this value so even a disconnect/reconnect completed within one UI frame
+    /// still cancels work that belonged to the old connection.
+    pub(crate) disconnect_generation: u64,
     /// "Pinned": follow the tail and autoscroll. While set, the console offset is
     /// forced to the bottom every frame (not via egui's `stick_to_bottom`, which
     /// stops following under fast input). Toggled from the footer, and
@@ -447,6 +470,10 @@ pub struct Connection {
     /// Bytes dropped from the front of `raw_ring`, for translating a
     /// [`RawSession`]'s absolute start into a position in the ring.
     pub raw_base: u64,
+    /// First byte in the latest contiguous receive region. Disconnects and
+    /// dropped-output notices advance this without discarding retained hex
+    /// history, so consumers cannot mistake bytes across a gap for neighbors.
+    pub(crate) raw_contiguous_start: u64,
     /// The runs whose bytes the ring holds, oldest first.
     pub raw_sessions: Vec<RawSession>,
     /// The most recent error on this connection, kept with its scope: a
@@ -600,6 +627,7 @@ impl Connection {
                     // otherwise stay lit across the outage and beyond it.
                     if s != ConnState::Connected {
                         self.store.finalize_last_provisional();
+                        self.mark_raw_discontinuity();
                     } else if matches!(
                         self.last_error,
                         Some(TabError {
@@ -615,7 +643,7 @@ impl Connection {
                         // they survive it.
                         self.last_error = None;
                     }
-                    self.state = s;
+                    self.set_state(s);
                 }
                 ReaderEvent::Error { scope, msg } => {
                     tracing::warn!(port = self.id.0, "{msg}");
@@ -643,6 +671,7 @@ impl Connection {
                     line_updates,
                     at,
                 } => {
+                    self.mark_raw_discontinuity();
                     let label = format!(
                         "output dropped · {raw_bytes} bytes, {line_updates} line updates · display was busy"
                     );
@@ -742,6 +771,18 @@ impl Connection {
             bytes,
             self.raw_capacity,
         );
+    }
+
+    /// Begin a new contiguous receive region at the current raw position.
+    pub(crate) fn mark_raw_discontinuity(&mut self) {
+        self.raw_contiguous_start = self.raw_next();
+    }
+
+    pub(crate) fn set_state(&mut self, state: ConnState) {
+        if self.state == ConnState::Connected && state != ConnState::Connected {
+            self.disconnect_generation = self.disconnect_generation.wrapping_add(1);
+        }
+        self.state = state;
     }
 
     /// Open the run of bytes this session is producing, unless it is open
@@ -1099,6 +1140,39 @@ pub struct UpdateDialog {
     pub skip_version: Option<String>,
 }
 
+/// One in-flight macro execution. The definition is copied when it starts so
+/// editing or deleting a macro cannot change a sequence halfway through.
+pub(crate) struct MacroRun {
+    /// Catalog position of the definition that started this run. It becomes
+    /// `None` if that definition is deleted while its copied steps continue.
+    pub(crate) macro_index: Option<usize>,
+    pub(crate) name: String,
+    pub(crate) started_at: Instant,
+    /// Further full executions after the current one; `None` means forever.
+    pub(crate) repetitions_remaining: Option<u32>,
+    pub(crate) port: PortId,
+    pub(crate) disconnect_generation: u64,
+    pub(crate) steps: Vec<serialcore::config::MacroStep>,
+    pub(crate) next_step: usize,
+    pub(crate) next_at: Instant,
+    pub(crate) wait_for: Option<MacroWait>,
+}
+
+/// A receive condition starts at an absolute raw-byte position, so output
+/// already in the console before the wait step cannot satisfy it.
+pub(crate) struct MacroWait {
+    pub(crate) regex: regex::Regex,
+    pub(crate) raw_start: u64,
+}
+
+/// Draft owned by the separate add/edit window. Config is changed only when
+/// the user saves, so closing the editor can discard every in-progress change.
+pub(crate) struct MacroEditor {
+    pub(crate) index: Option<usize>,
+    pub(crate) draft: TransmitMacro,
+    pub(crate) step_selection: Option<usize>,
+}
+
 pub struct App {
     pub clock: SessionClock,
     pub config: Config,
@@ -1183,6 +1257,12 @@ pub struct App {
     // Floating tool windows, toggled from the console right-click menu, so the
     // main window stays uncluttered.
     pub show_settings: bool,
+    pub show_macros_win: bool,
+    pub(crate) macro_editor: Option<MacroEditor>,
+    /// Macro definition awaiting confirmation because it is currently running.
+    pub(crate) macro_running_edit_confirmation: Option<usize>,
+    /// Target macro, requested digit, and the macro currently owning it.
+    pub(crate) macro_shortcut_conflict: Option<(usize, u8, usize)>,
     pub show_filters_win: bool,
     pub show_highlight_win: bool,
     pub show_extract_win: bool,
@@ -1206,6 +1286,8 @@ pub struct App {
     /// it was set. Ctrl+wheel has nothing else to show for itself: the change
     /// it makes is legible only if you already know what you are looking for.
     pub font_toast: Option<(u8, f64)>,
+    /// Command sequences waiting for their next non-blocking delayed send.
+    pub(crate) macro_runs: Vec<MacroRun>,
     /// Background operations that failed outright — opening or reconnecting a
     /// port, starting the enumerator — rather than through the normal
     /// per-connection error path (e.g. the OS refused to spawn a thread).
@@ -1266,6 +1348,10 @@ impl App {
             merged_tx_port: None,
             merged_selected: false,
             show_settings: false,
+            show_macros_win: false,
+            macro_editor: None,
+            macro_running_edit_confirmation: None,
+            macro_shortcut_conflict: None,
             show_filters_win: false,
             show_highlight_win: false,
             show_extract_win: false,
@@ -1276,11 +1362,14 @@ impl App {
             update_manual: false,
             update_dialog: None,
             font_toast: None,
+            macro_runs: Vec::new(),
             connect_errors: VecDeque::new(),
         }
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>, paths: AppPaths, config: Config) -> App {
+        cc.egui_ctx.set_fonts(app_font_definitions());
+
         // Theme from settings.
         let dark = config.settings.theme != "light";
         cc.egui_ctx.set_visuals(if dark {
@@ -1564,7 +1653,7 @@ impl App {
                     // its caret stays lit forever on a tab that will never
                     // reconnect.
                     conn.store.finalize_last_provisional();
-                    conn.state = ConnState::Closed;
+                    conn.set_state(ConnState::Closed);
                     conn.last_error = Some(TabError::connection(msg));
                     self.merged_dirty = true;
                     return;
@@ -1586,7 +1675,7 @@ impl App {
             conn.identity = identity;
             conn.port_config = config;
             conn.label = label;
-            conn.state = ConnState::Connecting;
+            conn.set_state(ConnState::Connecting);
             conn.dtr = dtr;
             conn.rts = rts;
             conn.last_error = None;
@@ -1735,6 +1824,7 @@ impl App {
             handle,
             store: LineStore::new(limits.max_lines),
             state: ConnState::Connecting,
+            disconnect_generation: 0,
             follow: true,
             new_since_scroll: 0,
             pin_view_h: 0.0,
@@ -1748,6 +1838,7 @@ impl App {
             history_allocation_shrink_pending: false,
             raw_evicted_any: false,
             raw_base: 0,
+            raw_contiguous_start: 0,
             raw_sessions: Vec::new(),
             last_error: None,
             mark_micros: None,
@@ -2473,6 +2564,7 @@ impl App {
             // above for them to be counted from.
             conn.raw_base = conn.raw_next();
             conn.raw_ring.clear();
+            conn.raw_contiguous_start = conn.raw_base;
             conn.raw_sessions.clear();
             // Everything derived from the lines that just went away. The dirty
             // flags make the next frame rebuild both indices against the now
@@ -2506,6 +2598,10 @@ impl App {
             || !self.connect_errors.is_empty()
             || self.update_dialog.is_some()
             || self.show_settings
+            || self.show_macros_win
+            || self.macro_editor.is_some()
+            || self.macro_running_edit_confirmation.is_some()
+            || self.macro_shortcut_conflict.is_some()
             || self.show_filters_win
             || self.show_highlight_win
             || self.show_extract_win
@@ -2587,6 +2683,11 @@ impl eframe::App for App {
         self.poll_enumerator();
         self.poll_update_check();
 
+        // Macro shortcuts belong to the unfocused console, just like raw
+        // keyboard input. Consume an assigned chord before it can become bytes
+        // for the device or activate a widget during layout.
+        self.consume_macro_shortcut(ctx);
+
         let max_lines = self.config.settings.max_lines;
         let mut any_data = false;
         for conn in &mut self.connections {
@@ -2625,6 +2726,7 @@ impl eframe::App for App {
         self.show_config_dialog(ctx);
         self.show_rename_dialog(ctx);
         self.show_tool_windows(ctx);
+        self.show_macros_window(ctx);
         self.show_settings_window(ctx);
         self.show_update_dialog(ctx);
         self.show_font_toast(ctx);
@@ -2632,6 +2734,11 @@ impl eframe::App for App {
         // Keep the guard focused until every widget has been drawn, so none of
         // the later floating windows can claim this Tab either.
         self.release_console_tab_after_layout(ctx, console_tab_claimed);
+
+        // Sends every command whose deadline has arrived and schedules only
+        // the next deadline, keeping an otherwise idle console asleep between
+        // macro steps.
+        self.maintain_macro_runs(ctx);
 
         // A close-request frame may be the last update the app receives. Save
         // immediately in that case; otherwise coalesce rapid edits and wake the
@@ -3131,6 +3238,29 @@ pub(crate) mod tests {
     /// swapped for one this test controls.
     pub(crate) fn test_app(name: &str) -> (App, crossbeam_channel::Sender<EnumEvent>) {
         test_app_with_config(name, Config::default())
+    }
+
+    #[test]
+    fn bundled_hack_font_is_the_final_proportional_fallback() {
+        let fonts = app_font_definitions();
+        assert!(fonts.font_data.contains_key("Hack"));
+        assert_eq!(
+            fonts
+                .families
+                .get(&egui::FontFamily::Proportional)
+                .and_then(|family| family.last())
+                .map(String::as_str),
+            Some("Hack")
+        );
+
+        let ctx = egui::Context::default();
+        ctx.set_fonts(fonts);
+        ctx.begin_pass(Default::default());
+        assert!(ctx.fonts(|fonts| {
+            let ui_font = egui::FontId::proportional(12.0);
+            fonts.has_glyph(&ui_font, '↑') && fonts.has_glyph(&ui_font, '↓')
+        }));
+        let _ = ctx.end_pass();
     }
 
     /// Like `test_app`, but seeded with a config the test provides.
@@ -3982,6 +4112,7 @@ pub(crate) mod tests {
         assert_eq!(conn.store.get(2).unwrap().text, "after");
 
         assert_eq!(conn.raw_ring.iter().copied().collect::<Vec<_>>(), b"oldnew");
+        assert_eq!(conn.raw_contiguous_start, 3);
         assert_eq!(conn.raw_sessions.len(), 2);
         assert!(conn.raw_sessions[0]
             .label

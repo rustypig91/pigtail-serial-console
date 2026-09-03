@@ -407,6 +407,120 @@ pub struct NamedConfig {
     pub config: PortConfig,
 }
 
+/// One ordered step in a transmit macro.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum MacroStep {
+    /// Text sent using the selected connection's configured line ending.
+    Command { text: String },
+    /// A non-blocking pause before advancing to the next step.
+    Delay { delay_ms: u64 },
+    /// Pause until newly received serial data matches a regular expression.
+    #[serde(rename = "wait_for")]
+    WaitFor { pattern: String },
+}
+
+/// A reusable ordered sequence of command, delay, and receive-wait steps.
+///
+/// `shortcut` is the digit in Ctrl+Shift+0 through Ctrl+Shift+9 when one is
+/// assigned.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TransmitMacro {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub steps: Vec<MacroStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shortcut: Option<u8>,
+    /// Total executions when `repeat_indefinitely` is false.
+    #[serde(
+        default = "default_macro_repeat_count",
+        skip_serializing_if = "macro_repeat_is_once"
+    )]
+    pub repeat_count: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub repeat_indefinitely: bool,
+}
+
+const fn default_macro_repeat_count() -> u32 {
+    1
+}
+
+fn macro_repeat_is_once(count: &u32) -> bool {
+    *count == 1
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl Default for TransmitMacro {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            steps: Vec::new(),
+            shortcut: None,
+            repeat_count: default_macro_repeat_count(),
+            repeat_indefinitely: false,
+        }
+    }
+}
+
+/// Deserialization wire form retaining the command-list/global-delay fields
+/// written by the first macro implementation. New saves contain only `steps`.
+#[derive(Deserialize)]
+struct TransmitMacroWire {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    steps: Vec<MacroStep>,
+    #[serde(default)]
+    shortcut: Option<u8>,
+    #[serde(default = "default_macro_repeat_count")]
+    repeat_count: u32,
+    #[serde(default)]
+    repeat_indefinitely: bool,
+    #[serde(default)]
+    commands: Vec<String>,
+    #[serde(default)]
+    delay_ms: u64,
+}
+
+impl<'de> Deserialize<'de> for TransmitMacro {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = TransmitMacroWire::deserialize(deserializer)?;
+        let steps = if wire.steps.is_empty() && !wire.commands.is_empty() {
+            let command_count = wire.commands.len();
+            let mut steps = Vec::with_capacity(command_count.saturating_mul(2).saturating_sub(1));
+            for (index, text) in wire.commands.into_iter().enumerate() {
+                steps.push(MacroStep::Command { text });
+                if wire.delay_ms > 0 && index + 1 < command_count {
+                    steps.push(MacroStep::Delay {
+                        delay_ms: wire.delay_ms,
+                    });
+                }
+            }
+            steps
+        } else {
+            wire.steps
+        };
+        Ok(Self {
+            name: wire.name,
+            description: wire.description,
+            steps,
+            shortcut: wire.shortcut,
+            repeat_count: wire.repeat_count.max(1),
+            repeat_indefinitely: wire.repeat_indefinitely,
+        })
+    }
+}
+
 /// A connection that was open when the app last exited, so it can be reopened on
 /// the next launch (remembered session).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -430,6 +544,9 @@ pub struct Config {
     /// Named port-config presets for the new-connection dialog.
     #[serde(default, rename = "preset")]
     pub presets: Vec<NamedConfig>,
+    /// Reusable transmit command sequences, available to every connection.
+    #[serde(default, rename = "macro")]
+    pub macros: Vec<TransmitMacro>,
     /// Connections open at last exit, reopened on the next launch.
     #[serde(default, rename = "last_open")]
     pub last_open: Vec<SavedConnection>,
@@ -462,6 +579,7 @@ impl Default for Config {
             settings: Settings::default(),
             highlight: default_highlight_rules(),
             presets: Vec::new(),
+            macros: Vec::new(),
             last_open: Vec::new(),
         }
     }
@@ -691,6 +809,25 @@ bold = true
                     ..PortConfig::default()
                 },
             }],
+            macros: vec![TransmitMacro {
+                name: "Reboot and inspect".into(),
+                description: "Restart the target and read its status".into(),
+                steps: vec![
+                    MacroStep::Command {
+                        text: "reboot".into(),
+                    },
+                    MacroStep::Delay { delay_ms: 500 },
+                    MacroStep::WaitFor {
+                        pattern: "ready\\s+ok".into(),
+                    },
+                    MacroStep::Command {
+                        text: "status".into(),
+                    },
+                ],
+                shortcut: Some(2),
+                repeat_count: 3,
+                repeat_indefinitely: false,
+            }],
             last_open: vec![SavedConnection {
                 identity: PortIdentity {
                     vid: Some(3),
@@ -704,6 +841,47 @@ bold = true
         let s = cfg.to_toml().unwrap();
         let back = Config::from_toml(&s).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn macros_are_backward_compatible_and_roundtrip() {
+        let old = Config::from_toml("[settings]\nmax_lines = 1000\n").unwrap();
+        assert!(old.macros.is_empty());
+
+        // The first macro format had a command list and one delay shared by
+        // every pair. It migrates to explicit ordered steps when read.
+        let cfg = Config::from_toml(
+            r#"
+                [[macro]]
+                name = "Provision"
+                description = "Set up a fresh unit"
+                commands = ["erase", "program", "verify"]
+                delay_ms = 250
+                shortcut = 7
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.macros.len(), 1);
+        assert_eq!(
+            cfg.macros[0].steps,
+            [
+                MacroStep::Command {
+                    text: "erase".into()
+                },
+                MacroStep::Delay { delay_ms: 250 },
+                MacroStep::Command {
+                    text: "program".into()
+                },
+                MacroStep::Delay { delay_ms: 250 },
+                MacroStep::Command {
+                    text: "verify".into()
+                },
+            ]
+        );
+        assert_eq!(cfg.macros[0].shortcut, Some(7));
+        assert_eq!(cfg.macros[0].repeat_count, 1);
+        assert!(!cfg.macros[0].repeat_indefinitely);
+        assert_eq!(Config::from_toml(&cfg.to_toml().unwrap()).unwrap(), cfg);
     }
 
     #[test]

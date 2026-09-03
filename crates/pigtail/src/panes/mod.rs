@@ -5,6 +5,7 @@ mod connect;
 mod log;
 pub use log::wrap_len;
 
+mod macros;
 mod plot;
 mod settings;
 mod transmit;

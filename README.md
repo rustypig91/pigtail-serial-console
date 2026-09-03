@@ -18,6 +18,8 @@ Most serial terminals just show you text. Pigtail is built around the parts of f
   and interleaves every device by timestamp
 - Hex view alongside the text view
 - Transmit with configurable line endings, send history, and hex input
+- Named transmit macros with reorderable command, delay, and regex wait steps,
+  finite or indefinite looping, and assignable Ctrl+Shift+0 through Ctrl+Shift+9 shortcuts
 - DTR/RTS toggles and break signal
 - Export the current (filtered) view to `.txt` or `.csv`
 - Startup notice when a newer release is published, with "skip this version"; the

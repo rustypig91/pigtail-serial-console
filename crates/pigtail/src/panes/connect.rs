@@ -4,8 +4,10 @@
 use crate::app::{available_port_is_added, App, ConfigDialog};
 use serialcore::config::{
     DataBits, FlowControl, LineEnding, NamedConfig, Parity, PortConfig, StopBits, TerminalMode,
+    TransmitMacro,
 };
 use serialcore::reader::ConnState;
+use std::time::Instant;
 
 const COMMON_BAUDS: &[u32] = &[
     9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1_000_000, 2_000_000, 3_000_000,
@@ -38,6 +40,7 @@ impl App {
         let mut save_text = false;
         let mut port_options: Option<usize> = None;
         let mut rename_tab: Option<usize> = None;
+        let macros_tooltip = macro_tooltip(&self.config.macros);
 
         // The config dialog is meant to be modal, but an `egui::Window` does
         // not block input to what it covers, so the header would keep acting
@@ -123,6 +126,9 @@ impl App {
                     if ui.button("⚙").on_hover_text("Settings").clicked() {
                         self.show_settings = true;
                     }
+                    if ui.button("Macros").on_hover_text(&macros_tooltip).clicked() {
+                        self.show_macros_win = true;
+                    }
                     if ui
                         .add_enabled(self.active_index().is_some(), egui::Button::new("💾"))
                         .on_hover_text(if self.merged_selected {
@@ -193,11 +199,15 @@ impl App {
         let has_highlights = self.config.highlight.iter().any(|rule| rule.enabled);
         let mut merged_tx_port = self.merged_tx_port;
         let mut open_error_win: Option<serialcore::store::PortId> = None;
+        let long_running_macros =
+            self.long_running_macro_indicators(Instant::now(), self.macro_target_port());
+        let mut stop_macro_run = None;
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if self.merged_selected {
                     let shown = self.merged_view().len();
                     ui.label(format!("merged · {} lines", self.merged.len()));
+                    show_macro_run_indicators(ui, &long_running_macros, &mut stop_macro_run);
                     if self.merged_filter_active() {
                         ui.separator();
                         ui.label(format!("{shown} shown"));
@@ -290,6 +300,7 @@ impl App {
                 ui.monospace(conn.port_config.summary());
                 ui.separator();
                 ui.label(format!("{} lines", conn.store.next_abs_index()));
+                show_macro_run_indicators(ui, &long_running_macros, &mut stop_macro_run);
                 if conn.filter_index_active() {
                     ui.separator();
                     ui.label(format!("{} shown", conn.filter_index.len()));
@@ -362,6 +373,9 @@ impl App {
         });
 
         self.merged_tx_port = merged_tx_port;
+        if let Some(run_index) = stop_macro_run {
+            self.stop_macro_run(run_index);
+        }
         if toggle_highlights {
             self.highlights_visible = !self.highlights_visible;
         }
@@ -780,6 +794,64 @@ fn short_label(label: &str) -> String {
     }
 }
 
+fn show_macro_run_indicators(
+    ui: &mut egui::Ui,
+    runs: &[(usize, String)],
+    stop_run: &mut Option<usize>,
+) {
+    for (run_index, name) in runs {
+        ui.separator();
+        if ui
+            .small_button(format!("⏳ {}", short_label(name)))
+            .on_hover_text("Macro is running. Click to stop it.")
+            .clicked()
+        {
+            *stop_run = Some(*run_index);
+        }
+    }
+}
+
+/// A compact catalog for the Macros header button. Keeping every field labeled
+/// makes several macros easy to scan without opening the editor.
+fn macro_tooltip(macros: &[TransmitMacro]) -> String {
+    if macros.is_empty() {
+        return "No macros configured. Click to add one.".to_owned();
+    }
+
+    let mut tooltip = String::from("Transmit macros\n");
+    for (index, macro_def) in macros.iter().enumerate() {
+        if index > 0 {
+            tooltip.push('\n');
+        }
+        let name = if macro_def.name.trim().is_empty() {
+            "(unnamed)"
+        } else {
+            macro_def.name.trim()
+        };
+        let description = if macro_def.description.trim().is_empty() {
+            "—"
+        } else {
+            macro_def.description.trim()
+        };
+        let shortcut = macro_def.shortcut.filter(|digit| *digit <= 9).map_or_else(
+            || "Unassigned".to_owned(),
+            |digit| format!("Ctrl+Shift+{digit}"),
+        );
+        let runs = if macro_def.repeat_indefinitely {
+            "Indefinitely".to_owned()
+        } else if macro_def.repeat_count <= 1 {
+            "Once".to_owned()
+        } else {
+            format!("{} times", macro_def.repeat_count)
+        };
+        tooltip.push_str(&format!(
+            "Name: {name}\nDescription: {description}\nShortcut: {shortcut}\nRuns: {runs}\n"
+        ));
+    }
+    tooltip.push_str("\nClick to edit or run macros.");
+    tooltip
+}
+
 /// Text for one detected-port choice. Path-only devices use their path as the
 /// identity label too; repeating it adds no information and is especially
 /// noisy for ordinary `/dev/tty*` and Windows `COM*` ports.
@@ -812,7 +884,8 @@ fn windows_com_name(value: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::port_choice_text;
+    use super::{macro_tooltip, port_choice_text};
+    use serialcore::config::TransmitMacro;
 
     #[test]
     fn duplicate_unix_path_label_is_shown_once() {
@@ -839,5 +912,29 @@ mod tests {
             port_choice_text("COM3", "ST-Link Virtual COM Port", false),
             "COM3  ST-Link Virtual COM Port"
         );
+    }
+
+    #[test]
+    fn macro_tooltip_lists_every_macro_and_field() {
+        let tooltip = macro_tooltip(&[
+            TransmitMacro {
+                name: "Boot".into(),
+                description: "Restart the target".into(),
+                shortcut: Some(2),
+                ..Default::default()
+            },
+            TransmitMacro {
+                name: "Status".into(),
+                description: String::new(),
+                shortcut: None,
+                ..Default::default()
+            },
+        ]);
+
+        assert!(
+            tooltip.contains("Name: Boot\nDescription: Restart the target\nShortcut: Ctrl+Shift+2")
+        );
+        assert!(tooltip.contains("Name: Status\nDescription: —\nShortcut: Unassigned"));
+        assert_eq!(tooltip.matches("Runs: Once").count(), 2);
     }
 }
