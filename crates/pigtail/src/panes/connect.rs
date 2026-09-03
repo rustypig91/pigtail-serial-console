@@ -23,6 +23,11 @@ impl App {
     /// simultaneous failures all get seen rather than the latest silently
     /// replacing the others.
     pub(crate) fn show_connect_error(&mut self, ctx: &egui::Context) {
+        // A drop confirmation is modal and already anchored at the centre;
+        // keep an unrelated background error queued until it closes.
+        if self.file_transfer_dialog.is_some() {
+            return;
+        }
         let Some(err) = self.connect_errors.front() else {
             return;
         };
@@ -50,7 +55,9 @@ impl App {
         // `editing` pointing at a tab that no longer exists (issue #16).
         // Disabled rather than merely ignored so the greying-out shows *why*
         // the clicks do nothing.
-        let modal_open = self.config_dialog.is_some() || self.rename_dialog.is_some();
+        let modal_open = self.config_dialog.is_some()
+            || self.rename_dialog.is_some()
+            || self.file_transfer_dialog.is_some();
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {

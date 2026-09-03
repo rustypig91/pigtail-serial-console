@@ -8,6 +8,7 @@ pub use log::wrap_len;
 mod macros;
 mod plot;
 mod settings;
+mod transfer;
 mod transmit;
 mod update;
 mod windows;

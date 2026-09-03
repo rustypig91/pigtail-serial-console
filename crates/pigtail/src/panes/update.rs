@@ -5,6 +5,11 @@ use crate::app::App;
 
 impl App {
     pub(crate) fn show_update_dialog(&mut self, ctx: &egui::Context) {
+        // Do not stack two centred dialogs if a file was dropped while the
+        // asynchronous update check was still in flight.
+        if self.file_transfer_dialog.is_some() {
+            return;
+        }
         let Some(dialog) = &self.update_dialog else {
             return;
         };

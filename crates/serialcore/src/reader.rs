@@ -16,6 +16,7 @@ use crate::framer::{FramedLine, Framer};
 use crate::session::{SessionMeta, SessionWriter};
 use crate::source::{ByteSource, SerialSource, SourceError};
 use crate::store::{LineFlags, PortId};
+use crate::transfer::PreparedTransfer;
 use crate::wake::Wake;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use std::collections::VecDeque;
@@ -99,6 +100,15 @@ pub enum ReaderEvent {
         scope: ErrorScope,
         msg: String,
     },
+    /// Latest file-transfer byte counts. Progress updates are deliberately
+    /// lossy; the reader must never stop receiving because the UI is busy.
+    TransferProgress {
+        sent: usize,
+        total: usize,
+    },
+    /// The active transfer ended (completed, cancelled, or failed). The UI
+    /// removes its progress controls without presenting a separate result.
+    TransferEnded,
 }
 
 /// What an error is actually about, so the UI can tell a broken link from a
@@ -135,6 +145,8 @@ impl ReaderEvent {
 #[derive(Clone, Debug)]
 enum ReaderCommand {
     Transmit(Vec<u8>),
+    StartTransfer(PreparedTransfer),
+    CancelTransfer,
     SetDtr(bool),
     SetRts(bool),
     SendBreak,
@@ -185,6 +197,12 @@ pub struct ReaderHandle {
 impl ReaderHandle {
     pub fn transmit(&self, bytes: Vec<u8>) {
         let _ = self.cmd.send(ReaderCommand::Transmit(bytes));
+    }
+    pub fn start_transfer(&self, transfer: PreparedTransfer) {
+        let _ = self.cmd.send(ReaderCommand::StartTransfer(transfer));
+    }
+    pub fn cancel_transfer(&self) {
+        let _ = self.cmd.send(ReaderCommand::CancelTransfer);
     }
     pub fn set_dtr(&self, on: bool) {
         let _ = self.cmd.send(ReaderCommand::SetDtr(on));
@@ -544,6 +562,7 @@ fn run(
         let mut last_send = Instant::now();
         let mut last_byte = Instant::now();
         let mut provisional_flushed = false;
+        let mut transfer: Option<ActiveTransfer> = None;
 
         loop {
             // Handle any queued commands.
@@ -553,7 +572,7 @@ fn run(
                 pending: &mut pending,
                 backlog: &mut backlog,
             };
-            match drain_commands(&cmd_rx, source.as_mut(), targets, &event_tx) {
+            match drain_commands(&cmd_rx, source.as_mut(), targets, &mut transfer, &event_tx) {
                 CommandOutcome::Shutdown => {
                     // Flush and exit.
                     framer.flush_final(&mut pending.lines);
@@ -567,6 +586,8 @@ fn run(
                 }
                 CommandOutcome::Continue => {}
             }
+
+            advance_transfer(&mut transfer, source.as_mut(), &event_tx);
 
             match source.read(&mut buf) {
                 Ok(0) => {
@@ -615,6 +636,10 @@ fn run(
             }
             // Try to drain any backlog that built up while the channel was full.
             drain_backlog(&mut backlog, &event_tx);
+        }
+
+        if transfer.take().is_some() {
+            event_tx.send(ReaderEvent::TransferEnded);
         }
 
         // Left the read loop due to disconnect. The line being framed will never
@@ -682,6 +707,30 @@ enum CommandOutcome {
     Shutdown,
 }
 
+/// Reader-owned cursor over a prepared file.  Keeping pacing here means an
+/// open transfer shares the same short loop as reads, commands, reconnect, and
+/// shutdown instead of occupying a second writer that could outlive the port.
+struct ActiveTransfer {
+    prepared: PreparedTransfer,
+    sent: usize,
+    next_line_end: usize,
+    next_write: Instant,
+    last_progress: Instant,
+}
+
+impl ActiveTransfer {
+    fn new(prepared: PreparedTransfer) -> Self {
+        let now = Instant::now();
+        Self {
+            prepared,
+            sent: 0,
+            next_line_end: 0,
+            next_write: now,
+            last_progress: now,
+        }
+    }
+}
+
 /// State a `ClearLog` command has to reach into: everything holding bytes that
 /// the user just deleted from the console.
 struct ClearTargets<'a> {
@@ -709,6 +758,7 @@ fn drain_commands(
     cmd_rx: &Receiver<ReaderCommand>,
     source: &mut dyn ByteSource,
     targets: ClearTargets<'_>,
+    transfer: &mut Option<ActiveTransfer>,
     event_tx: &EventTx,
 ) -> CommandOutcome {
     let ClearTargets {
@@ -735,6 +785,24 @@ fn drain_commands(
                     event_tx.send(ReaderEvent::session_error(format!("transmit: {e}")));
                 }
             }
+            ReaderCommand::StartTransfer(prepared) => {
+                if transfer.is_some() {
+                    event_tx.send(ReaderEvent::session_error(
+                        "file transfer: another transfer is already active",
+                    ));
+                } else if prepared.data.is_empty() {
+                    event_tx.send(ReaderEvent::TransferEnded);
+                } else {
+                    let total = prepared.total_bytes();
+                    *transfer = Some(ActiveTransfer::new(prepared));
+                    let _ = event_tx.try_send(ReaderEvent::TransferProgress { sent: 0, total });
+                }
+            }
+            ReaderCommand::CancelTransfer => {
+                if transfer.take().is_some() {
+                    event_tx.send(ReaderEvent::TransferEnded);
+                }
+            }
             ReaderCommand::SetDtr(on) => {
                 if let Err(e) = source.set_dtr(on) {
                     event_tx.send(ReaderEvent::session_error(format!("dtr: {e}")));
@@ -753,6 +821,97 @@ fn drain_commands(
         }
     }
     CommandOutcome::Continue
+}
+
+/// Write at most one paced unit. A zero character delay sends a bounded block
+/// up to the next line boundary; a non-zero delay sends one byte. Either way,
+/// the surrounding loop gets another chance to read and handle commands before
+/// more of the file is written.
+fn advance_transfer(
+    transfer: &mut Option<ActiveTransfer>,
+    source: &mut dyn ByteSource,
+    event_tx: &EventTx,
+) {
+    let Some(active) = transfer.as_mut() else {
+        return;
+    };
+    let now = Instant::now();
+    if now < active.next_write {
+        return;
+    }
+
+    // A blank line with no outgoing line ending can share its byte offset with
+    // the line before it. It still owns a line pause, even though there is no
+    // byte to write for it. Consume such zero-width boundaries one at a time.
+    while let Some(&end) = active.prepared.line_ends.get(active.next_line_end) {
+        if end < active.sent {
+            active.next_line_end += 1;
+            continue;
+        }
+        if end == active.sent {
+            active.next_line_end += 1;
+            if active.next_line_end < active.prepared.line_ends.len()
+                && !active.prepared.line_delay.is_zero()
+            {
+                active.next_write = now + active.prepared.line_delay;
+                return;
+            }
+            continue;
+        }
+        break;
+    }
+    let line_end = active
+        .prepared
+        .line_ends
+        .get(active.next_line_end)
+        .copied()
+        .unwrap_or(active.prepared.data.len());
+    let chunk_end = if active.prepared.char_delay.is_zero() {
+        active
+            .sent
+            .saturating_add(4096)
+            .min(line_end)
+            .min(active.prepared.data.len())
+    } else {
+        active
+            .sent
+            .saturating_add(1)
+            .min(active.prepared.data.len())
+    };
+
+    if let Err(e) = source.write(&active.prepared.data[active.sent..chunk_end]) {
+        event_tx.send(ReaderEvent::session_error(format!("file transfer: {e}")));
+        *transfer = None;
+        event_tx.send(ReaderEvent::TransferEnded);
+        return;
+    }
+    active.sent = chunk_end;
+    let finished = active.sent == active.prepared.data.len();
+    let crossed_line = active
+        .prepared
+        .line_ends
+        .get(active.next_line_end)
+        .is_some_and(|&end| active.sent == end);
+    let report = finished || active.last_progress.elapsed() >= Duration::from_millis(50);
+    if report {
+        let _ = event_tx.try_send(ReaderEvent::TransferProgress {
+            sent: active.sent,
+            total: active.prepared.data.len(),
+        });
+        active.last_progress = now;
+    }
+    if finished {
+        *transfer = None;
+        event_tx.send(ReaderEvent::TransferEnded);
+        return;
+    }
+
+    let mut delay = active.prepared.char_delay;
+    if crossed_line {
+        delay = delay.saturating_add(active.prepared.line_delay);
+        active.next_line_end += 1;
+    }
+    active.next_write = now + delay;
 }
 
 /// Move `pending` into the backlog, then try to push backlog entries onto the
@@ -873,6 +1032,12 @@ fn wait_or_shutdown(
             report_dropped_command(event_tx, "transmit");
             false
         }
+        Ok(ReaderCommand::StartTransfer(_)) => {
+            report_dropped_command(event_tx, "file transfer");
+            event_tx.send(ReaderEvent::TransferEnded);
+            false
+        }
+        Ok(ReaderCommand::CancelTransfer) => false,
         Ok(ReaderCommand::SetDtr(_)) => {
             report_dropped_command(event_tx, "dtr");
             false
@@ -912,6 +1077,26 @@ mod tests {
     use crate::config::PortConfig;
     use crate::source::ScriptedSource;
 
+    #[derive(Default)]
+    struct WriteSink {
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl ByteSource for WriteSink {
+        fn read(&mut self, _buf: &mut [u8]) -> Result<usize, SourceError> {
+            Ok(0)
+        }
+
+        fn description(&self) -> String {
+            "write sink".to_owned()
+        }
+
+        fn write(&mut self, bytes: &[u8]) -> Result<(), SourceError> {
+            self.writes.push(bytes.to_vec());
+            Ok(())
+        }
+    }
+
     fn test_meta() -> SessionMeta {
         SessionMeta {
             identity: PortIdentity::default(),
@@ -940,6 +1125,7 @@ mod tests {
                 }
                 Ok(ReaderEvent::OutputDropped { .. }) => {}
                 Ok(ReaderEvent::Error { .. }) => {}
+                Ok(ReaderEvent::TransferProgress { .. } | ReaderEvent::TransferEnded) => {}
                 Err(_) => {}
             }
         }
@@ -1009,6 +1195,87 @@ mod tests {
         assert_eq!(lines, vec!["hello", "world"]);
         assert!(states.contains(&ConnState::Connected));
         assert!(states.contains(&ConnState::Closed));
+    }
+
+    #[test]
+    fn file_transfer_yields_at_line_boundaries_and_reports_its_end() {
+        let prepared = PreparedTransfer {
+            path: PathBuf::from("commands.txt"),
+            data: b"abCDE".to_vec(),
+            line_ends: vec![2, 5],
+            line_delay: Duration::ZERO,
+            char_delay: Duration::ZERO,
+        };
+        let mut active = Some(ActiveTransfer::new(prepared));
+        let mut source = WriteSink::default();
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        let events = EventTx {
+            tx,
+            wake: Wake::none(),
+        };
+
+        advance_transfer(&mut active, &mut source, &events);
+        assert!(active.is_some(), "the second line must remain queued");
+        advance_transfer(&mut active, &mut source, &events);
+
+        assert_eq!(source.writes, [b"ab".to_vec(), b"CDE".to_vec()]);
+        assert!(active.is_none());
+        assert!(rx
+            .try_iter()
+            .any(|event| matches!(event, ReaderEvent::TransferEnded)));
+    }
+
+    #[test]
+    fn character_pacing_writes_only_one_byte_before_its_deadline() {
+        let prepared = PreparedTransfer {
+            path: PathBuf::from("firmware.bin"),
+            data: vec![1, 2],
+            line_ends: Vec::new(),
+            line_delay: Duration::ZERO,
+            char_delay: Duration::from_secs(1),
+        };
+        let mut active = Some(ActiveTransfer::new(prepared));
+        let mut source = WriteSink::default();
+        let (tx, _rx) = crossbeam_channel::bounded(8);
+        let events = EventTx {
+            tx,
+            wake: Wake::none(),
+        };
+
+        advance_transfer(&mut active, &mut source, &events);
+        advance_transfer(&mut active, &mut source, &events);
+
+        assert_eq!(source.writes, [vec![1]]);
+        assert_eq!(active.as_ref().map(|state| state.sent), Some(1));
+    }
+
+    #[test]
+    fn empty_lines_without_terminator_bytes_keep_each_line_pause() {
+        let prepared = PreparedTransfer {
+            path: PathBuf::from("blank-lines.txt"),
+            data: b"x".to_vec(),
+            line_ends: vec![0, 0, 1],
+            line_delay: Duration::from_secs(1),
+            char_delay: Duration::ZERO,
+        };
+        let mut active = Some(ActiveTransfer::new(prepared));
+        let mut source = WriteSink::default();
+        let (tx, _rx) = crossbeam_channel::bounded(8);
+        let events = EventTx {
+            tx,
+            wake: Wake::none(),
+        };
+
+        advance_transfer(&mut active, &mut source, &events);
+        assert_eq!(active.as_ref().map(|state| state.next_line_end), Some(1));
+        active.as_mut().unwrap().next_write = Instant::now();
+        advance_transfer(&mut active, &mut source, &events);
+        assert_eq!(active.as_ref().map(|state| state.next_line_end), Some(2));
+        active.as_mut().unwrap().next_write = Instant::now();
+        advance_transfer(&mut active, &mut source, &events);
+
+        assert_eq!(source.writes, [b"x".to_vec()]);
+        assert!(active.is_none());
     }
 
     #[test]
