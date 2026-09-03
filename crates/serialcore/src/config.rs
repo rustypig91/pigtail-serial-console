@@ -415,13 +415,16 @@ pub enum MacroStep {
     Command { text: String },
     /// A non-blocking pause before advancing to the next step.
     Delay { delay_ms: u64 },
+    /// Pause until newly received serial data matches a regular expression.
+    #[serde(rename = "wait_for")]
+    WaitFor { pattern: String },
 }
 
-/// A reusable ordered sequence of command and delay steps.
+/// A reusable ordered sequence of command, delay, and receive-wait steps.
 ///
 /// `shortcut` is the digit in Ctrl+Shift+0 through Ctrl+Shift+9 when one is
 /// assigned.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct TransmitMacro {
     pub name: String,
     #[serde(default)]
@@ -430,6 +433,39 @@ pub struct TransmitMacro {
     pub steps: Vec<MacroStep>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shortcut: Option<u8>,
+    /// Total executions when `repeat_indefinitely` is false.
+    #[serde(
+        default = "default_macro_repeat_count",
+        skip_serializing_if = "macro_repeat_is_once"
+    )]
+    pub repeat_count: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub repeat_indefinitely: bool,
+}
+
+const fn default_macro_repeat_count() -> u32 {
+    1
+}
+
+fn macro_repeat_is_once(count: &u32) -> bool {
+    *count == 1
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl Default for TransmitMacro {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            steps: Vec::new(),
+            shortcut: None,
+            repeat_count: default_macro_repeat_count(),
+            repeat_indefinitely: false,
+        }
+    }
 }
 
 /// Deserialization wire form retaining the command-list/global-delay fields
@@ -443,6 +479,10 @@ struct TransmitMacroWire {
     steps: Vec<MacroStep>,
     #[serde(default)]
     shortcut: Option<u8>,
+    #[serde(default = "default_macro_repeat_count")]
+    repeat_count: u32,
+    #[serde(default)]
+    repeat_indefinitely: bool,
     #[serde(default)]
     commands: Vec<String>,
     #[serde(default)]
@@ -475,6 +515,8 @@ impl<'de> Deserialize<'de> for TransmitMacro {
             description: wire.description,
             steps,
             shortcut: wire.shortcut,
+            repeat_count: wire.repeat_count.max(1),
+            repeat_indefinitely: wire.repeat_indefinitely,
         })
     }
 }
@@ -775,11 +817,16 @@ bold = true
                         text: "reboot".into(),
                     },
                     MacroStep::Delay { delay_ms: 500 },
+                    MacroStep::WaitFor {
+                        pattern: "ready\\s+ok".into(),
+                    },
                     MacroStep::Command {
                         text: "status".into(),
                     },
                 ],
                 shortcut: Some(2),
+                repeat_count: 3,
+                repeat_indefinitely: false,
             }],
             last_open: vec![SavedConnection {
                 identity: PortIdentity {
@@ -832,6 +879,8 @@ bold = true
             ]
         );
         assert_eq!(cfg.macros[0].shortcut, Some(7));
+        assert_eq!(cfg.macros[0].repeat_count, 1);
+        assert!(!cfg.macros[0].repeat_indefinitely);
         assert_eq!(Config::from_toml(&cfg.to_toml().unwrap()).unwrap(), cfg);
     }
 

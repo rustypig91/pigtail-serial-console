@@ -1121,10 +1121,25 @@ pub struct UpdateDialog {
 /// One in-flight macro execution. The definition is copied when it starts so
 /// editing or deleting a macro cannot change a sequence halfway through.
 pub(crate) struct MacroRun {
+    /// Catalog position of the definition that started this run. It becomes
+    /// `None` if that definition is deleted while its copied steps continue.
+    pub(crate) macro_index: Option<usize>,
+    pub(crate) name: String,
+    pub(crate) started_at: Instant,
+    /// Further full executions after the current one; `None` means forever.
+    pub(crate) repetitions_remaining: Option<u32>,
     pub(crate) port: PortId,
     pub(crate) steps: Vec<serialcore::config::MacroStep>,
     pub(crate) next_step: usize,
     pub(crate) next_at: Instant,
+    pub(crate) wait_for: Option<MacroWait>,
+}
+
+/// A receive condition starts at an absolute raw-byte position, so output
+/// already in the console before the wait step cannot satisfy it.
+pub(crate) struct MacroWait {
+    pub(crate) regex: regex::Regex,
+    pub(crate) raw_start: u64,
 }
 
 /// Draft owned by the separate add/edit window. Config is changed only when
@@ -1221,6 +1236,8 @@ pub struct App {
     pub show_settings: bool,
     pub show_macros_win: bool,
     pub(crate) macro_editor: Option<MacroEditor>,
+    /// Macro definition awaiting confirmation because it is currently running.
+    pub(crate) macro_running_edit_confirmation: Option<usize>,
     /// Target macro, requested digit, and the macro currently owning it.
     pub(crate) macro_shortcut_conflict: Option<(usize, u8, usize)>,
     pub show_filters_win: bool,
@@ -1310,6 +1327,7 @@ impl App {
             show_settings: false,
             show_macros_win: false,
             macro_editor: None,
+            macro_running_edit_confirmation: None,
             macro_shortcut_conflict: None,
             show_filters_win: false,
             show_highlight_win: false,
@@ -2556,6 +2574,7 @@ impl App {
             || self.show_settings
             || self.show_macros_win
             || self.macro_editor.is_some()
+            || self.macro_running_edit_confirmation.is_some()
             || self.macro_shortcut_conflict.is_some()
             || self.show_filters_win
             || self.show_highlight_win

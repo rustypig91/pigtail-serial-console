@@ -1,6 +1,7 @@
 //! User-defined transmit macros and their non-blocking execution scheduler.
 
-use crate::app::{App, MacroEditor, MacroRun};
+use crate::app::{App, Connection, MacroEditor, MacroRun, MacroWait};
+use regex::Regex;
 use serialcore::config::{MacroStep, TransmitMacro};
 use serialcore::reader::ConnState;
 use serialcore::store::{IncomingLine, LineFlags, PortId};
@@ -8,6 +9,8 @@ use std::time::{Duration, Instant};
 
 const MAX_DELAY_MS: u64 = 3_600_000;
 const DEFAULT_DELAY_MS: u64 = 100;
+const MACRO_INDICATOR_DELAY: Duration = Duration::from_millis(500);
+const MAX_MACRO_REPEAT_COUNT: u32 = 1_000_000;
 
 impl App {
     /// The connection a macro started right now should keep targeting.
@@ -15,7 +18,7 @@ impl App {
     /// In the merged view this is the explicit "Send to" device. A run stores
     /// its port id so switching tabs while it is delayed does not redirect the
     /// remaining commands to a different device.
-    fn macro_target_port(&self) -> Option<PortId> {
+    pub(crate) fn macro_target_port(&self) -> Option<PortId> {
         if self.merged_selected {
             self.merged_tx_port.filter(|id| {
                 self.connections
@@ -78,6 +81,7 @@ impl App {
             self.show_macro_catalog(ctx);
         }
         self.show_shortcut_conflict(ctx);
+        self.show_running_macro_edit_confirmation(ctx);
         self.show_macro_editor(ctx);
     }
 
@@ -85,9 +89,12 @@ impl App {
     /// add/edit window so an accidental click cannot rewrite configuration.
     fn show_macro_catalog(&mut self, ctx: &egui::Context) {
         let mut open = self.show_macros_win;
-        let can_run = self.macro_target_port().is_some();
-        let editor_open = self.macro_editor.is_some();
+        let target_port = self.macro_target_port();
+        let can_run = target_port.is_some();
+        let definition_dialog_open =
+            self.macro_editor.is_some() || self.macro_running_edit_confirmation.is_some();
         let mut run = None;
+        let mut stop = None;
         let mut edit = None;
         let mut remove = None;
         let mut add = false;
@@ -110,12 +117,6 @@ impl App {
                         "Select a connection (and a Send to device in Merged) to run a macro.",
                     );
                 }
-                if !self.macro_runs.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{} running", self.macro_runs.len()));
-                        stop_all = ui.small_button("Stop all").clicked();
-                    });
-                }
                 ui.separator();
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -123,6 +124,9 @@ impl App {
                         ui.weak("No macros configured.");
                     }
                     for (index, macro_def) in self.config.macros.iter().enumerate() {
+                        let running = self.macro_runs.iter().any(|run| {
+                            run.macro_index == Some(index) && Some(run.port) == target_port
+                        });
                         ui.group(|ui| {
                             ui.horizontal(|ui| {
                                 let name = if macro_def.name.trim().is_empty() {
@@ -135,30 +139,44 @@ impl App {
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
                                         if ui
-                                            .add_enabled(!editor_open, egui::Button::new("Delete"))
+                                            .add_enabled(
+                                                !definition_dialog_open,
+                                                egui::Button::new("Delete"),
+                                            )
                                             .clicked()
                                         {
                                             remove = Some(index);
                                         }
                                         if ui
                                             .add_enabled(
-                                                !editor_open,
+                                                !definition_dialog_open,
                                                 egui::Button::new("Edit macro"),
                                             )
                                             .clicked()
                                         {
                                             edit = Some(index);
                                         }
+                                        let can_start = !definition_dialog_open
+                                            && can_run
+                                            && macro_has_command(macro_def);
                                         if ui
                                             .add_enabled(
-                                                !editor_open
-                                                    && can_run
-                                                    && macro_has_command(macro_def),
-                                                egui::Button::new("Run"),
+                                                running || can_start,
+                                                egui::Button::new(if running {
+                                                    "Stop"
+                                                } else {
+                                                    "Run"
+                                                }),
                                             )
                                             .clicked()
                                         {
-                                            run = Some(index);
+                                            if running {
+                                                if let Some(port) = target_port {
+                                                    stop = Some((index, port));
+                                                }
+                                            } else {
+                                                run = Some(index);
+                                            }
                                         }
                                     },
                                 );
@@ -178,7 +196,7 @@ impl App {
                                     ui.label("Shortcut");
                                     let current = macro_def.shortcut.filter(|digit| *digit <= 9);
                                     let mut selected = current;
-                                    ui.add_enabled_ui(!editor_open, |ui| {
+                                    ui.add_enabled_ui(!definition_dialog_open, |ui| {
                                         egui::ComboBox::from_id_salt((
                                             "macro-catalog-shortcut",
                                             index,
@@ -235,23 +253,37 @@ impl App {
                                         }
                                     }
                                     ui.end_row();
+                                    ui.label("Runs");
+                                    ui.label(macro_runs_label(macro_def));
+                                    ui.end_row();
                                 });
                         });
                         ui.add_space(6.0);
                     }
                 });
 
-                if ui
-                    .add_enabled(!editor_open, egui::Button::new("+ Add macro"))
-                    .clicked()
-                {
-                    add = true;
-                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!definition_dialog_open, egui::Button::new("+ Add macro"))
+                        .clicked()
+                    {
+                        add = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if !self.macro_runs.is_empty() {
+                            stop_all = ui.button("Stop all").clicked();
+                            ui.label(format!("{} running", self.macro_runs.len()));
+                        }
+                    });
+                });
             });
 
         self.show_macros_win = open;
         if stop_all {
             self.macro_runs.clear();
+        }
+        if let Some((index, port)) = stop {
+            self.stop_macro_on_port(index, port);
         }
         if let Some((index, shortcut)) = shortcut_change {
             if set_macro_shortcut(&mut self.config.macros, index, shortcut) {
@@ -263,6 +295,15 @@ impl App {
         }
         if let Some(index) = remove {
             self.config.macros.remove(index);
+            for running in &mut self.macro_runs {
+                match running.macro_index {
+                    Some(running_index) if running_index == index => running.macro_index = None,
+                    Some(running_index) if running_index > index => {
+                        running.macro_index = Some(running_index - 1);
+                    }
+                    _ => {}
+                }
+            }
             self.write_config();
             if run == Some(index) {
                 run = None;
@@ -271,12 +312,73 @@ impl App {
             }
         }
         if let Some(index) = edit {
-            self.open_macro_editor(Some(index));
+            if self
+                .macro_runs
+                .iter()
+                .any(|run| run.macro_index == Some(index))
+            {
+                self.macro_running_edit_confirmation = Some(index);
+            } else {
+                self.open_macro_editor(Some(index));
+            }
         } else if add {
             self.open_macro_editor(None);
         }
         if let Some(index) = run {
             self.start_macro(index, Instant::now());
+        }
+    }
+
+    fn show_running_macro_edit_confirmation(&mut self, ctx: &egui::Context) {
+        let Some(index) = self.macro_running_edit_confirmation else {
+            return;
+        };
+        let Some(macro_def) = self.config.macros.get(index) else {
+            self.macro_running_edit_confirmation = None;
+            return;
+        };
+        let name = macro_display_name(macro_def);
+        let running_count = self
+            .macro_runs
+            .iter()
+            .filter(|run| run.macro_index == Some(index))
+            .count();
+        if running_count == 0 {
+            self.macro_running_edit_confirmation = None;
+            self.open_macro_editor(Some(index));
+            return;
+        }
+
+        let mut open = true;
+        let mut continue_editing = false;
+        let mut cancel = false;
+        egui::Window::new("Macro is running")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                let terminals = if running_count == 1 {
+                    "terminal"
+                } else {
+                    "terminals"
+                };
+                ui.label(format!(
+                    "\"{name}\" is running on {running_count} {terminals}."
+                ));
+                ui.label("Continuing will stop it on every terminal before editing.");
+                ui.horizontal(|ui| {
+                    continue_editing = ui.button("Stop and edit").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+
+        if continue_editing {
+            self.stop_macro(index);
+            self.macro_running_edit_confirmation = None;
+            self.open_macro_editor(Some(index));
+        } else if cancel || !open {
+            self.macro_running_edit_confirmation = None;
         }
     }
 
@@ -335,14 +437,43 @@ impl App {
                                 .desired_width(340.0),
                         );
                         ui.end_row();
+
+                        ui.label("Runs");
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut editor.draft.repeat_indefinitely, false, "Run");
+                            ui.add_enabled(
+                                !editor.draft.repeat_indefinitely,
+                                egui::DragValue::new(&mut editor.draft.repeat_count)
+                                    .range(1..=MAX_MACRO_REPEAT_COUNT)
+                                    .suffix(" times"),
+                            );
+                            ui.radio_value(
+                                &mut editor.draft.repeat_indefinitely,
+                                true,
+                                "Indefinitely",
+                            );
+                        });
+                        ui.end_row();
                     });
 
                 ui.separator();
                 show_macro_steps(ui, &mut editor);
                 ui.separator();
+                let wait_patterns_valid = editor.draft.steps.iter().all(|step| match step {
+                    MacroStep::WaitFor { pattern } => Regex::new(pattern).is_ok(),
+                    _ => true,
+                });
                 ui.horizontal(|ui| {
-                    save = ui.button("Save").clicked();
+                    save = ui
+                        .add_enabled(wait_patterns_valid, egui::Button::new("Save"))
+                        .clicked();
                     cancel = ui.button("Cancel").clicked();
+                    if !wait_patterns_valid {
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            "Fix invalid wait-for expressions before saving.",
+                        );
+                    }
                 });
             });
 
@@ -395,6 +526,13 @@ impl App {
         let Some(port) = self.macro_target_port() else {
             return false;
         };
+        if self
+            .macro_runs
+            .iter()
+            .any(|run| run.macro_index == Some(index) && run.port == port)
+        {
+            return false;
+        }
         let Some(macro_def) = self.config.macros.get(index) else {
             return false;
         };
@@ -402,12 +540,50 @@ impl App {
             return false;
         }
         self.macro_runs.push(MacroRun {
+            macro_index: Some(index),
+            name: macro_display_name(macro_def),
+            started_at: now,
+            repetitions_remaining: (!macro_def.repeat_indefinitely)
+                .then_some(macro_def.repeat_count.max(1) - 1),
             port,
             steps: macro_def.steps.clone(),
             next_step: 0,
             next_at: now,
+            wait_for: None,
         });
         true
+    }
+
+    pub(crate) fn long_running_macro_indicators(
+        &self,
+        now: Instant,
+        port: Option<PortId>,
+    ) -> Vec<(usize, String)> {
+        self.macro_runs
+            .iter()
+            .enumerate()
+            .filter(|(_, run)| {
+                Some(run.port) == port
+                    && now.saturating_duration_since(run.started_at) >= MACRO_INDICATOR_DELAY
+            })
+            .map(|(run_index, run)| (run_index, run.name.clone()))
+            .collect()
+    }
+
+    pub(crate) fn stop_macro_run(&mut self, run_index: usize) {
+        if run_index < self.macro_runs.len() {
+            self.macro_runs.remove(run_index);
+        }
+    }
+
+    fn stop_macro(&mut self, macro_index: usize) {
+        self.macro_runs
+            .retain(|run| run.macro_index != Some(macro_index));
+    }
+
+    fn stop_macro_on_port(&mut self, macro_index: usize, port: PortId) {
+        self.macro_runs
+            .retain(|run| run.macro_index != Some(macro_index) || run.port != port);
     }
 
     /// Advance all runs without ever sleeping the UI thread.
@@ -432,6 +608,22 @@ impl App {
                 advanced_any = true;
                 continue;
             }
+
+            if let Some(wait) = &run.wait_for {
+                let matched = self
+                    .connections
+                    .iter()
+                    .find(|conn| conn.id == run.port)
+                    .is_some_and(|conn| macro_wait_matches(conn, wait));
+                if !matched {
+                    pending.push(run);
+                    continue;
+                }
+                run.wait_for = None;
+                run.next_at = now;
+                advanced_any = true;
+            }
+
             let mut target_exists = true;
             while run.next_step < run.steps.len() && run.next_at <= now {
                 let step = run.steps[run.next_step].clone();
@@ -445,21 +637,58 @@ impl App {
                         }
                     }
                     MacroStep::Delay { delay_ms } => {
-                        // A trailing delay has nothing to delay. Otherwise the
-                        // next step is scheduled relative to when this delay
-                        // actually begins, preserving the requested pause even
-                        // if the UI woke a little late.
-                        if run.next_step < run.steps.len() && delay_ms > 0 {
+                        // A trailing delay applies between loop iterations;
+                        // without a loop it has nothing to delay. The next step
+                        // is scheduled relative to when this delay actually
+                        // begins, preserving the requested pause even if the UI
+                        // woke a little late.
+                        if (run.next_step < run.steps.len() || macro_run_will_repeat(&run))
+                            && delay_ms > 0
+                        {
                             run.next_at = now
                                 .checked_add(Duration::from_millis(delay_ms))
                                 .unwrap_or(now);
                             break;
                         }
                     }
+                    MacroStep::WaitFor { pattern } => {
+                        let Some(conn) = self.connections.iter().find(|conn| conn.id == run.port)
+                        else {
+                            target_exists = false;
+                            break;
+                        };
+                        let Ok(regex) = Regex::new(&pattern) else {
+                            // The editor prevents invalid expressions from
+                            // being saved. A hand-edited config should stop the
+                            // run instead of leaving it stuck forever.
+                            target_exists = false;
+                            break;
+                        };
+                        let wait = MacroWait {
+                            raw_start: conn.raw_next(),
+                            regex,
+                        };
+                        if wait.regex.is_match("") {
+                            continue;
+                        }
+                        run.wait_for = Some(wait);
+                        break;
+                    }
                 }
             }
-            if target_exists && run.next_step < run.steps.len() {
-                pending.push(run);
+            if target_exists {
+                if run.next_step >= run.steps.len() && macro_run_will_repeat(&run) {
+                    if let Some(remaining) = &mut run.repetitions_remaining {
+                        *remaining -= 1;
+                    }
+                    run.next_step = 0;
+                    // Continue on a fresh frame. This prevents an indefinitely
+                    // looping macro with no delay or wait step from locking the
+                    // UI in this scheduler call.
+                    pending.push(run);
+                } else if run.next_step < run.steps.len() {
+                    pending.push(run);
+                }
             }
         }
         self.macro_runs = pending;
@@ -470,8 +699,24 @@ impl App {
         if advanced_any {
             ctx.request_repaint();
         }
-        if let Some(next_at) = self.macro_runs.iter().map(|run| run.next_at).min() {
+        if let Some(next_at) = self
+            .macro_runs
+            .iter()
+            .filter(|run| run.wait_for.is_none())
+            .map(|run| run.next_at)
+            .min()
+        {
             ctx.request_repaint_after(next_at.saturating_duration_since(Instant::now()));
+        }
+        // A receive wait has no timer or animation of its own, but its footer
+        // indicator must still appear once the run reaches its threshold on an
+        // otherwise silent connection.
+        for indicator_at in self.macro_runs.iter().filter_map(|run| {
+            (now.saturating_duration_since(run.started_at) < MACRO_INDICATOR_DELAY)
+                .then(|| run.started_at.checked_add(MACRO_INDICATOR_DELAY))
+                .flatten()
+        }) {
+            ctx.request_repaint_after(indicator_at.saturating_duration_since(Instant::now()));
         }
     }
 
@@ -525,11 +770,37 @@ impl App {
     }
 }
 
+/// Match only bytes received since this wait began. The raw ring is bounded;
+/// if a very long wait outlives retained history, the surviving suffix is used.
+/// Converting the full suffix at once also preserves UTF-8 characters split
+/// across reader batches.
+fn macro_wait_matches(conn: &Connection, wait: &MacroWait) -> bool {
+    let start = wait.raw_start.max(conn.raw_base);
+    let skip = usize::try_from(start.saturating_sub(conn.raw_base)).unwrap_or(usize::MAX);
+    let bytes: Vec<u8> = conn.raw_ring.iter().skip(skip).copied().collect();
+    wait.regex.is_match(&String::from_utf8_lossy(&bytes))
+}
+
 fn macro_has_command(macro_def: &TransmitMacro) -> bool {
     macro_def
         .steps
         .iter()
         .any(|step| matches!(step, MacroStep::Command { .. }))
+}
+
+fn macro_run_will_repeat(run: &MacroRun) -> bool {
+    run.repetitions_remaining != Some(0)
+}
+
+fn macro_runs_label(macro_def: &TransmitMacro) -> String {
+    if macro_def.repeat_indefinitely {
+        "Indefinitely".to_owned()
+    } else {
+        match macro_def.repeat_count.max(1) {
+            1 => "Once".to_owned(),
+            count => format!("{count} times"),
+        }
+    }
 }
 
 fn show_macro_steps(ui: &mut egui::Ui, editor: &mut MacroEditor) {
@@ -551,6 +822,7 @@ fn show_macro_steps(ui: &mut egui::Ui, editor: &mut MacroEditor) {
                     let kind = match step {
                         MacroStep::Command { .. } => "Command",
                         MacroStep::Delay { .. } => "Delay",
+                        MacroStep::WaitFor { .. } => "Wait for",
                     };
                     if ui
                         .add_sized(
@@ -586,6 +858,22 @@ fn show_macro_steps(ui: &mut egui::Ui, editor: &mut MacroEditor) {
                                 editor.step_selection = Some(step_index);
                             }
                         }
+                        MacroStep::WaitFor { pattern } => {
+                            let error = Regex::new(pattern).err().map(|error| error.to_string());
+                            let edit = ui.add_sized(
+                                [300.0, row_height],
+                                egui::TextEdit::singleline(pattern)
+                                    .hint_text("regular expression")
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                            if edit.clicked() {
+                                editor.step_selection = Some(step_index);
+                            }
+                            if let Some(error) = error {
+                                ui.colored_label(ui.visuals().error_fg_color, "⚠")
+                                    .on_hover_text(format!("Invalid regular expression: {error}"));
+                            }
+                        }
                     }
                     if ui
                         .add_enabled(step_index > 0, egui::Button::new("↑").small())
@@ -601,7 +889,11 @@ fn show_macro_steps(ui: &mut egui::Ui, editor: &mut MacroEditor) {
                     {
                         move_step_to = Some((step_index, step_index + 1));
                     }
-                    if ui.small_button("−").clicked() {
+                    if ui
+                        .small_button("−")
+                        .on_hover_text("Remove this step")
+                        .clicked()
+                    {
                         remove_step = Some(step_index);
                     }
                 });
@@ -641,6 +933,20 @@ fn show_macro_steps(ui: &mut egui::Ui, editor: &mut MacroEditor) {
                 insert_at,
                 MacroStep::Delay {
                     delay_ms: DEFAULT_DELAY_MS,
+                },
+            );
+            editor.step_selection = Some(insert_at);
+        }
+        let add_wait = ui
+            .add(egui::Button::new("+ Add wait for").small())
+            .on_hover_text("Wait for newly received serial data to match a regular expression");
+        if add_wait.clicked() {
+            let insert_at =
+                selected_step.map_or(editor.draft.steps.len(), |step_index| step_index + 1);
+            editor.draft.steps.insert(
+                insert_at,
+                MacroStep::WaitFor {
+                    pattern: String::new(),
                 },
             );
             editor.step_selection = Some(insert_at);
@@ -820,6 +1126,7 @@ mod tests {
                 },
             ],
             shortcut: Some(7),
+            ..Default::default()
         });
         let id = PortId(0);
         let conn = app.make_connection(
@@ -867,6 +1174,62 @@ mod tests {
     }
 
     #[test]
+    fn a_macro_cannot_be_started_twice_and_can_be_stopped_by_its_run() {
+        let mut app = app_with_macro(60_000);
+        let started = Instant::now();
+        assert!(app.start_macro(0, started));
+        assert!(!app.start_macro(0, started));
+        assert_eq!(app.macro_runs.len(), 1);
+
+        assert!(app
+            .long_running_macro_indicators(started + Duration::from_millis(499), Some(PortId(0)),)
+            .is_empty());
+        let indicators = app
+            .long_running_macro_indicators(started + Duration::from_millis(500), Some(PortId(0)));
+        assert_eq!(indicators, [(0, "Setup".to_owned())]);
+
+        app.stop_macro_run(indicators[0].0);
+        assert!(app.macro_runs.is_empty());
+    }
+
+    #[test]
+    fn the_same_macro_can_run_once_on_each_terminal() {
+        let mut app = app_with_macro(60_000);
+        let second_id = PortId(1);
+        let second = app.make_connection(
+            second_id,
+            "other".into(),
+            Default::default(),
+            PortConfig::default(),
+            inert_handle(second_id),
+        );
+        app.connections.push(second);
+        let started = Instant::now();
+
+        assert!(app.start_macro(0, started));
+        app.active = 1;
+        assert!(app.start_macro(0, started));
+        assert!(!app.start_macro(0, started));
+        assert_eq!(app.macro_runs.len(), 2);
+
+        let shown_at = started + MACRO_INDICATOR_DELAY;
+        assert_eq!(
+            app.long_running_macro_indicators(shown_at, Some(PortId(0)))
+                .len(),
+            1
+        );
+        assert_eq!(
+            app.long_running_macro_indicators(shown_at, Some(second_id))
+                .len(),
+            1
+        );
+
+        app.stop_macro_on_port(0, second_id);
+        assert_eq!(app.macro_runs.len(), 1);
+        assert_eq!(app.macro_runs[0].port, PortId(0));
+    }
+
+    #[test]
     fn each_delay_step_controls_only_what_follows_it() {
         let mut app = app_with_macro(100);
         app.config.macros[0].steps.extend([
@@ -887,6 +1250,127 @@ mod tests {
         assert_eq!(echoed(&app), ["first", "second"]);
         app.maintain_macro_runs_at(started + Duration::from_millis(350), &ctx);
         assert_eq!(echoed(&app), ["first", "second", "third"]);
+    }
+
+    #[test]
+    fn a_finite_loop_runs_the_macro_the_requested_number_of_times() {
+        let mut app = app_with_macro(100);
+        app.config.macros[0].steps = vec![MacroStep::Command {
+            text: "again".into(),
+        }];
+        app.config.macros[0].repeat_count = 3;
+        let started = Instant::now();
+        app.start_macro(0, started);
+
+        app.maintain_macro_runs_at(started, &egui::Context::default());
+        assert_eq!(echoed(&app), ["again"]);
+        app.maintain_macro_runs_at(started, &egui::Context::default());
+        assert_eq!(echoed(&app), ["again", "again"]);
+        app.maintain_macro_runs_at(started, &egui::Context::default());
+        assert_eq!(echoed(&app), ["again", "again", "again"]);
+        assert!(app.macro_runs.is_empty());
+    }
+
+    #[test]
+    fn an_indefinite_loop_runs_until_stopped() {
+        let mut app = app_with_macro(100);
+        app.config.macros[0].steps = vec![MacroStep::Command {
+            text: "again".into(),
+        }];
+        app.config.macros[0].repeat_indefinitely = true;
+        let started = Instant::now();
+        app.start_macro(0, started);
+
+        for _ in 0..3 {
+            app.maintain_macro_runs_at(started, &egui::Context::default());
+        }
+        assert_eq!(echoed(&app), ["again", "again", "again"]);
+        assert_eq!(app.macro_runs.len(), 1);
+
+        app.stop_macro(0);
+        assert!(app.macro_runs.is_empty());
+    }
+
+    #[test]
+    fn a_trailing_delay_is_preserved_between_loop_iterations() {
+        let mut app = app_with_macro(100);
+        app.config.macros[0].steps = vec![
+            MacroStep::Command {
+                text: "again".into(),
+            },
+            MacroStep::Delay { delay_ms: 100 },
+        ];
+        app.config.macros[0].repeat_count = 2;
+        let started = Instant::now();
+        app.start_macro(0, started);
+
+        app.maintain_macro_runs_at(started, &egui::Context::default());
+        app.maintain_macro_runs_at(
+            started + Duration::from_millis(99),
+            &egui::Context::default(),
+        );
+        assert_eq!(echoed(&app), ["again"]);
+        app.maintain_macro_runs_at(
+            started + Duration::from_millis(100),
+            &egui::Context::default(),
+        );
+        assert_eq!(echoed(&app), ["again", "again"]);
+        assert!(app.macro_runs.is_empty());
+    }
+
+    #[test]
+    fn wait_for_matches_only_new_bus_data_and_can_span_batches() {
+        let mut app = app_with_macro(100);
+        app.config.macros[0].steps = vec![
+            MacroStep::Command {
+                text: "reboot".into(),
+            },
+            MacroStep::WaitFor {
+                pattern: r"BOOT\s+OK".into(),
+            },
+            MacroStep::Command {
+                text: "status".into(),
+            },
+        ];
+        // Identical output from before the command must not release the wait.
+        app.connections[0].push_raw_bytes(b"BOOT OK\r\n");
+        let started = Instant::now();
+        app.start_macro(0, started);
+        app.maintain_macro_runs_at(started, &egui::Context::default());
+        assert_eq!(echoed(&app), ["reboot"]);
+        assert!(app.macro_runs[0].wait_for.is_some());
+
+        app.connections[0].push_raw_bytes(b"BO");
+        app.maintain_macro_runs_at(started, &egui::Context::default());
+        assert_eq!(echoed(&app), ["reboot"]);
+
+        app.connections[0].push_raw_bytes(b"OT OK\r\n");
+        app.maintain_macro_runs_at(started, &egui::Context::default());
+        assert_eq!(echoed(&app), ["reboot", "status"]);
+        assert!(app.macro_runs.is_empty());
+    }
+
+    #[test]
+    fn invalid_wait_for_expression_stops_a_hand_edited_macro() {
+        let mut app = app_with_macro(100);
+        app.config.macros[0].steps = vec![
+            MacroStep::Command {
+                text: "first".into(),
+            },
+            MacroStep::WaitFor {
+                pattern: "(".into(),
+            },
+            MacroStep::Command {
+                text: "second".into(),
+            },
+        ];
+        let started = Instant::now();
+        app.start_macro(0, started);
+
+        app.maintain_macro_runs_at(started, &egui::Context::default());
+
+        assert_eq!(echoed(&app), ["first"]);
+        assert!(app.macro_runs.is_empty());
     }
 
     #[test]
