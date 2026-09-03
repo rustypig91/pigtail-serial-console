@@ -56,7 +56,7 @@ impl App {
             egui::Key::Num9,
         ];
         let modifiers = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
-        let mut selected = None;
+        let mut selected = Vec::new();
         for (digit, key) in keys.into_iter().enumerate() {
             let Some(index) = self
                 .config
@@ -67,11 +67,10 @@ impl App {
                 continue;
             };
             if consume_macro_key(ctx, modifiers, key) {
-                selected = Some(index);
-                break;
+                selected.push(index);
             }
         }
-        if let Some(index) = selected {
+        for index in selected {
             self.start_macro(index, Instant::now());
         }
     }
@@ -91,8 +90,11 @@ impl App {
         let mut open = self.show_macros_win;
         let target_port = self.macro_target_port();
         let can_run = target_port.is_some();
-        let definition_dialog_open =
-            self.macro_editor.is_some() || self.macro_running_edit_confirmation.is_some();
+        // Confirmation windows retain catalog indices. Prevent edits behind
+        // them from moving those indices before the user answers.
+        let definition_dialog_open = self.macro_editor.is_some()
+            || self.macro_running_edit_confirmation.is_some()
+            || self.macro_shortcut_conflict.is_some();
         let mut run = None;
         let mut stop = None;
         let mut edit = None;
@@ -985,9 +987,9 @@ fn consume_macro_key(
             )
         };
         let pressed = input.events.iter().any(|event| matches(event, false));
-        if pressed {
-            // Remove repeats from the same input batch too, matching
-            // `InputState::consume_key`'s behavior.
+        if input.events.iter().any(|event| matches(event, true)) {
+            // Consume repeat-only batches without starting the macro again,
+            // and remove repeats accompanying a fresh press too.
             input.events.retain(|event| !matches(event, true));
         }
         pressed
@@ -1488,6 +1490,71 @@ mod tests {
         app.consume_macro_shortcut(&ctx);
 
         assert_eq!(app.macro_runs.len(), 1);
+        assert!(ctx.input(|input| input.events.is_empty()));
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn every_assigned_shortcut_in_one_input_batch_is_consumed_and_started() {
+        let mut app = app_with_macro(100);
+        app.config.macros.push(TransmitMacro {
+            name: "Second".into(),
+            steps: vec![MacroStep::Command {
+                text: "other".into(),
+            }],
+            shortcut: Some(2),
+            ..Default::default()
+        });
+        let ctx = egui::Context::default();
+        let key_event = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+        };
+        ctx.begin_pass(egui::RawInput {
+            events: vec![key_event(egui::Key::Num7), key_event(egui::Key::Num2)],
+            ..Default::default()
+        });
+
+        app.consume_macro_shortcut(&ctx);
+
+        assert_eq!(app.macro_runs.len(), 2);
+        assert!(ctx.input(|input| input.events.is_empty()));
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn shortcut_key_repeats_are_consumed_without_restarting_the_macro() {
+        let mut app = app_with_macro(100);
+        let ctx = egui::Context::default();
+        let shortcut = egui::Event::Key {
+            key: egui::Key::Num7,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+        };
+        ctx.begin_pass(egui::RawInput {
+            events: vec![shortcut.clone()],
+            ..Default::default()
+        });
+        app.consume_macro_shortcut(&ctx);
+        assert_eq!(app.macro_runs.len(), 1);
+        app.stop_macro(0);
+        let _ = ctx.end_pass();
+
+        // egui determines repeat state from the key-down state retained
+        // across passes, regardless of the repeat value supplied in RawInput.
+        ctx.begin_pass(egui::RawInput {
+            events: vec![shortcut],
+            ..Default::default()
+        });
+
+        app.consume_macro_shortcut(&ctx);
+
+        assert!(app.macro_runs.is_empty());
         assert!(ctx.input(|input| input.events.is_empty()));
         let _ = ctx.end_pass();
     }
