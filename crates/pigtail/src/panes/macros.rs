@@ -63,21 +63,7 @@ impl App {
             else {
                 continue;
             };
-            let pressed = ctx.input(|input| {
-                input.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: event_key,
-                            pressed: true,
-                            repeat: false,
-                            modifiers: event_modifiers,
-                            ..
-                        } if *event_key == key && event_modifiers.matches_logically(modifiers)
-                    )
-                })
-            });
-            if pressed && ctx.input_mut(|input| input.consume_key(modifiers, key)) {
+            if consume_macro_key(ctx, modifiers, key) {
                 selected = Some(index);
                 break;
             }
@@ -528,6 +514,41 @@ fn macro_has_command(macro_def: &TransmitMacro) -> bool {
         .any(|step| matches!(step, MacroStep::Command { .. }))
 }
 
+/// Consume a shortcut by its digit key even when Shift changes its logical key.
+///
+/// Winit reports, for example, Shift+2 as `Quote` on several keyboard layouts,
+/// while retaining `Num2` as the physical key. `InputState::consume_key` checks
+/// only the logical key, so it would neither recognize nor consume that event.
+fn consume_macro_key(
+    ctx: &egui::Context,
+    modifiers: egui::Modifiers,
+    digit_key: egui::Key,
+) -> bool {
+    ctx.input_mut(|input| {
+        let matches = |event: &egui::Event, allow_repeat: bool| {
+            matches!(
+                event,
+                egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed: true,
+                    repeat,
+                    modifiers: event_modifiers,
+                } if (allow_repeat || !repeat)
+                    && (*key == digit_key || *physical_key == Some(digit_key))
+                    && event_modifiers.matches_logically(modifiers)
+            )
+        };
+        let pressed = input.events.iter().any(|event| matches(event, false));
+        if pressed {
+            // Remove repeats from the same input batch too, matching
+            // `InputState::consume_key`'s behavior.
+            input.events.retain(|event| !matches(event, true));
+        }
+        pressed
+    })
+}
+
 /// Move `from` to the requested final index, returning the clamped index used.
 fn move_step(steps: &mut Vec<MacroStep>, from: usize, destination: usize) -> usize {
     if from >= steps.len() {
@@ -749,6 +770,33 @@ mod tests {
         let event = egui::Event::Key {
             key: egui::Key::Num7,
             physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+        };
+        ctx.begin_pass(egui::RawInput {
+            events: vec![event],
+            ..Default::default()
+        });
+
+        app.consume_macro_shortcut(&ctx);
+
+        assert_eq!(app.macro_runs.len(), 1);
+        assert!(ctx.input(|input| input.events.is_empty()));
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn shortcut_uses_the_physical_digit_when_shift_changes_the_logical_key() {
+        let mut app = app_with_macro(100);
+        app.config.macros[0].shortcut = Some(2);
+        let ctx = egui::Context::default();
+        // On layouts including Swedish and German, Shift+2 is a quote. Winit
+        // exposes that as the logical key while preserving the digit as the
+        // physical key.
+        let event = egui::Event::Key {
+            key: egui::Key::Quote,
+            physical_key: Some(egui::Key::Num2),
             pressed: true,
             repeat: false,
             modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
