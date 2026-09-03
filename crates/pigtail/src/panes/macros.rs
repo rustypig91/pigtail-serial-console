@@ -677,7 +677,12 @@ impl App {
                 }
             }
             if target_exists {
-                if run.next_step >= run.steps.len() && macro_run_will_repeat(&run) {
+                if run.wait_for.is_some() {
+                    // A wait remains part of the current execution even when it
+                    // is the final step. Do not complete (or begin the next
+                    // repetition) until its receive condition has matched.
+                    pending.push(run);
+                } else if run.next_step >= run.steps.len() && macro_run_will_repeat(&run) {
                     if let Some(remaining) = &mut run.repetitions_remaining {
                         *remaining -= 1;
                     }
@@ -1347,6 +1352,32 @@ mod tests {
         app.connections[0].push_raw_bytes(b"OT OK\r\n");
         app.maintain_macro_runs_at(started, &egui::Context::default());
         assert_eq!(echoed(&app), ["reboot", "status"]);
+        assert!(app.macro_runs.is_empty());
+    }
+
+    #[test]
+    fn a_final_wait_for_keeps_the_macro_running_until_it_matches() {
+        let mut app = app_with_macro(100);
+        app.config.macros[0].steps = vec![
+            MacroStep::Command {
+                text: "reboot".into(),
+            },
+            MacroStep::WaitFor {
+                pattern: "READY".into(),
+            },
+        ];
+        let started = Instant::now();
+        app.start_macro(0, started);
+
+        app.maintain_macro_runs_at(started, &egui::Context::default());
+
+        assert_eq!(echoed(&app), ["reboot"]);
+        assert_eq!(app.macro_runs.len(), 1);
+        assert!(app.macro_runs[0].wait_for.is_some());
+
+        app.connections[0].push_raw_bytes(b"READY\r\n");
+        app.maintain_macro_runs_at(started, &egui::Context::default());
+
         assert!(app.macro_runs.is_empty());
     }
 
