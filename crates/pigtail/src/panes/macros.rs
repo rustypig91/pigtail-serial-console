@@ -776,7 +776,10 @@ impl App {
 /// Converting the full suffix at once also preserves UTF-8 characters split
 /// across reader batches.
 fn macro_wait_matches(conn: &Connection, wait: &MacroWait) -> bool {
-    let start = wait.raw_start.max(conn.raw_base);
+    let start = wait
+        .raw_start
+        .max(conn.raw_base)
+        .max(conn.raw_contiguous_start);
     let skip = usize::try_from(start.saturating_sub(conn.raw_base)).unwrap_or(usize::MAX);
     let bytes: Vec<u8> = conn.raw_ring.iter().skip(skip).copied().collect();
     wait.regex.is_match(&String::from_utf8_lossy(&bytes))
@@ -1356,6 +1359,39 @@ mod tests {
 
         app.connections[0].push_raw_bytes(b"OT OK\r\n");
         app.maintain_macro_runs_at(started, &egui::Context::default());
+        assert_eq!(echoed(&app), ["reboot", "status"]);
+        assert!(app.macro_runs.is_empty());
+    }
+
+    #[test]
+    fn wait_for_does_not_match_across_a_receive_gap() {
+        let mut app = app_with_macro(100);
+        app.config.macros[0].steps = vec![
+            MacroStep::Command {
+                text: "reboot".into(),
+            },
+            MacroStep::WaitFor {
+                pattern: "READY".into(),
+            },
+            MacroStep::Command {
+                text: "status".into(),
+            },
+        ];
+        let started = Instant::now();
+        app.start_macro(0, started);
+        app.maintain_macro_runs_at(started, &egui::Context::default());
+
+        app.connections[0].push_raw_bytes(b"REA");
+        app.connections[0].mark_raw_discontinuity();
+        app.connections[0].push_raw_bytes(b"DY");
+        app.maintain_macro_runs_at(started, &egui::Context::default());
+
+        assert_eq!(echoed(&app), ["reboot"]);
+        assert!(app.macro_runs[0].wait_for.is_some());
+
+        app.connections[0].push_raw_bytes(b"READY\r\n");
+        app.maintain_macro_runs_at(started, &egui::Context::default());
+
         assert_eq!(echoed(&app), ["reboot", "status"]);
         assert!(app.macro_runs.is_empty());
     }

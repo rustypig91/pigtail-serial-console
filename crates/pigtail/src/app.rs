@@ -466,6 +466,10 @@ pub struct Connection {
     /// Bytes dropped from the front of `raw_ring`, for translating a
     /// [`RawSession`]'s absolute start into a position in the ring.
     pub raw_base: u64,
+    /// First byte in the latest contiguous receive region. Disconnects and
+    /// dropped-output notices advance this without discarding retained hex
+    /// history, so consumers cannot mistake bytes across a gap for neighbors.
+    pub(crate) raw_contiguous_start: u64,
     /// The runs whose bytes the ring holds, oldest first.
     pub raw_sessions: Vec<RawSession>,
     /// The most recent error on this connection, kept with its scope: a
@@ -619,6 +623,7 @@ impl Connection {
                     // otherwise stay lit across the outage and beyond it.
                     if s != ConnState::Connected {
                         self.store.finalize_last_provisional();
+                        self.mark_raw_discontinuity();
                     } else if matches!(
                         self.last_error,
                         Some(TabError {
@@ -662,6 +667,7 @@ impl Connection {
                     line_updates,
                     at,
                 } => {
+                    self.mark_raw_discontinuity();
                     let label = format!(
                         "output dropped · {raw_bytes} bytes, {line_updates} line updates · display was busy"
                     );
@@ -761,6 +767,11 @@ impl Connection {
             bytes,
             self.raw_capacity,
         );
+    }
+
+    /// Begin a new contiguous receive region at the current raw position.
+    pub(crate) fn mark_raw_discontinuity(&mut self) {
+        self.raw_contiguous_start = self.raw_next();
     }
 
     /// Open the run of bytes this session is producing, unless it is open
@@ -1814,6 +1825,7 @@ impl App {
             history_allocation_shrink_pending: false,
             raw_evicted_any: false,
             raw_base: 0,
+            raw_contiguous_start: 0,
             raw_sessions: Vec::new(),
             last_error: None,
             mark_micros: None,
@@ -2539,6 +2551,7 @@ impl App {
             // above for them to be counted from.
             conn.raw_base = conn.raw_next();
             conn.raw_ring.clear();
+            conn.raw_contiguous_start = conn.raw_base;
             conn.raw_sessions.clear();
             // Everything derived from the lines that just went away. The dirty
             // flags make the next frame rebuild both indices against the now
@@ -4086,6 +4099,7 @@ pub(crate) mod tests {
         assert_eq!(conn.store.get(2).unwrap().text, "after");
 
         assert_eq!(conn.raw_ring.iter().copied().collect::<Vec<_>>(), b"oldnew");
+        assert_eq!(conn.raw_contiguous_start, 3);
         assert_eq!(conn.raw_sessions.len(), 2);
         assert!(conn.raw_sessions[0]
             .label
