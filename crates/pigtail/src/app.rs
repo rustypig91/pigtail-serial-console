@@ -1133,8 +1133,6 @@ pub(crate) struct MacroEditor {
     pub(crate) index: Option<usize>,
     pub(crate) draft: TransmitMacro,
     pub(crate) step_selection: Option<usize>,
-    /// Requested shortcut and the other macro that currently owns it.
-    pub(crate) shortcut_conflict: Option<(u8, usize)>,
 }
 
 pub struct App {
@@ -1223,6 +1221,8 @@ pub struct App {
     pub show_settings: bool,
     pub show_macros_win: bool,
     pub(crate) macro_editor: Option<MacroEditor>,
+    /// Target macro, requested digit, and the macro currently owning it.
+    pub(crate) macro_shortcut_conflict: Option<(usize, u8, usize)>,
     pub show_filters_win: bool,
     pub show_highlight_win: bool,
     pub show_extract_win: bool,
@@ -1310,6 +1310,7 @@ impl App {
             show_settings: false,
             show_macros_win: false,
             macro_editor: None,
+            macro_shortcut_conflict: None,
             show_filters_win: false,
             show_highlight_win: false,
             show_extract_win: false,
@@ -2555,6 +2556,7 @@ impl App {
             || self.show_settings
             || self.show_macros_win
             || self.macro_editor.is_some()
+            || self.macro_shortcut_conflict.is_some()
             || self.show_filters_win
             || self.show_highlight_win
             || self.show_extract_win

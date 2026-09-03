@@ -77,6 +77,7 @@ impl App {
         if self.show_macros_win {
             self.show_macro_catalog(ctx);
         }
+        self.show_shortcut_conflict(ctx);
         self.show_macro_editor(ctx);
     }
 
@@ -91,6 +92,8 @@ impl App {
         let mut remove = None;
         let mut add = false;
         let mut stop_all = false;
+        let mut shortcut_change = None;
+        let mut shortcut_conflict = None;
 
         egui::Window::new("Transmit macros")
             .open(&mut open)
@@ -173,9 +176,64 @@ impl App {
                                     ui.label(description);
                                     ui.end_row();
                                     ui.label("Shortcut");
-                                    ui.label(shortcut_label(
-                                        macro_def.shortcut.filter(|digit| *digit <= 9),
-                                    ));
+                                    let current = macro_def.shortcut.filter(|digit| *digit <= 9);
+                                    let mut selected = current;
+                                    ui.add_enabled_ui(!editor_open, |ui| {
+                                        egui::ComboBox::from_id_salt((
+                                            "macro-catalog-shortcut",
+                                            index,
+                                        ))
+                                        .selected_text(shortcut_label(current))
+                                        .show_ui(
+                                            ui,
+                                            |ui| {
+                                                ui.selectable_value(
+                                                    &mut selected,
+                                                    None,
+                                                    "Unassigned",
+                                                );
+                                                for digit in 0..=9 {
+                                                    let owner = shortcut_owner(
+                                                        &self.config.macros,
+                                                        digit,
+                                                        Some(index),
+                                                    );
+                                                    let label = owner.map_or_else(
+                                                        || shortcut_label(Some(digit)),
+                                                        |owner| {
+                                                            format!(
+                                                                "{} — used by {}",
+                                                                shortcut_label(Some(digit)),
+                                                                macro_display_name(
+                                                                    &self.config.macros[owner]
+                                                                )
+                                                            )
+                                                        },
+                                                    );
+                                                    ui.selectable_value(
+                                                        &mut selected,
+                                                        Some(digit),
+                                                        label,
+                                                    );
+                                                }
+                                            },
+                                        );
+                                    });
+                                    if selected != current {
+                                        if let Some(digit) = selected {
+                                            if let Some(owner) = shortcut_owner(
+                                                &self.config.macros,
+                                                digit,
+                                                Some(index),
+                                            ) {
+                                                shortcut_conflict = Some((index, digit, owner));
+                                            } else {
+                                                shortcut_change = Some((index, Some(digit)));
+                                            }
+                                        } else {
+                                            shortcut_change = Some((index, None));
+                                        }
+                                    }
                                     ui.end_row();
                                 });
                         });
@@ -194,6 +252,14 @@ impl App {
         self.show_macros_win = open;
         if stop_all {
             self.macro_runs.clear();
+        }
+        if let Some((index, shortcut)) = shortcut_change {
+            if set_macro_shortcut(&mut self.config.macros, index, shortcut) {
+                self.write_config();
+            }
+        }
+        if let Some(conflict) = shortcut_conflict {
+            self.macro_shortcut_conflict = Some(conflict);
         }
         if let Some(index) = remove {
             self.config.macros.remove(index);
@@ -215,7 +281,7 @@ impl App {
     }
 
     fn open_macro_editor(&mut self, index: Option<usize>) {
-        let mut draft = index
+        let draft = index
             .and_then(|index| self.config.macros.get(index).cloned())
             .unwrap_or_else(|| TransmitMacro {
                 name: "New macro".into(),
@@ -224,12 +290,10 @@ impl App {
                 }],
                 ..Default::default()
             });
-        draft.shortcut = draft.shortcut.filter(|digit| *digit <= 9);
         self.macro_editor = Some(MacroEditor {
             index,
             step_selection: (!draft.steps.is_empty()).then_some(0),
             draft,
-            shortcut_conflict: None,
         });
     }
 
@@ -271,97 +335,59 @@ impl App {
                                 .desired_width(340.0),
                         );
                         ui.end_row();
-
-                        ui.label("Shortcut");
-                        let current = editor.draft.shortcut;
-                        let mut selected = current;
-                        egui::ComboBox::from_id_salt("macro-editor-shortcut")
-                            .selected_text(shortcut_label(current))
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut selected, None, "Unassigned");
-                                for digit in 0..=9 {
-                                    let owner =
-                                        shortcut_owner(&self.config.macros, digit, editor.index);
-                                    let label = owner.map_or_else(
-                                        || shortcut_label(Some(digit)),
-                                        |owner| {
-                                            format!(
-                                                "{} — used by {}",
-                                                shortcut_label(Some(digit)),
-                                                macro_display_name(&self.config.macros[owner])
-                                            )
-                                        },
-                                    );
-                                    ui.selectable_value(&mut selected, Some(digit), label);
-                                }
-                            });
-                        if selected != current {
-                            if let Some(digit) = selected {
-                                if let Some(owner) =
-                                    shortcut_owner(&self.config.macros, digit, editor.index)
-                                {
-                                    editor.shortcut_conflict = Some((digit, owner));
-                                } else {
-                                    editor.draft.shortcut = Some(digit);
-                                }
-                            } else {
-                                editor.draft.shortcut = None;
-                            }
-                        }
-                        ui.end_row();
                     });
 
                 ui.separator();
                 show_macro_steps(ui, &mut editor);
                 ui.separator();
                 ui.horizontal(|ui| {
-                    save = ui
-                        .add_enabled(
-                            editor.shortcut_conflict.is_none(),
-                            egui::Button::new("Save"),
-                        )
-                        .clicked();
+                    save = ui.button("Save").clicked();
                     cancel = ui.button("Cancel").clicked();
                 });
             });
-
-        if let Some((digit, owner)) = editor.shortcut_conflict {
-            let owner_name = self
-                .config
-                .macros
-                .get(owner)
-                .map(macro_display_name)
-                .unwrap_or_else(|| "another macro".to_owned());
-            let mut move_shortcut = false;
-            let mut keep_shortcut = false;
-            egui::Window::new("Shortcut already used")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(ctx, |ui| {
-                    ui.label(format!(
-                        "{} is already used by \"{owner_name}\".",
-                        shortcut_label(Some(digit))
-                    ));
-                    ui.label("Move this shortcut to the macro being edited?");
-                    ui.horizontal(|ui| {
-                        move_shortcut = ui.button("Yes, move it").clicked();
-                        keep_shortcut = ui.button("No").clicked();
-                    });
-                });
-            if move_shortcut {
-                editor.draft.shortcut = Some(digit);
-                editor.shortcut_conflict = None;
-            } else if keep_shortcut {
-                editor.shortcut_conflict = None;
-            }
-        }
 
         if save {
             save_macro(&mut self.config.macros, editor);
             self.write_config();
         } else if open && !cancel {
             self.macro_editor = Some(editor);
+        }
+    }
+
+    fn show_shortcut_conflict(&mut self, ctx: &egui::Context) {
+        let Some((target, digit, owner)) = self.macro_shortcut_conflict else {
+            return;
+        };
+        let owner_name = self
+            .config
+            .macros
+            .get(owner)
+            .map(macro_display_name)
+            .unwrap_or_else(|| "another macro".to_owned());
+        let mut move_shortcut = false;
+        let mut keep_shortcut = false;
+        egui::Window::new("Shortcut already used")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "{} is already used by \"{owner_name}\".",
+                    shortcut_label(Some(digit))
+                ));
+                ui.label("Move this shortcut to the selected macro?");
+                ui.horizontal(|ui| {
+                    move_shortcut = ui.button("Yes, move it").clicked();
+                    keep_shortcut = ui.button("No").clicked();
+                });
+            });
+        if move_shortcut {
+            if transfer_macro_shortcut(&mut self.config.macros, target, digit) {
+                self.write_config();
+            }
+            self.macro_shortcut_conflict = None;
+        } else if keep_shortcut {
+            self.macro_shortcut_conflict = None;
         }
     }
 
@@ -728,19 +754,10 @@ fn shortcut_owner(
         .map(|(index, _)| index)
 }
 
-/// Save a draft and enforce exclusive shortcut ownership. A confirmed occupied
-/// shortcut is transferred by clearing every previous owner before the draft is
-/// inserted or replaces its original definition.
 fn save_macro(macros: &mut Vec<TransmitMacro>, mut editor: MacroEditor) -> usize {
-    editor.draft.shortcut = editor.draft.shortcut.filter(|digit| *digit <= 9);
     let target = editor.index.filter(|index| *index < macros.len());
-    if let Some(shortcut) = editor.draft.shortcut {
-        for (index, macro_def) in macros.iter_mut().enumerate() {
-            if Some(index) != target && macro_def.shortcut == Some(shortcut) {
-                macro_def.shortcut = None;
-            }
-        }
-    }
+    // Shortcut ownership belongs to the catalog, never the definition editor.
+    editor.draft.shortcut = target.and_then(|index| macros[index].shortcut);
     if let Some(index) = target {
         macros[index] = editor.draft;
         index
@@ -748,6 +765,38 @@ fn save_macro(macros: &mut Vec<TransmitMacro>, mut editor: MacroEditor) -> usize
         macros.push(editor.draft);
         macros.len() - 1
     }
+}
+
+fn set_macro_shortcut(macros: &mut [TransmitMacro], index: usize, shortcut: Option<u8>) -> bool {
+    let Some(macro_def) = macros.get(index) else {
+        return false;
+    };
+    if macro_def.shortcut == shortcut
+        || shortcut
+            .is_some_and(|digit| digit > 9 || shortcut_owner(macros, digit, Some(index)).is_some())
+    {
+        return false;
+    }
+    macros[index].shortcut = shortcut;
+    true
+}
+
+fn transfer_macro_shortcut(macros: &mut [TransmitMacro], target: usize, digit: u8) -> bool {
+    if target >= macros.len() || digit > 9 {
+        return false;
+    }
+    let changed = macros[target].shortcut != Some(digit)
+        || macros
+            .iter()
+            .enumerate()
+            .any(|(index, macro_def)| index != target && macro_def.shortcut == Some(digit));
+    for (index, macro_def) in macros.iter_mut().enumerate() {
+        if index != target && macro_def.shortcut == Some(digit) {
+            macro_def.shortcut = None;
+        }
+    }
+    macros[target].shortcut = Some(digit);
+    changed
 }
 
 #[cfg(test)]
@@ -929,24 +978,15 @@ mod tests {
     }
 
     #[test]
-    fn saving_an_edit_moves_an_occupied_shortcut() {
+    fn confirming_a_conflict_moves_the_occupied_shortcut() {
         let mut app = app_with_macro(100);
         app.config.macros.push(TransmitMacro {
             name: "Second".into(),
             ..Default::default()
         });
 
-        let editor = MacroEditor {
-            index: Some(1),
-            draft: TransmitMacro {
-                name: "Second".into(),
-                shortcut: Some(7),
-                ..Default::default()
-            },
-            step_selection: None,
-            shortcut_conflict: None,
-        };
-        assert_eq!(save_macro(&mut app.config.macros, editor), 1);
+        assert_eq!(shortcut_owner(&app.config.macros, 7, Some(1)), Some(0));
+        assert!(transfer_macro_shortcut(&mut app.config.macros, 1, 7));
 
         assert_eq!(app.config.macros[0].shortcut, None);
         assert_eq!(app.config.macros[1].shortcut, Some(7));
@@ -966,22 +1006,21 @@ mod tests {
     }
 
     #[test]
-    fn saving_a_new_macro_moves_an_occupied_shortcut() {
+    fn definition_editor_cannot_change_a_shortcut() {
         let mut app = app_with_macro(100);
         let editor = MacroEditor {
-            index: None,
+            index: Some(0),
             draft: TransmitMacro {
-                name: "Second".into(),
-                shortcut: Some(7),
+                name: "Changed".into(),
+                shortcut: Some(2),
                 ..Default::default()
             },
             step_selection: None,
-            shortcut_conflict: None,
         };
 
-        assert_eq!(save_macro(&mut app.config.macros, editor), 1);
-        assert_eq!(app.config.macros[0].shortcut, None);
-        assert_eq!(app.config.macros[1].shortcut, Some(7));
+        assert_eq!(save_macro(&mut app.config.macros, editor), 0);
+        assert_eq!(app.config.macros[0].name, "Changed");
+        assert_eq!(app.config.macros[0].shortcut, Some(7));
     }
 
     #[test]
