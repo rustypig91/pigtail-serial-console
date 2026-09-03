@@ -56,22 +56,16 @@ impl App {
             egui::Key::Num9,
         ];
         let modifiers = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
-        let mut selected = Vec::new();
-        for (digit, key) in keys.into_iter().enumerate() {
-            let Some(index) = self
-                .config
+        let assignments: [Option<usize>; 10] = std::array::from_fn(|digit| {
+            self.config
                 .macros
                 .iter()
                 .position(|macro_def| macro_def.shortcut == Some(digit as u8))
-            else {
-                continue;
-            };
-            if consume_macro_key(ctx, modifiers, key) {
-                selected.push(index);
-            }
-        }
+        });
+        let selected = consume_macro_keys(ctx, modifiers, &keys, &assignments);
+        let now = Instant::now();
         for index in selected {
-            self.start_macro(index, Instant::now());
+            self.start_macro(index, now);
         }
     }
 
@@ -961,38 +955,47 @@ fn show_macro_steps(ui: &mut egui::Ui, editor: &mut MacroEditor) {
     });
 }
 
-/// Consume a shortcut by its digit key even when Shift changes its logical key.
+/// Consume assigned shortcuts in event order even when Shift changes their
+/// logical keys. Repeat events are consumed without starting another run.
 ///
 /// Winit reports, for example, Shift+2 as `Quote` on several keyboard layouts,
 /// while retaining `Num2` as the physical key. `InputState::consume_key` checks
 /// only the logical key, so it would neither recognize nor consume that event.
-fn consume_macro_key(
+fn consume_macro_keys(
     ctx: &egui::Context,
     modifiers: egui::Modifiers,
-    digit_key: egui::Key,
-) -> bool {
+    digit_keys: &[egui::Key; 10],
+    assignments: &[Option<usize>; 10],
+) -> Vec<usize> {
     ctx.input_mut(|input| {
-        let matches = |event: &egui::Event, allow_repeat: bool| {
-            matches!(
-                event,
-                egui::Event::Key {
-                    key,
-                    physical_key,
-                    pressed: true,
-                    repeat,
-                    modifiers: event_modifiers,
-                } if (allow_repeat || !repeat)
-                    && (*key == digit_key || *physical_key == Some(digit_key))
-                    && event_modifiers.matches_logically(modifiers)
-            )
-        };
-        let pressed = input.events.iter().any(|event| matches(event, false));
-        if input.events.iter().any(|event| matches(event, true)) {
-            // Consume repeat-only batches without starting the macro again,
-            // and remove repeats accompanying a fresh press too.
-            input.events.retain(|event| !matches(event, true));
-        }
-        pressed
+        let mut selected = Vec::new();
+        input.events.retain(|event| {
+            let egui::Event::Key {
+                key,
+                physical_key,
+                pressed: true,
+                repeat,
+                modifiers: event_modifiers,
+            } = event
+            else {
+                return true;
+            };
+            if !event_modifiers.matches_logically(modifiers) {
+                return true;
+            }
+            let digit = physical_key
+                .as_ref()
+                .and_then(|key| digit_keys.iter().position(|candidate| candidate == key))
+                .or_else(|| digit_keys.iter().position(|candidate| candidate == key));
+            let Some(index) = digit.and_then(|digit| assignments[digit]) else {
+                return true;
+            };
+            if !repeat {
+                selected.push(index);
+            }
+            false
+        });
+        selected
     })
 }
 
@@ -1521,6 +1524,13 @@ mod tests {
         app.consume_macro_shortcut(&ctx);
 
         assert_eq!(app.macro_runs.len(), 2);
+        assert_eq!(
+            app.macro_runs
+                .iter()
+                .map(|run| run.macro_index)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(1)]
+        );
         assert!(ctx.input(|input| input.events.is_empty()));
         let _ = ctx.end_pass();
     }
