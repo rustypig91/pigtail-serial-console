@@ -425,6 +425,10 @@ pub struct Connection {
     pub handle: reader::ReaderHandle,
     pub store: LineStore,
     pub state: ConnState,
+    /// Advances whenever a connected port leaves `Connected`. Macro runs copy
+    /// this value so even a disconnect/reconnect completed within one UI frame
+    /// still cancels work that belonged to the old connection.
+    pub(crate) disconnect_generation: u64,
     /// "Pinned": follow the tail and autoscroll. While set, the console offset is
     /// forced to the bottom every frame (not via egui's `stick_to_bottom`, which
     /// stops following under fast input). Toggled from the footer, and
@@ -639,7 +643,7 @@ impl Connection {
                         // they survive it.
                         self.last_error = None;
                     }
-                    self.state = s;
+                    self.set_state(s);
                 }
                 ReaderEvent::Error { scope, msg } => {
                     tracing::warn!(port = self.id.0, "{msg}");
@@ -772,6 +776,13 @@ impl Connection {
     /// Begin a new contiguous receive region at the current raw position.
     pub(crate) fn mark_raw_discontinuity(&mut self) {
         self.raw_contiguous_start = self.raw_next();
+    }
+
+    pub(crate) fn set_state(&mut self, state: ConnState) {
+        if self.state == ConnState::Connected && state != ConnState::Connected {
+            self.disconnect_generation = self.disconnect_generation.wrapping_add(1);
+        }
+        self.state = state;
     }
 
     /// Open the run of bytes this session is producing, unless it is open
@@ -1140,6 +1151,7 @@ pub(crate) struct MacroRun {
     /// Further full executions after the current one; `None` means forever.
     pub(crate) repetitions_remaining: Option<u32>,
     pub(crate) port: PortId,
+    pub(crate) disconnect_generation: u64,
     pub(crate) steps: Vec<serialcore::config::MacroStep>,
     pub(crate) next_step: usize,
     pub(crate) next_at: Instant,
@@ -1641,7 +1653,7 @@ impl App {
                     // its caret stays lit forever on a tab that will never
                     // reconnect.
                     conn.store.finalize_last_provisional();
-                    conn.state = ConnState::Closed;
+                    conn.set_state(ConnState::Closed);
                     conn.last_error = Some(TabError::connection(msg));
                     self.merged_dirty = true;
                     return;
@@ -1663,7 +1675,7 @@ impl App {
             conn.identity = identity;
             conn.port_config = config;
             conn.label = label;
-            conn.state = ConnState::Connecting;
+            conn.set_state(ConnState::Connecting);
             conn.dtr = dtr;
             conn.rts = rts;
             conn.last_error = None;
@@ -1812,6 +1824,7 @@ impl App {
             handle,
             store: LineStore::new(limits.max_lines),
             state: ConnState::Connecting,
+            disconnect_generation: 0,
             follow: true,
             new_since_scroll: 0,
             pin_view_h: 0.0,

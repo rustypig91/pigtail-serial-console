@@ -23,12 +23,12 @@ impl App {
             self.merged_tx_port.filter(|id| {
                 self.connections
                     .iter()
-                    .any(|conn| conn.id == *id && conn.state != ConnState::Closed)
+                    .any(|conn| conn.id == *id && conn.state == ConnState::Connected)
             })
         } else {
             self.active_index()
                 .map(|index| &self.connections[index])
-                .filter(|conn| conn.state != ConnState::Closed)
+                .filter(|conn| conn.state == ConnState::Connected)
                 .map(|conn| conn.id)
         }
     }
@@ -522,6 +522,14 @@ impl App {
         let Some(port) = self.macro_target_port() else {
             return false;
         };
+        let Some(disconnect_generation) = self
+            .connections
+            .iter()
+            .find(|conn| conn.id == port)
+            .map(|conn| conn.disconnect_generation)
+        else {
+            return false;
+        };
         if self
             .macro_runs
             .iter()
@@ -542,6 +550,7 @@ impl App {
             repetitions_remaining: (!macro_def.repeat_indefinitely)
                 .then_some(macro_def.repeat_count.max(1) - 1),
             port,
+            disconnect_generation,
             steps: macro_def.steps.clone(),
             next_step: 0,
             next_at: now,
@@ -591,16 +600,14 @@ impl App {
         let mut pending = Vec::with_capacity(self.macro_runs.len());
         let mut advanced_any = false;
         for mut run in std::mem::take(&mut self.macro_runs) {
-            // A run waiting in a long delay should disappear as soon as its
-            // tab is closed (or a failed reconnect leaves it inert), rather
-            // than lingering in the UI and scheduling a useless wake at the
-            // old deadline. Lost/reconnecting connections remain valid
-            // targets, matching interactive transmission behavior.
-            if !self
-                .connections
-                .iter()
-                .any(|conn| conn.id == run.port && conn.state != ConnState::Closed)
-            {
+            // A run belongs to one continuous connection. Stop it as soon as
+            // that connection leaves Connected, even if it reconnects before
+            // this frame, rather than sending later steps to a new session.
+            if !self.connections.iter().any(|conn| {
+                conn.id == run.port
+                    && conn.state == ConnState::Connected
+                    && conn.disconnect_generation == run.disconnect_generation
+            }) {
                 advanced_any = true;
                 continue;
             }
@@ -1154,6 +1161,7 @@ mod tests {
             inert_handle(id),
         );
         app.connections.push(conn);
+        app.connections[0].set_state(ConnState::Connected);
         app
     }
 
@@ -1217,6 +1225,7 @@ mod tests {
             inert_handle(second_id),
         );
         app.connections.push(second);
+        app.connections[1].set_state(ConnState::Connected);
         let started = Instant::now();
 
         assert!(app.start_macro(0, started));
@@ -1666,6 +1675,7 @@ mod tests {
             inert_handle(second_id),
         );
         app.connections.push(second);
+        app.connections[1].set_state(ConnState::Connected);
         let started = Instant::now();
         app.start_macro(0, started);
         app.maintain_macro_runs_at(started, &egui::Context::default());
@@ -1696,5 +1706,40 @@ mod tests {
 
         assert!(app.macro_runs.is_empty());
         assert_eq!(echoed(&app), ["first"]);
+    }
+
+    #[test]
+    fn every_macro_on_a_port_stops_when_it_disconnects() {
+        let mut app = app_with_macro(100);
+        app.config.macros.push(TransmitMacro {
+            name: "Other".into(),
+            steps: vec![
+                MacroStep::Command {
+                    text: "third".into(),
+                },
+                MacroStep::Delay { delay_ms: 100 },
+                MacroStep::Command {
+                    text: "fourth".into(),
+                },
+            ],
+            ..Default::default()
+        });
+        let started = Instant::now();
+        assert!(app.start_macro(0, started));
+        assert!(app.start_macro(1, started));
+        app.maintain_macro_runs_at(started, &egui::Context::default());
+        assert_eq!(echoed(&app), ["first", "third"]);
+
+        // The generation records the loss even if reconnection completes
+        // before the scheduler runs again.
+        app.connections[0].set_state(ConnState::Lost);
+        app.connections[0].set_state(ConnState::Connected);
+        app.maintain_macro_runs_at(
+            started + Duration::from_millis(100),
+            &egui::Context::default(),
+        );
+
+        assert!(app.macro_runs.is_empty());
+        assert_eq!(echoed(&app), ["first", "third"]);
     }
 }
