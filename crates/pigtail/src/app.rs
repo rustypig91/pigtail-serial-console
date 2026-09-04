@@ -1289,6 +1289,8 @@ pub struct App {
     // main window stays uncluttered.
     pub show_settings: bool,
     pub show_macros_win: bool,
+    /// Global reference for the keyboard commands Pigtail reserves.
+    pub show_keyboard_shortcuts: bool,
     pub(crate) macro_editor: Option<MacroEditor>,
     /// Macro definition awaiting confirmation because it is currently running.
     pub(crate) macro_running_edit_confirmation: Option<usize>,
@@ -1386,6 +1388,7 @@ impl App {
             merged_selected: false,
             show_settings: false,
             show_macros_win: false,
+            show_keyboard_shortcuts: false,
             macro_editor: None,
             macro_running_edit_confirmation: None,
             macro_shortcut_conflict: None,
@@ -2643,6 +2646,7 @@ impl App {
             || self.update_dialog.is_some()
             || self.show_settings
             || self.show_macros_win
+            || self.show_keyboard_shortcuts
             || self.macro_editor.is_some()
             || self.macro_running_edit_confirmation.is_some()
             || self.macro_shortcut_conflict.is_some()
@@ -2732,6 +2736,7 @@ impl eframe::App for App {
         // keyboard input. Consume an assigned chord before it can become bytes
         // for the device or activate a widget during layout.
         self.consume_macro_shortcut(ctx);
+        self.consume_tab_switch_shortcut(ctx);
 
         let max_lines = self.config.settings.max_lines;
         let mut any_data = false;
@@ -2774,6 +2779,7 @@ impl eframe::App for App {
         self.show_tool_windows(ctx);
         self.show_macros_window(ctx);
         self.show_settings_window(ctx);
+        self.show_keyboard_shortcuts_window(ctx);
         self.show_update_dialog(ctx);
         self.show_file_transfer(ctx);
         self.show_font_toast(ctx);

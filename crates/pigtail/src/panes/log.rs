@@ -1599,6 +1599,10 @@ fn console_menu(
         menu.open_filters = true;
         ui.close_menu();
     }
+    if (own_console || merged_view) && ui.button("Save view…").clicked() {
+        menu.export = Some(false);
+        ui.close_menu();
+    }
     if ui.button("Highlight rules…").clicked() {
         menu.open_highlight = true;
         ui.close_menu();

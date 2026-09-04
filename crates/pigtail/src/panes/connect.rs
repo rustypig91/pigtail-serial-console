@@ -14,6 +14,69 @@ const COMMON_BAUDS: &[u32] = &[
 ];
 
 impl App {
+    /// Reserve Ctrl+Shift+Left/Right for cycling the visible connection tabs.
+    /// This is deliberately handled before the console sees raw input, so the
+    /// terminal never receives the corresponding escape sequence.
+    pub(crate) fn consume_tab_switch_shortcut(&mut self, ctx: &egui::Context) {
+        // Keep keyboard input with whichever control or overlay currently owns
+        // it. This matches the console-only scope of the macro shortcuts.
+        if self.floating_window_open()
+            || self.config_dialog.is_some()
+            || self.rename_dialog.is_some()
+            || self.file_transfer_dialog.is_some()
+            || ctx.is_context_menu_open()
+            || ctx.memory(|memory| memory.any_popup_open() || memory.focused().is_some())
+        {
+            return;
+        }
+
+        let tab_count = self.connections.len() + usize::from(self.connections.len() >= 2);
+        if tab_count == 0 {
+            return;
+        }
+        let modifiers = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
+        let previous = ctx.input_mut(|input| input.consume_key(modifiers, egui::Key::ArrowLeft));
+        let next = ctx.input_mut(|input| input.consume_key(modifiers, egui::Key::ArrowRight));
+        if !previous && !next {
+            return;
+        }
+
+        let current = if self.merged_selected {
+            self.connections.len()
+        } else {
+            self.active.min(self.connections.len() - 1)
+        };
+        let selected = if previous {
+            (current + tab_count - 1) % tab_count
+        } else {
+            (current + 1) % tab_count
+        };
+
+        if selected == self.connections.len() {
+            self.merged_selected = true;
+            let selected_is_live = self.merged_tx_port.is_some_and(|id| {
+                self.connections
+                    .iter()
+                    .any(|conn| conn.id == id && conn.state != ConnState::Closed)
+            });
+            if !selected_is_live {
+                self.merged_tx_port = self
+                    .connections
+                    .get(self.active)
+                    .filter(|conn| conn.state != ConnState::Closed)
+                    .or_else(|| {
+                        self.connections
+                            .iter()
+                            .find(|conn| conn.state != ConnState::Closed)
+                    })
+                    .map(|conn| conn.id);
+            }
+        } else {
+            self.active = selected;
+            self.merged_selected = false;
+        }
+    }
+
     /// A plain acknowledgement dialog for `connect_errors`: a one-off
     /// background operation — connect, reconnect, port-detection start, an
     /// export write — that failed outright rather than through the normal
@@ -36,13 +99,13 @@ impl App {
         }
     }
 
-    /// The top header: one tab per connection, a merged tab, and `+`/save/⚙.
+    /// The top header: one tab per connection, a merged tab, `+`, and global
+    /// actions collected under an ellipsis menu.
     pub(crate) fn show_header(&mut self, ctx: &egui::Context) {
         let mut to_close: Option<usize> = None;
         let mut set_active: Option<usize> = None;
         let mut select_merged = false;
         let mut new_tab = false;
-        let mut save_text = false;
         let mut choose_file = false;
         let mut port_options: Option<usize> = None;
         let mut rename_tab: Option<usize> = None;
@@ -62,9 +125,9 @@ impl App {
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                // Only the tab strip and "+" are disabled: the settings gear
-                // and save-view button below act on neither the dialog nor
-                // the set of tabs, so there is nothing for them to corrupt.
+                // Only the tab strip and "+" are disabled: global actions
+                // below act on neither the dialog nor the set of tabs, so
+                // there is nothing for them to corrupt.
                 ui.add_enabled_ui(!modal_open, |ui| {
                     for (i, conn) in self.connections.iter().enumerate() {
                         let selected = !self.merged_selected && self.active == i;
@@ -112,12 +175,11 @@ impl App {
                         });
                     }
 
-                    if self.connections.len() >= 2
-                        && ui
-                            .selectable_label(self.merged_selected, "Merged")
-                            .clicked()
-                    {
-                        select_merged = true;
+                    if self.connections.len() >= 2 {
+                        let resp = ui.selectable_label(self.merged_selected, "Merged");
+                        if resp.clicked() {
+                            select_merged = true;
+                        }
                     }
 
                     if ui
@@ -131,30 +193,29 @@ impl App {
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⚙").on_hover_text("Settings").clicked() {
-                        self.show_settings = true;
-                    }
-                    if ui.button("Macros").on_hover_text(&macros_tooltip).clicked() {
-                        self.show_macros_win = true;
-                    }
-                    if ui
-                        .button("Send file…")
-                        .on_hover_text("Choose a file to send to the active console")
-                        .clicked()
-                    {
-                        choose_file = true;
-                    }
-                    if ui
-                        .add_enabled(self.active_index().is_some(), egui::Button::new("💾"))
-                        .on_hover_text(if self.merged_selected {
-                            "Save the merged view to a text file"
-                        } else {
-                            "Save this tab's view to a text file"
-                        })
-                        .clicked()
-                    {
-                        save_text = true;
-                    }
+                    ui.menu_button("…", |ui| {
+                        if ui
+                            .button("Send file…")
+                            .on_hover_text("Choose a file to send to the active console")
+                            .clicked()
+                        {
+                            choose_file = true;
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Macros").on_hover_text(&macros_tooltip).clicked() {
+                            self.show_macros_win = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("Show keyboard shortcuts").clicked() {
+                            self.show_keyboard_shortcuts = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("Settings").clicked() {
+                            self.show_settings = true;
+                            ui.close_menu();
+                        }
+                    });
                 });
             });
         });
@@ -195,16 +256,44 @@ impl App {
         if new_tab {
             self.open_config_dialog();
         }
-        if save_text {
-            if self.merged_selected {
-                self.export_merged_view(false);
-            } else if let Some(active) = self.active_index() {
-                self.export_active_view(active, false);
-            }
-        }
         if choose_file {
             self.choose_file_transfer();
         }
+    }
+
+    /// A compact reference for the application-wide keyboard commands. Device
+    /// input remains intentionally separate: unlisted keystrokes go to the
+    /// active serial console.
+    pub(crate) fn show_keyboard_shortcuts_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_keyboard_shortcuts;
+        egui::Window::new("Keyboard shortcuts")
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                egui::Grid::new("keyboard_shortcuts_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.strong("Ctrl+Shift+Left / Right");
+                        ui.label("Previous / next tab");
+                        ui.end_row();
+                        ui.strong("Ctrl+Shift+F");
+                        ui.label("Show or hide search");
+                        ui.end_row();
+                        ui.strong("Ctrl+Shift+C / V");
+                        ui.label("Copy selected text / paste to console");
+                        ui.end_row();
+                        ui.strong("Ctrl+mouse wheel");
+                        ui.label("Change console text size");
+                        ui.end_row();
+                        ui.strong("Ctrl+Shift+0–9");
+                        ui.label("Run the assigned macro");
+                        ui.end_row();
+                    });
+                ui.separator();
+                ui.weak("All other keystrokes are sent to the active serial console.");
+            });
+        self.show_keyboard_shortcuts = open;
     }
 
     /// The bottom status footer: connection state, view details, and the view
@@ -903,7 +992,60 @@ fn windows_com_name(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{macro_tooltip, port_choice_text};
+    use crate::app::tests::{inert_handle, test_app};
+    use egui::{Event, Key};
     use serialcore::config::TransmitMacro;
+    use serialcore::store::PortId;
+
+    fn tab_switch(key: Key) -> Event {
+        Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+        }
+    }
+
+    #[test]
+    fn ctrl_shift_arrows_cycle_tabs_and_consume_the_terminal_input() {
+        let (mut app, _enum_tx) = test_app("tab-switch-shortcuts");
+        for id in [PortId(1), PortId(2)] {
+            app.connections.push(app.make_connection(
+                id,
+                format!("probe-{id:?}"),
+                Default::default(),
+                Default::default(),
+                inert_handle(id),
+            ));
+        }
+
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![tab_switch(Key::ArrowLeft)],
+            ..Default::default()
+        });
+        app.consume_tab_switch_shortcut(&ctx);
+        assert!(
+            app.merged_selected,
+            "left from the first tab wraps to Merged"
+        );
+        assert!(ctx.input(|input| input.events.is_empty()));
+        let _ = ctx.end_pass();
+
+        let ctx = egui::Context::default();
+        app.merged_selected = false;
+        app.active = 0;
+        ctx.begin_pass(egui::RawInput {
+            events: vec![tab_switch(Key::ArrowRight)],
+            ..Default::default()
+        });
+        app.consume_tab_switch_shortcut(&ctx);
+        assert_eq!(app.active, 1, "right selects the next connection tab");
+        assert!(!app.merged_selected);
+        assert!(ctx.input(|input| input.events.is_empty()));
+        let _ = ctx.end_pass();
+    }
 
     #[test]
     fn duplicate_unix_path_label_is_shown_once() {
