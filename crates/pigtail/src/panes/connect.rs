@@ -43,6 +43,7 @@ impl App {
         let mut select_merged = false;
         let mut new_tab = false;
         let mut save_text = false;
+        let mut choose_file = false;
         let mut port_options: Option<usize> = None;
         let mut rename_tab: Option<usize> = None;
         let macros_tooltip = macro_tooltip(&self.config.macros);
@@ -137,6 +138,13 @@ impl App {
                         self.show_macros_win = true;
                     }
                     if ui
+                        .button("Send file…")
+                        .on_hover_text("Choose a file to send to the active console")
+                        .clicked()
+                    {
+                        choose_file = true;
+                    }
+                    if ui
                         .add_enabled(self.active_index().is_some(), egui::Button::new("💾"))
                         .on_hover_text(if self.merged_selected {
                             "Save the merged view to a text file"
@@ -193,6 +201,9 @@ impl App {
             } else if let Some(active) = self.active_index() {
                 self.export_active_view(active, false);
             }
+        }
+        if choose_file {
+            self.choose_file_transfer();
         }
     }
 

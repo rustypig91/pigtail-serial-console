@@ -19,6 +19,22 @@ impl App {
         let Some(dropped) = dropped else {
             return;
         };
+        if self.floating_window_open() {
+            return;
+        }
+        let Some(path) = dropped.path else {
+            self.record_connect_error(
+                "Couldn't open dropped file",
+                "This build can only send files that have a local filesystem path.".to_owned(),
+            );
+            return;
+        };
+        self.open_file_transfer(path, "Couldn't open dropped file");
+    }
+
+    /// Open a native file picker for desktop sessions where the window backend
+    /// cannot deliver drag-and-drop events (notably Wayland in winit 0.30).
+    pub(crate) fn choose_file_transfer(&mut self) {
         if self.file_transfer_dialog.is_some() || self.any_file_transfer_active() {
             self.record_connect_error(
                 "Couldn't start file transfer",
@@ -26,16 +42,31 @@ impl App {
             );
             return;
         }
-        if self.floating_window_open() {
+        if self.file_transfer_target().is_none() {
+            self.record_connect_error(
+                "Couldn't start file transfer",
+                "Connect the active console before choosing a file to send.".to_owned(),
+            );
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new().pick_file() else {
+            return;
+        };
+        self.open_file_transfer(path, "Couldn't open selected file");
+    }
+
+    fn open_file_transfer(&mut self, path: PathBuf, error_title: &'static str) {
+        if self.file_transfer_dialog.is_some() || self.any_file_transfer_active() {
+            self.record_connect_error(
+                "Couldn't start file transfer",
+                "Finish or cancel the current file transfer first.".to_owned(),
+            );
             return;
         }
         let Some(port) = self.file_transfer_target() else {
-            return;
-        };
-        let Some(path) = dropped.path else {
             self.record_connect_error(
-                "Couldn't open dropped file",
-                "This build can only send files that have a local filesystem path.".to_owned(),
+                "Couldn't start file transfer",
+                "The active console is no longer connected.".to_owned(),
             );
             return;
         };
@@ -44,7 +75,7 @@ impl App {
                 self.file_transfer_dialog = Some(dialog);
                 self.start_file_preparation();
             }
-            Err(message) => self.record_connect_error("Couldn't open dropped file", message),
+            Err(message) => self.record_connect_error(error_title, message),
         }
     }
 
