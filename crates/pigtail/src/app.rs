@@ -1204,6 +1204,12 @@ pub(crate) struct MacroEditor {
     pub(crate) step_selection: Option<usize>,
 }
 
+/// A retention edit that would immediately discard existing captures.
+pub(crate) struct RetentionCleanupConfirmation {
+    pub(crate) days: u32,
+    pub(crate) captures: usize,
+}
+
 pub struct App {
     pub clock: SessionClock,
     pub config: Config,
@@ -1296,6 +1302,8 @@ pub struct App {
     pub(crate) macro_running_edit_confirmation: Option<usize>,
     /// Target macro, requested digit, and the macro currently owning it.
     pub(crate) macro_shortcut_conflict: Option<(usize, u8, usize)>,
+    /// Retention edit waiting for the user to approve deletion of old captures.
+    pub(crate) retention_cleanup_confirmation: Option<RetentionCleanupConfirmation>,
     pub show_filters_win: bool,
     pub show_highlight_win: bool,
     pub show_extract_win: bool,
@@ -1392,6 +1400,7 @@ impl App {
             macro_editor: None,
             macro_running_edit_confirmation: None,
             macro_shortcut_conflict: None,
+            retention_cleanup_confirmation: None,
             show_filters_win: false,
             show_highlight_win: false,
             show_extract_win: false,
@@ -2650,6 +2659,7 @@ impl App {
             || self.macro_editor.is_some()
             || self.macro_running_edit_confirmation.is_some()
             || self.macro_shortcut_conflict.is_some()
+            || self.retention_cleanup_confirmation.is_some()
             || self.show_filters_win
             || self.show_highlight_win
             || self.show_extract_win

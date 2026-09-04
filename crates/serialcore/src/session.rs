@@ -284,17 +284,19 @@ fn meta_path_for(bin_path: &Path) -> PathBuf {
     }
 }
 
-/// Delete session files (`.session.bin` and their `.meta.json`) whose modified
-/// time is older than `days` (spec §7.5). Returns the number of bin files
-/// removed.
-pub fn cleanup_old_sessions(dir: &Path, days: u32) -> std::io::Result<usize> {
+/// Return session captures whose modified time is older than `days`.
+///
+/// This lets callers ask for confirmation before invoking
+/// [`cleanup_old_sessions`]. Metadata failures are ignored just as they are by
+/// cleanup: a capture with an unavailable modification time is retained.
+pub fn old_session_paths(dir: &Path, days: u32) -> std::io::Result<Vec<PathBuf>> {
     if !dir.exists() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     let cutoff = std::time::SystemTime::now()
         .checked_sub(Duration::from_secs(days as u64 * 86_400))
         .unwrap_or(std::time::UNIX_EPOCH);
-    let mut removed = 0;
+    let mut old = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -305,13 +307,23 @@ pub fn cleanup_old_sessions(dir: &Path, days: u32) -> std::io::Result<usize> {
         let modified = entry.metadata().and_then(|m| m.modified());
         if let Ok(modified) = modified {
             if modified < cutoff {
-                std::fs::remove_file(&path)?;
-                let _ = std::fs::remove_file(meta_path_for(&path));
-                removed += 1;
+                old.push(path);
             }
         }
     }
-    Ok(removed)
+    Ok(old)
+}
+
+/// Delete session files (`.session.bin` and their `.meta.json`) whose modified
+/// time is older than `days` (spec §7.5). Returns the number of bin files
+/// removed.
+pub fn cleanup_old_sessions(dir: &Path, days: u32) -> std::io::Result<usize> {
+    let old = old_session_paths(dir, days)?;
+    for path in &old {
+        std::fs::remove_file(path)?;
+        let _ = std::fs::remove_file(meta_path_for(path));
+    }
+    Ok(old.len())
 }
 
 fn sanitize_label(label: &str) -> String {
@@ -512,6 +524,31 @@ mod tests {
             read_meta(&bin).unwrap().cleared,
             "restoring history must stop at a capture the user cleared"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn old_sessions_can_be_previewed_before_cleanup() {
+        let dir = std::env::temp_dir().join(format!("smon-cleanup-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let mut writer = SessionWriter::create(&dir, &sample_meta()).unwrap();
+        writer.write_record(0, b"old\n").unwrap();
+        writer.flush().unwrap();
+        let bin = writer.bin_path().to_path_buf();
+        let sidecar = writer.meta_path().to_path_buf();
+        drop(writer);
+
+        let old = std::time::SystemTime::now() - Duration::from_secs(2 * 86_400);
+        std::fs::File::open(&bin)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+
+        assert_eq!(old_session_paths(&dir, 1).unwrap(), vec![bin.clone()]);
+        assert_eq!(cleanup_old_sessions(&dir, 1).unwrap(), 1);
+        assert!(!bin.exists());
+        assert!(!sidecar.exists());
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -1,6 +1,6 @@
 //! Settings window (spec §7.14, §5 M5): max lines, retention, theme, updates.
 
-use crate::app::{history_limits, App};
+use crate::app::{history_limits, App, RetentionCleanupConfirmation};
 use serialcore::config::{MAX_CONSOLE_FONT_SIZE, MIN_CONSOLE_FONT_SIZE};
 
 impl App {
@@ -62,7 +62,8 @@ impl App {
                         ui.end_row();
 
                         ui.label("Session retention (days)");
-                        changed |= ui
+                        let previous_retention = self.config.settings.session_retention_days;
+                        let retention_changed = ui
                             .add(
                                 egui::DragValue::new(
                                     &mut self.config.settings.session_retention_days,
@@ -70,6 +71,28 @@ impl App {
                                 .range(1..=3650),
                             )
                             .changed();
+                        if retention_changed {
+                            let days = self.config.settings.session_retention_days;
+                            // Do not persist the new limit until deletion has
+                            // been approved. Restoring the displayed value also
+                            // makes Cancel leave Settings exactly as it was.
+                            self.config.settings.session_retention_days = previous_retention;
+                            match serialcore::session::old_session_paths(&self.paths.sessions, days)
+                            {
+                                Ok(old) if old.is_empty() => self.apply_session_retention(days),
+                                Ok(old) => {
+                                    self.retention_cleanup_confirmation =
+                                        Some(RetentionCleanupConfirmation {
+                                            days,
+                                            captures: old.len(),
+                                        });
+                                }
+                                Err(error) => {
+                                    tracing::warn!("couldn't preview session cleanup: {error}");
+                                    self.apply_session_retention(days);
+                                }
+                            }
+                        }
                         ui.end_row();
 
                         ui.label("Theme");
@@ -140,6 +163,52 @@ impl App {
         }
         if check_now {
             self.start_update_check(true);
+        }
+        self.show_retention_cleanup_confirmation(ctx);
+    }
+
+    fn apply_session_retention(&mut self, days: u32) {
+        self.config.settings.session_retention_days = days;
+        match serialcore::session::cleanup_old_sessions(&self.paths.sessions, days) {
+            Ok(removed) => tracing::info!("removed {removed} expired session capture(s)"),
+            Err(error) => tracing::warn!("session cleanup failed: {error}"),
+        }
+        self.write_config();
+    }
+
+    fn show_retention_cleanup_confirmation(&mut self, ctx: &egui::Context) {
+        let Some(pending) = &self.retention_cleanup_confirmation else {
+            return;
+        };
+        let days = pending.days;
+        let captures = pending.captures;
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Remove expired session captures?")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Changing retention to {days} days will delete {captures} stored session {}.",
+                    if captures == 1 { "capture" } else { "captures" },
+                ));
+                ui.label("This cannot be undone.");
+                ui.horizontal(|ui| {
+                    confirm = ui.button("Remove captures").clicked();
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if confirm {
+            self.retention_cleanup_confirmation = None;
+            self.apply_session_retention(days);
+        } else if cancel || !open {
+            self.retention_cleanup_confirmation = None;
         }
     }
 }
