@@ -70,7 +70,14 @@ impl App {
             );
             return;
         };
-        match dropped_dialog(port, path, self.connection_line_ending(port)) {
+        let options = self
+            .file_transfer_options
+            .clone()
+            .unwrap_or_else(|| TransferOptions {
+                line_ending: self.connection_line_ending(port),
+                ..Default::default()
+            });
+        match dropped_dialog(port, path, options) {
             Ok(dialog) => {
                 self.file_transfer_dialog = Some(dialog);
                 self.start_file_preparation();
@@ -354,7 +361,9 @@ impl App {
                 });
             });
 
-        if options_changed {
+        let remembered_options = options_changed.then(|| dialog.options.clone());
+        if let Some(options) = remembered_options {
+            self.file_transfer_options = Some(options);
             self.start_file_preparation();
         }
         if cancel {
@@ -432,7 +441,7 @@ impl App {
 fn dropped_dialog(
     port: PortId,
     path: PathBuf,
-    line_ending: LineEnding,
+    options: TransferOptions,
 ) -> Result<FileTransferDialog, String> {
     let metadata = std::fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     if !metadata.is_file() {
@@ -455,10 +464,7 @@ fn dropped_dialog(
         file_name,
         source_size: metadata.len(),
         preview,
-        options: TransferOptions {
-            line_ending,
-            ..Default::default()
-        },
+        options,
         prepared: None,
         prepare_rx: None,
         prepare_error: None,

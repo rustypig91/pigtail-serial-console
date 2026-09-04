@@ -1315,6 +1315,10 @@ pub struct App {
     pub update_dialog: Option<UpdateDialog>,
     /// Confirmation dialog opened by dropping a file onto the active console.
     pub file_transfer_dialog: Option<FileTransferDialog>,
+    /// Most recent file-transfer choices. They deliberately live only in the
+    /// running app, so opening another file is convenient without turning a
+    /// one-off transfer setting into a persistent preference.
+    pub file_transfer_options: Option<TransferOptions>,
     /// Console text size to flash over the middle of the window, and the time
     /// it was set. Ctrl+wheel has nothing else to show for itself: the change
     /// it makes is legible only if you already know what you are looking for.
@@ -1395,6 +1399,7 @@ impl App {
             update_manual: false,
             update_dialog: None,
             file_transfer_dialog: None,
+            file_transfer_options: None,
             font_toast: None,
             macro_runs: Vec::new(),
             connect_errors: VecDeque::new(),
