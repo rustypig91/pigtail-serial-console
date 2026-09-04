@@ -1207,7 +1207,7 @@ pub(crate) struct MacroEditor {
 /// A retention edit that would immediately discard existing captures.
 pub(crate) struct RetentionCleanupConfirmation {
     pub(crate) days: u32,
-    pub(crate) captures: usize,
+    pub(crate) paths: Vec<PathBuf>,
 }
 
 pub struct App {

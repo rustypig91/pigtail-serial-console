@@ -319,11 +319,19 @@ pub fn old_session_paths(dir: &Path, days: u32) -> std::io::Result<Vec<PathBuf>>
 /// removed.
 pub fn cleanup_old_sessions(dir: &Path, days: u32) -> std::io::Result<usize> {
     let old = old_session_paths(dir, days)?;
-    for path in &old {
+    remove_session_paths(&old)
+}
+
+/// Delete exactly the session captures in `paths`, along with their metadata.
+///
+/// Callers that displayed a cleanup preview can pass the previewed paths here
+/// so files that become old while awaiting confirmation are not removed too.
+pub fn remove_session_paths(paths: &[PathBuf]) -> std::io::Result<usize> {
+    for path in paths {
         std::fs::remove_file(path)?;
         let _ = std::fs::remove_file(meta_path_for(path));
     }
-    Ok(old.len())
+    Ok(paths.len())
 }
 
 fn sanitize_label(label: &str) -> String {
@@ -550,6 +558,23 @@ mod tests {
         assert!(!bin.exists());
         assert!(!sidecar.exists());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn removing_previewed_sessions_leaves_unpreviewed_sessions() {
+        let dir = std::env::temp_dir().join(format!("smon-remove-preview-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let approved = dir.join("approved.session.bin");
+        let unapproved = dir.join("unapproved.session.bin");
+        std::fs::write(&approved, b"approved").unwrap();
+        std::fs::write(&unapproved, b"unapproved").unwrap();
+
+        remove_session_paths(std::slice::from_ref(&approved)).unwrap();
+
+        assert!(!approved.exists());
+        assert!(unapproved.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 

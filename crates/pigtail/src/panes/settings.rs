@@ -2,6 +2,7 @@
 
 use crate::app::{history_limits, App, RetentionCleanupConfirmation};
 use serialcore::config::{MAX_CONSOLE_FONT_SIZE, MIN_CONSOLE_FONT_SIZE};
+use std::path::PathBuf;
 
 impl App {
     pub(crate) fn show_settings_window(&mut self, ctx: &egui::Context) {
@@ -152,10 +153,10 @@ impl App {
         self.show_retention_cleanup_confirmation(ctx);
     }
 
-    fn apply_session_retention(&mut self, days: u32) {
+    fn apply_session_retention(&mut self, days: u32, paths: &[PathBuf]) {
         self.config.settings.session_retention_days = days;
         self.session_retention_draft = None;
-        match serialcore::session::cleanup_old_sessions(&self.paths.sessions, days) {
+        match serialcore::session::remove_session_paths(paths) {
             Ok(removed) => tracing::info!("removed {removed} expired session capture(s)"),
             Err(error) => tracing::warn!("session cleanup failed: {error}"),
         }
@@ -164,12 +165,10 @@ impl App {
 
     fn request_session_retention_change(&mut self, days: u32) {
         match serialcore::session::old_session_paths(&self.paths.sessions, days) {
-            Ok(old) if old.is_empty() => self.apply_session_retention(days),
+            Ok(old) if old.is_empty() => self.apply_session_retention(days, &old),
             Ok(old) => {
-                self.retention_cleanup_confirmation = Some(RetentionCleanupConfirmation {
-                    days,
-                    captures: old.len(),
-                });
+                self.retention_cleanup_confirmation =
+                    Some(RetentionCleanupConfirmation { days, paths: old });
             }
             Err(error) => {
                 tracing::warn!("couldn't preview session cleanup: {error}");
@@ -187,7 +186,8 @@ impl App {
             return;
         };
         let days = pending.days;
-        let captures = pending.captures;
+        let captures = pending.paths.len();
+        let paths = pending.paths.clone();
         let mut open = true;
         let mut confirm = false;
         let mut cancel = false;
@@ -212,7 +212,7 @@ impl App {
 
         if confirm {
             self.retention_cleanup_confirmation = None;
-            self.apply_session_retention(days);
+            self.apply_session_retention(days, &paths);
         } else if cancel || !open {
             self.retention_cleanup_confirmation = None;
             self.session_retention_draft = None;
