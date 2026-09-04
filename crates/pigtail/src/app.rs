@@ -18,6 +18,7 @@ use serialcore::reader::{self, ConnState, ErrorScope, ReaderEvent, SourceSpec};
 use serialcore::series::Series;
 use serialcore::session::{self, SessionMeta};
 use serialcore::store::{IncomingLine, LineFlags, LineStore, PortId};
+use serialcore::transfer::{PreparedTransfer, TransferOptions};
 use serialcore::update;
 use serialcore::wake::Wake;
 use std::collections::{HashMap, VecDeque};
@@ -401,6 +402,13 @@ pub struct TabError {
     pub msg: String,
 }
 
+/// File transfer currently owned by a connection's reader.
+pub struct TransferProgress {
+    pub file_name: String,
+    pub sent: usize,
+    pub total: usize,
+}
+
 impl TabError {
     /// An error about the link itself, raised by the UI rather than the reader
     /// (a spawn that failed before any reader existed to report it).
@@ -480,6 +488,9 @@ pub struct Connection {
     /// successful (re)connect retires a [`ErrorScope::Connection`] error but
     /// says nothing about a [`ErrorScope::Session`] one, which outlives it.
     pub last_error: Option<TabError>,
+    /// Present only while this reader is sending a dropped file. Completion,
+    /// cancellation, disconnect, and failure all remove it silently.
+    pub transfer_progress: Option<TransferProgress>,
     /// User-set time mark for delta-from-mark display, on the session axis, so
     /// a mark set on a restored line is negative. Deliberately not persisted:
     /// a mark is a "measure from here" gesture on the console in front of you,
@@ -666,6 +677,13 @@ impl Connection {
                         self.last_error = Some(TabError { scope, msg });
                     }
                 }
+                ReaderEvent::TransferProgress { sent, total } => {
+                    if let Some(progress) = &mut self.transfer_progress {
+                        progress.sent = sent;
+                        progress.total = total;
+                    }
+                }
+                ReaderEvent::TransferEnded => self.transfer_progress = None,
                 ReaderEvent::OutputDropped {
                     raw_bytes,
                     line_updates,
@@ -1140,6 +1158,19 @@ pub struct UpdateDialog {
     pub skip_version: Option<String>,
 }
 
+/// Confirmation and preparation state for one dropped file.
+pub struct FileTransferDialog {
+    pub port: PortId,
+    pub path: PathBuf,
+    pub file_name: String,
+    pub source_size: u64,
+    pub preview: Vec<u8>,
+    pub options: TransferOptions,
+    pub prepared: Option<PreparedTransfer>,
+    pub prepare_rx: Option<Receiver<Result<PreparedTransfer, String>>>,
+    pub prepare_error: Option<String>,
+}
+
 /// One in-flight macro execution. The definition is copied when it starts so
 /// editing or deleting a macro cannot change a sequence halfway through.
 pub(crate) struct MacroRun {
@@ -1282,6 +1313,12 @@ pub struct App {
     pub update_manual: bool,
     /// `Some` while the update notice is showing.
     pub update_dialog: Option<UpdateDialog>,
+    /// Confirmation dialog opened by dropping a file onto the active console.
+    pub file_transfer_dialog: Option<FileTransferDialog>,
+    /// Most recent file-transfer choices. They deliberately live only in the
+    /// running app, so opening another file is convenient without turning a
+    /// one-off transfer setting into a persistent preference.
+    pub file_transfer_options: Option<TransferOptions>,
     /// Console text size to flash over the middle of the window, and the time
     /// it was set. Ctrl+wheel has nothing else to show for itself: the change
     /// it makes is legible only if you already know what you are looking for.
@@ -1361,6 +1398,8 @@ impl App {
             update_rx: None,
             update_manual: false,
             update_dialog: None,
+            file_transfer_dialog: None,
+            file_transfer_options: None,
             font_toast: None,
             macro_runs: Vec::new(),
             connect_errors: VecDeque::new(),
@@ -1625,6 +1664,9 @@ impl App {
         // again. The wait is no new cost: this join already happened, just
         // after the spawn rather than before it.
         self.connections[index].handle.shutdown_in_place();
+        // `shutdown_in_place` drains and discards the old reader's final
+        // events, including `TransferEnded`, so retire its UI state here.
+        self.connections[index].transfer_progress = None;
 
         // Keep the same port id so the preserved lines still map to this tab in
         // the merged view; only the reader (and its capture file) is replaced.
@@ -1841,6 +1883,7 @@ impl App {
             raw_contiguous_start: 0,
             raw_sessions: Vec::new(),
             last_error: None,
+            transfer_progress: None,
             mark_micros: None,
             hex_view: false,
             filter_rules: Vec::new(),
@@ -2595,6 +2638,7 @@ impl App {
     pub fn floating_window_open(&self) -> bool {
         self.config_dialog.is_some()
             || self.rename_dialog.is_some()
+            || self.file_transfer_dialog.is_some()
             || !self.connect_errors.is_empty()
             || self.update_dialog.is_some()
             || self.show_settings
@@ -2682,6 +2726,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_enumerator();
         self.poll_update_check();
+        self.poll_file_drop(ctx);
 
         // Macro shortcuts belong to the unfocused console, just like raw
         // keyboard input. Consume an assigned chord before it can become bytes
@@ -2721,6 +2766,7 @@ impl eframe::App for App {
         self.show_footer(ctx);
         self.show_plot(ctx); // bottom panel, only when enabled for the tab
         self.show_console(ctx, console_tab_claimed);
+        self.show_file_drop_overlay(ctx);
 
         // Floating windows.
         self.show_config_dialog(ctx);
@@ -2729,6 +2775,7 @@ impl eframe::App for App {
         self.show_macros_window(ctx);
         self.show_settings_window(ctx);
         self.show_update_dialog(ctx);
+        self.show_file_transfer(ctx);
         self.show_font_toast(ctx);
         self.show_connect_error(ctx);
         // Keep the guard focused until every widget has been drawn, so none of

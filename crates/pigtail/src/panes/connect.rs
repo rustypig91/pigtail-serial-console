@@ -23,6 +23,11 @@ impl App {
     /// simultaneous failures all get seen rather than the latest silently
     /// replacing the others.
     pub(crate) fn show_connect_error(&mut self, ctx: &egui::Context) {
+        // A drop confirmation is modal and already anchored at the centre;
+        // keep an unrelated background error queued until it closes.
+        if self.file_transfer_dialog.is_some() {
+            return;
+        }
         let Some(err) = self.connect_errors.front() else {
             return;
         };
@@ -38,6 +43,7 @@ impl App {
         let mut select_merged = false;
         let mut new_tab = false;
         let mut save_text = false;
+        let mut choose_file = false;
         let mut port_options: Option<usize> = None;
         let mut rename_tab: Option<usize> = None;
         let macros_tooltip = macro_tooltip(&self.config.macros);
@@ -50,7 +56,9 @@ impl App {
         // `editing` pointing at a tab that no longer exists (issue #16).
         // Disabled rather than merely ignored so the greying-out shows *why*
         // the clicks do nothing.
-        let modal_open = self.config_dialog.is_some() || self.rename_dialog.is_some();
+        let modal_open = self.config_dialog.is_some()
+            || self.rename_dialog.is_some()
+            || self.file_transfer_dialog.is_some();
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -130,6 +138,13 @@ impl App {
                         self.show_macros_win = true;
                     }
                     if ui
+                        .button("Send file…")
+                        .on_hover_text("Choose a file to send to the active console")
+                        .clicked()
+                    {
+                        choose_file = true;
+                    }
+                    if ui
                         .add_enabled(self.active_index().is_some(), egui::Button::new("💾"))
                         .on_hover_text(if self.merged_selected {
                             "Save the merged view to a text file"
@@ -186,6 +201,9 @@ impl App {
             } else if let Some(active) = self.active_index() {
                 self.export_active_view(active, false);
             }
+        }
+        if choose_file {
+            self.choose_file_transfer();
         }
     }
 
