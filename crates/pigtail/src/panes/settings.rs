@@ -173,7 +173,11 @@ impl App {
             }
             Err(error) => {
                 tracing::warn!("couldn't preview session cleanup: {error}");
-                self.apply_session_retention(days);
+                // A preview is the user's chance to approve a destructive
+                // change. Do not retry it as cleanup here: a transient error
+                // could make that second scan succeed and delete captures the
+                // user never saw or approved.
+                self.session_retention_draft = None;
             }
         }
     }
@@ -222,5 +226,25 @@ fn format_bytes(bytes: usize) -> String {
         format!("{:.1} MiB", bytes as f64 / MIB)
     } else {
         format!("{:.1} KiB", bytes as f64 / 1024.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::tests::test_app;
+
+    #[test]
+    fn failed_retention_preview_keeps_the_saved_setting() {
+        let (mut app, _enum_tx) = test_app("retention-preview-failure");
+        let saved = app.config.settings.session_retention_days;
+        std::fs::create_dir_all(app.paths.sessions.parent().unwrap()).unwrap();
+        std::fs::write(&app.paths.sessions, b"not a directory").unwrap();
+        app.session_retention_draft = Some(1);
+
+        app.request_session_retention_change(1);
+
+        assert_eq!(app.config.settings.session_retention_days, saved);
+        assert!(app.session_retention_draft.is_none());
+        std::fs::remove_dir_all(app.paths.sessions.parent().unwrap()).ok();
     }
 }
