@@ -10,6 +10,8 @@
 //! search (see `log::show_console`), freeing plain Ctrl+F to reach the device.
 //! Any Ctrl+Shift+digit chord assigned to a transmit macro is also consumed
 //! before this module sees the frame's raw input.
+//! Ctrl+Shift+Left/Right likewise switches console tabs before raw input is
+//! translated into terminal escape sequences.
 //!
 //! `PortConfig` still governs the send line ending, optional local echo (for
 //! devices that don't echo), and whether Up/Down recall local history instead
