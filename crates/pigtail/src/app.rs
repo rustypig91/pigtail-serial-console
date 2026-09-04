@@ -1304,6 +1304,9 @@ pub struct App {
     pub(crate) macro_shortcut_conflict: Option<(usize, u8, usize)>,
     /// Retention edit waiting for the user to approve deletion of old captures.
     pub(crate) retention_cleanup_confirmation: Option<RetentionCleanupConfirmation>,
+    /// Value being edited in Settings. It is kept separate from the saved
+    /// configuration until the number box loses focus.
+    pub(crate) session_retention_draft: Option<u32>,
     pub show_filters_win: bool,
     pub show_highlight_win: bool,
     pub show_extract_win: bool,
@@ -1401,6 +1404,7 @@ impl App {
             macro_running_edit_confirmation: None,
             macro_shortcut_conflict: None,
             retention_cleanup_confirmation: None,
+            session_retention_draft: None,
             show_filters_win: false,
             show_highlight_win: false,
             show_extract_win: false,

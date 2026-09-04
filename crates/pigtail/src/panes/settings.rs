@@ -62,36 +62,21 @@ impl App {
                         ui.end_row();
 
                         ui.label("Session retention (days)");
-                        let previous_retention = self.config.settings.session_retention_days;
-                        let retention_changed = ui
-                            .add(
-                                egui::DragValue::new(
-                                    &mut self.config.settings.session_retention_days,
-                                )
-                                .range(1..=3650),
-                            )
-                            .changed();
-                        if retention_changed {
-                            let days = self.config.settings.session_retention_days;
-                            // Do not persist the new limit until deletion has
-                            // been approved. Restoring the displayed value also
-                            // makes Cancel leave Settings exactly as it was.
-                            self.config.settings.session_retention_days = previous_retention;
-                            match serialcore::session::old_session_paths(&self.paths.sessions, days)
-                            {
-                                Ok(old) if old.is_empty() => self.apply_session_retention(days),
-                                Ok(old) => {
-                                    self.retention_cleanup_confirmation =
-                                        Some(RetentionCleanupConfirmation {
-                                            days,
-                                            captures: old.len(),
-                                        });
-                                }
-                                Err(error) => {
-                                    tracing::warn!("couldn't preview session cleanup: {error}");
-                                    self.apply_session_retention(days);
-                                }
-                            }
+                        let saved_retention = self.config.settings.session_retention_days;
+                        let draft = self.session_retention_draft.get_or_insert(saved_retention);
+                        let response = ui.add_enabled(
+                            self.retention_cleanup_confirmation.is_none(),
+                            egui::DragValue::new(draft).range(1..=3650),
+                        );
+                        let days = *draft;
+                        // Typing produces an edit event for every character.
+                        // Wait until the user leaves the field before previewing
+                        // deletion, so e.g. entering 20 never prompts at 2.
+                        if days != saved_retention
+                            && (response.lost_focus()
+                                || (response.changed() && !response.has_focus()))
+                        {
+                            self.request_session_retention_change(days);
                         }
                         ui.end_row();
 
@@ -169,11 +154,28 @@ impl App {
 
     fn apply_session_retention(&mut self, days: u32) {
         self.config.settings.session_retention_days = days;
+        self.session_retention_draft = None;
         match serialcore::session::cleanup_old_sessions(&self.paths.sessions, days) {
             Ok(removed) => tracing::info!("removed {removed} expired session capture(s)"),
             Err(error) => tracing::warn!("session cleanup failed: {error}"),
         }
         self.write_config();
+    }
+
+    fn request_session_retention_change(&mut self, days: u32) {
+        match serialcore::session::old_session_paths(&self.paths.sessions, days) {
+            Ok(old) if old.is_empty() => self.apply_session_retention(days),
+            Ok(old) => {
+                self.retention_cleanup_confirmation = Some(RetentionCleanupConfirmation {
+                    days,
+                    captures: old.len(),
+                });
+            }
+            Err(error) => {
+                tracing::warn!("couldn't preview session cleanup: {error}");
+                self.apply_session_retention(days);
+            }
+        }
     }
 
     fn show_retention_cleanup_confirmation(&mut self, ctx: &egui::Context) {
@@ -209,6 +211,7 @@ impl App {
             self.apply_session_retention(days);
         } else if cancel || !open {
             self.retention_cleanup_confirmation = None;
+            self.session_retention_draft = None;
         }
     }
 }
