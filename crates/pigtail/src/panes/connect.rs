@@ -157,7 +157,11 @@ impl App {
                                 tooltip
                             ));
                         if !modal_open {
-                            resp.dnd_set_drag_payload(DraggedTab(conn.id));
+                            // Other buttons belong to the context menu and
+                            // close-tab action, not tab reordering.
+                            if resp.drag_started_by(egui::PointerButton::Primary) {
+                                resp.dnd_set_drag_payload(DraggedTab(conn.id));
+                            }
                             if resp.dnd_hover_payload::<DraggedTab>().is_some() {
                                 if let Some(pointer) = ctx.pointer_interact_pos() {
                                     let after = pointer.x >= resp.rect.center().x;
@@ -1058,6 +1062,81 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
         }
+    }
+
+    #[test]
+    fn mouse_drag_reorders_tabs_without_changing_selection() {
+        check_mouse_tab_drag(egui::PointerButton::Primary, true);
+    }
+
+    #[test]
+    fn secondary_and_middle_drags_do_not_reorder_tabs() {
+        check_mouse_tab_drag(egui::PointerButton::Secondary, false);
+        check_mouse_tab_drag(egui::PointerButton::Middle, false);
+    }
+
+    fn check_mouse_tab_drag(drag_button: egui::PointerButton, should_reorder: bool) {
+        let (mut app, _enum_tx) = test_app("mouse-tab-reorder");
+        for id in [PortId(1), PortId(2), PortId(3)] {
+            let mut conn = app.make_connection(
+                id,
+                format!("probe-{}", id.0),
+                Default::default(),
+                Default::default(),
+                inert_handle(id),
+            );
+            conn.name = Some(format!("Tab {}", id.0));
+            app.connections.push(conn);
+        }
+        app.active = 1;
+        let ctx = egui::Context::default();
+        let mut frame = |events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.show_header(ctx),
+            )
+        };
+        let output = frame(vec![]);
+        let tab_center = |name: &str| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        (text.galley.text() == name).then_some(text.pos + text.galley.size() / 2.0)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap()
+        };
+        let start = tab_center("Tab 1");
+        let end = tab_center("Tab 3") + egui::vec2(5.0, 0.0);
+        let button = |pos, pressed| Event::PointerButton {
+            pos,
+            button: drag_button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![Event::PointerMoved(start), button(start, true)]);
+        frame(vec![Event::PointerMoved(end)]);
+        frame(vec![button(end, false)]);
+        assert_eq!(
+            app.connections.iter().map(|c| c.id).collect::<Vec<_>>(),
+            if should_reorder {
+                vec![PortId(2), PortId(3), PortId(1)]
+            } else {
+                vec![PortId(1), PortId(2), PortId(3)]
+            }
+        );
+        assert_eq!(app.connections[app.active].id, PortId(2));
     }
 
     #[test]
