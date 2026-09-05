@@ -13,6 +13,9 @@ const COMMON_BAUDS: &[u32] = &[
     9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1_000_000, 2_000_000, 3_000_000,
 ];
 
+#[derive(Clone, Copy)]
+struct DraggedTab(serialcore::store::PortId);
+
 impl App {
     /// Reserve Ctrl+Shift+Left/Right for cycling the visible connection tabs.
     /// This is deliberately handled before the console sees raw input, so the
@@ -109,6 +112,7 @@ impl App {
         let mut choose_file = false;
         let mut port_options: Option<usize> = None;
         let mut rename_tab: Option<usize> = None;
+        let mut reorder = None;
         let macros_tooltip = macro_tooltip(&self.config.macros);
 
         // The config dialog is meant to be modal, but an `egui::Window` does
@@ -146,11 +150,36 @@ impl App {
                         // detected device name and port available.
                         let resp = ui
                             .selectable_label(selected, label)
+                            .interact(egui::Sense::click_and_drag())
                             .on_hover_text(&tooltip)
                             .on_disabled_hover_text(format!(
                                 "{}\n(finish or cancel the open dialog first)",
                                 tooltip
                             ));
+                        if !modal_open {
+                            resp.dnd_set_drag_payload(DraggedTab(conn.id));
+                            if resp.dnd_hover_payload::<DraggedTab>().is_some() {
+                                if let Some(pointer) = ctx.pointer_interact_pos() {
+                                    let after = pointer.x >= resp.rect.center().x;
+                                    let boundary = i + usize::from(after);
+                                    let x = if after {
+                                        resp.rect.right()
+                                    } else {
+                                        resp.rect.left()
+                                    };
+                                    ui.painter().line_segment(
+                                        [
+                                            egui::pos2(x, resp.rect.top()),
+                                            egui::pos2(x, resp.rect.bottom()),
+                                        ],
+                                        egui::Stroke::new(2.0_f32, ui.visuals().selection.bg_fill),
+                                    );
+                                    if let Some(tab) = resp.dnd_release_payload::<DraggedTab>() {
+                                        reorder = Some((tab.0, boundary));
+                                    }
+                                }
+                            }
+                        }
                         if resp.clicked() {
                             set_active = Some(i);
                         }
@@ -264,6 +293,11 @@ impl App {
                             .find(|conn| conn.state != ConnState::Closed)
                     })
                     .map(|conn| conn.id);
+            }
+        }
+        if to_close.is_none() {
+            if let Some((id, boundary)) = reorder {
+                self.reorder_connection(id, boundary);
             }
         }
         if let Some(i) = to_close {
@@ -1024,6 +1058,53 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
         }
+    }
+
+    #[test]
+    fn reordering_tabs_preserves_selection_and_saves_order() {
+        let (mut app, _enum_tx) = test_app("tab-reorder");
+        for id in [PortId(1), PortId(2), PortId(3)] {
+            let mut conn = app.make_connection(
+                id,
+                format!("probe-{id:?}"),
+                Default::default(),
+                Default::default(),
+                inert_handle(id),
+            );
+            conn.name = Some(format!("{}", id.0));
+            app.connections.push(conn);
+        }
+        app.active = 1;
+        app.reorder_connection(PortId(1), 3);
+        assert_eq!(
+            app.connections.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![PortId(2), PortId(3), PortId(1)]
+        );
+        assert_eq!(app.connections[app.active].id, PortId(2));
+        assert_eq!(
+            app.config
+                .last_open
+                .iter()
+                .map(|c| c.name.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("2"), Some("3"), Some("1")]
+        );
+
+        app.merged_selected = true;
+        app.merged_tx_port = Some(PortId(3));
+        app.reorder_connection(PortId(1), 0);
+        assert_eq!(
+            app.connections.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![PortId(1), PortId(2), PortId(3)]
+        );
+        assert_eq!(app.connections[app.active].id, PortId(2));
+        assert!(app.merged_selected);
+        assert_eq!(app.merged_tx_port, Some(PortId(3)));
+
+        app.reorder_connection(PortId(2), 2);
+        app.reorder_connection(PortId(99), 0);
+        assert_eq!(app.connections[app.active].id, PortId(2));
+        assert_eq!(app.connections[1].id, PortId(2));
     }
 
     #[test]
