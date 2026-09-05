@@ -112,8 +112,10 @@ jobs:
             BIN="$BIN.exe"
             ASSET="$ASSET.exe"
           fi
-          cp "$BIN" "$ASSET"
-          echo "UPDATE_ASSET=$ASSET" >> "$GITHUB_ENV"
+          # The Linux archive staging directory already has the asset's name.
+          mkdir -p updater-assets
+          cp "$BIN" "updater-assets/$ASSET"
+          echo "UPDATE_ASSET=updater-assets/$ASSET" >> "$GITHUB_ENV"
 
       # --- Windows installer -------------------------------------------------
       # WiX v3 is not guaranteed to be present on the runner image, so fetch a
