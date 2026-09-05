@@ -1153,6 +1153,8 @@ pub struct UpdateDialog {
     pub message: String,
     /// Release tag to download and install. `None` hides the Update button.
     pub update_version: Option<String>,
+    /// Release page for manual downloads, also retained after update failures.
+    pub download_url: Option<String>,
     /// Version the "Skip this version" button records. `None` hides that button.
     pub skip_version: Option<String>,
 }
@@ -2028,25 +2030,28 @@ impl App {
         );
 
         self.update_dialog = notice.map(|notice| match notice {
-            update::Notice::Available { version, .. } => UpdateDialog {
+            update::Notice::Available { version, url } => UpdateDialog {
                 title: "Update available".into(),
                 message: format!(
                     "v{} is available. You are on v{current}.\nUpdate will download, install, and restart Pigtail. Active connections will close.",
                     version.trim_start_matches('v')
                 ),
                 update_version: Some(version.clone()),
+                download_url: Some(url),
                 skip_version: Some(version),
             },
             update::Notice::UpToDate => UpdateDialog {
                 title: "Up to date".into(),
                 message: format!("You're running the latest version (v{current})."),
                 update_version: None,
+                download_url: None,
                 skip_version: None,
             },
             update::Notice::Failed(why) => UpdateDialog {
                 title: "Update check failed".into(),
                 message: why,
                 update_version: None,
+                download_url: None,
                 skip_version: None,
             },
         });
@@ -3446,6 +3451,9 @@ pub(crate) mod tests {
             title: "Downloading update".into(),
             message: String::new(),
             update_version: Some("v1.2.3".into()),
+            download_url: Some(
+                "https://github.com/rustypig91/pigtail-serial-console/releases/tag/v1.2.3".into(),
+            ),
             skip_version: Some("v1.2.3".into()),
         });
         let (tx, rx) = crossbeam_channel::unbounded();

@@ -59,6 +59,15 @@ impl App {
                             install_version = Some(version.clone());
                         }
                     }
+                    if let Some(url) = &dialog.download_url {
+                        if ui
+                            .button("Downloads page")
+                            .on_hover_text("Open this release in your browser to download manually")
+                            .clicked()
+                        {
+                            ctx.open_url(egui::OpenUrl::new_tab(url));
+                        }
+                    }
                     if let Some(version) = &dialog.skip_version {
                         if ui
                             .button("Skip this version")
