@@ -10,8 +10,6 @@ impl App {
         let mut changed = false;
         let mut history_limit_changed = false;
         let mut history_limit_dragged = false;
-        // Started after the window closes its borrow on `self`.
-        let mut check_now = false;
         egui::Window::new("Settings")
             .open(&mut open)
             .resizable(false)
@@ -112,19 +110,7 @@ impl App {
                 ui.separator();
                 ui.label(format!("Config: {}", self.paths.config_file.display()));
                 ui.label(format!("Sessions: {}", self.paths.sessions.display()));
-                ui.horizontal(|ui| {
-                    ui.weak(concat!("pigtail v", env!("CARGO_PKG_VERSION")));
-                    let checking = self.update_rx.is_some() || self.install_rx.is_some();
-                    if ui
-                        .add_enabled(!checking, egui::Button::new("Check for updates"))
-                        .clicked()
-                    {
-                        check_now = true;
-                    }
-                    if checking {
-                        ui.spinner();
-                    }
-                });
+                ui.weak(concat!("pigtail v", env!("CARGO_PKG_VERSION")));
             });
 
         self.show_settings = open;
@@ -146,9 +132,6 @@ impl App {
         }
         if changed {
             self.write_config();
-        }
-        if check_now {
-            self.start_update_check(true);
         }
         self.show_retention_cleanup_confirmation(ctx);
     }

@@ -215,6 +215,17 @@ impl App {
                             self.show_settings = true;
                             ui.close_menu();
                         }
+                        let updating = self.update_rx.is_some() || self.install_rx.is_some();
+                        if ui
+                            .add_enabled(!updating, egui::Button::new("Check for updates"))
+                            .on_disabled_hover_text(
+                                "An update check or installation is in progress",
+                            )
+                            .clicked()
+                        {
+                            self.start_update_check(true);
+                            ui.close_menu();
+                        }
                     });
                 });
             });

@@ -1323,7 +1323,7 @@ pub struct App {
     pub update_rx: Option<Receiver<update::CheckResult>>,
     pub install_rx: Option<Receiver<update::InstallEvent>>,
     pub update_progress: Option<f32>,
-    /// True when the in-flight check came from Settings → "Check for updates".
+    /// True when the in-flight check came from the menu's "Check for updates".
     /// A manual check always reports a result and ignores a previous skip; the
     /// startup check stays silent unless there is a new version to announce.
     pub update_manual: bool,
@@ -1995,7 +1995,7 @@ impl App {
     }
 
     /// Start a background check for a newer release. `manual` marks the explicit
-    /// Settings → "Check for updates" action, which reports a result either way;
+    /// Menu → "Check for updates" action, which reports a result either way;
     /// the startup check only speaks up when there is a new version.
     pub fn start_update_check(&mut self, manual: bool) {
         if self.update_rx.is_some() || self.install_rx.is_some() {
