@@ -2745,6 +2745,7 @@ impl eframe::App for App {
         self.poll_enumerator();
         self.poll_update_check();
         self.poll_file_drop(ctx);
+        self.close_window_on_escape(ctx);
 
         // Macro shortcuts belong to the unfocused console, just like raw
         // keyboard input. Consume an assigned chord before it can become bytes

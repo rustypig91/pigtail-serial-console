@@ -7,6 +7,103 @@ use serialcore::filter::{Combine, FilterRule};
 use serialcore::reader::ErrorScope;
 
 impl App {
+    /// Handle Escape before console input or text fields can consume it.
+    pub(crate) fn close_window_on_escape(&mut self, ctx: &egui::Context) {
+        if ctx.is_context_menu_open() || !ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            return;
+        }
+        let top = ctx.memory(|m| {
+            // Let dropdowns and context menus handle Escape first.
+            if m.any_popup_open() {
+                return None;
+            }
+            // The layer order retains closed windows; only consider visible
+            // top-level windows when selecting the next Escape target.
+            m.layer_ids()
+                .filter(|layer| {
+                    layer.order == egui::Order::Middle
+                        && m.areas().is_visible(layer)
+                        && m.areas().parent_layer(*layer).is_none()
+                })
+                .last()
+        });
+        let Some(top) = top else { return };
+        let is_window = |name: &str| top.id == egui::Id::new(name);
+        let mut closed = false;
+        for (name, open) in [
+            ("Settings", &mut self.show_settings),
+            ("Keyboard shortcuts", &mut self.show_keyboard_shortcuts),
+            ("Filters", &mut self.show_filters_win),
+            ("Highlight rules", &mut self.show_highlight_win),
+            ("Plot extraction", &mut self.show_extract_win),
+            ("Transmit macros", &mut self.show_macros_win),
+        ] {
+            if *open && is_window(name) {
+                *open = false;
+                closed = true;
+            }
+        }
+        if self.show_error_win.is_some() && is_window("error_window") {
+            self.show_error_win = None;
+            closed = true;
+        } else if self.retention_cleanup_confirmation.is_some()
+            && is_window("Remove expired session captures?")
+        {
+            self.retention_cleanup_confirmation = None;
+            self.session_retention_draft = None;
+            closed = true;
+        } else if self.macro_running_edit_confirmation.is_some() && is_window("Macro is running") {
+            self.macro_running_edit_confirmation = None;
+            closed = true;
+        } else if self.macro_editor.is_some() && (is_window("Edit macro") || is_window("Add macro"))
+        {
+            self.macro_editor = None;
+            closed = true;
+        } else if self.macro_shortcut_conflict.is_some() && is_window("Shortcut already used") {
+            self.macro_shortcut_conflict = None;
+            closed = true;
+        } else if self.config_dialog.is_some()
+            && (is_window("Port options") || is_window("New connection"))
+        {
+            self.config_dialog = None;
+            closed = true;
+        } else if self.rename_dialog.is_some() && is_window("Rename tab") {
+            self.rename_dialog = None;
+            closed = true;
+        } else if self.file_transfer_dialog.is_some() && is_window("Send file") {
+            self.file_transfer_dialog = None;
+            closed = true;
+        } else if self
+            .connect_errors
+            .front()
+            .is_some_and(|error| is_window(error.title))
+        {
+            self.connect_errors.pop_front();
+            closed = true;
+        } else if self
+            .update_dialog
+            .as_ref()
+            .is_some_and(|dialog| is_window(&dialog.title))
+        {
+            self.update_dialog = None;
+            closed = true;
+        } else if is_window("file_transfer_progress") {
+            if let Some(conn) = self
+                .connections
+                .iter()
+                .find(|conn| conn.transfer_progress.is_some())
+            {
+                conn.handle.cancel_transfer();
+                closed = true;
+            }
+        }
+        if closed {
+            ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+            });
+        }
+    }
+
     pub(crate) fn show_tool_windows(&mut self, ctx: &egui::Context) {
         self.show_filters_window(ctx);
         self.show_highlight_window(ctx);
@@ -444,5 +541,61 @@ fn show_filter_controls(
             egui::Color32::from_rgb(0xff, 0x88, 0x55),
             format!("rule {}: {err}", i + 1),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::tests::test_app;
+
+    #[test]
+    fn escape_closes_only_frontmost_window_and_consumes_key() {
+        let (mut app, _enum_tx) = test_app("escape-windows");
+        let ctx = egui::Context::default();
+        app.show_settings = true;
+        app.show_filters_win = true;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_tool_windows(ctx);
+            app.show_settings_window(ctx);
+        });
+        ctx.memory_mut(|m| {
+            m.areas_mut().move_to_top(egui::LayerId::new(
+                egui::Order::Middle,
+                egui::Id::new("Settings"),
+            ));
+        });
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(input.clone(), |ctx| {
+            app.close_window_on_escape(ctx);
+            assert!(!app.show_settings);
+            assert!(app.show_filters_win);
+            assert!(!ctx.input(|i| i.key_pressed(egui::Key::Escape)));
+            app.show_tool_windows(ctx);
+        });
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_tool_windows(ctx);
+        });
+        ctx.memory_mut(|m| m.open_popup(egui::Id::new("dropdown")));
+        let _ = ctx.run(input.clone(), |ctx| {
+            app.close_window_on_escape(ctx);
+            assert!(app.show_filters_win);
+            assert!(ctx.input(|i| i.key_pressed(egui::Key::Escape)));
+            app.show_tool_windows(ctx);
+        });
+        ctx.memory_mut(|m| m.close_popup());
+        let _ = ctx.run(input, |ctx| {
+            app.close_window_on_escape(ctx);
+            assert!(!app.show_filters_win);
+            assert!(!ctx.input(|i| i.key_pressed(egui::Key::Escape)));
+        });
     }
 }
