@@ -17,7 +17,15 @@ impl App {
             if m.any_popup_open() {
                 return None;
             }
-            m.areas().top_layer_id(egui::Order::Middle)
+            // The layer order retains closed windows; only consider visible
+            // top-level windows when selecting the next Escape target.
+            m.layer_ids()
+                .filter(|layer| {
+                    layer.order == egui::Order::Middle
+                        && m.areas().is_visible(layer)
+                        && m.areas().parent_layer(*layer).is_none()
+                })
+                .last()
         });
         let Some(top) = top else { return };
         let is_window = |name: &str| top.id == egui::Id::new(name);
@@ -577,10 +585,17 @@ mod tests {
             app.show_tool_windows(ctx);
         });
         ctx.memory_mut(|m| m.open_popup(egui::Id::new("dropdown")));
-        let _ = ctx.run(input, |ctx| {
+        let _ = ctx.run(input.clone(), |ctx| {
             app.close_window_on_escape(ctx);
             assert!(app.show_filters_win);
             assert!(ctx.input(|i| i.key_pressed(egui::Key::Escape)));
+            app.show_tool_windows(ctx);
+        });
+        ctx.memory_mut(|m| m.close_popup());
+        let _ = ctx.run(input, |ctx| {
+            app.close_window_on_escape(ctx);
+            assert!(!app.show_filters_win);
+            assert!(!ctx.input(|i| i.key_pressed(egui::Key::Escape)));
         });
     }
 }
