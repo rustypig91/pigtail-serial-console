@@ -305,7 +305,7 @@ impl App {
             }
         }
         if let Some(i) = to_close {
-            self.close_connection(i);
+            self.request_close_connection(i);
         }
         if let Some(i) = port_options {
             self.open_port_options(i);

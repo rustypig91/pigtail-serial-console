@@ -18,6 +18,15 @@ impl App {
                     .num_columns(2)
                     .spacing([12.0, 8.0])
                     .show(ui, |ui| {
+                        ui.label("Closing tabs");
+                        changed |= ui
+                            .checkbox(
+                                &mut self.config.settings.confirm_tab_close,
+                                "Ask before closing a tab",
+                            )
+                            .changed();
+                        ui.end_row();
+
                         ui.label("Console text size");
                         changed |= ui
                             .add(
