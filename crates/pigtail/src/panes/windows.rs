@@ -84,6 +84,7 @@ impl App {
             .update_dialog
             .as_ref()
             .is_some_and(|dialog| is_window(&dialog.title))
+            && self.install_rx.is_none()
         {
             self.update_dialog = None;
             closed = true;

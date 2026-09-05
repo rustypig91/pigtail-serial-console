@@ -11,6 +11,8 @@ mod wrap;
 
 use anyhow::Context;
 
+static RESTART_PATH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -51,7 +53,28 @@ fn main() -> anyhow::Result<()> {
         native_options,
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, dirs, cfg)))),
     )
-    .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
+    .map_err(|e| anyhow::anyhow!("eframe error: {e}"))?;
+    // run_native has dropped App and its serial connections before restarting.
+    if let Some(path) = RESTART_PATH.lock().expect("restart path lock").take() {
+        let mut command = std::process::Command::new(&path);
+        if let Some(directory) = path.parent() {
+            command.current_dir(directory);
+        }
+        // An AppImage must establish a fresh runtime and mount for the new file.
+        for key in ["APPIMAGE", "APPDIR", "OWD", "ARGV0"] {
+            command.env_remove(key);
+        }
+        if let Err(error) = command.spawn() {
+            rfd::MessageDialog::new()
+                .set_title("Update installed")
+                .set_description(format!(
+                    "Pigtail was updated, but could not restart: {error}. Please open it again."
+                ))
+                .set_level(rfd::MessageLevel::Error)
+                .show();
+        }
+    }
+    Ok(())
 }
 
 /// Append every panic to a file, then let the default hook run.

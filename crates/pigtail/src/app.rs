@@ -1151,8 +1151,9 @@ fn resolved_port<'a>(
 pub struct UpdateDialog {
     pub title: String,
     pub message: String,
-    /// Release page the "Download" button opens. `None` when there is nothing to
-    /// download and the dialog is a plain acknowledgement.
+    /// Release tag to download and install. `None` hides the Update button.
+    pub update_version: Option<String>,
+    /// Release page for manual downloads, also retained after update failures.
     pub download_url: Option<String>,
     /// Version the "Skip this version" button records. `None` hides that button.
     pub skip_version: Option<String>,
@@ -1320,7 +1321,9 @@ pub struct App {
     pub search_focus_request: bool,
     /// `Some` while an update check is in flight.
     pub update_rx: Option<Receiver<update::CheckResult>>,
-    /// True when the in-flight check came from Settings → "Check for updates".
+    pub install_rx: Option<Receiver<update::InstallEvent>>,
+    pub update_progress: Option<f32>,
+    /// True when the in-flight check came from the menu's "Check for updates".
     /// A manual check always reports a result and ignores a previous skip; the
     /// startup check stays silent unless there is a new version to announce.
     pub update_manual: bool,
@@ -1412,6 +1415,8 @@ impl App {
             show_search: false,
             search_focus_request: false,
             update_rx: None,
+            install_rx: None,
+            update_progress: None,
             update_manual: false,
             update_dialog: None,
             file_transfer_dialog: None,
@@ -1990,10 +1995,10 @@ impl App {
     }
 
     /// Start a background check for a newer release. `manual` marks the explicit
-    /// Settings → "Check for updates" action, which reports a result either way;
+    /// Menu → "Check for updates" action, which reports a result either way;
     /// the startup check only speaks up when there is a new version.
     pub fn start_update_check(&mut self, manual: bool) {
-        if self.update_rx.is_some() {
+        if self.update_rx.is_some() || self.install_rx.is_some() {
             return; // one already in flight
         }
         self.update_manual = manual;
@@ -2028,25 +2033,107 @@ impl App {
             update::Notice::Available { version, url } => UpdateDialog {
                 title: "Update available".into(),
                 message: format!(
-                    "v{} is available — you're on v{current}.",
+                    "v{} is available. You are on v{current}.\nUpdate will download, install, and restart Pigtail. Active connections will close.",
                     version.trim_start_matches('v')
                 ),
+                update_version: Some(version.clone()),
                 download_url: Some(url),
                 skip_version: Some(version),
             },
             update::Notice::UpToDate => UpdateDialog {
                 title: "Up to date".into(),
                 message: format!("You're running the latest version (v{current})."),
+                update_version: None,
                 download_url: None,
                 skip_version: None,
             },
             update::Notice::Failed(why) => UpdateDialog {
                 title: "Update check failed".into(),
                 message: why,
+                update_version: None,
                 download_url: None,
                 skip_version: None,
             },
         });
+    }
+
+    pub(crate) fn start_update_download(&mut self, version: String) {
+        if self.install_rx.is_some() || self.update_rx.is_some() {
+            return;
+        }
+        match update::spawn_download(version, self.wake.clone()) {
+            Ok(rx) => {
+                self.install_rx = Some(rx);
+                self.update_progress = Some(0.0);
+                if let Some(dialog) = &mut self.update_dialog {
+                    dialog.title = "Downloading update".into();
+                    dialog.message = "Downloading Pigtail...".into();
+                }
+            }
+            Err(e) => self.update_install_failed(e.to_string()),
+        }
+    }
+
+    fn update_install_failed(&mut self, message: String) {
+        self.install_rx = None;
+        self.update_progress = None;
+        if let Some(dialog) = &mut self.update_dialog {
+            dialog.title = "Update failed".into();
+            dialog.message = message;
+        }
+    }
+
+    fn poll_update_install(&mut self, ctx: &egui::Context) {
+        loop {
+            let event = match self.install_rx.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok(event)) => event,
+                Some(Err(crossbeam_channel::TryRecvError::Disconnected)) => {
+                    self.update_install_failed(
+                        "The updater stopped unexpectedly. Please try again.".into(),
+                    );
+                    break;
+                }
+                _ => break,
+            };
+            match event {
+                update::InstallEvent::Progress { downloaded, total } => {
+                    self.update_progress = Some(downloaded as f32 / total as f32);
+                }
+                update::InstallEvent::Downloaded(Ok(prepared)) => {
+                    // Do not close or replace the application if its settings
+                    // could not be saved. Dropping prepared removes the download.
+                    if !self.flush_config() {
+                        self.update_install_failed("Could not save settings. Resolve the save error, then try updating again.".into());
+                        break;
+                    }
+                    match update::spawn_install(prepared, self.wake.clone()) {
+                        Ok(rx) => {
+                            self.install_rx = Some(rx);
+                            self.update_progress = None;
+                            if let Some(dialog) = &mut self.update_dialog {
+                                dialog.title = "Installing update".into();
+                                dialog.message = "Installing Pigtail...".into();
+                            }
+                        }
+                        Err(e) => self.update_install_failed(e.to_string()),
+                    }
+                    break;
+                }
+                update::InstallEvent::Installed(Ok(outcome)) => {
+                    self.install_rx = None;
+                    if let update::InstallOutcome::Restart(path) = outcome {
+                        *crate::RESTART_PATH.lock().expect("restart path lock") = Some(path);
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    break;
+                }
+                update::InstallEvent::Downloaded(Err(e))
+                | update::InstallEvent::Installed(Err(e)) => {
+                    self.update_install_failed(e);
+                    break;
+                }
+            }
+        }
     }
 
     /// Disconnect and close the active connection tab.
@@ -2744,6 +2831,13 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_enumerator();
         self.poll_update_check();
+        self.poll_update_install(ctx);
+        if self.install_rx.is_some()
+            && self.update_progress.is_none()
+            && ctx.input(|i| i.viewport().close_requested())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         self.poll_file_drop(ctx);
         self.close_window_on_escape(ctx);
 
@@ -3349,6 +3443,65 @@ pub(crate) mod tests {
             rx,
         );
         (app, tx)
+    }
+
+    fn update_test_app(name: &str) -> (App, crossbeam_channel::Sender<update::InstallEvent>) {
+        let (mut app, _) = test_app(name);
+        app.update_dialog = Some(UpdateDialog {
+            title: "Downloading update".into(),
+            message: String::new(),
+            update_version: Some("v1.2.3".into()),
+            download_url: Some(
+                "https://github.com/rustypig91/pigtail-serial-console/releases/tag/v1.2.3".into(),
+            ),
+            skip_version: Some("v1.2.3".into()),
+        });
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.install_rx = Some(rx);
+        (app, tx)
+    }
+
+    #[test]
+    fn update_progress_and_failure_keep_the_release_available_for_retry() {
+        let (mut app, tx) = update_test_app("update-retry");
+        let ctx = egui::Context::default();
+        tx.send(update::InstallEvent::Progress {
+            downloaded: 25,
+            total: 100,
+        })
+        .unwrap();
+        app.poll_update_install(&ctx);
+        assert_eq!(app.update_progress, Some(0.25));
+        tx.send(update::InstallEvent::Downloaded(Err(
+            "Connection lost".into()
+        )))
+        .unwrap();
+        app.poll_update_install(&ctx);
+        assert!(app.install_rx.is_none());
+        assert!(app.update_progress.is_none());
+        let dialog = app.update_dialog.unwrap();
+        assert_eq!(dialog.title, "Update failed");
+        assert_eq!(dialog.message, "Connection lost");
+        assert_eq!(dialog.update_version.as_deref(), Some("v1.2.3"));
+    }
+
+    #[test]
+    fn disconnected_updater_reports_failure_instead_of_spinning_forever() {
+        let (mut app, tx) = update_test_app("update-disconnected");
+        drop(tx);
+        app.poll_update_install(&egui::Context::default());
+        assert!(app.install_rx.is_none());
+        assert_eq!(app.update_dialog.unwrap().title, "Update failed");
+    }
+
+    #[test]
+    fn an_active_update_prevents_duplicate_downloads_and_checks() {
+        let (mut app, _tx) = update_test_app("update-duplicate");
+        let original = app.install_rx.as_ref().unwrap().clone();
+        app.start_update_download("v9.9.9".into());
+        app.start_update_check(true);
+        assert!(app.install_rx.as_ref().unwrap().same_channel(&original));
+        assert!(app.update_rx.is_none());
     }
 
     #[test]
