@@ -537,6 +537,21 @@ pub struct SavedConnection {
     pub config: PortConfig,
 }
 
+/// A merged view uses device identities because runtime port IDs change at startup.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedMergedView {
+    pub name: String,
+    #[serde(default)]
+    pub connections: Vec<PortIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SavedTab {
+    Connection { identity: PortIdentity },
+    Merged { index: usize },
+}
+
 /// Top-level config, matching the TOML layout in spec §7.14.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
@@ -554,6 +569,10 @@ pub struct Config {
     /// Connections open at last exit, reopened on the next launch.
     #[serde(default, rename = "last_open")]
     pub last_open: Vec<SavedConnection>,
+    #[serde(default)]
+    pub merged_views: Vec<SavedMergedView>,
+    #[serde(default)]
+    pub tab_order: Vec<SavedTab>,
 }
 
 impl Config {
@@ -585,6 +604,8 @@ impl Default for Config {
             presets: Vec::new(),
             macros: Vec::new(),
             last_open: Vec::new(),
+            merged_views: Vec::new(),
+            tab_order: Vec::new(),
         }
     }
 }
@@ -850,6 +871,8 @@ bold = true
                 name: Some("debug probe".into()),
                 config: PortConfig::default(),
             }],
+            merged_views: Vec::new(),
+            tab_order: Vec::new(),
         };
         let s = cfg.to_toml().unwrap();
         let back = Config::from_toml(&s).unwrap();

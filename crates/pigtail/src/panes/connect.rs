@@ -1,7 +1,7 @@
 //! Minimal chrome: the header (tabs + new/save/settings), the status footer,
 //! and the modal new-connection dialog with preset management.
 
-use crate::app::{available_port_is_added, App, ConfigDialog};
+use crate::app::{available_port_is_added, App, ConfigDialog, MergedDialog, TabId};
 use serialcore::config::{
     DataBits, FlowControl, LineEnding, NamedConfig, Parity, PortConfig, StopBits, TerminalMode,
     TransmitMacro,
@@ -14,7 +14,40 @@ const COMMON_BAUDS: &[u32] = &[
 ];
 
 #[derive(Clone, Copy)]
-struct DraggedTab(serialcore::store::PortId);
+struct DraggedTab(TabId);
+
+fn tab_drag(
+    ui: &egui::Ui,
+    ctx: &egui::Context,
+    resp: &egui::Response,
+    id: TabId,
+    position: usize,
+) -> Option<(TabId, usize)> {
+    if resp.drag_started_by(egui::PointerButton::Primary) {
+        resp.dnd_set_drag_payload(DraggedTab(id));
+    }
+    if resp.dnd_hover_payload::<DraggedTab>().is_some() {
+        if let Some(pointer) = ctx.pointer_interact_pos() {
+            let after = pointer.x >= resp.rect.center().x;
+            let x = if after {
+                resp.rect.right()
+            } else {
+                resp.rect.left()
+            };
+            ui.painter().line_segment(
+                [
+                    egui::pos2(x, resp.rect.top()),
+                    egui::pos2(x, resp.rect.bottom()),
+                ],
+                egui::Stroke::new(2.0_f32, ui.visuals().selection.bg_fill),
+            );
+            if let Some(tab) = resp.dnd_release_payload::<DraggedTab>() {
+                return Some((tab.0, position + usize::from(after)));
+            }
+        }
+    }
+    None
+}
 
 impl App {
     /// Reserve Ctrl+Shift+Left/Right for cycling the visible connection tabs.
@@ -33,7 +66,8 @@ impl App {
             return;
         }
 
-        let tab_count = self.connections.len() + usize::from(self.connections.len() >= 2);
+        let tabs = self.ordered_tabs();
+        let tab_count = tabs.len();
         if tab_count == 0 {
             return;
         }
@@ -44,39 +78,107 @@ impl App {
             return;
         }
 
-        let current = if self.merged_selected {
-            self.connections.len()
+        let active_tab = if self.merged_selected {
+            self.loaded_merged_tab
+                .and_then(|i| self.merged_tabs.get(i))
+                .map(|t| TabId::Merged(t.id))
         } else {
-            self.active.min(self.connections.len() - 1)
+            self.connections
+                .get(self.active)
+                .map(|c| TabId::Connection(c.id))
         };
+        let current = tabs
+            .iter()
+            .position(|id| Some(*id) == active_tab)
+            .unwrap_or(0);
         let selected = if previous {
             (current + tab_count - 1) % tab_count
         } else {
             (current + 1) % tab_count
         };
 
-        if selected == self.connections.len() {
-            self.merged_selected = true;
-            let selected_is_live = self.merged_tx_port.is_some_and(|id| {
-                self.connections
-                    .iter()
-                    .any(|conn| conn.id == id && conn.state != ConnState::Closed)
-            });
-            if !selected_is_live {
-                self.merged_tx_port = self
-                    .connections
-                    .get(self.active)
-                    .filter(|conn| conn.state != ConnState::Closed)
-                    .or_else(|| {
-                        self.connections
-                            .iter()
-                            .find(|conn| conn.state != ConnState::Closed)
-                    })
-                    .map(|conn| conn.id);
+        match tabs[selected] {
+            TabId::Merged(id) => {
+                let index = self.merged_tabs.iter().position(|t| t.id == id).unwrap();
+                self.select_merged_tab(index);
             }
+            TabId::Connection(id) => {
+                self.active = self.connections.iter().position(|c| c.id == id).unwrap();
+                self.merged_selected = false;
+            }
+        }
+    }
+
+    pub(crate) fn show_merged_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.merged_dialog.take() else {
+            return;
+        };
+        let selected = &mut dialog.ports;
+        selected.retain(|id| self.connections.iter().any(|conn| conn.id == *id));
+        let mut open = true;
+        let mut create = false;
+        let mut cancel = false;
+        egui::Window::new(if dialog.editing.is_some() {
+            "Options"
         } else {
-            self.active = selected;
-            self.merged_selected = false;
+            "New merged view"
+        })
+        .id(egui::Id::new("new_merged_view"))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                ui.text_edit_singleline(&mut dialog.name);
+            });
+            ui.label("Choose connections to include in this view:");
+            if self.connections.is_empty() {
+                ui.label(
+                    "No connections are open. You can add them later using this tab's options.",
+                );
+            }
+            egui::ScrollArea::vertical()
+                .max_height(300.0)
+                .show(ui, |ui| {
+                    for conn in &self.connections {
+                        let mut checked = selected.contains(&conn.id);
+                        if ui
+                            .checkbox(&mut checked, conn.display_label())
+                            .on_hover_text(&conn.label)
+                            .changed()
+                        {
+                            if checked {
+                                selected.push(conn.id);
+                            } else {
+                                selected.retain(|id| *id != conn.id);
+                            }
+                        }
+                    }
+                });
+            ui.horizontal(|ui| {
+                create = ui
+                    .button(if dialog.editing.is_some() {
+                        "Save"
+                    } else {
+                        "Create merged view"
+                    })
+                    .clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if create {
+            if let Some(id) = dialog.editing {
+                self.edit_merged_tab(id, dialog.ports);
+                self.name_merged_tab(id, &dialog.name);
+            } else {
+                self.create_merged_tab(dialog.ports);
+                let id = self.merged_tabs.last().unwrap().id;
+                self.name_merged_tab(id, &dialog.name);
+            }
+        } else if open && !cancel && !ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.merged_dialog = Some(dialog);
         }
     }
 
@@ -102,18 +204,22 @@ impl App {
         }
     }
 
-    /// The top header: one tab per connection, a merged tab, `+`, and global
+    /// The top header: one tab per connection or merged view, `+`, and global
     /// actions collected under an ellipsis menu.
     pub(crate) fn show_header(&mut self, ctx: &egui::Context) {
         let mut to_close: Option<usize> = None;
         let mut set_active: Option<usize> = None;
-        let mut select_merged = false;
+        let mut select_merged = None;
+        let mut close_merged = None;
+        let mut edit_merged = None;
+        let mut new_merged = false;
         let mut new_tab = false;
         let mut choose_file = false;
         let mut port_options: Option<usize> = None;
         let mut rename_tab: Option<usize> = None;
         let mut reorder = None;
         let macros_tooltip = macro_tooltip(&self.config.macros);
+        let tabs = self.ordered_tabs();
 
         // The config dialog is meant to be modal, but an `egui::Window` does
         // not block input to what it covers, so the header would keep acting
@@ -125,7 +231,8 @@ impl App {
         // the clicks do nothing.
         // A pending close must also block new editors and replacement close
         // requests until the user confirms or cancels its original target.
-        let modal_open = self.tab_close_confirmation.is_some()
+        let modal_open = self.merged_dialog.is_some()
+            || self.tab_close_confirmation.is_some()
             || self.config_dialog.is_some()
             || self.rename_dialog.is_some()
             || self.file_transfer_dialog.is_some();
@@ -136,96 +243,104 @@ impl App {
                 // below act on neither the dialog nor the set of tabs, so
                 // there is nothing for them to corrupt.
                 ui.add_enabled_ui(!modal_open, |ui| {
-                    for (i, conn) in self.connections.iter().enumerate() {
-                        let selected = !self.merged_selected && self.active == i;
-                        let display_label = conn.display_label();
-                        let label = egui::RichText::new(short_label(display_label))
-                            .color(state_color(conn.state))
-                            .strong();
-                        let device_details = if conn.name.is_some() {
-                            format!("{}\n{}", display_label, conn.label)
-                        } else {
-                            conn.label.clone()
-                        };
-                        let tooltip = format!("Status: {}\n{}", conn.state, device_details);
-                        // `on_hover_text` only fires on an *enabled* widget,
-                        // so a disabled tab needs its own tooltip to keep the
-                        // detected device name and port available.
-                        let resp = ui
-                            .selectable_label(selected, label)
-                            .interact(egui::Sense::click_and_drag())
-                            .on_hover_text(&tooltip)
-                            .on_disabled_hover_text(format!(
-                                "{}\n(finish or cancel the open dialog first)",
-                                tooltip
-                            ));
-                        if !modal_open {
-                            // Other buttons belong to the context menu and
-                            // close-tab action, not tab reordering.
-                            if resp.drag_started_by(egui::PointerButton::Primary) {
-                                resp.dnd_set_drag_payload(DraggedTab(conn.id));
-                            }
-                            if resp.dnd_hover_payload::<DraggedTab>().is_some() {
-                                if let Some(pointer) = ctx.pointer_interact_pos() {
-                                    let after = pointer.x >= resp.rect.center().x;
-                                    let boundary = i + usize::from(after);
-                                    let x = if after {
-                                        resp.rect.right()
-                                    } else {
-                                        resp.rect.left()
-                                    };
-                                    ui.painter().line_segment(
-                                        [
-                                            egui::pos2(x, resp.rect.top()),
-                                            egui::pos2(x, resp.rect.bottom()),
-                                        ],
-                                        egui::Stroke::new(2.0_f32, ui.visuals().selection.bg_fill),
-                                    );
-                                    if let Some(tab) = resp.dnd_release_payload::<DraggedTab>() {
-                                        reorder = Some((tab.0, boundary));
-                                    }
+                    for (position, tab_id) in tabs.iter().copied().enumerate() {
+                        match tab_id {
+                            TabId::Connection(id) => {
+                                let i = self.connections.iter().position(|c| c.id == id).unwrap();
+                                let conn = &self.connections[i];
+                                let selected = !self.merged_selected && self.active == i;
+                                let display_label = conn.display_label();
+                                let label = egui::RichText::new(short_label(display_label))
+                                    .color(state_color(conn.state))
+                                    .strong();
+                                let device_details = if conn.name.is_some() {
+                                    format!("{}\n{}", display_label, conn.label)
+                                } else {
+                                    conn.label.clone()
+                                };
+                                let tooltip = format!("Status: {}\n{}", conn.state, device_details);
+                                // `on_hover_text` only fires on an *enabled* widget,
+                                // so a disabled tab needs its own tooltip to keep the
+                                // detected device name and port available.
+                                let resp = ui
+                                    .selectable_label(selected, label)
+                                    .interact(egui::Sense::click_and_drag())
+                                    .on_hover_text(&tooltip)
+                                    .on_disabled_hover_text(format!(
+                                        "{}\n(finish or cancel the open dialog first)",
+                                        tooltip
+                                    ));
+                                if !modal_open {
+                                    reorder =
+                                        tab_drag(ui, ctx, &resp, tab_id, position).or(reorder);
                                 }
+                                if resp.clicked() {
+                                    set_active = Some(i);
+                                }
+                                // Middle-click closes the tab.
+                                if resp.middle_clicked() {
+                                    to_close = Some(i);
+                                }
+                                // Right-click menu on the tab.
+                                resp.context_menu(|ui| {
+                                    if ui.button("Rename…").clicked() {
+                                        rename_tab = Some(i);
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("Port options…").clicked() {
+                                        port_options = Some(i);
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("Close tab").clicked() {
+                                        to_close = Some(i);
+                                        ui.close_menu();
+                                    }
+                                });
                             }
-                        }
-                        if resp.clicked() {
-                            set_active = Some(i);
-                        }
-                        // Middle-click closes the tab.
-                        if resp.middle_clicked() {
-                            to_close = Some(i);
-                        }
-                        // Right-click menu on the tab.
-                        resp.context_menu(|ui| {
-                            if ui.button("Rename…").clicked() {
-                                rename_tab = Some(i);
-                                ui.close_menu();
-                            }
-                            if ui.button("Port options…").clicked() {
-                                port_options = Some(i);
-                                ui.close_menu();
-                            }
-                            if ui.button("Close tab").clicked() {
-                                to_close = Some(i);
-                                ui.close_menu();
-                            }
-                        });
-                    }
 
-                    if self.connections.len() >= 2 {
-                        let resp = ui.selectable_label(self.merged_selected, "Merged");
-                        if resp.clicked() {
-                            select_merged = true;
+                            TabId::Merged(id) => {
+                                let i = self.merged_tabs.iter().position(|t| t.id == id).unwrap();
+                                let tab = &self.merged_tabs[i];
+                                let resp = ui
+                                    .selectable_label(
+                                        self.merged_selected && self.loaded_merged_tab == Some(i),
+                                        short_label(&tab.name),
+                                    )
+                                    .interact(egui::Sense::click_and_drag())
+                                    .on_hover_text(&tab.name);
+                                if !modal_open {
+                                    reorder =
+                                        tab_drag(ui, ctx, &resp, tab_id, position).or(reorder);
+                                }
+                                if resp.clicked() {
+                                    select_merged = Some(i);
+                                }
+                                if resp.middle_clicked() {
+                                    close_merged = Some(i);
+                                }
+                                resp.context_menu(|ui| {
+                                    if ui.button("Options").clicked() {
+                                        edit_merged = Some(i);
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("Close tab").clicked() {
+                                        close_merged = Some(i);
+                                        ui.close_menu();
+                                    }
+                                });
+                            }
                         }
                     }
-
-                    if ui
-                        .button("+")
-                        .on_hover_text("New connection")
-                        .on_disabled_hover_text("Finish or cancel the open dialog first")
-                        .clicked()
-                    {
-                        new_tab = true;
-                    }
+                    ui.menu_button("+", |ui| {
+                        if ui.button("New connection").clicked() {
+                            new_tab = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("New merged view").clicked() {
+                            new_merged = true;
+                            ui.close_menu();
+                        }
+                    });
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -282,29 +397,30 @@ impl App {
             self.active = i;
             self.merged_selected = false;
         }
-        if select_merged {
-            self.merged_selected = true;
-            let selected_is_live = self.merged_tx_port.is_some_and(|id| {
-                self.connections
-                    .iter()
-                    .any(|conn| conn.id == id && conn.state != ConnState::Closed)
+        if let Some(i) = select_merged {
+            self.select_merged_tab(i);
+        }
+        if let Some(i) = close_merged {
+            self.request_close_merged_tab(i);
+        }
+        if let Some(i) = edit_merged {
+            let tab = &self.merged_tabs[i];
+            self.merged_dialog = Some(MergedDialog {
+                name: tab.name.clone(),
+                editing: Some(tab.id),
+                ports: tab.ports.clone(),
             });
-            if !selected_is_live {
-                self.merged_tx_port = self
-                    .connections
-                    .get(self.active)
-                    .filter(|conn| conn.state != ConnState::Closed)
-                    .or_else(|| {
-                        self.connections
-                            .iter()
-                            .find(|conn| conn.state != ConnState::Closed)
-                    })
-                    .map(|conn| conn.id);
-            }
+        }
+        if new_merged {
+            self.merged_dialog = Some(MergedDialog {
+                name: String::new(),
+                editing: None,
+                ports: self.connections.iter().map(|conn| conn.id).collect(),
+            });
         }
         if to_close.is_none() {
             if let Some((id, boundary)) = reorder {
-                self.reorder_connection(id, boundary);
+                self.reorder_tab(id, boundary);
             }
         }
         if let Some(i) = to_close {
@@ -403,7 +519,11 @@ impl App {
                         egui::ComboBox::from_id_salt("merged_tx_device")
                             .selected_text(format!("Send to: {selected_label}"))
                             .show_ui(ui, |ui| {
-                                for conn in &self.connections {
+                                for conn in self
+                                    .connections
+                                    .iter()
+                                    .filter(|conn| self.merged_contains(conn.id))
+                                {
                                     let text = short_label(conn.display_label());
                                     ui.add_enabled_ui(conn.state != ConnState::Closed, |ui| {
                                         ui.selectable_value(
@@ -1068,6 +1188,144 @@ mod tests {
     }
 
     #[test]
+    fn plus_opens_a_connection_or_the_merged_view_picker() {
+        let (mut app, _enum_tx) = test_app("new-merged-menu");
+        let ctx = egui::Context::default();
+        let frame = |app: &mut crate::app::App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 700.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.show_header(ctx);
+                    app.show_merged_dialog(ctx);
+                    app.show_tab_close_confirmation(ctx);
+                },
+            )
+        };
+        let click_button = |app: &mut crate::app::App, label: &str, button| {
+            frame(app, vec![]);
+            let output = frame(app, vec![]);
+            let center = output
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        (text.galley.text() == label).then_some(text.pos + text.galley.size() / 2.0)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| panic!("missing control: {label}"));
+            for pressed in [true, false] {
+                frame(
+                    app,
+                    vec![
+                        Event::PointerMoved(center),
+                        Event::PointerButton {
+                            pos: center,
+                            button,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                );
+            }
+        };
+        let click = |app: &mut crate::app::App, label: &str| {
+            click_button(app, label, egui::PointerButton::Primary);
+        };
+        click(&mut app, "+");
+        click(&mut app, "New merged view");
+        click(&mut app, "Create merged view");
+        assert!(app.merged_tabs[0].ports.is_empty());
+        app.close_merged_tab(0);
+        click(&mut app, "+");
+        click(&mut app, "New connection");
+        assert!(app.config_dialog.is_some());
+        app.config_dialog = None;
+        for id in 1..=3 {
+            app.connections.push(app.make_connection(
+                PortId(id),
+                format!("Tab {id}"),
+                Default::default(),
+                Default::default(),
+                inert_handle(PortId(id)),
+            ));
+        }
+        assert!(app.merged_tabs.is_empty());
+        click(&mut app, "+");
+        assert!(app.config_dialog.is_none());
+        click(&mut app, "New connection");
+        assert!(app.config_dialog.is_some());
+        app.config_dialog = None;
+        click(&mut app, "+");
+        click(&mut app, "New merged view");
+        assert!(app.merged_dialog.is_some());
+        assert!(app.floating_window_open());
+        click(&mut app, "Cancel");
+        assert!(app.merged_tabs.is_empty());
+        click(&mut app, "+");
+        click(&mut app, "New merged view");
+        // The tab and checkbox share a label; select the subset directly here.
+        app.merged_dialog.as_mut().unwrap().ports = vec![PortId(1), PortId(3)];
+        click(&mut app, "Create merged view");
+        assert!(app.merged_dialog.is_none());
+        assert_eq!(app.merged_tabs[0].ports, vec![PortId(1), PortId(3)]);
+        click(&mut app, "+");
+        click(&mut app, "New merged view");
+        click(&mut app, "Create merged view");
+        assert_eq!(app.merged_tabs.len(), 2);
+        assert_eq!(app.loaded_merged_tab, Some(1));
+        let edited_id = app.merged_tabs[0].id;
+        let label = app.merged_tabs[0].name.clone();
+        click_button(&mut app, &label, egui::PointerButton::Secondary);
+        click(&mut app, "Options");
+        assert_eq!(app.merged_dialog.as_ref().unwrap().editing, Some(edited_id));
+        assert_eq!(
+            app.merged_dialog.as_ref().unwrap().ports,
+            vec![PortId(1), PortId(3)]
+        );
+        app.merged_dialog.as_mut().unwrap().ports.clear();
+        app.merged_dialog.as_mut().unwrap().name = "Cancelled name".into();
+        click(&mut app, "Cancel");
+        assert_eq!(app.merged_tabs[0].name, label);
+        assert_eq!(app.merged_tabs[0].ports, vec![PortId(1), PortId(3)]);
+        click_button(&mut app, &label, egui::PointerButton::Secondary);
+        click(&mut app, "Options");
+        app.merged_dialog.as_mut().unwrap().ports = vec![PortId(2)];
+        app.merged_dialog.as_mut().unwrap().name = "  My merged view  ".into();
+        click(&mut app, "Save");
+        assert_eq!(app.merged_tabs[0].name, "My merged view");
+        assert_eq!(app.merged_tabs.len(), 2);
+        assert_eq!(app.merged_tabs[0].id, edited_id);
+        assert_eq!(app.merged_tabs[0].ports, vec![PortId(2)]);
+        assert_eq!(
+            app.merged_tabs[1].ports,
+            vec![PortId(1), PortId(2), PortId(3)]
+        );
+        assert_eq!(app.loaded_merged_tab, Some(0));
+        click_button(&mut app, "My merged view", egui::PointerButton::Middle);
+        assert!(app.tab_close_confirmation.is_some());
+        assert_eq!(app.merged_tabs.len(), 2);
+        click(&mut app, "Cancel");
+        assert!(app.tab_close_confirmation.is_none());
+        assert_eq!(app.merged_tabs.len(), 2);
+        click_button(&mut app, "My merged view", egui::PointerButton::Secondary);
+        click(&mut app, "Close tab");
+        assert!(app.tab_close_confirmation.is_some());
+        click(&mut app, "Close tab");
+        assert!(app.tab_close_confirmation.is_none());
+        assert_eq!(app.merged_tabs.len(), 1);
+        assert_eq!(app.connections.len(), 3);
+    }
+
+    #[test]
     fn close_confirmation_blocks_tab_actions_until_dismissed() {
         let (mut app, _enum_tx) = test_app("close-confirmation-header");
         for id in [PortId(1), PortId(2)] {
@@ -1128,7 +1386,10 @@ mod tests {
             "port options must stay inaccessible"
         );
         click(&mut app, egui::PointerButton::Middle);
-        assert_eq!(app.tab_close_confirmation, Some((PortId(1), false)));
+        assert_eq!(
+            app.tab_close_confirmation,
+            Some((crate::app::TabId::Connection(PortId(1)), false))
+        );
         click(&mut app, egui::PointerButton::Primary);
         assert_eq!(app.active, 0);
         app.tab_close_confirmation = None;
@@ -1139,16 +1400,23 @@ mod tests {
 
     #[test]
     fn mouse_drag_reorders_tabs_without_changing_selection() {
-        check_mouse_tab_drag(egui::PointerButton::Primary, true);
+        check_mouse_tab_drag(egui::PointerButton::Primary, true, false);
     }
 
     #[test]
     fn secondary_and_middle_drags_do_not_reorder_tabs() {
-        check_mouse_tab_drag(egui::PointerButton::Secondary, false);
-        check_mouse_tab_drag(egui::PointerButton::Middle, false);
+        check_mouse_tab_drag(egui::PointerButton::Secondary, false, false);
+        check_mouse_tab_drag(egui::PointerButton::Middle, false, false);
     }
 
-    fn check_mouse_tab_drag(drag_button: egui::PointerButton, should_reorder: bool) {
+    #[test]
+    fn merged_tabs_drag_between_connections_without_changing_selection() {
+        check_mouse_tab_drag(egui::PointerButton::Primary, true, true);
+        check_mouse_tab_drag(egui::PointerButton::Secondary, false, true);
+        check_mouse_tab_drag(egui::PointerButton::Middle, false, true);
+    }
+
+    fn check_mouse_tab_drag(drag_button: egui::PointerButton, should_reorder: bool, merged: bool) {
         let (mut app, _enum_tx) = test_app("mouse-tab-reorder");
         for id in [PortId(1), PortId(2), PortId(3)] {
             let mut conn = app.make_connection(
@@ -1160,6 +1428,10 @@ mod tests {
             );
             conn.name = Some(format!("Tab {}", id.0));
             app.connections.push(conn);
+        }
+        if merged {
+            app.create_merged_tab(vec![PortId(1), PortId(2)]);
+            app.merged_selected = false;
         }
         app.active = 1;
         let ctx = egui::Context::default();
@@ -1190,8 +1462,8 @@ mod tests {
                 })
                 .unwrap()
         };
-        let start = tab_center("Tab 1");
-        let end = tab_center("Tab 3") + egui::vec2(5.0, 0.0);
+        let start = tab_center(if merged { "Merged 1" } else { "Tab 1" });
+        let end = tab_center(if merged { "Tab 1" } else { "Tab 3" }) + egui::vec2(5.0, 0.0);
         let button = |pos, pressed| Event::PointerButton {
             pos,
             button: drag_button,
@@ -1203,13 +1475,34 @@ mod tests {
         frame(vec![button(end, false)]);
         assert_eq!(
             app.connections.iter().map(|c| c.id).collect::<Vec<_>>(),
-            if should_reorder {
+            if should_reorder && !merged {
                 vec![PortId(2), PortId(3), PortId(1)]
             } else {
                 vec![PortId(1), PortId(2), PortId(3)]
             }
         );
         assert_eq!(app.connections[app.active].id, PortId(2));
+        if merged {
+            use crate::app::TabId::{Connection, Merged};
+            assert_eq!(
+                app.ordered_tabs(),
+                if should_reorder {
+                    vec![
+                        Connection(PortId(1)),
+                        Merged(1),
+                        Connection(PortId(2)),
+                        Connection(PortId(3)),
+                    ]
+                } else {
+                    vec![
+                        Connection(PortId(1)),
+                        Connection(PortId(2)),
+                        Connection(PortId(3)),
+                        Merged(1),
+                    ]
+                }
+            );
+        }
     }
 
     #[test]
@@ -1272,6 +1565,8 @@ mod tests {
             ));
         }
 
+        app.create_merged_tab(vec![PortId(1), PortId(2)]);
+        app.merged_selected = false;
         let ctx = egui::Context::default();
         ctx.begin_pass(egui::RawInput {
             events: vec![tab_switch(Key::ArrowLeft)],

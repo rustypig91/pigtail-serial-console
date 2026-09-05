@@ -6,7 +6,8 @@ use crate::wrap::WrapIndex;
 use crossbeam_channel::Receiver;
 use serialcore::clock::{SessionClock, Timestamp};
 use serialcore::config::{
-    Config, ExtractRule, PortConfig, PortIdentity, SavedConnection, TransmitMacro,
+    Config, ExtractRule, PortConfig, PortIdentity, SavedConnection, SavedMergedView, SavedTab,
+    TransmitMacro,
 };
 use serialcore::enumerate::{
     match_identity, spawn_enumerator, DiscoveredPort, EnumEvent, MatchResult,
@@ -1211,6 +1212,179 @@ pub(crate) struct RetentionCleanupConfirmation {
     pub(crate) paths: Vec<PathBuf>,
 }
 
+/// State parked while another merged tab is displayed. The loaded tab keeps
+/// its state on App so the console can borrow connections and caches separately.
+pub struct MergedTab {
+    pub id: u64,
+    pub name: String,
+    pub ports: Vec<PortId>,
+    state: MergedTabState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabId {
+    Connection(PortId),
+    Merged(u64),
+}
+
+pub struct MergedDialog {
+    pub name: String,
+    /// Stable tab ID when editing; None creates a new view.
+    pub editing: Option<u64>,
+    pub ports: Vec<PortId>,
+}
+
+struct MergedTabState {
+    /// Timestamp-interleaved merged view across all ports (spec §7.12).
+    pub merged: Vec<MergedEntry>,
+    pub merged_dirty: bool,
+    /// Visual-row totals for the merged view, as `Connection::wrap_index` is
+    /// for a single tab.
+    pub merged_wrap: WrapIndex,
+    /// Hands out `MergedEntry::seq`. Only ever counts up while the view is
+    /// appended to; a reorder renumbers the whole view and resets it.
+    pub merged_seq: u64,
+    /// Bumped whenever `merged` is rebuilt or reordered rather than appended
+    /// to, which is the one change `merged_wrap` cannot follow incrementally.
+    pub merged_generation: u64,
+    /// Per-port eviction boundary last applied to `merged`. This makes the
+    /// common append-only path a constant-time check per connection while still
+    /// letting `prune_merged` remove dead entries from inside the interleaving.
+    pub merged_pruned_before: HashMap<PortId, u64>,
+    /// Filter state owned by the loaded merged tab. A merged filter is kept
+    /// separate from every port's filter so its meaning does not depend on
+    /// whichever real tab happened to be active last.
+    pub merged_filter_rules: Vec<FilterRule>,
+    pub merged_filter_combine: Combine,
+    pub merged_filter_errors: Vec<(usize, String)>,
+    pub merged_filter_dirty: bool,
+    /// Cached subset of `merged` that passes the merged filter. This is only
+    /// consulted while a rule is active; the ordinary unfiltered path reads
+    /// `merged` directly and pays no extra per-frame scan.
+    pub merged_filtered: Vec<MergedEntry>,
+    pub merged_filter_generation: u64,
+    pub merged_filter_source_generation: u64,
+    pub merged_filter_upto_seq: u64,
+    /// Search state owned by the loaded merged tab. Matches keep the complete
+    /// merged key so navigation can identify both the port and its line.
+    pub merged_search_query: String,
+    pub merged_search_case_sensitive: bool,
+    pub merged_search_matches: Vec<MergedEntry>,
+    pub merged_search_pos: Option<usize>,
+    pub merged_search_dirty: bool,
+    pub merged_search_source_generation: u64,
+    pub merged_search_upto_seq: u64,
+    pub merged_scroll_to: Option<MergedEntry>,
+    /// Follow the tail of the merged console. Kept separately from each
+    /// connection's pin so browsing the aggregate does not disturb any tab's
+    /// own scroll position.
+    pub merged_follow: bool,
+    /// Entries added while the merged console is not following its tail.
+    pub merged_new_since_scroll: u64,
+    /// Last measured viewport height, used by the merged view's explicit
+    /// bottom-pin calculation.
+    pub merged_pin_view_h: f32,
+    /// Device that receives raw keyboard input while the merged tab is open.
+    pub merged_tx_port: Option<PortId>,
+}
+
+impl Default for MergedTabState {
+    fn default() -> Self {
+        Self {
+            merged: Vec::new(),
+            merged_seq: 0,
+            merged_dirty: false,
+            merged_wrap: WrapIndex::new(),
+            merged_generation: 0,
+            merged_pruned_before: HashMap::new(),
+            merged_filter_rules: Vec::new(),
+            merged_filter_combine: Combine::And,
+            merged_filter_errors: Vec::new(),
+            merged_filter_dirty: true,
+            merged_filtered: Vec::new(),
+            merged_filter_generation: 0,
+            merged_filter_source_generation: 0,
+            merged_filter_upto_seq: 0,
+            merged_search_query: String::new(),
+            merged_search_case_sensitive: false,
+            merged_search_matches: Vec::new(),
+            merged_search_pos: None,
+            merged_search_dirty: true,
+            merged_search_source_generation: 0,
+            merged_search_upto_seq: 0,
+            merged_scroll_to: None,
+            merged_follow: true,
+            merged_new_since_scroll: 0,
+            merged_pin_view_h: 0.0,
+            merged_tx_port: None,
+        }
+    }
+}
+
+impl MergedTabState {
+    fn swap_with_app(&mut self, app: &mut App) {
+        std::mem::swap(&mut self.merged, &mut app.merged);
+        std::mem::swap(&mut self.merged_dirty, &mut app.merged_dirty);
+        std::mem::swap(&mut self.merged_wrap, &mut app.merged_wrap);
+        std::mem::swap(&mut self.merged_seq, &mut app.merged_seq);
+        std::mem::swap(&mut self.merged_generation, &mut app.merged_generation);
+        std::mem::swap(
+            &mut self.merged_pruned_before,
+            &mut app.merged_pruned_before,
+        );
+        std::mem::swap(&mut self.merged_filter_rules, &mut app.merged_filter_rules);
+        std::mem::swap(
+            &mut self.merged_filter_combine,
+            &mut app.merged_filter_combine,
+        );
+        std::mem::swap(
+            &mut self.merged_filter_errors,
+            &mut app.merged_filter_errors,
+        );
+        std::mem::swap(&mut self.merged_filter_dirty, &mut app.merged_filter_dirty);
+        std::mem::swap(&mut self.merged_filtered, &mut app.merged_filtered);
+        std::mem::swap(
+            &mut self.merged_filter_generation,
+            &mut app.merged_filter_generation,
+        );
+        std::mem::swap(
+            &mut self.merged_filter_source_generation,
+            &mut app.merged_filter_source_generation,
+        );
+        std::mem::swap(
+            &mut self.merged_filter_upto_seq,
+            &mut app.merged_filter_upto_seq,
+        );
+        std::mem::swap(&mut self.merged_search_query, &mut app.merged_search_query);
+        std::mem::swap(
+            &mut self.merged_search_case_sensitive,
+            &mut app.merged_search_case_sensitive,
+        );
+        std::mem::swap(
+            &mut self.merged_search_matches,
+            &mut app.merged_search_matches,
+        );
+        std::mem::swap(&mut self.merged_search_pos, &mut app.merged_search_pos);
+        std::mem::swap(&mut self.merged_search_dirty, &mut app.merged_search_dirty);
+        std::mem::swap(
+            &mut self.merged_search_source_generation,
+            &mut app.merged_search_source_generation,
+        );
+        std::mem::swap(
+            &mut self.merged_search_upto_seq,
+            &mut app.merged_search_upto_seq,
+        );
+        std::mem::swap(&mut self.merged_scroll_to, &mut app.merged_scroll_to);
+        std::mem::swap(&mut self.merged_follow, &mut app.merged_follow);
+        std::mem::swap(
+            &mut self.merged_new_since_scroll,
+            &mut app.merged_new_since_scroll,
+        );
+        std::mem::swap(&mut self.merged_pin_view_h, &mut app.merged_pin_view_h);
+        std::mem::swap(&mut self.merged_tx_port, &mut app.merged_tx_port);
+    }
+}
+
 pub struct App {
     pub clock: SessionClock,
     pub config: Config,
@@ -1226,7 +1400,7 @@ pub struct App {
     pub enum_rx: Receiver<EnumEvent>,
     pub available: Vec<DiscoveredPort>,
     pub connections: Vec<Connection>,
-    /// Active tab index; `connections.len()` selects the merged view.
+    /// Active connection index, retained while a merged tab is selected.
     pub active: usize,
     pub next_port_id: u32,
     /// `Some` while the modal new-connection dialog is open.
@@ -1255,7 +1429,7 @@ pub struct App {
     /// common append-only path a constant-time check per connection while still
     /// letting `prune_merged` remove dead entries from inside the interleaving.
     pub merged_pruned_before: HashMap<PortId, u64>,
-    /// Filter state owned by the merged pseudo-tab. A merged filter is kept
+    /// Filter state owned by the loaded merged tab. A merged filter is kept
     /// separate from every port's filter so its meaning does not depend on
     /// whichever real tab happened to be active last.
     pub merged_filter_rules: Vec<FilterRule>,
@@ -1269,7 +1443,7 @@ pub struct App {
     pub merged_filter_generation: u64,
     pub merged_filter_source_generation: u64,
     pub merged_filter_upto_seq: u64,
-    /// Search state owned by the merged pseudo-tab. Matches keep the complete
+    /// Search state owned by the loaded merged tab. Matches keep the complete
     /// merged key so navigation can identify both the port and its line.
     pub merged_search_query: String,
     pub merged_search_case_sensitive: bool,
@@ -1290,12 +1464,17 @@ pub struct App {
     pub merged_pin_view_h: f32,
     /// Device that receives raw keyboard input while the merged tab is open.
     pub merged_tx_port: Option<PortId>,
-    /// True when the merged pseudo-tab is active.
+    /// True when the loaded merged tab is active.
     pub merged_selected: bool,
+    pub merged_tabs: Vec<MergedTab>,
+    pub tab_order: Vec<TabId>,
+    pub loaded_merged_tab: Option<usize>,
+    pub next_merged_id: u64,
+    pub merged_dialog: Option<MergedDialog>,
     // Floating tool windows, toggled from the console right-click menu, so the
     // main window stays uncluttered.
     pub show_settings: bool,
-    pub(crate) tab_close_confirmation: Option<(PortId, bool)>,
+    pub(crate) tab_close_confirmation: Option<(TabId, bool)>,
     pub show_macros_win: bool,
     /// Global reference for the keyboard commands Pigtail reserves.
     pub show_keyboard_shortcuts: bool,
@@ -1401,6 +1580,11 @@ impl App {
             merged_pin_view_h: 0.0,
             merged_tx_port: None,
             merged_selected: false,
+            merged_tabs: Vec::new(),
+            tab_order: Vec::new(),
+            loaded_merged_tab: None,
+            next_merged_id: 1,
+            merged_dialog: None,
             show_settings: false,
             tab_close_confirmation: None,
             show_macros_win: false,
@@ -1497,6 +1681,7 @@ impl App {
         }
         app.active = 0;
         app.merged_selected = false;
+        app.restore_merged_views();
 
         app
     }
@@ -1843,11 +2028,65 @@ impl App {
         };
         let mut conn = self.make_connection(id, label, identity, port_config, handle);
         conn.name = name.and_then(|name| normalized_tab_name(&name));
+        self.tab_order = self.ordered_tabs();
         self.connections.push(conn);
         self.active = self.connections.len() - 1;
         self.merged_selected = false;
         self.merged_dirty = true;
         true
+    }
+
+    /// Restore after physical connections have received their new runtime IDs.
+    fn restore_merged_views(&mut self) {
+        for saved in &self.config.merged_views {
+            let id = self.next_merged_id;
+            self.next_merged_id += 1;
+            let ports = saved
+                .connections
+                .iter()
+                .filter_map(|identity| {
+                    self.connections
+                        .iter()
+                        .find(|conn| &conn.identity == identity)
+                        .map(|conn| conn.id)
+                })
+                .collect();
+            self.merged_tabs.push(MergedTab {
+                id,
+                name: saved.name.clone(),
+                ports,
+                state: MergedTabState::default(),
+            });
+        }
+        self.tab_order = self
+            .config
+            .tab_order
+            .iter()
+            .filter_map(|tab| match tab {
+                SavedTab::Connection { identity } => self
+                    .connections
+                    .iter()
+                    .find(|conn| &conn.identity == identity)
+                    .map(|conn| TabId::Connection(conn.id)),
+                SavedTab::Merged { index } => self
+                    .merged_tabs
+                    .get(*index)
+                    .map(|tab| TabId::Merged(tab.id)),
+            })
+            .collect();
+        self.tab_order.dedup();
+        self.tab_order = self.ordered_tabs();
+        if self.connections.is_empty() && !self.merged_tabs.is_empty() {
+            let index = self
+                .tab_order
+                .iter()
+                .find_map(|id| match id {
+                    TabId::Merged(id) => self.merged_tabs.iter().position(|tab| tab.id == *id),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            self.select_merged_tab(index);
+        }
     }
 
     /// Persist the set of currently-open connections so they reopen next
@@ -1866,11 +2105,104 @@ impl App {
                 config: c.port_config.clone(),
             })
             .collect();
+        self.config.merged_views = self
+            .merged_tabs
+            .iter()
+            .map(|tab| SavedMergedView {
+                name: tab.name.clone(),
+                connections: tab
+                    .ports
+                    .iter()
+                    .filter_map(|id| {
+                        self.connections
+                            .iter()
+                            .find(|conn| conn.id == *id && conn.state != ConnState::Closed)
+                            .map(|conn| conn.identity.clone())
+                    })
+                    .collect(),
+            })
+            .collect();
+        self.config.tab_order = self
+            .ordered_tabs()
+            .iter()
+            .filter_map(|tab| match tab {
+                TabId::Connection(id) => self
+                    .connections
+                    .iter()
+                    .find(|conn| conn.id == *id && conn.state != ConnState::Closed)
+                    .map(|conn| SavedTab::Connection {
+                        identity: conn.identity.clone(),
+                    }),
+                TabId::Merged(id) => self
+                    .merged_tabs
+                    .iter()
+                    .position(|tab| tab.id == *id)
+                    .map(|index| SavedTab::Merged { index }),
+            })
+            .collect();
         self.write_config();
+    }
+
+    /// Reconcile stable tab IDs with connections opened or closed since layout.
+    pub(crate) fn ordered_tabs(&self) -> Vec<TabId> {
+        let live: Vec<_> = self
+            .connections
+            .iter()
+            .map(|c| TabId::Connection(c.id))
+            .chain(self.merged_tabs.iter().map(|t| TabId::Merged(t.id)))
+            .collect();
+        let mut order: Vec<_> = self
+            .tab_order
+            .iter()
+            .copied()
+            .filter(|id| live.contains(id))
+            .collect();
+        for id in live {
+            if !order.contains(&id) {
+                order.push(id);
+            }
+        }
+        order
+    }
+
+    pub(crate) fn reorder_tab(&mut self, id: TabId, boundary: usize) {
+        let mut order = self.ordered_tabs();
+        let Some(from) = order.iter().position(|tab| *tab == id) else {
+            return;
+        };
+        let boundary = boundary.min(order.len());
+        let to = boundary - usize::from(from < boundary);
+        order.remove(from);
+        order.insert(to, id);
+        if let TabId::Connection(port) = id {
+            let connection_to = order[..to]
+                .iter()
+                .filter(|tab| matches!(tab, TabId::Connection(_)))
+                .count();
+            let connection_from = self.connections.iter().position(|c| c.id == port).unwrap();
+            self.reorder_connection(
+                port,
+                connection_to + usize::from(connection_from <= connection_to),
+            );
+        }
+        self.tab_order = order;
+        self.save_session();
+    }
+
+    pub(crate) fn name_merged_tab(&mut self, id: u64, name: &str) {
+        if let Some(tab) = self.merged_tabs.iter_mut().find(|tab| tab.id == id) {
+            tab.name = if name.trim().is_empty() {
+                format!("Merged {id}")
+            } else {
+                name.trim().to_owned()
+            };
+        }
+        self.save_session();
     }
 
     /// Move a connection to an insertion boundary in the current tab order.
     pub(crate) fn reorder_connection(&mut self, id: PortId, boundary: usize) {
+        self.tab_order = self.ordered_tabs();
         let Some(from) = self.connections.iter().position(|conn| conn.id == id) else {
             return;
         };
@@ -1888,6 +2220,14 @@ impl App {
                 .iter()
                 .position(|conn| conn.id == active)
                 .unwrap();
+        }
+        let mut connections = self.connections.iter();
+        for tab in &mut self.tab_order {
+            if matches!(tab, TabId::Connection(_)) {
+                if let Some(conn) = connections.next() {
+                    *tab = TabId::Connection(conn.id);
+                }
+            }
         }
         self.save_session();
     }
@@ -2167,7 +2507,7 @@ impl App {
             return;
         };
         if self.config.settings.confirm_tab_close {
-            self.tab_close_confirmation = Some((conn.id, false));
+            self.tab_close_confirmation = Some((TabId::Connection(conn.id), false));
         } else {
             self.close_connection(index);
         }
@@ -2187,6 +2527,13 @@ impl App {
             self.active = self.connections.len().saturating_sub(1);
         }
         self.merged_dirty = true;
+        if self.connections.is_empty() && !self.merged_selected {
+            if let Some(TabId::Merged(id)) = self.ordered_tabs().last().copied() {
+                if let Some(index) = self.merged_tabs.iter().position(|tab| tab.id == id) {
+                    self.select_merged_tab(index);
+                }
+            }
+        }
         self.save_session();
     }
 
@@ -2339,6 +2686,117 @@ impl App {
         settled_change
     }
 
+    pub(crate) fn merged_contains(&self, port: PortId) -> bool {
+        self.loaded_merged_tab
+            .and_then(|i| self.merged_tabs.get(i))
+            .is_none_or(|tab| tab.ports.contains(&port))
+    }
+
+    pub(crate) fn create_merged_tab(&mut self, mut ports: Vec<PortId>) {
+        ports.retain(|id| self.connections.iter().any(|conn| conn.id == *id));
+        ports.sort_by_key(|id| id.0);
+        ports.dedup();
+        self.tab_order = self.ordered_tabs();
+        let id = self.next_merged_id;
+        self.next_merged_id += 1;
+        self.merged_tabs.push(MergedTab {
+            id,
+            name: format!("Merged {id}"),
+            ports,
+            state: MergedTabState::default(),
+        });
+        self.select_merged_tab(self.merged_tabs.len() - 1);
+        self.save_session();
+    }
+
+    pub(crate) fn edit_merged_tab(&mut self, id: u64, mut ports: Vec<PortId>) {
+        let Some(index) = self.merged_tabs.iter().position(|tab| tab.id == id) else {
+            return;
+        };
+        ports.retain(|id| self.connections.iter().any(|conn| conn.id == *id));
+        ports.sort_by_key(|id| id.0);
+        ports.dedup();
+        self.merged_tabs[index].ports = ports;
+        self.select_merged_tab(index);
+        // Rebuild even when editing the already loaded view. Keep its display
+        // preferences, but discard navigation into the old source selection.
+        self.merged_scroll_to = None;
+        self.merged_search_pos = None;
+        self.merged_dirty = true;
+        self.maintain_merged();
+        self.maintain_merged_filter(true);
+        self.maintain_merged_search(true);
+        self.save_session();
+    }
+
+    pub(crate) fn select_merged_tab(&mut self, index: usize) {
+        if index >= self.merged_tabs.len() {
+            return;
+        }
+        if self.loaded_merged_tab != Some(index) {
+            if let Some(old) = self.loaded_merged_tab {
+                let mut state = MergedTabState::default();
+                state.swap_with_app(self);
+                self.merged_tabs[old].state = state;
+            }
+            let mut state = std::mem::take(&mut self.merged_tabs[index].state);
+            state.swap_with_app(self);
+            self.loaded_merged_tab = Some(index);
+            // Sources may have changed while this tab was parked.
+            self.merged_dirty = true;
+            self.maintain_merged();
+            self.maintain_merged_filter(true);
+            self.maintain_merged_search(true);
+        }
+        self.merged_selected = true;
+        if !self.merged_tx_port.is_some_and(|id| {
+            self.merged_contains(id)
+                && self
+                    .connections
+                    .iter()
+                    .any(|c| c.id == id && c.state != ConnState::Closed)
+        }) {
+            self.merged_tx_port = self
+                .connections
+                .iter()
+                .find(|c| self.merged_contains(c.id) && c.state != ConnState::Closed)
+                .map(|c| c.id);
+        }
+    }
+
+    pub(crate) fn request_close_merged_tab(&mut self, index: usize) {
+        let Some(tab) = self.merged_tabs.get(index) else {
+            return;
+        };
+        if self.config.settings.confirm_tab_close {
+            self.tab_close_confirmation = Some((TabId::Merged(tab.id), false));
+        } else {
+            self.close_merged_tab(index);
+        }
+    }
+
+    pub(crate) fn close_merged_tab(&mut self, index: usize) {
+        if index >= self.merged_tabs.len() {
+            return;
+        }
+        let was_loaded = self.loaded_merged_tab == Some(index);
+        self.merged_tabs.remove(index);
+        if was_loaded {
+            self.loaded_merged_tab = None;
+            MergedTabState::default().swap_with_app(self);
+            if self.merged_selected && !self.merged_tabs.is_empty() {
+                self.select_merged_tab(index.min(self.merged_tabs.len() - 1));
+            } else {
+                self.merged_selected = false;
+            }
+        } else if let Some(loaded) = &mut self.loaded_merged_tab {
+            if *loaded > index {
+                *loaded -= 1;
+            }
+        }
+        self.save_session();
+    }
+
     /// Maintain the timestamp-interleaved merged view (spec §7.12). Rebuilds on
     /// connect/close; otherwise a fast append of each port's new tail.
     fn maintain_merged(&mut self) {
@@ -2359,9 +2817,18 @@ impl App {
                 self.merged_pruned_before.insert(conn.id, first);
             }
         }
-        // Collect new entries from every port.
+        let ports = self
+            .loaded_merged_tab
+            .map(|i| self.merged_tabs[i].ports.clone());
+        // Collect new entries from the connections selected for this view.
         let mut fresh: Vec<MergedEntry> = Vec::new();
         for conn in &mut self.connections {
+            if ports
+                .as_ref()
+                .is_some_and(|ports| !ports.contains(&conn.id))
+            {
+                continue;
+            }
             let start = conn.merged_upto.max(conn.store.first_abs_index());
             let end = conn.store.next_abs_index();
             for abs in start..end {
@@ -2414,7 +2881,7 @@ impl App {
         }
     }
 
-    /// True when the merged pseudo-tab has at least one enabled, non-empty
+    /// True when the loaded merged tab has at least one enabled, non-empty
     /// filter rule. This deliberately follows `Connection::filter_index_active`:
     /// even an invalid active rule keeps the filtered view selected while its
     /// compile error is shown in the filter window.
@@ -2425,7 +2892,7 @@ impl App {
             .all(|r| !r.enabled || r.pattern.is_empty())
     }
 
-    /// The entries currently displayed by the merged pseudo-tab.
+    /// The entries currently displayed by the loaded merged tab.
     pub(crate) fn merged_view(&self) -> &[MergedEntry] {
         if self.merged_filter_active() {
             &self.merged_filtered
@@ -2729,7 +3196,13 @@ impl App {
                 .position(|c| c.id == id)
                 .into_iter()
                 .collect(),
-            None if self.merged_selected => (0..self.connections.len()).collect(),
+            None if self.merged_selected => self
+                .connections
+                .iter()
+                .enumerate()
+                .filter(|(_, conn)| self.merged_contains(conn.id))
+                .map(|(i, _)| i)
+                .collect(),
             None => self.active_index().into_iter().collect(),
         };
         for i in targets {
@@ -2777,6 +3250,7 @@ impl App {
     /// fields, so a newly added window only needs to be listed here once.
     pub fn floating_window_open(&self) -> bool {
         self.config_dialog.is_some()
+            || self.merged_dialog.is_some()
             || self.rename_dialog.is_some()
             || self.file_transfer_dialog.is_some()
             || !self.connect_errors.is_empty()
@@ -2899,12 +3373,14 @@ impl eframe::App for App {
         // Maintain derived indices.
         self.rebuild_highlight_if_dirty();
         self.maintain_filters();
-        if any_data || self.merged_dirty {
-            self.maintain_merged();
+        if self.loaded_merged_tab.is_some() {
+            if any_data || self.merged_dirty {
+                self.maintain_merged();
+            }
+            self.maintain_merged_filter(any_data);
+            self.maintain_merged_search(any_data);
         }
-        self.maintain_merged_filter(any_data);
         self.maintain_search();
-        self.maintain_merged_search(any_data);
 
         // Minimal chrome: a header of tabs on top, a status footer at the
         // bottom, and the console filling everything in between. Tool panels are
@@ -2921,6 +3397,7 @@ impl eframe::App for App {
         self.show_file_drop_overlay(ctx);
 
         // Floating windows.
+        self.show_merged_dialog(ctx);
         self.show_config_dialog(ctx);
         self.show_rename_dialog(ctx);
         self.show_tool_windows(ctx);
@@ -3627,12 +4104,292 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn merged_tabs_are_optional_and_keep_independent_sources_and_settings() {
+        let (mut app, _enum_tx) = test_app("multiple-merged-tabs");
+        for id in 1..=3 {
+            add_merged_test_connection(
+                &mut app,
+                PortId(id),
+                &format!("port-{id}"),
+                &[("first", i64::from(id), LineFlags::default())],
+            );
+        }
+        assert!(app.merged_tabs.is_empty());
+        assert!(!app.merged_selected);
+        app.create_merged_tab(vec![PortId(1), PortId(1)]);
+        assert_eq!(app.merged_tabs[0].ports, vec![PortId(1)]);
+        app.close_merged_tab(0);
+        app.create_merged_tab(vec![PortId(1), PortId(2)]);
+        assert_eq!(
+            app.merged.iter().map(|e| e.port).collect::<Vec<_>>(),
+            vec![PortId(1), PortId(2)]
+        );
+        app.merged_search_query = "first".into();
+        app.merged_search_case_sensitive = true;
+        app.merged_follow = false;
+        app.merged_tx_port = Some(PortId(2));
+        app.merged_filter_combine = Combine::Or;
+        app.create_merged_tab(vec![PortId(2), PortId(3)]);
+        assert_eq!(app.merged_tabs.len(), 2);
+        assert_eq!(
+            app.merged.iter().map(|e| e.port).collect::<Vec<_>>(),
+            vec![PortId(2), PortId(3)]
+        );
+        assert!(app.merged_search_query.is_empty());
+        assert!(app.merged_follow);
+        app.merged_search_query = "second".into();
+        app.select_merged_tab(0);
+        assert_eq!(app.merged_search_query, "first");
+        assert!(app.merged_search_case_sensitive);
+        assert!(!app.merged_follow);
+        assert_eq!(app.merged_tx_port, Some(PortId(2)));
+        assert!(matches!(app.merged_filter_combine, Combine::Or));
+        assert_eq!(app.merged_search_matches.len(), 2);
+        app.clear_console(None);
+        assert_eq!(app.connections[0].store.len(), 0);
+        assert_eq!(app.connections[1].store.len(), 0);
+        assert_eq!(app.connections[2].store.len(), 1);
+        app.select_merged_tab(1);
+        assert_eq!(app.merged_search_query, "second");
+        assert_eq!(app.merged.len(), 1);
+        assert_eq!(app.merged[0].port, PortId(3));
+        app.close_merged_tab(0);
+        assert_eq!(app.loaded_merged_tab, Some(0));
+        assert_eq!(app.merged_search_query, "second");
+        app.close_merged_tab(0);
+        assert!(!app.merged_selected);
+        assert!(app.merged_tabs.is_empty());
+        assert_eq!(
+            app.connections.len(),
+            3,
+            "closing a view leaves its sources open"
+        );
+    }
+
+    #[test]
+    fn merged_views_roundtrip_with_names_sources_order_and_empty_views() {
+        let (mut app, _enum_tx) = test_app("save-merged-views");
+        for id in 1..=2 {
+            add_merged_test_connection(&mut app, PortId(id), &format!("port-{id}"), &[]);
+        }
+        app.create_merged_tab(vec![PortId(1), PortId(2)]);
+        let first = app.merged_tabs[0].id;
+        app.name_merged_tab(first, "Both devices");
+        app.create_merged_tab(vec![]);
+        let empty = app.merged_tabs[1].id;
+        app.name_merged_tab(empty, "Future devices");
+        app.reorder_tab(TabId::Merged(first), 1);
+        app.reorder_tab(TabId::Merged(empty), 0);
+        let saved = Config::from_toml(&app.config.to_toml().unwrap()).unwrap();
+        let (mut restored, _enum_tx2) = test_app("restore-merged-views");
+        // Reversed allocation order proves source membership uses identities.
+        add_merged_test_connection(&mut restored, PortId(80), "port-2", &[]);
+        add_merged_test_connection(&mut restored, PortId(90), "port-1", &[]);
+        restored.config = saved.clone();
+        restored.restore_merged_views();
+        assert_eq!(
+            restored.config, saved,
+            "restoring must not rewrite partial session state"
+        );
+        assert_eq!(restored.merged_tabs[0].name, "Both devices");
+        assert_eq!(restored.merged_tabs[0].ports, vec![PortId(90), PortId(80)]);
+        assert_eq!(restored.merged_tabs[1].name, "Future devices");
+        assert!(restored.merged_tabs[1].ports.is_empty());
+        assert_eq!(
+            restored.ordered_tabs(),
+            vec![
+                TabId::Merged(2),
+                TabId::Connection(PortId(90)),
+                TabId::Merged(1),
+                TabId::Connection(PortId(80))
+            ]
+        );
+        restored.edit_merged_tab(1, vec![PortId(80)]);
+        assert_eq!(
+            restored.config.merged_views[0].connections,
+            vec![identity("port-2")]
+        );
+        restored.close_merged_tab(0);
+        assert_eq!(restored.config.merged_views.len(), 1);
+        assert_eq!(restored.config.merged_views[0].name, "Future devices");
+        assert!(restored
+            .config
+            .tab_order
+            .contains(&SavedTab::Merged { index: 0 }));
+    }
+
+    #[test]
+    fn closing_last_connection_selects_last_visible_merged_tab() {
+        let (mut app, _enum_tx) = test_app("close-last-connection");
+        add_merged_test_connection(&mut app, PortId(1), "port-1", &[]);
+        app.create_merged_tab(vec![PortId(1)]);
+        let first = app.merged_tabs[0].id;
+        app.create_merged_tab(vec![]);
+        // The last visible tab may differ from the last-created merged tab.
+        app.reorder_tab(TabId::Merged(first), 3);
+        app.merged_selected = false;
+        app.active = 0;
+        app.close_connection(0);
+        assert!(app.connections.is_empty());
+        assert!(app.merged_selected);
+        assert_eq!(app.loaded_merged_tab, Some(0));
+        assert_eq!(app.merged_tabs[app.loaded_merged_tab.unwrap()].id, first);
+        assert!(app.merged.is_empty());
+
+        add_merged_test_connection(&mut app, PortId(2), "port-2", &[]);
+        app.select_merged_tab(1);
+        app.close_connection(0);
+        assert_eq!(
+            app.loaded_merged_tab,
+            Some(1),
+            "keep an already selected merged view"
+        );
+    }
+
+    #[test]
+    fn merged_only_session_restores_an_active_empty_view() {
+        let (mut app, _enum_tx) = test_app("save-empty-merged");
+        app.create_merged_tab(vec![]);
+        app.name_merged_tab(app.merged_tabs[0].id, "Empty view");
+        let saved = Config::from_toml(&app.config.to_toml().unwrap()).unwrap();
+        let (mut restored, _enum_tx2) = test_app("restore-empty-merged");
+        restored.config = saved;
+        restored.restore_merged_views();
+        assert!(restored.merged_selected);
+        assert_eq!(restored.loaded_merged_tab, Some(0));
+        assert_eq!(restored.merged_tabs[0].name, "Empty view");
+        let old = Config::from_toml("[settings]\n").unwrap();
+        assert!(old.merged_views.is_empty());
+        assert!(old.tab_order.is_empty());
+    }
+
+    #[test]
+    fn merged_names_order_and_close_confirmation_preserve_tab_identity() {
+        let (mut app, _enum_tx) = test_app("merged-tab-behavior");
+        for id in 1..=2 {
+            add_merged_test_connection(&mut app, PortId(id), &format!("port-{id}"), &[]);
+        }
+        app.create_merged_tab(vec![PortId(1), PortId(2)]);
+        let id = app.merged_tabs[0].id;
+        app.name_merged_tab(id, "  Combined output  ");
+        assert_eq!(app.merged_tabs[0].name, "Combined output");
+        app.reorder_tab(TabId::Merged(id), 0);
+        assert_eq!(
+            app.ordered_tabs(),
+            vec![
+                TabId::Merged(id),
+                TabId::Connection(PortId(1)),
+                TabId::Connection(PortId(2))
+            ]
+        );
+        assert!(app.merged_selected);
+        assert_eq!(app.loaded_merged_tab, Some(0));
+        app.reorder_tab(TabId::Connection(PortId(2)), 0);
+        assert_eq!(
+            app.ordered_tabs(),
+            vec![
+                TabId::Connection(PortId(2)),
+                TabId::Merged(id),
+                TabId::Connection(PortId(1))
+            ]
+        );
+        app.name_merged_tab(id, "  ");
+        assert_eq!(app.merged_tabs[0].name, format!("Merged {id}"));
+        app.request_close_merged_tab(0);
+        assert_eq!(app.tab_close_confirmation, Some((TabId::Merged(id), false)));
+        assert_eq!(app.merged_tabs.len(), 1);
+        app.tab_close_confirmation = None;
+        app.config.settings.confirm_tab_close = false;
+        app.request_close_merged_tab(0);
+        assert!(app.merged_tabs.is_empty());
+        assert_eq!(app.connections.len(), 2);
+        assert_eq!(
+            app.ordered_tabs(),
+            vec![TabId::Connection(PortId(2)), TabId::Connection(PortId(1))]
+        );
+    }
+
+    #[test]
+    fn editing_merged_sources_rebuilds_output_search_and_transmit_target() {
+        let (mut app, _enum_tx) = test_app("edit-merged-sources");
+        for id in 1..=3 {
+            add_merged_test_connection(
+                &mut app,
+                PortId(id),
+                &format!("port-{id}"),
+                &[("line", i64::from(id), LineFlags::default())],
+            );
+        }
+        app.create_merged_tab(vec![PortId(1), PortId(2)]);
+        let id = app.merged_tabs[0].id;
+        app.merged_search_query = "line".into();
+        app.merged_follow = false;
+        app.merged_tx_port = Some(PortId(1));
+        app.edit_merged_tab(id, vec![PortId(3)]);
+        assert_eq!(app.merged.len(), 1);
+        assert_eq!(app.merged[0].port, PortId(3));
+        assert_eq!(app.merged_search_matches.len(), 1);
+        assert_eq!(app.merged_search_matches[0].port, PortId(3));
+        assert_eq!(app.merged_tx_port, Some(PortId(3)));
+        assert!(!app.merged_follow);
+        app.edit_merged_tab(id, vec![]);
+        assert!(app.merged.is_empty());
+        assert!(app.merged_search_matches.is_empty());
+        assert!(app.merged_tx_port.is_none());
+        app.create_merged_tab(vec![]);
+        app.edit_merged_tab(id, vec![PortId(2), PortId(3)]);
+        assert_eq!(app.loaded_merged_tab, Some(0));
+        assert_eq!(app.merged_search_query, "line");
+        assert_eq!(app.merged.len(), 2);
+        assert!(app.merged_tabs[1].ports.is_empty());
+    }
+
+    #[test]
+    fn merged_sources_survive_reordering_and_closing_connections() {
+        let (mut app, _enum_tx) = test_app("merged-source-lifetime");
+        for id in 1..=3 {
+            add_merged_test_connection(
+                &mut app,
+                PortId(id),
+                &format!("port-{id}"),
+                &[("line", i64::from(id), LineFlags::default())],
+            );
+        }
+        app.create_merged_tab(vec![PortId(1), PortId(3)]);
+        app.create_merged_tab(vec![PortId(2), PortId(3)]);
+        app.reorder_connection(PortId(3), 0);
+        let close = app
+            .connections
+            .iter()
+            .position(|c| c.id == PortId(1))
+            .unwrap();
+        app.close_connection(close);
+        app.select_merged_tab(0);
+        assert_eq!(app.merged.len(), 1);
+        assert_eq!(app.merged[0].port, PortId(3));
+        assert_eq!(app.merged_tx_port, Some(PortId(3)));
+        app.close_merged_tab(0);
+        assert!(app.merged_selected);
+        assert_eq!(app.loaded_merged_tab, Some(0));
+        assert_eq!(app.merged.len(), 2);
+        while !app.connections.is_empty() {
+            app.close_connection(0);
+        }
+        app.maintain_merged();
+        assert!(app.merged.is_empty());
+        assert!(app.merged_selected, "an empty merged view remains closable");
+    }
+
+    #[test]
     fn closing_tabs_requires_confirmation_unless_disabled() {
         let (mut app, _enum_tx) = test_app("tab-close-confirmation");
         add_merged_test_connection(&mut app, PortId(1), "first", &[]);
         app.request_close_connection(0);
         assert_eq!(app.connections.len(), 1);
-        assert_eq!(app.tab_close_confirmation, Some((PortId(1), false)));
+        assert_eq!(
+            app.tab_close_confirmation,
+            Some((TabId::Connection(PortId(1)), false))
+        );
         app.tab_close_confirmation = None;
         assert_eq!(app.connections.len(), 1);
         app.config.settings.confirm_tab_close = false;
