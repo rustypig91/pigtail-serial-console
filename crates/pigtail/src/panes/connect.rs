@@ -226,6 +226,17 @@ impl App {
                             self.start_update_check(true);
                             ui.close_menu();
                         }
+                        ui.separator();
+                        if ui
+                            .button("Support developer")
+                            .on_hover_text("Opens Buy Me a Coffee in your browser")
+                            .clicked()
+                        {
+                            ctx.open_url(egui::OpenUrl::new_tab(
+                                "https://buymeacoffee.com/rustypig91g",
+                            ));
+                            ui.close_menu();
+                        }
                     });
                 });
             });
