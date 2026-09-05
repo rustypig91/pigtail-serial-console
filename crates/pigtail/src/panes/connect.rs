@@ -123,7 +123,10 @@ impl App {
         // `editing` pointing at a tab that no longer exists (issue #16).
         // Disabled rather than merely ignored so the greying-out shows *why*
         // the clicks do nothing.
-        let modal_open = self.config_dialog.is_some()
+        // A pending close must also block new editors and replacement close
+        // requests until the user confirms or cancels its original target.
+        let modal_open = self.tab_close_confirmation.is_some()
+            || self.config_dialog.is_some()
             || self.rename_dialog.is_some()
             || self.file_transfer_dialog.is_some();
 
@@ -305,7 +308,7 @@ impl App {
             }
         }
         if let Some(i) = to_close {
-            self.close_connection(i);
+            self.request_close_connection(i);
         }
         if let Some(i) = port_options {
             self.open_port_options(i);
@@ -1062,6 +1065,76 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
         }
+    }
+
+    #[test]
+    fn close_confirmation_blocks_tab_actions_until_dismissed() {
+        let (mut app, _enum_tx) = test_app("close-confirmation-header");
+        for id in [PortId(1), PortId(2)] {
+            app.connections.push(app.make_connection(
+                id,
+                format!("Tab {}", id.0),
+                Default::default(),
+                Default::default(),
+                inert_handle(id),
+            ));
+        }
+        app.request_close_connection(0);
+        let ctx = egui::Context::default();
+        let frame = |app: &mut crate::app::App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.show_header(ctx),
+            )
+        };
+        let output = frame(&mut app, vec![]);
+        let tab = output
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    (text.galley.text() == "Tab 2").then_some(text.pos + text.galley.size() / 2.0)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let click = |app: &mut crate::app::App, button| {
+            for pressed in [true, false] {
+                frame(
+                    app,
+                    vec![
+                        Event::PointerMoved(tab),
+                        Event::PointerButton {
+                            pos: tab,
+                            button,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+        };
+        click(&mut app, egui::PointerButton::Secondary);
+        assert!(
+            !ctx.is_context_menu_open(),
+            "port options must stay inaccessible"
+        );
+        click(&mut app, egui::PointerButton::Middle);
+        assert_eq!(app.tab_close_confirmation, Some((PortId(1), false)));
+        click(&mut app, egui::PointerButton::Primary);
+        assert_eq!(app.active, 0);
+        app.tab_close_confirmation = None;
+        frame(&mut app, vec![]);
+        click(&mut app, egui::PointerButton::Primary);
+        assert_eq!(app.active, 1, "dismissing restores tab interaction");
     }
 
     #[test]

@@ -7,6 +7,49 @@ use serialcore::filter::{Combine, FilterRule};
 use serialcore::reader::ErrorScope;
 
 impl App {
+    pub(crate) fn show_tab_close_confirmation(&mut self, ctx: &egui::Context) {
+        let Some((id, mut do_not_ask)) = self.tab_close_confirmation else {
+            return;
+        };
+        let Some(conn) = self.connections.iter().find(|conn| conn.id == id) else {
+            self.tab_close_confirmation = None;
+            return;
+        };
+        let mut open = true;
+        let mut close = false;
+        let mut cancel = false;
+        egui::Window::new("Close tab?")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Are you sure you want to close \"{}\"?",
+                    conn.display_label()
+                ));
+                ui.label("Closing the tab disconnects this connection.");
+                ui.checkbox(&mut do_not_ask, "Do not ask me again");
+                ui.horizontal(|ui| {
+                    cancel = ui.button("Cancel").clicked();
+                    close = ui.button("Close tab").clicked();
+                });
+            });
+        if close {
+            self.tab_close_confirmation = None;
+            if do_not_ask {
+                self.config.settings.confirm_tab_close = false;
+                self.write_config();
+            }
+            if let Some(index) = self.connections.iter().position(|conn| conn.id == id) {
+                self.close_connection(index);
+            }
+        } else if cancel || !open {
+            self.tab_close_confirmation = None;
+        } else {
+            self.tab_close_confirmation = Some((id, do_not_ask));
+        }
+    }
+
     /// Handle Escape before console input or text fields can consume it.
     pub(crate) fn close_window_on_escape(&mut self, ctx: &egui::Context) {
         if ctx.is_context_menu_open() || !ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -43,7 +86,10 @@ impl App {
                 closed = true;
             }
         }
-        if self.show_error_win.is_some() && is_window("error_window") {
+        if self.tab_close_confirmation.is_some() && is_window("Close tab?") {
+            self.tab_close_confirmation = None;
+            closed = true;
+        } else if self.show_error_win.is_some() && is_window("error_window") {
             self.show_error_win = None;
             closed = true;
         } else if self.retention_cleanup_confirmation.is_some()

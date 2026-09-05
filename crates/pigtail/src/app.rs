@@ -1295,6 +1295,7 @@ pub struct App {
     // Floating tool windows, toggled from the console right-click menu, so the
     // main window stays uncluttered.
     pub show_settings: bool,
+    pub(crate) tab_close_confirmation: Option<(PortId, bool)>,
     pub show_macros_win: bool,
     /// Global reference for the keyboard commands Pigtail reserves.
     pub show_keyboard_shortcuts: bool,
@@ -1401,6 +1402,7 @@ impl App {
             merged_tx_port: None,
             merged_selected: false,
             show_settings: false,
+            tab_close_confirmation: None,
             show_macros_win: false,
             show_keyboard_shortcuts: false,
             macro_editor: None,
@@ -2159,6 +2161,18 @@ impl App {
         }
     }
 
+    /// Request confirmation before disconnecting and closing a tab.
+    pub(crate) fn request_close_connection(&mut self, index: usize) {
+        let Some(conn) = self.connections.get(index) else {
+            return;
+        };
+        if self.config.settings.confirm_tab_close {
+            self.tab_close_confirmation = Some((conn.id, false));
+        } else {
+            self.close_connection(index);
+        }
+    }
+
     /// Disconnect and close the active connection tab.
     pub fn close_connection(&mut self, index: usize) {
         if index >= self.connections.len() {
@@ -2774,6 +2788,7 @@ impl App {
             || self.macro_running_edit_confirmation.is_some()
             || self.macro_shortcut_conflict.is_some()
             || self.retention_cleanup_confirmation.is_some()
+            || self.tab_close_confirmation.is_some()
             || self.show_filters_win
             || self.show_highlight_win
             || self.show_extract_win
@@ -2911,6 +2926,7 @@ impl eframe::App for App {
         self.show_tool_windows(ctx);
         self.show_macros_window(ctx);
         self.show_settings_window(ctx);
+        self.show_tab_close_confirmation(ctx);
         self.show_keyboard_shortcuts_window(ctx);
         self.show_update_dialog(ctx);
         self.show_file_transfer(ctx);
@@ -3608,6 +3624,21 @@ pub(crate) mod tests {
         }
         app.connections.push(conn);
         app.merged_dirty = true;
+    }
+
+    #[test]
+    fn closing_tabs_requires_confirmation_unless_disabled() {
+        let (mut app, _enum_tx) = test_app("tab-close-confirmation");
+        add_merged_test_connection(&mut app, PortId(1), "first", &[]);
+        app.request_close_connection(0);
+        assert_eq!(app.connections.len(), 1);
+        assert_eq!(app.tab_close_confirmation, Some((PortId(1), false)));
+        app.tab_close_confirmation = None;
+        assert_eq!(app.connections.len(), 1);
+        app.config.settings.confirm_tab_close = false;
+        app.request_close_connection(0);
+        assert!(app.connections.is_empty());
+        assert!(app.tab_close_confirmation.is_none());
     }
 
     #[test]

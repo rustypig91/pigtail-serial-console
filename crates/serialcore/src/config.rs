@@ -358,6 +358,9 @@ pub const MAX_CONSOLE_FONT_SIZE: u8 = 40;
 /// Global settings.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
+    /// Ask before disconnecting and closing a connection tab.
+    #[serde(default = "default_true")]
+    pub confirm_tab_close: bool,
     #[serde(default = "default_max_lines")]
     pub max_lines: usize,
     /// Point size of the console's monospace text (see the bounds above).
@@ -386,6 +389,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            confirm_tab_close: true,
             max_lines: default_max_lines(),
             console_font_size: default_console_font_size(),
             wrap_lines: true,
@@ -738,6 +742,15 @@ enabled = true
         let settings: Settings = toml::from_str("max_lines = 1000").unwrap();
         assert!(settings.check_updates);
         assert_eq!(settings.skipped_version, None);
+    }
+
+    #[test]
+    fn tab_close_confirmation_defaults_on_and_persists_opt_out() {
+        let mut settings: Settings = toml::from_str("max_lines = 1000").unwrap();
+        assert!(settings.confirm_tab_close);
+        settings.confirm_tab_close = false;
+        let back: Settings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+        assert!(!back.confirm_tab_close);
     }
 
     #[test]
