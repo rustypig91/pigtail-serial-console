@@ -1,12 +1,9 @@
-//! Update check: is a newer release published than the one that's running?
-//!
-//! Nothing here downloads or installs anything. The check asks GitHub for the
-//! newest published release and reports whether it is ahead of the version
-//! passed in; the UI decides how to say so, and sends the user to the release
-//! page to fetch it themselves.
-//!
-//! This is the only outbound network request pigtail makes, so it is opt-out
-//! (`settings.check_updates`) and it never blocks the UI — see [`spawn_check`].
+//! Release checks and user-initiated downloads and installation.
+//! Startup checks are opt-out; downloads only begin after pressing Update.
+
+#[path = "update_install.rs"]
+mod install;
+pub use install::{spawn_download, spawn_install, InstallEvent, InstallOutcome};
 
 use crate::wake::Wake;
 use crossbeam_channel::Receiver;
@@ -74,8 +71,8 @@ pub fn is_newer(current: &str, latest: &str) -> bool {
 /// What the UI should say once a check has finished.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Notice {
-    /// A newer release exists. The UI offers to open `url` and to skip
-    /// `version`.
+    /// A newer release exists. The UI offers to install or skip `version`.
+    /// `url` is retained for clients that need a manual download link.
     Available { version: String, url: String },
     /// Nothing newer is published.
     UpToDate,

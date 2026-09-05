@@ -23,8 +23,8 @@ Most serial terminals just show you text. Pigtail is built around the parts of f
   finite or indefinite looping, and assignable Ctrl+Shift+0 through Ctrl+Shift+9 shortcuts
 - DTR/RTS toggles and break signal
 - Export the current (filtered) view to `.txt` or `.csv`
-- Startup notice when a newer release is published, with "skip this version"; the
-  only network request pigtail makes, and switchable off in Settings
+- Startup notice when a newer release is published, with "skip this version" and
+  one-click download and update. Startup checks can be switched off in Settings.
 
 ## Installing
 
@@ -43,6 +43,19 @@ Neither Windows installer is code-signed, so SmartScreen shows an
 "unrecognized app" warning on first run; choose "More info" → "Run anyway".
 Install one or the other, not both — Windows treats them as separate products
 and each keeps its own Add/Remove Programs entry.
+
+### Updating
+
+Press **Update** in the update notice to download, verify, install, and restart
+Pigtail. Downloads run in the background and show progress; failed downloads
+leave the current installation untouched and can be retried. Settings are saved
+before installation; active connections close when the application restarts.
+Windows setup installations use the setup installer and may show a Windows
+permission prompt. Portable Windows/Linux builds and writable AppImages update
+in place. Installations managed by MSI or a Linux package manager should be
+updated with that installer/package manager, especially in protected folders.
+Automatic updates require the matching release asset and its GitHub SHA-256
+digest; older releases without these assets cannot be installed automatically.
 
 ## Building
 

@@ -103,7 +103,7 @@ impl App {
                             .checkbox(&mut self.config.settings.check_updates, "check at startup")
                             .on_hover_text(
                                 "Asks GitHub for the newest release. \
-                                 The only network request pigtail makes.",
+                                 Updates are downloaded only when you press Update.",
                             )
                             .changed();
                         ui.end_row();
@@ -114,7 +114,7 @@ impl App {
                 ui.label(format!("Sessions: {}", self.paths.sessions.display()));
                 ui.horizontal(|ui| {
                     ui.weak(concat!("pigtail v", env!("CARGO_PKG_VERSION")));
-                    let checking = self.update_rx.is_some();
+                    let checking = self.update_rx.is_some() || self.install_rx.is_some();
                     if ui
                         .add_enabled(!checking, egui::Button::new("Check for updates"))
                         .clicked()

@@ -101,6 +101,20 @@ jobs:
             echo "ASSET=$OUT.tar.gz" >> "$GITHUB_ENV"
           fi
 
+      # Uncompressed executables allow portable installations to update in place.
+      - name: Package updater executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/pigtail"
+          ASSET="pigtail-v${VERSION}-${{ matrix.target }}"
+          if [ "${{ matrix.platform }}" = "windows-latest" ]; then
+            BIN="$BIN.exe"
+            ASSET="$ASSET.exe"
+          fi
+          cp "$BIN" "$ASSET"
+          echo "UPDATE_ASSET=$ASSET" >> "$GITHUB_ENV"
+
       # --- Windows installer -------------------------------------------------
       # WiX v3 is not guaranteed to be present on the runner image, so fetch a
       # pinned copy and drive candle/light directly. The same crates/pigtail/
@@ -198,6 +212,7 @@ jobs:
           # assets it actually produced.
           files: |
             ${{ env.ASSET }}
+            ${{ env.UPDATE_ASSET }}
             ${{ env.SETUP_ASSET }}
             ${{ env.MSI_ASSET }}
             ${{ env.DEB_ASSET }}

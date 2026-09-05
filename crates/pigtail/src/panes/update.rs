@@ -1,5 +1,4 @@
-//! The update notice. Nothing here installs anything — "Download" opens the
-//! release page in the browser.
+//! Update notices, download progress, installation, and retry.
 
 use crate::app::App;
 
@@ -22,7 +21,7 @@ impl App {
         }
         // Nothing to download or skip: this is a plain acknowledgement, same
         // shape as any other one-off failure dialog (e.g. `show_connect_error`).
-        if dialog.download_url.is_none() && dialog.skip_version.is_none() {
+        if dialog.update_version.is_none() && dialog.skip_version.is_none() {
             if show_ack_window(ctx, &dialog.title, &dialog.message) {
                 self.update_dialog = None;
             }
@@ -30,7 +29,9 @@ impl App {
         }
         // Decided inside the closure, acted on after it, so the handlers can
         // touch `self` (config, dialog state) without borrowing it twice.
-        let mut open_url: Option<String> = None;
+        let mut install_version: Option<String> = None;
+        let installing = self.install_rx.is_some();
+        let checking = self.update_rx.is_some();
         let mut skip: Option<String> = None;
         let mut close = false;
 
@@ -41,10 +42,21 @@ impl App {
             .show(ctx, |ui| {
                 ui.label(&dialog.message);
                 ui.add_space(8.0);
+                if installing {
+                    if let Some(progress) = self.update_progress {
+                        ui.add(egui::ProgressBar::new(progress).show_percentage());
+                    } else {
+                        ui.spinner();
+                    }
+                    return;
+                }
                 ui.horizontal(|ui| {
-                    if let Some(url) = &dialog.download_url {
-                        if ui.button("Download").clicked() {
-                            open_url = Some(url.clone());
+                    if let Some(version) = &dialog.update_version {
+                        if ui
+                            .add_enabled(!checking, egui::Button::new("Update"))
+                            .clicked()
+                        {
+                            install_version = Some(version.clone());
                         }
                     }
                     if let Some(version) = &dialog.skip_version {
@@ -64,9 +76,8 @@ impl App {
                 });
             });
 
-        if let Some(url) = open_url {
-            ctx.open_url(egui::OpenUrl::new_tab(url));
-            close = true;
+        if let Some(version) = install_version {
+            self.start_update_download(version);
         }
         if let Some(version) = skip {
             self.config.settings.skipped_version = Some(version);
