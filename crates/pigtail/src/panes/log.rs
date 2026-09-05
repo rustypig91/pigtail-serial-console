@@ -359,6 +359,9 @@ impl App {
     fn console_input_index(&self) -> Option<usize> {
         if self.merged_selected {
             let id = self.merged_tx_port?;
+            if !self.merged_contains(id) {
+                return None;
+            }
             self.connections
                 .iter()
                 .position(|conn| conn.id == id && conn.state != ConnState::Closed)
@@ -523,7 +526,7 @@ impl App {
             if ui.rect_contains_pointer(ui.max_rect()) {
                 font_steps = ctrl_wheel_steps(ui.ctx());
             }
-            if self.connections.is_empty() {
+            if self.connections.is_empty() && !self.merged_selected {
                 ui.vertical_centered(|ui| {
                     ui.add_space(80.0);
                     ui.heading("No connection");
@@ -542,7 +545,7 @@ impl App {
                 });
                 return;
             }
-            let active = self.active.min(self.connections.len() - 1);
+            let active = self.active.min(self.connections.len().saturating_sub(1));
             self.active = active;
 
             // Optional search bar pinned to the top of the console.
@@ -997,6 +1000,10 @@ impl App {
             tag_chars,
             self.connections.iter().any(tx_marker),
         );
+        let merged_tab_id = self
+            .loaded_merged_tab
+            .and_then(|i| self.merged_tabs.get(i))
+            .map(|tab| tab.id);
         let App {
             connections,
             highlight_cache,
@@ -1067,6 +1074,7 @@ impl App {
         ui.spacing_mut().item_spacing.y = 0.0;
 
         let mut area = egui::ScrollArea::vertical()
+            .id_salt(("merged_scroll", merged_tab_id))
             .auto_shrink([false, false])
             .drag_to_scroll(false);
         if let Some(offset) = scroll_offset {
@@ -2281,6 +2289,40 @@ mod tests {
             wall: chrono::Utc::now(),
             micros,
         }
+    }
+
+    #[test]
+    fn empty_merged_view_renders_console_instead_of_no_connection_prompt() {
+        let (mut app, _enum_tx) = test_app("empty-merged-console");
+        let ctx = egui::Context::default();
+        let render = |app: &mut App| {
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                app.show_console(ctx, false);
+            });
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        Some(text.galley.text().to_owned())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let labels = render(&mut app);
+        assert!(labels.iter().any(|text| text == "No connection"));
+        assert!(labels.iter().any(|text| text == "+ New connection"));
+        app.create_merged_tab(vec![]);
+        let labels = render(&mut app);
+        assert!(!labels.iter().any(|text| text == "No connection"));
+        assert!(!labels.iter().any(|text| text == "+ New connection"));
+        app.show_search = true;
+        render(&mut app);
+        app.close_merged_tab(0);
+        let labels = render(&mut app);
+        assert!(labels.iter().any(|text| text == "No connection"));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Floating tool windows (filters, highlight, plot extraction), toggled from the
 //! console right-click menu so the main window stays uncluttered.
 
-use crate::app::App;
+use crate::app::{App, TabId};
 use serialcore::config::{ExtractMode, ExtractRule, HighlightRule};
 use serialcore::filter::{Combine, FilterRule};
 use serialcore::reader::ErrorScope;
@@ -11,7 +11,19 @@ impl App {
         let Some((id, mut do_not_ask)) = self.tab_close_confirmation else {
             return;
         };
-        let Some(conn) = self.connections.iter().find(|conn| conn.id == id) else {
+        let label = match id {
+            TabId::Connection(port) => self
+                .connections
+                .iter()
+                .find(|conn| conn.id == port)
+                .map(|conn| conn.display_label().to_owned()),
+            TabId::Merged(tab_id) => self
+                .merged_tabs
+                .iter()
+                .find(|tab| tab.id == tab_id)
+                .map(|tab| tab.name.clone()),
+        };
+        let Some(label) = label else {
             self.tab_close_confirmation = None;
             return;
         };
@@ -23,11 +35,12 @@ impl App {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label(format!(
-                    "Are you sure you want to close \"{}\"?",
-                    conn.display_label()
-                ));
-                ui.label("Closing the tab disconnects this connection.");
+                ui.label(format!("Are you sure you want to close \"{}\"?", label));
+                if matches!(id, TabId::Connection(_)) {
+                    ui.label("Closing the tab disconnects this connection.");
+                } else {
+                    ui.label("The connections included in this view will stay open.");
+                }
                 ui.checkbox(&mut do_not_ask, "Do not ask me again");
                 ui.horizontal(|ui| {
                     cancel = ui.button("Cancel").clicked();
@@ -40,8 +53,17 @@ impl App {
                 self.config.settings.confirm_tab_close = false;
                 self.write_config();
             }
-            if let Some(index) = self.connections.iter().position(|conn| conn.id == id) {
-                self.close_connection(index);
+            match id {
+                TabId::Connection(port) => {
+                    if let Some(index) = self.connections.iter().position(|conn| conn.id == port) {
+                        self.close_connection(index);
+                    }
+                }
+                TabId::Merged(tab_id) => {
+                    if let Some(index) = self.merged_tabs.iter().position(|tab| tab.id == tab_id) {
+                        self.close_merged_tab(index);
+                    }
+                }
             }
         } else if cancel || !open {
             self.tab_close_confirmation = None;
