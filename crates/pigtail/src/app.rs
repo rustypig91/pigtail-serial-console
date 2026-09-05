@@ -1867,6 +1867,29 @@ impl App {
         self.write_config();
     }
 
+    /// Move a connection to an insertion boundary in the current tab order.
+    pub(crate) fn reorder_connection(&mut self, id: PortId, boundary: usize) {
+        let Some(from) = self.connections.iter().position(|conn| conn.id == id) else {
+            return;
+        };
+        let boundary = boundary.min(self.connections.len());
+        let to = boundary - usize::from(from < boundary);
+        if from == to {
+            return;
+        }
+        let active_id = self.connections.get(self.active).map(|conn| conn.id);
+        let conn = self.connections.remove(from);
+        self.connections.insert(to, conn);
+        if let Some(active) = active_id {
+            self.active = self
+                .connections
+                .iter()
+                .position(|conn| conn.id == active)
+                .unwrap();
+        }
+        self.save_session();
+    }
+
     pub(crate) fn make_connection(
         &self,
         id: PortId,
