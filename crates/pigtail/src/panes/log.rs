@@ -548,6 +548,10 @@ impl App {
             let active = self.active.min(self.connections.len().saturating_sub(1));
             self.active = active;
 
+            if !self.merged_selected {
+                self.show_terminal_controls(ui, active);
+            }
+
             // Optional search bar pinned to the top of the console.
             if self.show_search {
                 egui::TopBottomPanel::top("search_bar")
@@ -565,6 +569,8 @@ impl App {
             // an inline REPL row at the end of the single-connection view.
             if self.merged_selected {
                 self.show_merged_rows(ui, &mut menu);
+            } else if self.connections[active].screen_view {
+                self.show_terminal_screen(ui, active);
             } else if self.connections[active].hex_view {
                 self.show_hex_rows(ui, active, &mut menu);
             } else {
@@ -1358,6 +1364,7 @@ impl App {
         }
         if let Some(conn) = target.and_then(|i| self.connections.get_mut(i)) {
             if menu.toggle_hex {
+                conn.screen_view = false;
                 conn.hex_view = !conn.hex_view;
             }
             if menu.toggle_plot {

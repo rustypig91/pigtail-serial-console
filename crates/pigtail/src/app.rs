@@ -499,6 +499,8 @@ pub struct Connection {
     pub mark_micros: Option<i64>,
     /// Show the raw-byte hex view instead of decoded lines (spec §7.11).
     pub hex_view: bool,
+    pub screen_view: bool,
+    pub terminal: vt100::Parser,
     // Filtering (spec §7.8).
     pub filter_rules: Vec<FilterRule>,
     pub filter_combine: Combine,
@@ -784,6 +786,7 @@ impl Connection {
 
     /// Append bytes to the hex view's ring, evicting from the front at capacity.
     pub fn push_raw_bytes(&mut self, bytes: &[u8]) {
+        self.terminal.process(bytes);
         self.raw_evicted_any |= push_raw(
             &mut self.raw_ring,
             &mut self.raw_base,
@@ -794,7 +797,13 @@ impl Connection {
 
     /// Begin a new contiguous receive region at the current raw position.
     pub(crate) fn mark_raw_discontinuity(&mut self) {
+        self.reset_terminal();
         self.raw_contiguous_start = self.raw_next();
+    }
+
+    pub(crate) fn reset_terminal(&mut self) {
+        let (rows, cols) = self.terminal.screen().size();
+        self.terminal = vt100::Parser::new(rows, cols, 0);
     }
 
     pub(crate) fn set_state(&mut self, state: ConnState) {
@@ -2272,6 +2281,8 @@ impl App {
             transfer_progress: None,
             mark_micros: None,
             hex_view: false,
+            screen_view: false,
+            terminal: vt100::Parser::new(24, 80, 0),
             filter_rules: Vec::new(),
             filter_combine: Combine::And,
             filter_index: FilterIndex::new(),
@@ -3216,6 +3227,7 @@ impl App {
                 conn.handle.clear_log();
             }
             conn.store.clear();
+            conn.reset_terminal();
             // The offsets restart at zero with the next byte: nothing is left
             // above for them to be counted from.
             conn.raw_base = conn.raw_next();
@@ -5099,6 +5111,71 @@ pub(crate) mod tests {
     /// The bounded reader backlog reports a gap before the output it retained.
     /// Both views must show that boundary: silently joining the raw bytes would
     /// make the hex offsets claim two non-contiguous regions were one stream.
+    #[test]
+    fn vt_screen_tracks_raw_batches_independently_of_log_and_hex() {
+        let (mut app, _enum_tx) = test_app("vt-raw");
+        let tx = conn_with_injected_events(&mut app, PortId(0));
+        let bytes = b"old\rnew\x1b[2;3H\x1b[1;3;4;38;2;10;20;30mX";
+        // One-byte batches exercise escape and UTF-8 parser state across reads.
+        for byte in bytes {
+            tx.send(ReaderEvent::Batch(reader::Batch {
+                lines: vec![],
+                raw: vec![*byte],
+            }))
+            .unwrap();
+        }
+        app.connections[0].drain_events(1000);
+        let conn = &mut app.connections[0];
+        assert!(!conn.screen_view && !conn.hex_view);
+        assert_eq!(conn.terminal.screen().cell(0, 0).unwrap().contents(), "n");
+        let cell = conn.terminal.screen().cell(1, 2).unwrap();
+        assert_eq!(cell.contents(), "X");
+        assert!(cell.bold() && cell.italic() && cell.underline());
+        assert_eq!(cell.fgcolor(), vt100::Color::Rgb(10, 20, 30));
+        assert_eq!(conn.raw_ring.iter().copied().collect::<Vec<_>>(), bytes);
+        conn.screen_view = true;
+        conn.push_raw_bytes(b"\x1b[?1049h\x1b[2J\x1b[Hmenu");
+        assert!(conn.terminal.screen().alternate_screen());
+        assert_eq!(conn.terminal.screen().contents(), "menu");
+        conn.hex_view = true;
+        conn.screen_view = false;
+        conn.push_raw_bytes(b"\x1b[?1049l");
+        assert!(!conn.terminal.screen().alternate_screen());
+        assert_eq!(conn.terminal.screen().cell(1, 2).unwrap().contents(), "X");
+    }
+
+    #[test]
+    fn vt_scroll_resize_unicode_and_reset() {
+        let (mut app, _enum_tx) = test_app("vt-scroll");
+        let _tx = conn_with_injected_events(&mut app, PortId(0));
+        let conn = &mut app.connections[0];
+        conn.terminal.screen_mut().set_size(5, 20);
+        conn.push_raw_bytes(b"header\x1b[2;4r\x1b[4;1Hbottom\r\nnext");
+        assert_eq!(conn.terminal.screen().cell(0, 0).unwrap().contents(), "h");
+        assert_eq!(conn.terminal.screen().cell(2, 0).unwrap().contents(), "b");
+        assert_eq!(conn.terminal.screen().cell(3, 0).unwrap().contents(), "n");
+        conn.push_raw_bytes(b"\x1b[H\x1b[2K");
+        for byte in "界e\u{301}".as_bytes() {
+            conn.push_raw_bytes(&[*byte]);
+        }
+        assert!(conn.terminal.screen().cell(0, 0).unwrap().is_wide());
+        assert_eq!(
+            conn.terminal.screen().cell(0, 2).unwrap().contents(),
+            "e\u{301}"
+        );
+        conn.push_raw_bytes(b"\x1b[");
+        conn.mark_raw_discontinuity();
+        conn.push_raw_bytes(b"fresh");
+        assert_eq!(conn.terminal.screen().size(), (5, 20));
+        assert_eq!(conn.terminal.screen().contents(), "fresh");
+        conn.reset_terminal();
+        assert_eq!(conn.terminal.screen().contents(), "");
+        assert!(
+            !conn.raw_ring.is_empty(),
+            "reset must preserve capture history"
+        );
+    }
+
     #[test]
     fn dropped_reader_output_marks_the_console_and_hex_view() {
         let (mut app, _enum_tx) = test_app("dropped-reader-output");
