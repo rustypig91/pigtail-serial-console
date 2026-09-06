@@ -28,16 +28,21 @@ Most serial terminals just show you text. Pigtail is built around the parts of f
   positioning, erase and redraw operations, scrolling regions, styled/colored
   text, and alternate screen buffers. Select **Log**, **Hex**, or **ANSI/VT** in
   the footer; Log is the default for new connections, and each connection remembers
-  its selected view across restarts. **Ctrl+Shift+F** in ANSI/VT searches the current screen
+  its selected view across restarts. ANSI/VT retains up to 2,000 rows of scrollback
+  per connection during the session. Use the mouse wheel or scrollbar to review it;
+  **Pin** or typing returns to live output. New output preserves your scroll position.
+  **Ctrl+Shift+F** in ANSI/VT searches the screen and retained scrollback
   with regex and optional case sensitivity; **Next**/**Prev** (Enter/Shift+Enter)
-  navigate highlighted matches. Switch to Log to search older output. Raw capture and chronological
+  scroll to highlighted matches. Switch to Log to search older output. Raw capture and chronological
   history continue in every mode. Screen mode supports application cursor keys
   and bracketed paste, and sends Up/Down to the device even when local history is enabled.
   The screen fills the available console area and automatically adjusts its rows
   and columns when the window or font size changes. Plain serial has no resize
   notification protocol, so configure the device shell to match if needed. Connection
-  interruptions and dropped live output reset the emulator to avoid carrying
-  partial escape sequences across gaps. Merged views remain chronological logs.
+  interruptions and dropped live output discard partial escape sequences while
+  preserving VT history. Clear console clears VT history too. Alternate-screen
+  applications retain the main screen's history but do not add their redraws to it.
+  Merged views remain chronological logs.
 - Transmit with configurable line endings, send history, and hex input
 - Drop files onto a console, or use **Send file…**, to send raw bytes, paced text lines, or hex-decoded data
 - Named transmit macros with reorderable command, delay, and regex wait steps,

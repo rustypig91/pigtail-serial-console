@@ -2,10 +2,14 @@
 use crate::app::App;
 use egui::{Color32, FontId, Rect, Sense, Stroke, Vec2};
 
+pub(crate) const VT_SCROLLBACK_ROWS: usize = 2000;
+
 #[derive(Default)]
 pub(crate) struct ScreenSearch {
-    pub matches: Vec<(u16, std::ops::Range<u16>)>,
+    pub matches: Vec<(usize, std::ops::Range<u16>)>,
     pub position: Option<usize>,
+    pub dirty: bool,
+    pub scroll_to: Option<usize>,
     query: String,
     case_sensitive: bool,
 }
@@ -13,17 +17,30 @@ pub(crate) struct ScreenSearch {
 impl ScreenSearch {
     pub fn refresh(&mut self, screen: &vt100::Screen, query: &str, case_sensitive: bool) {
         let changed = self.query != query || self.case_sensitive != case_sensitive;
+        if !changed && !self.dirty {
+            return;
+        }
+        self.dirty = false;
         let selected = self.position.and_then(|i| self.matches.get(i)).cloned();
         self.query = query.to_owned();
         self.case_sensitive = case_sensitive;
         self.matches.clear();
         if let Some(re) = crate::app::compile_search(query, case_sensitive) {
+            let mut screen = screen.clone();
             let (rows, cols) = screen.size();
-            for row in 0..rows {
+            screen.set_scrollback(usize::MAX);
+            let history = screen.scrollback();
+            let total = history + usize::from(rows);
+            for line in 0..total {
+                let base = (line / usize::from(rows) * usize::from(rows)).min(history);
+                screen.set_scrollback(history - base);
+                let row = (line - base) as u16;
                 let mut text = String::new();
                 let mut cells = Vec::new();
                 for col in 0..cols {
-                    let cell = screen.cell(row, col).unwrap();
+                    let Some(cell) = screen.cell(row, col) else {
+                        continue;
+                    };
                     if cell.is_wide_continuation() {
                         continue;
                     }
@@ -47,7 +64,7 @@ impl ScreenSearch {
                     });
                     if let Some((_, first)) = matching.next() {
                         let end = matching.next_back().map_or(first.end, |(_, cell)| cell.end);
-                        self.matches.push((row, first.start..end));
+                        self.matches.push((line, first.start..end));
                     }
                 }
             }
@@ -71,6 +88,7 @@ impl ScreenSearch {
                     (pos as i64 + dir).rem_euclid(len)
                 }) as usize,
         );
+        self.scroll_to = self.position.map(|i| self.matches[i].0);
     }
 }
 
@@ -82,92 +100,136 @@ impl App {
         let rows = (available.y / cell_size.y).floor().max(1.0) as u16;
         let cols = (available.x / cell_size.x).floor().max(1.0) as u16;
         let conn = &mut self.connections[active];
-        let terminal = &mut conn.terminal;
-        if terminal.screen().size() != (rows, cols) {
-            terminal.screen_mut().set_size(rows, cols);
+        if conn.terminal.screen().size() != (rows, cols) {
+            conn.terminal.screen_mut().set_size(rows, cols);
+            conn.screen_search.dirty = true;
         }
-        let screen = terminal.screen();
+        let screen = conn.terminal.screen_mut();
+        let old_offset = screen.scrollback();
+        screen.set_scrollback(usize::MAX);
+        let history = screen.scrollback();
+        screen.set_scrollback(old_offset);
         conn.screen_search
             .refresh(screen, &conn.search_query, conn.search_case_sensitive);
-        let search = &conn.screen_search;
-        let (rect, response) = ui.allocate_exact_size(available, Sense::click());
-        if response.clicked() {
-            ui.memory_mut(|m| {
-                if let Some(id) = m.focused() {
-                    m.surrender_focus(id);
+        let requested = conn.screen_search.scroll_to.take();
+        if requested.is_some() {
+            conn.follow = false;
+        }
+        let top = if let Some(line) = requested {
+            line.min(history)
+        } else if conn.follow {
+            history
+        } else {
+            history.saturating_sub(old_offset)
+        };
+        let output = egui::ScrollArea::vertical()
+            .id_salt(("vt-scrollback", conn.id.0))
+            .auto_shrink([false, false])
+            .vertical_scroll_offset(top as f32 * cell_size.y)
+            .show_viewport(ui, |ui, viewport| {
+                let first = ((viewport.min.y / cell_size.y).round() as usize).min(history);
+                screen.set_scrollback(history - first);
+                let search = &conn.screen_search;
+                let (content, response) = ui.allocate_exact_size(
+                    Vec2::new(
+                        ui.available_width(),
+                        available.y + history as f32 * cell_size.y,
+                    ),
+                    Sense::click(),
+                );
+                let rect = Rect::from_min_size(
+                    content.min + Vec2::new(0.0, viewport.min.y),
+                    Vec2::new(content.width(), available.y),
+                );
+                if response.clicked() {
+                    ui.memory_mut(|m| {
+                        if let Some(id) = m.focused() {
+                            m.surrender_focus(id);
+                        }
+                    });
+                }
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 0.0, Color32::BLACK);
+                for row in 0..rows {
+                    let line = first + usize::from(row);
+                    let start = search.matches.partition_point(|(r, _)| *r < line);
+                    let end = search.matches.partition_point(|(r, _)| *r <= line);
+                    for col in 0..cols {
+                        let Some(cell) = screen.cell(row, col) else {
+                            continue;
+                        };
+                        if cell.is_wide_continuation() {
+                            continue;
+                        }
+                        let pos = rect.min
+                            + Vec2::new(f32::from(col) * cell_size.x, f32::from(row) * cell_size.y);
+                        let size = Vec2::new(
+                            cell_size.x * if cell.is_wide() { 2.0 } else { 1.0 },
+                            cell_size.y,
+                        );
+                        let cell_rect = Rect::from_min_size(pos, size);
+                        if !ui.is_rect_visible(cell_rect) {
+                            continue;
+                        }
+                        let mut fg = color(cell.fgcolor(), Color32::LIGHT_GRAY);
+                        let mut bg = color(cell.bgcolor(), Color32::BLACK);
+                        if cell.inverse() {
+                            std::mem::swap(&mut fg, &mut bg);
+                        }
+                        if cell.dim() {
+                            fg = fg.gamma_multiply(0.5);
+                        }
+                        if let Some((index, _)) = search.matches[start..end]
+                            .iter()
+                            .enumerate()
+                            .find(|(_, (_, range))| range.contains(&col))
+                        {
+                            bg = if search.position == Some(start + index) {
+                                Color32::from_rgb(255, 150, 40)
+                            } else {
+                                Color32::from_rgb(230, 210, 80)
+                            };
+                            fg = Color32::BLACK;
+                        }
+                        painter.rect_filled(cell_rect, 0.0, bg);
+                        let mut format = egui::TextFormat {
+                            font_id: font.clone(),
+                            color: fg,
+                            italics: cell.italic(),
+                            ..Default::default()
+                        };
+                        if cell.underline() {
+                            format.underline = Stroke::new(1.0_f32, fg);
+                        }
+                        let job = egui::text::LayoutJob::single_section(
+                            cell.contents().to_owned(),
+                            format,
+                        );
+                        let galley = ui.fonts(|f| f.layout_job(job));
+                        painter.galley(pos, galley.clone(), fg);
+                        if cell.bold() {
+                            painter.galley(pos + Vec2::new(0.5, 0.0), galley, fg);
+                        }
+                    }
+                }
+                if screen.scrollback() == 0 && !screen.hide_cursor() {
+                    let (row, col) = screen.cursor_position();
+                    let pos = rect.min
+                        + Vec2::new(
+                            f32::from(col) * cell_size.x,
+                            (f32::from(row) + 1.0) * cell_size.y - 2.0,
+                        );
+                    painter.line_segment(
+                        [pos, pos + Vec2::new(cell_size.x, 0.0)],
+                        Stroke::new(2.0_f32, Color32::WHITE),
+                    );
                 }
             });
-        }
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, Color32::BLACK);
-        for row in 0..rows {
-            for col in 0..cols {
-                let Some(cell) = screen.cell(row, col) else {
-                    continue;
-                };
-                if cell.is_wide_continuation() {
-                    continue;
-                }
-                let pos = rect.min
-                    + Vec2::new(f32::from(col) * cell_size.x, f32::from(row) * cell_size.y);
-                let size = Vec2::new(
-                    cell_size.x * if cell.is_wide() { 2.0 } else { 1.0 },
-                    cell_size.y,
-                );
-                let cell_rect = Rect::from_min_size(pos, size);
-                if !ui.is_rect_visible(cell_rect) {
-                    continue;
-                }
-                let mut fg = color(cell.fgcolor(), Color32::LIGHT_GRAY);
-                let mut bg = color(cell.bgcolor(), Color32::BLACK);
-                if cell.inverse() {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-                if cell.dim() {
-                    fg = fg.gamma_multiply(0.5);
-                }
-                if let Some((index, _)) = search
-                    .matches
-                    .iter()
-                    .enumerate()
-                    .find(|(_, (r, range))| *r == row && range.contains(&col))
-                {
-                    bg = if search.position == Some(index) {
-                        Color32::from_rgb(255, 150, 40)
-                    } else {
-                        Color32::from_rgb(230, 210, 80)
-                    };
-                    fg = Color32::BLACK;
-                }
-                painter.rect_filled(cell_rect, 0.0, bg);
-                let mut format = egui::TextFormat {
-                    font_id: font.clone(),
-                    color: fg,
-                    italics: cell.italic(),
-                    ..Default::default()
-                };
-                if cell.underline() {
-                    format.underline = Stroke::new(1.0_f32, fg);
-                }
-                let job = egui::text::LayoutJob::single_section(cell.contents().to_owned(), format);
-                let galley = ui.fonts(|f| f.layout_job(job));
-                painter.galley(pos, galley.clone(), fg);
-                if cell.bold() {
-                    painter.galley(pos + Vec2::new(0.5, 0.0), galley, fg);
-                }
-            }
-        }
-        if !screen.hide_cursor() {
-            let (row, col) = screen.cursor_position();
-            let pos = rect.min
-                + Vec2::new(
-                    f32::from(col) * cell_size.x,
-                    (f32::from(row) + 1.0) * cell_size.y - 2.0,
-                );
-            painter.line_segment(
-                [pos, pos + Vec2::new(cell_size.x, 0.0)],
-                Stroke::new(2.0_f32, Color32::WHITE),
-            );
+        conn.follow = output.state.offset.y >= history as f32 * cell_size.y - 1.0;
+        let first = ((output.state.offset.y / cell_size.y).round() as usize).min(history);
+        conn.terminal.screen_mut().set_scrollback(history - first);
+        if conn.follow {
+            conn.new_since_scroll = 0;
         }
     }
 }
@@ -216,6 +278,113 @@ mod tests {
     use serialcore::store::PortId;
 
     #[test]
+    fn vt_scrollback_is_bounded_searchable_and_survives_new_output_and_gaps() {
+        let (mut app, _enum_tx) = test_app("vt-scrollback");
+        let id = PortId(0);
+        let conn = app.make_connection(
+            id,
+            "probe".into(),
+            Default::default(),
+            Default::default(),
+            inert_handle(id),
+        );
+        app.connections.push(conn);
+        let conn = &mut app.connections[0];
+        conn.terminal.screen_mut().set_size(5, 30);
+        for i in 0..VT_SCROLLBACK_ROWS + 50 {
+            conn.push_raw_bytes(format!("line {i}\r\n").as_bytes());
+        }
+        conn.terminal.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(conn.terminal.screen().scrollback(), VT_SCROLLBACK_ROWS);
+        conn.terminal.screen_mut().set_scrollback(100);
+        let before = conn.terminal.screen().contents();
+        conn.push_raw_bytes(b"more\r\n");
+        assert_eq!(conn.terminal.screen().scrollback(), 101);
+        assert_eq!(conn.terminal.screen().contents(), before);
+        conn.mark_raw_discontinuity();
+        assert_eq!(conn.terminal.screen().contents(), before);
+        conn.screen_search
+            .refresh(conn.terminal.screen(), r"line 100\b", true);
+        assert_eq!(conn.screen_search.matches.len(), 1);
+        conn.screen_search.step(1);
+        assert!(conn.screen_search.scroll_to.is_some());
+        conn.push_raw_bytes(b"\x1b[?1049hmenu");
+        conn.terminal.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(conn.terminal.screen().scrollback(), 0);
+        conn.push_raw_bytes(b"\x1b[?1049l");
+        conn.terminal.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(conn.terminal.screen().scrollback(), VT_SCROLLBACK_ROWS);
+        conn.reset_terminal();
+        conn.terminal.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(conn.terminal.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn wheel_scrolls_history_and_pin_returns_to_live_output() {
+        let (mut app, _enum_tx) = test_app("vt-wheel");
+        let id = PortId(0);
+        let conn = app.make_connection(
+            id,
+            "probe".into(),
+            Default::default(),
+            Default::default(),
+            inert_handle(id),
+        );
+        app.connections.push(conn);
+        let ctx = egui::Context::default();
+        let draw = |app: &mut App, events| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(500.0, 250.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.show_terminal_screen(ui, 0));
+                },
+            );
+        };
+        draw(&mut app, vec![]);
+        for i in 0..100 {
+            app.connections[0].push_raw_bytes(format!("line {i}\r\n").as_bytes());
+        }
+        draw(&mut app, vec![]);
+        draw(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(100.0, 100.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: Vec2::new(0.0, 100.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(!app.connections[0].follow);
+        assert!(app.connections[0].terminal.screen().scrollback() > 0);
+        app.connections[0].follow = true;
+        // Pin is in the footer, outside the scroll area's hover region.
+        draw(
+            &mut app,
+            vec![egui::Event::PointerMoved(egui::pos2(100.0, 300.0))],
+        );
+        assert_eq!(app.connections[0].terminal.screen().scrollback(), 0);
+        app.connections[0].screen_view = true;
+        app.connections[0].search_query = r"line 0\b".into();
+        app.search_step(1);
+        draw(&mut app, vec![]);
+        assert!(app.connections[0].terminal.screen().scrollback() > 0);
+        assert!(app.connections[0]
+            .terminal
+            .screen()
+            .contents()
+            .contains("line 0"));
+    }
+
+    #[test]
     fn screen_search_maps_unicode_cells_and_tracks_redraws() {
         let mut terminal = vt100::Parser::new(5, 30, 0);
         terminal.process("界e\u{301} Error error".as_bytes());
@@ -233,6 +402,7 @@ mod tests {
         search.refresh(terminal.screen(), "error", false);
         assert_eq!(search.position, Some(1));
         terminal.process(b"\r\x1b[2Kdone");
+        search.dirty = true;
         search.refresh(terminal.screen(), "error", false);
         assert!(search.matches.is_empty());
         assert_eq!(search.position, None);
@@ -253,6 +423,7 @@ mod tests {
         search.refresh(terminal.screen(), "Error", false);
         assert!(search.matches.is_empty());
         terminal.process(b"\x1b[?1049l");
+        search.dirty = true;
         search.refresh(terminal.screen(), "Error", false);
         assert_eq!(search.matches.len(), 2);
         search.refresh(terminal.screen(), "", false);

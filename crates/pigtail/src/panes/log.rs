@@ -669,7 +669,7 @@ impl App {
                 );
                 let n = conn.screen_search.position.map_or(0, |p| p + 1);
                 ui.weak(format!(
-                    "{n}/{} on screen",
+                    "{n}/{} in VT history",
                     conn.screen_search.matches.len()
                 ));
             } else if !conn.search_matches.is_empty() {

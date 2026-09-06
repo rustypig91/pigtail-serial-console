@@ -804,6 +804,7 @@ impl Connection {
     /// Append bytes to the hex view's ring, evicting from the front at capacity.
     pub fn push_raw_bytes(&mut self, bytes: &[u8]) {
         self.terminal.process(bytes);
+        self.screen_search.dirty = true;
         self.raw_evicted_any |= push_raw(
             &mut self.raw_ring,
             &mut self.raw_base,
@@ -814,13 +815,18 @@ impl Connection {
 
     /// Begin a new contiguous receive region at the current raw position.
     pub(crate) fn mark_raw_discontinuity(&mut self) {
+        // Discard an incomplete escape sequence without losing the displayed
+        // screen or its scrollback at a reconnect or live-view gap.
+        let screen = self.terminal.screen().clone();
         self.reset_terminal();
+        *self.terminal.screen_mut() = screen;
         self.raw_contiguous_start = self.raw_next();
     }
 
     pub(crate) fn reset_terminal(&mut self) {
         let (rows, cols) = self.terminal.screen().size();
-        self.terminal = vt100::Parser::new(rows, cols, 0);
+        self.terminal = vt100::Parser::new(rows, cols, crate::panes::VT_SCROLLBACK_ROWS);
+        self.screen_search.dirty = true;
     }
 
     pub(crate) fn set_state(&mut self, state: ConnState) {
@@ -2302,7 +2308,7 @@ impl App {
             hex_view: false,
             screen_view: false,
             screen_search: Default::default(),
-            terminal: vt100::Parser::new(24, 80, 0),
+            terminal: vt100::Parser::new(24, 80, crate::panes::VT_SCROLLBACK_ROWS),
             filter_rules: Vec::new(),
             filter_combine: Combine::And,
             filter_index: FilterIndex::new(),
@@ -5196,7 +5202,8 @@ pub(crate) mod tests {
         conn.mark_raw_discontinuity();
         conn.push_raw_bytes(b"fresh");
         assert_eq!(conn.terminal.screen().size(), (5, 20));
-        assert_eq!(conn.terminal.screen().contents(), "fresh");
+        assert!(conn.terminal.screen().contents().contains("fresh"));
+        assert!(conn.terminal.screen().contents().contains("bottom"));
         conn.reset_terminal();
         assert_eq!(conn.terminal.screen().contents(), "");
         assert!(

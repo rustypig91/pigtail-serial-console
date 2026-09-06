@@ -186,6 +186,7 @@ impl App {
         if !out.is_empty() {
             if local_echo && conn.screen_view {
                 conn.terminal.process(&out);
+                conn.screen_search.dirty = true;
             }
             conn.handle.transmit(out);
         }
