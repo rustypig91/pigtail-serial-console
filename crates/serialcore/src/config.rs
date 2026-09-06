@@ -529,12 +529,24 @@ impl<'de> Deserialize<'de> for TransmitMacro {
 /// the next launch (remembered session).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedConnection {
+    #[serde(default)]
+    pub view: ConsoleView,
     pub identity: PortIdentity,
     /// Optional user-assigned name shown in the tab and merged view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(flatten)]
     pub config: PortConfig,
+}
+
+/// The selected display for a remembered connection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleView {
+    #[default]
+    Log,
+    Hex,
+    Ansi,
 }
 
 /// A merged view uses device identities because runtime port IDs change at startup.
@@ -863,6 +875,7 @@ bold = true
                 repeat_indefinitely: false,
             }],
             last_open: vec![SavedConnection {
+                view: ConsoleView::Ansi,
                 identity: PortIdentity {
                     vid: Some(3),
                     pid: Some(4),
@@ -940,5 +953,6 @@ bold = true
 
         assert_eq!(cfg.last_open.len(), 1);
         assert_eq!(cfg.last_open[0].name, None);
+        assert_eq!(cfg.last_open[0].view, ConsoleView::Log);
     }
 }

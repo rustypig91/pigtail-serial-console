@@ -1396,6 +1396,9 @@ impl App {
                 conn.handle.send_break();
             }
         }
+        if menu.toggle_hex {
+            self.save_session();
+        }
     }
 
     /// Export the active connection's current (filtered) view to a file.

@@ -710,6 +710,9 @@ impl App {
         if let Some(id) = open_error_win {
             self.show_error_win = Some(id);
         }
+        if select_view.is_some() {
+            self.save_session();
+        }
     }
 
     /// The modal new-connection dialog (opening a tab first configures the port).

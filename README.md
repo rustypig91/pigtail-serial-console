@@ -27,7 +27,8 @@ Most serial terminals just show you text. Pigtail is built around the parts of f
 - Optional **ANSI/VT** screen for interactive shells and firmware menus: cursor
   positioning, erase and redraw operations, scrolling regions, styled/colored
   text, and alternate screen buffers. Select **Log**, **Hex**, or **ANSI/VT** in
-  the footer; Log remains the default. Raw capture and chronological
+  the footer; Log is the default for new connections, and each connection remembers
+  its selected view across restarts. Raw capture and chronological
   history continue in every mode. Screen mode supports application cursor keys
   and bracketed paste, and sends Up/Down to the device even when local history is enabled.
   The screen fills the available console area and automatically adjusts its rows

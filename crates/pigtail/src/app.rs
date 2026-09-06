@@ -558,6 +558,22 @@ fn normalized_tab_name(name: &str) -> Option<String> {
 }
 
 impl Connection {
+    fn selected_view(&self) -> serialcore::config::ConsoleView {
+        use serialcore::config::ConsoleView;
+        if self.screen_view {
+            ConsoleView::Ansi
+        } else if self.hex_view {
+            ConsoleView::Hex
+        } else {
+            ConsoleView::Log
+        }
+    }
+
+    fn restore_view(&mut self, view: serialcore::config::ConsoleView) {
+        self.screen_view = view == serialcore::config::ConsoleView::Ansi;
+        self.hex_view = view == serialcore::config::ConsoleView::Hex;
+    }
+
     /// Label presented to the user, preferring their custom name over the
     /// automatically detected device/path description.
     pub fn display_label(&self) -> &str {
@@ -1679,6 +1695,7 @@ impl App {
             // later one succeeds and triggers the save.
             if app.open_connection_inner(saved.identity.clone(), None, saved.config, saved.name) {
                 let conn = app.connections.last_mut().unwrap();
+                conn.restore_view(saved.view);
                 preload_last_session(
                     conn,
                     &prior_captures,
@@ -2100,7 +2117,7 @@ impl App {
 
     /// Persist the set of currently-open connections so they reopen next
     /// launch.
-    fn save_session(&mut self) {
+    pub(crate) fn save_session(&mut self) {
         self.config.last_open = self
             .connections
             .iter()
@@ -2109,6 +2126,7 @@ impl App {
             // next launch.
             .filter(|c| c.state != ConnState::Closed)
             .map(|c| SavedConnection {
+                view: c.selected_view(),
                 identity: c.identity.clone(),
                 name: c.name.clone(),
                 config: c.port_config.clone(),
@@ -5174,6 +5192,22 @@ pub(crate) mod tests {
             !conn.raw_ring.is_empty(),
             "reset must preserve capture history"
         );
+    }
+
+    #[test]
+    fn connection_view_survives_session_serialization() {
+        use serialcore::config::ConsoleView;
+        let (mut app, _enum_tx) = test_app("remember-view");
+        let _tx = conn_with_injected_events(&mut app, PortId(0));
+        for view in [ConsoleView::Ansi, ConsoleView::Hex, ConsoleView::Log] {
+            app.connections[0].restore_view(view);
+            app.save_session();
+            let saved = Config::from_toml(&app.config.to_toml().unwrap()).unwrap();
+            assert_eq!(saved.last_open[0].view, view);
+            app.connections[0].restore_view(ConsoleView::Log);
+            app.connections[0].restore_view(saved.last_open[0].view);
+            assert_eq!(app.connections[0].selected_view(), view);
+        }
     }
 
     #[test]
