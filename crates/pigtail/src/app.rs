@@ -300,11 +300,7 @@ fn preload_last_session(
             framer.push(bytes, ts, &mut framed);
         }
         framer.flush_final(&mut framed);
-        // A capture that framed to nothing gets no marker: a boundary with no
-        // output above it is just noise.
-        let Some(last_ts) = framed.last().map(|line| line.ts) else {
-            continue;
-        };
+        let last_ts = framed.last().map(|line| line.ts);
         // The console's marker text, shared with the hex view's boundary so the
         // two views name the same capture the same way.
         let label = format!(
@@ -321,10 +317,16 @@ fn preload_last_session(
         for (_, bytes) in records {
             conn.push_raw_bytes(bytes);
         }
+        conn.finish_terminal_capture(&label);
         conn.raw_sessions.push(RawSession {
             start: raw_start,
             label: Some(label.clone()),
         });
+        // Control-only captures still belong in raw/VT replay even if the
+        // line-oriented framer produced no log text.
+        let Some(last_ts) = last_ts else {
+            continue;
+        };
         for line in framed {
             let styled = serialcore::ansi::parse_line(&line.text, line.cursor);
             conn.store.append(IncomingLine {
@@ -826,6 +828,26 @@ impl Connection {
     pub(crate) fn reset_terminal(&mut self) {
         let (rows, cols) = self.terminal.screen().size();
         self.terminal = vt100::Parser::new(rows, cols, crate::panes::VT_SCROLLBACK_ROWS);
+        self.screen_search.dirty = true;
+    }
+
+    /// Close a replayed capture into VT scrollback before the next independent
+    /// byte stream can clear/redraw the live screen. The boundary is display
+    /// metadata, never written into the raw capture or hex ring.
+    fn finish_terminal_capture(&mut self, label: &str) {
+        self.mark_raw_discontinuity();
+        let (rows, _) = self.terminal.screen().size();
+        self.terminal.screen_mut().set_scrollback(0);
+        self.terminal.process(
+            b"\x1b[?1049l\x1b[?6l\x1b[r\x1b[0m\x1b[4l\x1b[?7h\x1b[?1l\x1b[?2004l\x1b[?25h",
+        );
+        self.terminal
+            .process(format!("\x1b[{rows};1H\r\n{label}").as_bytes());
+        // Scroll the final visible page and its marker into retained history.
+        for _ in 0..rows {
+            self.terminal.process(b"\r\n");
+        }
+        self.terminal.process(b"\x1b[H");
         self.screen_search.dirty = true;
     }
 
@@ -3570,6 +3592,85 @@ pub(crate) mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn vt_replays_shared_capture_files_across_launches_and_respects_clear() {
+        let (mut app, _enum_tx) = test_app("vt-disk-history");
+        let dev = identity("VT-history");
+        let dir = app.paths.sessions.clone();
+        let run = chrono::Utc::now();
+        let first = b"\x1b[31mold session\x1b[";
+        let second = b"\x1b[2J\x1b[Hnew session";
+        capture(&dir, &dev, run, &[(1000, first)]);
+        let (_, meta) = capture(&dir, &dev, run, &[(2000, second)]);
+        capture(&dir, &identity("other"), run, &[(3000, b"unrelated")]);
+        let id = PortId(0);
+        let conn = app.make_connection(
+            id,
+            "probe".into(),
+            dev.clone(),
+            Default::default(),
+            inert_handle(id),
+        );
+        app.connections.push(conn);
+        let captures = snapshot_captures(&dir);
+        preload_last_session(
+            &mut app.connections[0],
+            &captures,
+            &dev,
+            &app.clock,
+            1 << 20,
+        );
+        let conn = &mut app.connections[0];
+        conn.screen_search
+            .refresh(conn.terminal.screen(), "old session|new session", true);
+        assert_eq!(conn.screen_search.matches.len(), 2);
+        assert_eq!(
+            conn.raw_ring.iter().copied().collect::<Vec<_>>(),
+            [first.as_slice(), second.as_slice()].concat()
+        );
+        conn.push_raw_bytes(b"\x1b[2J\x1b[Hlive");
+        conn.screen_search
+            .refresh(conn.terminal.screen(), "old session|new session|live", true);
+        assert_eq!(
+            conn.screen_search.matches.len(),
+            3,
+            "live redraw must preserve replayed history"
+        );
+        conn.screen_search
+            .refresh(conn.terminal.screen(), "previous session", true);
+        assert_eq!(conn.screen_search.matches.len(), 2);
+
+        // Persist a clear, then simulate another launch from the same files.
+        let mut writer = SessionWriter::create(&dir, &meta).unwrap();
+        writer.truncate().unwrap();
+        writer.write_record(4000, b"after clear").unwrap();
+        writer.flush().unwrap();
+        let mut reopened = app.make_connection(
+            PortId(1),
+            "probe".into(),
+            dev.clone(),
+            Default::default(),
+            inert_handle(PortId(1)),
+        );
+        preload_last_session(
+            &mut reopened,
+            &snapshot_captures(&dir),
+            &dev,
+            &app.clock,
+            1 << 20,
+        );
+        reopened.screen_search.refresh(
+            reopened.terminal.screen(),
+            "old session|new session|after clear|unrelated",
+            true,
+        );
+        assert_eq!(reopened.screen_search.matches.len(), 1);
+        assert_eq!(
+            reopened.raw_ring.iter().copied().collect::<Vec<_>>(),
+            b"after clear"
+        );
     }
 
     #[test]
