@@ -661,7 +661,18 @@ impl App {
             if ui.small_button("Next").clicked() {
                 next = true;
             }
-            if !conn.search_matches.is_empty() {
+            if conn.screen_view {
+                conn.screen_search.refresh(
+                    conn.terminal.screen(),
+                    &conn.search_query,
+                    conn.search_case_sensitive,
+                );
+                let n = conn.screen_search.position.map_or(0, |p| p + 1);
+                ui.weak(format!(
+                    "{n}/{} on screen",
+                    conn.screen_search.matches.len()
+                ));
+            } else if !conn.search_matches.is_empty() {
                 let n = conn.search_pos.map(|p| p + 1).unwrap_or(0);
                 ui.weak(format!("{n}/{}", conn.search_matches.len()));
             }

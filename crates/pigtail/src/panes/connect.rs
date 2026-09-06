@@ -595,7 +595,7 @@ impl App {
                     ui.separator();
                     ui.label(format!("{} shown", conn.filter_index.len()));
                 }
-                if !conn.search_matches.is_empty() {
+                if !conn.screen_view && !conn.search_matches.is_empty() {
                     ui.separator();
                     let n = conn.search_pos.map(|p| p + 1).unwrap_or(0);
                     ui.label(format!("match {n}/{}", conn.search_matches.len()));

@@ -500,6 +500,7 @@ pub struct Connection {
     /// Show the raw-byte hex view instead of decoded lines (spec §7.11).
     pub hex_view: bool,
     pub screen_view: bool,
+    pub screen_search: crate::panes::ScreenSearch,
     pub terminal: vt100::Parser,
     // Filtering (spec §7.8).
     pub filter_rules: Vec<FilterRule>,
@@ -2300,6 +2301,7 @@ impl App {
             mark_micros: None,
             hex_view: false,
             screen_view: false,
+            screen_search: Default::default(),
             terminal: vt100::Parser::new(24, 80, 0),
             filter_rules: Vec::new(),
             filter_combine: Combine::And,
@@ -3324,6 +3326,15 @@ impl App {
         let Some(conn) = self.connections.get_mut(self.active) else {
             return;
         };
+        if conn.screen_view {
+            conn.screen_search.refresh(
+                conn.terminal.screen(),
+                &conn.search_query,
+                conn.search_case_sensitive,
+            );
+            conn.screen_search.step(dir);
+            return;
+        }
         if conn.search_matches.is_empty() {
             return;
         }

@@ -8,6 +8,7 @@ pub use log::wrap_len;
 mod macros;
 mod plot;
 mod screen;
+pub(crate) use screen::ScreenSearch;
 mod settings;
 mod transfer;
 mod transmit;
