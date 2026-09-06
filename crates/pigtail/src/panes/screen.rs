@@ -2,8 +2,6 @@
 use crate::app::App;
 use egui::{Color32, FontId, Rect, Sense, Stroke, Vec2};
 
-pub(crate) const VT_SCROLLBACK_ROWS: usize = 2000;
-
 #[derive(Default)]
 pub(crate) struct ScreenSearch {
     pub matches: Vec<(usize, std::ops::Range<u16>)>,
@@ -275,7 +273,43 @@ fn color(color: vt100::Color, default: Color32) -> Color32 {
 mod tests {
     use super::*;
     use crate::app::tests::{inert_handle, test_app};
+    use serialcore::config::DEFAULT_VT_SCROLLBACK_ROWS as VT_SCROLLBACK_ROWS;
     use serialcore::store::PortId;
+
+    #[test]
+    fn scrollback_setting_applies_to_new_connections_and_live_changes() {
+        let (mut app, _enum_tx) = test_app("vt-setting");
+        app.config.settings.vt_scrollback_rows = 20;
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            Default::default(),
+            Default::default(),
+            inert_handle(id),
+        );
+        conn.terminal.screen_mut().set_size(5, 30);
+        for i in 0..100 {
+            conn.push_raw_bytes(format!("line {i}\r\n").as_bytes());
+        }
+        conn.terminal.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(conn.terminal.screen().scrollback(), 20);
+        conn.terminal.screen_mut().set_scrollback(0);
+        let live = conn.terminal.screen().contents();
+        let raw_len = conn.raw_ring.len();
+        for rows in [5, 50, 0] {
+            conn.set_vt_scrollback_rows(rows);
+            assert_eq!(conn.terminal.screen().contents(), live);
+            conn.terminal.screen_mut().set_scrollback(usize::MAX);
+            assert_eq!(conn.terminal.screen().scrollback(), rows);
+            conn.terminal.screen_mut().set_scrollback(0);
+            assert_eq!(conn.raw_ring.len(), raw_len);
+        }
+        conn.reset_terminal();
+        conn.push_raw_bytes(b"1\r\n2\r\n3\r\n4\r\n5\r\n6");
+        conn.terminal.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(conn.terminal.screen().scrollback(), 0);
+    }
 
     #[test]
     fn vt_scrollback_is_bounded_searchable_and_survives_new_output_and_gaps() {

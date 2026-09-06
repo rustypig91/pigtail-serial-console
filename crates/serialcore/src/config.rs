@@ -354,10 +354,19 @@ pub struct ExtractRule {
 /// leaves no room for a line of output.
 pub const MIN_CONSOLE_FONT_SIZE: u8 = 6;
 pub const MAX_CONSOLE_FONT_SIZE: u8 = 40;
+pub const DEFAULT_VT_SCROLLBACK_ROWS: usize = 2000;
+pub const MAX_VT_SCROLLBACK_ROWS: usize = 100_000;
+
+fn default_vt_scrollback_rows() -> usize {
+    DEFAULT_VT_SCROLLBACK_ROWS
+}
 
 /// Global settings.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
+    /// Retained rendered VT scrollback rows per connection.
+    #[serde(default = "default_vt_scrollback_rows")]
+    pub vt_scrollback_rows: usize,
     /// Ask before disconnecting and closing a connection tab.
     #[serde(default = "default_true")]
     pub confirm_tab_close: bool,
@@ -389,6 +398,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            vt_scrollback_rows: default_vt_scrollback_rows(),
             confirm_tab_close: true,
             max_lines: default_max_lines(),
             console_font_size: default_console_font_size(),
@@ -799,6 +809,20 @@ enabled = true
         )
         .unwrap();
         assert_eq!(back.console_font_size, 20);
+    }
+
+    #[test]
+    fn vt_scrollback_defaults_and_round_trips() {
+        let old: Settings = toml::from_str("max_lines = 1000").unwrap();
+        assert_eq!(old.vt_scrollback_rows, DEFAULT_VT_SCROLLBACK_ROWS);
+        for rows in [0, 500, 10_000, MAX_VT_SCROLLBACK_ROWS] {
+            let settings = Settings {
+                vt_scrollback_rows: rows,
+                ..Default::default()
+            };
+            let restored: Settings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(restored.vt_scrollback_rows, rows);
+        }
     }
 
     #[test]

@@ -28,11 +28,14 @@ Most serial terminals just show you text. Pigtail is built around the parts of f
   positioning, erase and redraw operations, scrolling regions, styled/colored
   text, and alternate screen buffers. Select **Log**, **Hex**, or **ANSI/VT** in
   the footer; Log is the default for new connections, and each connection remembers
-  its selected view across restarts. ANSI/VT retains up to 2,000 rows of scrollback
-  per connection, restored across app restarts by replaying the same saved raw
+  its selected view across restarts. **Settings → VT scrollback rows** controls retained
+  VT history per connection (default 2,000, range 0–100,000; 0 disables scrollback).
+  The setting persists across restarts and applies to open connections when editing
+  finishes, rebuilding from retained receive data. ANSI/VT history is restored
+  across app restarts by replaying the same saved raw
   session captures used by Log and Hex. Prior captures are separated by session
   markers; the existing history restore budget and clear-history boundaries apply.
-  The VT grid retains the latest 2,000 scrolled rows, while the full raw capture
+  The VT grid retains the configured number of scrolled rows, while the full raw capture
   remains on disk. Use the mouse wheel or scrollbar to review it;
   **Pin** or typing returns to live output. New output preserves your scroll position.
   **Ctrl+Shift+F** in ANSI/VT searches the screen and retained scrollback

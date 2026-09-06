@@ -9,7 +9,6 @@ mod macros;
 mod plot;
 mod screen;
 pub(crate) use screen::ScreenSearch;
-pub(crate) use screen::VT_SCROLLBACK_ROWS;
 mod settings;
 mod transfer;
 mod transmit;

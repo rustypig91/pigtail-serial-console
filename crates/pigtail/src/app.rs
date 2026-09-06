@@ -385,6 +385,7 @@ fn push_raw(ring: &mut VecDeque<u8>, base: &mut u64, bytes: &[u8], cap: usize) -
 /// captures, one after the other, exactly as the console holds their lines. The
 /// hex view counts each run's offsets from its own first byte, so a dump always
 /// starts at `00000000` however much history sits above it.
+#[derive(Clone)]
 pub struct RawSession {
     /// Absolute index — counting every byte ever pushed to this connection — of
     /// this run's first byte. Offsets shown in the hex view are measured from
@@ -504,6 +505,7 @@ pub struct Connection {
     pub screen_view: bool,
     pub screen_search: crate::panes::ScreenSearch,
     pub terminal: vt100::Parser,
+    pub vt_scrollback_rows: usize,
     // Filtering (spec §7.8).
     pub filter_rules: Vec<FilterRule>,
     pub filter_combine: Combine,
@@ -827,7 +829,43 @@ impl Connection {
 
     pub(crate) fn reset_terminal(&mut self) {
         let (rows, cols) = self.terminal.screen().size();
-        self.terminal = vt100::Parser::new(rows, cols, crate::panes::VT_SCROLLBACK_ROWS);
+        self.terminal = vt100::Parser::new(rows, cols, self.vt_scrollback_rows);
+        self.screen_search.dirty = true;
+    }
+
+    /// vt100 fixes capacity at construction. Rebuild from the retained raw
+    /// receive stream when the setting changes, keeping capture boundaries.
+    pub(crate) fn set_vt_scrollback_rows(&mut self, rows: usize) {
+        let rows = rows.min(serialcore::config::MAX_VT_SCROLLBACK_ROWS);
+        if rows == self.vt_scrollback_rows {
+            return;
+        }
+        let offset = self.terminal.screen().scrollback();
+        let contiguous_start = self.raw_contiguous_start;
+        self.vt_scrollback_rows = rows;
+        self.reset_terminal();
+        let bytes: Vec<u8> = self.raw_ring.iter().copied().collect();
+        // Replay the runs in order, including restored-session/gap markers.
+        let mut start = 0;
+        for (i, session) in self.raw_sessions.clone().iter().enumerate() {
+            let end = self.raw_sessions.get(i + 1).map_or(bytes.len(), |next| {
+                (next.start.saturating_sub(self.raw_base) as usize).min(bytes.len())
+            });
+            if end <= start {
+                continue;
+            }
+            self.terminal.process(&bytes[start..end]);
+            if let Some(label) = &session.label {
+                self.finish_terminal_capture(label);
+            }
+            start = end;
+        }
+        if start < bytes.len() {
+            self.terminal.process(&bytes[start..]);
+        }
+        self.raw_contiguous_start = contiguous_start;
+        self.terminal.screen_mut().set_scrollback(offset);
+        self.screen_search = Default::default();
         self.screen_search.dirty = true;
     }
 
@@ -2330,7 +2368,19 @@ impl App {
             hex_view: false,
             screen_view: false,
             screen_search: Default::default(),
-            terminal: vt100::Parser::new(24, 80, crate::panes::VT_SCROLLBACK_ROWS),
+            terminal: vt100::Parser::new(
+                24,
+                80,
+                self.config
+                    .settings
+                    .vt_scrollback_rows
+                    .min(serialcore::config::MAX_VT_SCROLLBACK_ROWS),
+            ),
+            vt_scrollback_rows: self
+                .config
+                .settings
+                .vt_scrollback_rows
+                .min(serialcore::config::MAX_VT_SCROLLBACK_ROWS),
             filter_rules: Vec::new(),
             filter_combine: Combine::And,
             filter_index: FilterIndex::new(),
