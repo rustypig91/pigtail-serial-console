@@ -26,14 +26,13 @@ Most serial terminals just show you text. Pigtail is built around the parts of f
 - Hex view alongside the text view
 - Optional **ANSI/VT** screen for interactive shells and firmware menus: cursor
   positioning, erase and redraw operations, scrolling regions, styled/colored
-  text, and alternate screen buffers. Select **Log**, **Hex**, or **ANSI/VT** above
-  a connection's console; Log remains the default. Raw capture and chronological
+  text, and alternate screen buffers. Select **Log**, **Hex**, or **ANSI/VT** in
+  the footer; Log remains the default. Raw capture and chronological
   history continue in every mode. Screen mode supports application cursor keys
   and bracketed paste, and sends Up/Down to the device even when local history is enabled.
-  Configure columns (20–300) and rows (5–150) in screen mode (default 80×24).
-  Dimensions apply to the current tab; plain serial has no resize notification
-  protocol, so configure the device shell to match if needed. **Reset screen**
-  resets only the emulator, preserving capture and log/hex history. Connection
+  The screen fills the available console area and automatically adjusts its rows
+  and columns when the window or font size changes. Plain serial has no resize
+  notification protocol, so configure the device shell to match if needed. Connection
   interruptions and dropped live output reset the emulator to avoid carrying
   partial escape sequences across gaps. Merged views remain chronological logs.
 - Transmit with configurable line endings, send history, and hex input

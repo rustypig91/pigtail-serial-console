@@ -480,7 +480,7 @@ impl App {
     pub(crate) fn show_footer(&mut self, ctx: &egui::Context) {
         let mut toggle_pin = false;
         let mut toggle_plot = false;
-        let mut toggle_hex = false;
+        let mut select_view = None;
         let mut toggle_highlights = false;
         let has_highlights = self.config.highlight.iter().any(|rule| rule.enabled);
         let mut merged_tx_port = self.merged_tx_port;
@@ -611,7 +611,7 @@ impl App {
                         toggle_pin = true;
                     }
                     // Added after the pin in a right-to-left layout, so they
-                    // land to its left: Hex | Plot | Pinned.
+                    // land to its left: Log | Hex | ANSI/VT | Plot | Pinned.
                     if ui
                         .selectable_label(conn.show_plot, "Plot")
                         .on_hover_text("Show the plot pane below the console")
@@ -620,11 +620,25 @@ impl App {
                         toggle_plot = true;
                     }
                     if ui
-                        .selectable_label(conn.hex_view, "Hex")
+                        .selectable_label(conn.screen_view, "ANSI/VT")
+                        .on_hover_text("Terminal screen sized to the window")
+                        .clicked()
+                    {
+                        select_view = Some((true, false));
+                    }
+                    if ui
+                        .selectable_label(!conn.screen_view && conn.hex_view, "Hex")
                         .on_hover_text("Show raw bytes instead of decoded lines")
                         .clicked()
                     {
-                        toggle_hex = true;
+                        select_view = Some((false, true));
+                    }
+                    if ui
+                        .selectable_label(!conn.screen_view && !conn.hex_view, "Log")
+                        .on_hover_text("Show the chronological log")
+                        .clicked()
+                    {
+                        select_view = Some((false, false));
                     }
                     if has_highlights
                         && ui
@@ -675,7 +689,7 @@ impl App {
                 self.merged_new_since_scroll = 0;
             }
         }
-        if (!self.merged_selected && toggle_pin) || toggle_plot || toggle_hex {
+        if (!self.merged_selected && toggle_pin) || toggle_plot || select_view.is_some() {
             if let Some(active) = self.active_index() {
                 let conn = &mut self.connections[active];
                 if toggle_pin {
@@ -687,8 +701,9 @@ impl App {
                 if toggle_plot {
                     conn.show_plot = !conn.show_plot;
                 }
-                if toggle_hex {
-                    conn.hex_view = !conn.hex_view;
+                if let Some((screen, hex)) = select_view {
+                    conn.screen_view = screen;
+                    conn.hex_view = hex;
                 }
             }
         }

@@ -548,10 +548,6 @@ impl App {
             let active = self.active.min(self.connections.len().saturating_sub(1));
             self.active = active;
 
-            if !self.merged_selected {
-                self.show_terminal_controls(ui, active);
-            }
-
             // Optional search bar pinned to the top of the console.
             if self.show_search {
                 egui::TopBottomPanel::top("search_bar")
