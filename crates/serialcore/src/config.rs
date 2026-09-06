@@ -354,10 +354,19 @@ pub struct ExtractRule {
 /// leaves no room for a line of output.
 pub const MIN_CONSOLE_FONT_SIZE: u8 = 6;
 pub const MAX_CONSOLE_FONT_SIZE: u8 = 40;
+pub const DEFAULT_VT_SCROLLBACK_ROWS: usize = 2000;
+pub const MAX_VT_SCROLLBACK_ROWS: usize = 100_000;
+
+fn default_vt_scrollback_rows() -> usize {
+    DEFAULT_VT_SCROLLBACK_ROWS
+}
 
 /// Global settings.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
+    /// Retained rendered VT scrollback rows per connection.
+    #[serde(default = "default_vt_scrollback_rows")]
+    pub vt_scrollback_rows: usize,
     /// Ask before disconnecting and closing a connection tab.
     #[serde(default = "default_true")]
     pub confirm_tab_close: bool,
@@ -389,6 +398,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            vt_scrollback_rows: default_vt_scrollback_rows(),
             confirm_tab_close: true,
             max_lines: default_max_lines(),
             console_font_size: default_console_font_size(),
@@ -529,12 +539,24 @@ impl<'de> Deserialize<'de> for TransmitMacro {
 /// the next launch (remembered session).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedConnection {
+    #[serde(default)]
+    pub view: ConsoleView,
     pub identity: PortIdentity,
     /// Optional user-assigned name shown in the tab and merged view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(flatten)]
     pub config: PortConfig,
+}
+
+/// The selected display for a remembered connection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleView {
+    #[default]
+    Log,
+    Hex,
+    Ansi,
 }
 
 /// A merged view uses device identities because runtime port IDs change at startup.
@@ -790,6 +812,20 @@ enabled = true
     }
 
     #[test]
+    fn vt_scrollback_defaults_and_round_trips() {
+        let old: Settings = toml::from_str("max_lines = 1000").unwrap();
+        assert_eq!(old.vt_scrollback_rows, DEFAULT_VT_SCROLLBACK_ROWS);
+        for rows in [0, 500, 10_000, MAX_VT_SCROLLBACK_ROWS] {
+            let settings = Settings {
+                vt_scrollback_rows: rows,
+                ..Default::default()
+            };
+            let restored: Settings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(restored.vt_scrollback_rows, rows);
+        }
+    }
+
+    #[test]
     fn skipped_version_and_opt_out_round_trip() {
         let mut cfg = Config::default();
         cfg.settings.check_updates = false;
@@ -863,6 +899,7 @@ bold = true
                 repeat_indefinitely: false,
             }],
             last_open: vec![SavedConnection {
+                view: ConsoleView::Ansi,
                 identity: PortIdentity {
                     vid: Some(3),
                     pid: Some(4),
@@ -940,5 +977,6 @@ bold = true
 
         assert_eq!(cfg.last_open.len(), 1);
         assert_eq!(cfg.last_open[0].name, None);
+        assert_eq!(cfg.last_open[0].view, ConsoleView::Log);
     }
 }

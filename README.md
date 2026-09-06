@@ -24,6 +24,32 @@ Most serial terminals just show you text. Pigtail is built around the parts of f
   connection tabs to reorder them. Closing either kind of tab asks for confirmation
   unless you have disabled that preference.
 - Hex view alongside the text view
+- Optional **ANSI/VT** screen for interactive shells and firmware menus: cursor
+  positioning, erase and redraw operations, scrolling regions, styled/colored
+  text, and alternate screen buffers. Select **Log**, **Hex**, or **ANSI/VT** in
+  the footer; Log is the default for new connections, and each connection remembers
+  its selected view across restarts. **Settings → VT scrollback rows** controls retained
+  VT history per connection (default 2,000, range 0–100,000; 0 disables scrollback).
+  The setting persists across restarts and applies to open connections when editing
+  finishes, rebuilding from retained receive data. ANSI/VT history is restored
+  across app restarts by replaying the same saved raw
+  session captures used by Log and Hex. Prior captures are separated by session
+  markers; the existing history restore budget and clear-history boundaries apply.
+  The VT grid retains the configured number of scrolled rows, while the full raw capture
+  remains on disk. Use the mouse wheel or scrollbar to review it;
+  **Pin** or typing returns to live output. New output preserves your scroll position.
+  **Ctrl+Shift+F** in ANSI/VT searches the screen and retained scrollback
+  with regex and optional case sensitivity; **Next**/**Prev** (Enter/Shift+Enter)
+  scroll to highlighted matches. Switch to Log to search older output. Raw capture and chronological
+  history continue in every mode. Screen mode supports application cursor keys
+  and bracketed paste, and sends Up/Down to the device even when local history is enabled.
+  The screen fills the available console area and automatically adjusts its rows
+  and columns when the window or font size changes. Plain serial has no resize
+  notification protocol, so configure the device shell to match if needed. Connection
+  interruptions and dropped live output discard partial escape sequences while
+  preserving VT history. Clear console clears VT history too. Alternate-screen
+  applications retain the main screen's history but do not add their redraws to it.
+  Merged views remain chronological logs.
 - Transmit with configurable line endings, send history, and hex input
 - Drop files onto a console, or use **Send file…**, to send raw bytes, paced text lines, or hex-decoded data
 - Named transmit macros with reorderable command, delay, and regex wait steps,

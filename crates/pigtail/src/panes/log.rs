@@ -565,6 +565,8 @@ impl App {
             // an inline REPL row at the end of the single-connection view.
             if self.merged_selected {
                 self.show_merged_rows(ui, &mut menu);
+            } else if self.connections[active].screen_view {
+                self.show_terminal_screen(ui, active);
             } else if self.connections[active].hex_view {
                 self.show_hex_rows(ui, active, &mut menu);
             } else {
@@ -659,7 +661,18 @@ impl App {
             if ui.small_button("Next").clicked() {
                 next = true;
             }
-            if !conn.search_matches.is_empty() {
+            if conn.screen_view {
+                conn.screen_search.refresh(
+                    conn.terminal.screen(),
+                    &conn.search_query,
+                    conn.search_case_sensitive,
+                );
+                let n = conn.screen_search.position.map_or(0, |p| p + 1);
+                ui.weak(format!(
+                    "{n}/{} in VT history",
+                    conn.screen_search.matches.len()
+                ));
+            } else if !conn.search_matches.is_empty() {
                 let n = conn.search_pos.map(|p| p + 1).unwrap_or(0);
                 ui.weak(format!("{n}/{}", conn.search_matches.len()));
             }
@@ -1358,6 +1371,7 @@ impl App {
         }
         if let Some(conn) = target.and_then(|i| self.connections.get_mut(i)) {
             if menu.toggle_hex {
+                conn.screen_view = false;
                 conn.hex_view = !conn.hex_view;
             }
             if menu.toggle_plot {
@@ -1392,6 +1406,9 @@ impl App {
             if menu.send_break && live {
                 conn.handle.send_break();
             }
+        }
+        if menu.toggle_hex {
+            self.save_session();
         }
     }
 

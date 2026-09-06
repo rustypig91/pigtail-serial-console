@@ -300,11 +300,7 @@ fn preload_last_session(
             framer.push(bytes, ts, &mut framed);
         }
         framer.flush_final(&mut framed);
-        // A capture that framed to nothing gets no marker: a boundary with no
-        // output above it is just noise.
-        let Some(last_ts) = framed.last().map(|line| line.ts) else {
-            continue;
-        };
+        let last_ts = framed.last().map(|line| line.ts);
         // The console's marker text, shared with the hex view's boundary so the
         // two views name the same capture the same way.
         let label = format!(
@@ -321,10 +317,16 @@ fn preload_last_session(
         for (_, bytes) in records {
             conn.push_raw_bytes(bytes);
         }
+        conn.finish_terminal_capture(&label);
         conn.raw_sessions.push(RawSession {
             start: raw_start,
             label: Some(label.clone()),
         });
+        // Control-only captures still belong in raw/VT replay even if the
+        // line-oriented framer produced no log text.
+        let Some(last_ts) = last_ts else {
+            continue;
+        };
         for line in framed {
             let styled = serialcore::ansi::parse_line(&line.text, line.cursor);
             conn.store.append(IncomingLine {
@@ -383,6 +385,7 @@ fn push_raw(ring: &mut VecDeque<u8>, base: &mut u64, bytes: &[u8], cap: usize) -
 /// captures, one after the other, exactly as the console holds their lines. The
 /// hex view counts each run's offsets from its own first byte, so a dump always
 /// starts at `00000000` however much history sits above it.
+#[derive(Clone)]
 pub struct RawSession {
     /// Absolute index — counting every byte ever pushed to this connection — of
     /// this run's first byte. Offsets shown in the hex view are measured from
@@ -499,6 +502,10 @@ pub struct Connection {
     pub mark_micros: Option<i64>,
     /// Show the raw-byte hex view instead of decoded lines (spec §7.11).
     pub hex_view: bool,
+    pub screen_view: bool,
+    pub screen_search: crate::panes::ScreenSearch,
+    pub terminal: vt100::Parser,
+    pub vt_scrollback_rows: usize,
     // Filtering (spec §7.8).
     pub filter_rules: Vec<FilterRule>,
     pub filter_combine: Combine,
@@ -556,6 +563,22 @@ fn normalized_tab_name(name: &str) -> Option<String> {
 }
 
 impl Connection {
+    fn selected_view(&self) -> serialcore::config::ConsoleView {
+        use serialcore::config::ConsoleView;
+        if self.screen_view {
+            ConsoleView::Ansi
+        } else if self.hex_view {
+            ConsoleView::Hex
+        } else {
+            ConsoleView::Log
+        }
+    }
+
+    fn restore_view(&mut self, view: serialcore::config::ConsoleView) {
+        self.screen_view = view == serialcore::config::ConsoleView::Ansi;
+        self.hex_view = view == serialcore::config::ConsoleView::Hex;
+    }
+
     /// Label presented to the user, preferring their custom name over the
     /// automatically detected device/path description.
     pub fn display_label(&self) -> &str {
@@ -784,6 +807,8 @@ impl Connection {
 
     /// Append bytes to the hex view's ring, evicting from the front at capacity.
     pub fn push_raw_bytes(&mut self, bytes: &[u8]) {
+        self.terminal.process(bytes);
+        self.screen_search.dirty = true;
         self.raw_evicted_any |= push_raw(
             &mut self.raw_ring,
             &mut self.raw_base,
@@ -794,7 +819,74 @@ impl Connection {
 
     /// Begin a new contiguous receive region at the current raw position.
     pub(crate) fn mark_raw_discontinuity(&mut self) {
+        // Discard an incomplete escape sequence without losing the displayed
+        // screen or its scrollback at a reconnect or live-view gap.
+        let screen = self.terminal.screen().clone();
+        self.reset_terminal();
+        *self.terminal.screen_mut() = screen;
         self.raw_contiguous_start = self.raw_next();
+    }
+
+    pub(crate) fn reset_terminal(&mut self) {
+        let (rows, cols) = self.terminal.screen().size();
+        self.terminal = vt100::Parser::new(rows, cols, self.vt_scrollback_rows);
+        self.screen_search.dirty = true;
+    }
+
+    /// vt100 fixes capacity at construction. Rebuild from the retained raw
+    /// receive stream when the setting changes, keeping capture boundaries.
+    pub(crate) fn set_vt_scrollback_rows(&mut self, rows: usize) {
+        let rows = rows.min(serialcore::config::MAX_VT_SCROLLBACK_ROWS);
+        if rows == self.vt_scrollback_rows {
+            return;
+        }
+        let offset = self.terminal.screen().scrollback();
+        let contiguous_start = self.raw_contiguous_start;
+        self.vt_scrollback_rows = rows;
+        self.reset_terminal();
+        let bytes: Vec<u8> = self.raw_ring.iter().copied().collect();
+        // Replay the runs in order, including restored-session/gap markers.
+        let mut start = 0;
+        for (i, session) in self.raw_sessions.clone().iter().enumerate() {
+            let end = self.raw_sessions.get(i + 1).map_or(bytes.len(), |next| {
+                (next.start.saturating_sub(self.raw_base) as usize).min(bytes.len())
+            });
+            if end <= start {
+                continue;
+            }
+            self.terminal.process(&bytes[start..end]);
+            if let Some(label) = &session.label {
+                self.finish_terminal_capture(label);
+            }
+            start = end;
+        }
+        if start < bytes.len() {
+            self.terminal.process(&bytes[start..]);
+        }
+        self.raw_contiguous_start = contiguous_start;
+        self.terminal.screen_mut().set_scrollback(offset);
+        self.screen_search = Default::default();
+        self.screen_search.dirty = true;
+    }
+
+    /// Close a replayed capture into VT scrollback before the next independent
+    /// byte stream can clear/redraw the live screen. The boundary is display
+    /// metadata, never written into the raw capture or hex ring.
+    fn finish_terminal_capture(&mut self, label: &str) {
+        self.mark_raw_discontinuity();
+        let (rows, _) = self.terminal.screen().size();
+        self.terminal.screen_mut().set_scrollback(0);
+        self.terminal.process(
+            b"\x1b[?1049l\x1b[?6l\x1b[r\x1b[0m\x1b[4l\x1b[?7h\x1b[?1l\x1b[?2004l\x1b[?25h",
+        );
+        self.terminal
+            .process(format!("\x1b[{rows};1H\r\n{label}").as_bytes());
+        // Scroll the final visible page and its marker into retained history.
+        for _ in 0..rows {
+            self.terminal.process(b"\r\n");
+        }
+        self.terminal.process(b"\x1b[H");
+        self.screen_search.dirty = true;
     }
 
     pub(crate) fn set_state(&mut self, state: ConnState) {
@@ -1670,6 +1762,7 @@ impl App {
             // later one succeeds and triggers the save.
             if app.open_connection_inner(saved.identity.clone(), None, saved.config, saved.name) {
                 let conn = app.connections.last_mut().unwrap();
+                conn.restore_view(saved.view);
                 preload_last_session(
                     conn,
                     &prior_captures,
@@ -2091,7 +2184,7 @@ impl App {
 
     /// Persist the set of currently-open connections so they reopen next
     /// launch.
-    fn save_session(&mut self) {
+    pub(crate) fn save_session(&mut self) {
         self.config.last_open = self
             .connections
             .iter()
@@ -2100,6 +2193,7 @@ impl App {
             // next launch.
             .filter(|c| c.state != ConnState::Closed)
             .map(|c| SavedConnection {
+                view: c.selected_view(),
                 identity: c.identity.clone(),
                 name: c.name.clone(),
                 config: c.port_config.clone(),
@@ -2272,6 +2366,21 @@ impl App {
             transfer_progress: None,
             mark_micros: None,
             hex_view: false,
+            screen_view: false,
+            screen_search: Default::default(),
+            terminal: vt100::Parser::new(
+                24,
+                80,
+                self.config
+                    .settings
+                    .vt_scrollback_rows
+                    .min(serialcore::config::MAX_VT_SCROLLBACK_ROWS),
+            ),
+            vt_scrollback_rows: self
+                .config
+                .settings
+                .vt_scrollback_rows
+                .min(serialcore::config::MAX_VT_SCROLLBACK_ROWS),
             filter_rules: Vec::new(),
             filter_combine: Combine::And,
             filter_index: FilterIndex::new(),
@@ -3216,6 +3325,7 @@ impl App {
                 conn.handle.clear_log();
             }
             conn.store.clear();
+            conn.reset_terminal();
             // The offsets restart at zero with the next byte: nothing is left
             // above for them to be counted from.
             conn.raw_base = conn.raw_next();
@@ -3294,6 +3404,15 @@ impl App {
         let Some(conn) = self.connections.get_mut(self.active) else {
             return;
         };
+        if conn.screen_view {
+            conn.screen_search.refresh(
+                conn.terminal.screen(),
+                &conn.search_query,
+                conn.search_case_sensitive,
+            );
+            conn.screen_search.step(dir);
+            return;
+        }
         if conn.search_matches.is_empty() {
             return;
         }
@@ -3523,6 +3642,85 @@ pub(crate) mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn vt_replays_shared_capture_files_across_launches_and_respects_clear() {
+        let (mut app, _enum_tx) = test_app("vt-disk-history");
+        let dev = identity("VT-history");
+        let dir = app.paths.sessions.clone();
+        let run = chrono::Utc::now();
+        let first = b"\x1b[31mold session\x1b[";
+        let second = b"\x1b[2J\x1b[Hnew session";
+        capture(&dir, &dev, run, &[(1000, first)]);
+        let (_, meta) = capture(&dir, &dev, run, &[(2000, second)]);
+        capture(&dir, &identity("other"), run, &[(3000, b"unrelated")]);
+        let id = PortId(0);
+        let conn = app.make_connection(
+            id,
+            "probe".into(),
+            dev.clone(),
+            Default::default(),
+            inert_handle(id),
+        );
+        app.connections.push(conn);
+        let captures = snapshot_captures(&dir);
+        preload_last_session(
+            &mut app.connections[0],
+            &captures,
+            &dev,
+            &app.clock,
+            1 << 20,
+        );
+        let conn = &mut app.connections[0];
+        conn.screen_search
+            .refresh(conn.terminal.screen(), "old session|new session", true);
+        assert_eq!(conn.screen_search.matches.len(), 2);
+        assert_eq!(
+            conn.raw_ring.iter().copied().collect::<Vec<_>>(),
+            [first.as_slice(), second.as_slice()].concat()
+        );
+        conn.push_raw_bytes(b"\x1b[2J\x1b[Hlive");
+        conn.screen_search
+            .refresh(conn.terminal.screen(), "old session|new session|live", true);
+        assert_eq!(
+            conn.screen_search.matches.len(),
+            3,
+            "live redraw must preserve replayed history"
+        );
+        conn.screen_search
+            .refresh(conn.terminal.screen(), "previous session", true);
+        assert_eq!(conn.screen_search.matches.len(), 2);
+
+        // Persist a clear, then simulate another launch from the same files.
+        let mut writer = SessionWriter::create(&dir, &meta).unwrap();
+        writer.truncate().unwrap();
+        writer.write_record(4000, b"after clear").unwrap();
+        writer.flush().unwrap();
+        let mut reopened = app.make_connection(
+            PortId(1),
+            "probe".into(),
+            dev.clone(),
+            Default::default(),
+            inert_handle(PortId(1)),
+        );
+        preload_last_session(
+            &mut reopened,
+            &snapshot_captures(&dir),
+            &dev,
+            &app.clock,
+            1 << 20,
+        );
+        reopened.screen_search.refresh(
+            reopened.terminal.screen(),
+            "old session|new session|after clear|unrelated",
+            true,
+        );
+        assert_eq!(reopened.screen_search.matches.len(), 1);
+        assert_eq!(
+            reopened.raw_ring.iter().copied().collect::<Vec<_>>(),
+            b"after clear"
+        );
     }
 
     #[test]
@@ -5099,6 +5297,88 @@ pub(crate) mod tests {
     /// The bounded reader backlog reports a gap before the output it retained.
     /// Both views must show that boundary: silently joining the raw bytes would
     /// make the hex offsets claim two non-contiguous regions were one stream.
+    #[test]
+    fn vt_screen_tracks_raw_batches_independently_of_log_and_hex() {
+        let (mut app, _enum_tx) = test_app("vt-raw");
+        let tx = conn_with_injected_events(&mut app, PortId(0));
+        let bytes = b"old\rnew\x1b[2;3H\x1b[1;3;4;38;2;10;20;30mX";
+        // One-byte batches exercise escape and UTF-8 parser state across reads.
+        for byte in bytes {
+            tx.send(ReaderEvent::Batch(reader::Batch {
+                lines: vec![],
+                raw: vec![*byte],
+            }))
+            .unwrap();
+        }
+        app.connections[0].drain_events(1000);
+        let conn = &mut app.connections[0];
+        assert!(!conn.screen_view && !conn.hex_view);
+        assert_eq!(conn.terminal.screen().cell(0, 0).unwrap().contents(), "n");
+        let cell = conn.terminal.screen().cell(1, 2).unwrap();
+        assert_eq!(cell.contents(), "X");
+        assert!(cell.bold() && cell.italic() && cell.underline());
+        assert_eq!(cell.fgcolor(), vt100::Color::Rgb(10, 20, 30));
+        assert_eq!(conn.raw_ring.iter().copied().collect::<Vec<_>>(), bytes);
+        conn.screen_view = true;
+        conn.push_raw_bytes(b"\x1b[?1049h\x1b[2J\x1b[Hmenu");
+        assert!(conn.terminal.screen().alternate_screen());
+        assert_eq!(conn.terminal.screen().contents(), "menu");
+        conn.hex_view = true;
+        conn.screen_view = false;
+        conn.push_raw_bytes(b"\x1b[?1049l");
+        assert!(!conn.terminal.screen().alternate_screen());
+        assert_eq!(conn.terminal.screen().cell(1, 2).unwrap().contents(), "X");
+    }
+
+    #[test]
+    fn vt_scroll_resize_unicode_and_reset() {
+        let (mut app, _enum_tx) = test_app("vt-scroll");
+        let _tx = conn_with_injected_events(&mut app, PortId(0));
+        let conn = &mut app.connections[0];
+        conn.terminal.screen_mut().set_size(5, 20);
+        conn.push_raw_bytes(b"header\x1b[2;4r\x1b[4;1Hbottom\r\nnext");
+        assert_eq!(conn.terminal.screen().cell(0, 0).unwrap().contents(), "h");
+        assert_eq!(conn.terminal.screen().cell(2, 0).unwrap().contents(), "b");
+        assert_eq!(conn.terminal.screen().cell(3, 0).unwrap().contents(), "n");
+        conn.push_raw_bytes(b"\x1b[H\x1b[2K");
+        for byte in "界e\u{301}".as_bytes() {
+            conn.push_raw_bytes(&[*byte]);
+        }
+        assert!(conn.terminal.screen().cell(0, 0).unwrap().is_wide());
+        assert_eq!(
+            conn.terminal.screen().cell(0, 2).unwrap().contents(),
+            "e\u{301}"
+        );
+        conn.push_raw_bytes(b"\x1b[");
+        conn.mark_raw_discontinuity();
+        conn.push_raw_bytes(b"fresh");
+        assert_eq!(conn.terminal.screen().size(), (5, 20));
+        assert!(conn.terminal.screen().contents().contains("fresh"));
+        assert!(conn.terminal.screen().contents().contains("bottom"));
+        conn.reset_terminal();
+        assert_eq!(conn.terminal.screen().contents(), "");
+        assert!(
+            !conn.raw_ring.is_empty(),
+            "reset must preserve capture history"
+        );
+    }
+
+    #[test]
+    fn connection_view_survives_session_serialization() {
+        use serialcore::config::ConsoleView;
+        let (mut app, _enum_tx) = test_app("remember-view");
+        let _tx = conn_with_injected_events(&mut app, PortId(0));
+        for view in [ConsoleView::Ansi, ConsoleView::Hex, ConsoleView::Log] {
+            app.connections[0].restore_view(view);
+            app.save_session();
+            let saved = Config::from_toml(&app.config.to_toml().unwrap()).unwrap();
+            assert_eq!(saved.last_open[0].view, view);
+            app.connections[0].restore_view(ConsoleView::Log);
+            app.connections[0].restore_view(saved.last_open[0].view);
+            assert_eq!(app.connections[0].selected_view(), view);
+        }
+    }
+
     #[test]
     fn dropped_reader_output_marks_the_console_and_hex_view() {
         let (mut app, _enum_tx) = test_app("dropped-reader-output");

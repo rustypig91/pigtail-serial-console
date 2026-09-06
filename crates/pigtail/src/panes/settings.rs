@@ -10,6 +10,7 @@ impl App {
         let mut changed = false;
         let mut history_limit_changed = false;
         let mut history_limit_dragged = false;
+        let mut vt_limit_editing = false;
         egui::Window::new("Settings")
             .open(&mut open)
             .resizable(false)
@@ -69,6 +70,16 @@ impl App {
                         changed |= history_limit_changed;
                         ui.end_row();
 
+                        ui.label("VT scrollback rows");
+                        let response = ui.add(
+                            egui::DragValue::new(&mut self.config.settings.vt_scrollback_rows)
+                                .speed(100)
+                                .range(0..=serialcore::config::MAX_VT_SCROLLBACK_ROWS),
+                        ).on_hover_text("Rows of VT history kept per connection (0 disables scrollback). Applies when editing finishes, rebuilding from retained received bytes. Full capture stays on disk.");
+                        vt_limit_editing = response.dragged() || response.has_focus();
+                        changed |= response.changed();
+                        ui.end_row();
+
                         ui.label("Session retention (days)");
                         let saved_retention = self.config.settings.session_retention_days;
                         let draft = self.session_retention_draft.get_or_insert(saved_retention);
@@ -123,6 +134,11 @@ impl App {
             });
 
         self.show_settings = open;
+        if !vt_limit_editing || !open {
+            for conn in &mut self.connections {
+                conn.set_vt_scrollback_rows(self.config.settings.vt_scrollback_rows);
+            }
+        }
         if history_limit_changed {
             let limits = history_limits(self.config.settings.max_lines);
             for conn in &mut self.connections {

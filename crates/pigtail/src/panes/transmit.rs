@@ -49,7 +49,8 @@ impl App {
         }
         let ending = conn.port_config.line_ending;
         let local_echo = conn.port_config.local_echo;
-        let local_history = conn.port_config.local_history;
+        let local_history = conn.port_config.local_history && !conn.screen_view;
+        let application_cursor = conn.screen_view && conn.terminal.screen().application_cursor();
 
         let mut out: Vec<u8> = Vec::new();
         // Lines committed to the log this frame when local echo is on.
@@ -79,7 +80,13 @@ impl App {
                 }
                 Event::Paste(t) => {
                     if shift {
+                        if conn.screen_view && conn.terminal.screen().bracketed_paste() {
+                            out.extend_from_slice(b"\x1b[200~");
+                        }
                         out.extend_from_slice(t.as_bytes());
+                        if conn.screen_view && conn.terminal.screen().bracketed_paste() {
+                            out.extend_from_slice(b"\x1b[201~");
+                        }
                         conn.tx_input.push_str(t);
                     } else {
                         out.push(0x16); // SYN (Ctrl+V)
@@ -92,6 +99,24 @@ impl App {
                     ..
                 } => {
                     match key {
+                        Key::ArrowUp
+                        | Key::ArrowDown
+                        | Key::ArrowRight
+                        | Key::ArrowLeft
+                        | Key::Home
+                        | Key::End
+                            if application_cursor =>
+                        {
+                            out.extend_from_slice(b"\x1bO");
+                            out.push(match key {
+                                Key::ArrowUp => b'A',
+                                Key::ArrowDown => b'B',
+                                Key::ArrowRight => b'C',
+                                Key::ArrowLeft => b'D',
+                                Key::Home => b'H',
+                                _ => b'F',
+                            });
+                        }
                         Key::Enter => {
                             out.extend_from_slice(ending.bytes());
                             let line = std::mem::take(&mut conn.tx_input);
@@ -159,6 +184,10 @@ impl App {
             return false;
         }
         if !out.is_empty() {
+            if local_echo && conn.screen_view {
+                conn.terminal.process(&out);
+                conn.screen_search.dirty = true;
+            }
             conn.handle.transmit(out);
         }
         for line in echo_lines {
@@ -314,6 +343,52 @@ mod tests {
             .filter(|l| l.meta.flags.contains(LineFlags::TX_ECHO))
             .map(|l| l.text.to_string())
             .collect()
+    }
+
+    #[test]
+    fn screen_mode_renders_and_sends_arrows_instead_of_local_history() {
+        let (mut app, _enum_tx) = test_app("vt-input");
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            Default::default(),
+            PortConfig {
+                local_echo: true,
+                local_history: true,
+                ..Default::default()
+            },
+            inert_handle(id),
+        );
+        conn.screen_view = true;
+        conn.tx_history.push("previous command".into());
+        conn.push_raw_bytes(b"\x1b[2;2H\x1b[?1h");
+        app.connections.push(conn);
+        let ctx = egui::Context::default();
+        frame(
+            &mut app,
+            &ctx,
+            vec![Event::Key {
+                key: Key::ArrowUp,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(app.connections[0].tx_history_pos, None);
+        assert!(app.connections[0].tx_input.is_empty());
+        let (row, col) = app.connections[0].terminal.screen().cursor_position();
+        frame(&mut app, &ctx, vec![Event::Text("x".into())]);
+        assert_eq!(
+            app.connections[0]
+                .terminal
+                .screen()
+                .cell(row, col)
+                .unwrap()
+                .contents(),
+            "x"
+        );
     }
 
     /// Issue #43: with the line ending set to "none", pressing Enter puts no
