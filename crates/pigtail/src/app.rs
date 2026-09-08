@@ -3481,6 +3481,7 @@ impl eframe::App for App {
         // for the device or activate a widget during layout.
         self.consume_macro_shortcut(ctx);
         self.consume_tab_switch_shortcut(ctx);
+        self.consume_console_view_shortcuts(ctx);
 
         let max_lines = self.config.settings.max_lines;
         let mut any_data = false;

@@ -92,6 +92,7 @@ impl ScreenSearch {
 
 impl App {
     pub(crate) fn show_terminal_screen(&mut self, ui: &mut egui::Ui, active: usize) {
+        let (pages, lines) = self.consume_scroll_shortcut(ui.ctx());
         let font = FontId::monospace(f32::from(self.config.settings.console_font_size));
         let cell_size = ui.fonts(|f| Vec2::new(f.glyph_width(&font, 'M'), f.row_height(&font)));
         let available = ui.available_size();
@@ -120,10 +121,11 @@ impl App {
         } else {
             history.saturating_sub(old_offset)
         };
+        let top = (top as f32 + pages * f32::from(rows) + lines).clamp(0.0, history as f32);
         let output = egui::ScrollArea::vertical()
             .id_salt(("vt-scrollback", conn.id.0))
             .auto_shrink([false, false])
-            .vertical_scroll_offset(top as f32 * cell_size.y)
+            .vertical_scroll_offset(top * cell_size.y)
             .show_viewport(ui, |ui, viewport| {
                 let first = ((viewport.min.y / cell_size.y).round() as usize).min(history);
                 screen.set_scrollback(history - first);
@@ -386,6 +388,37 @@ mod tests {
             app.connections[0].push_raw_bytes(format!("line {i}\r\n").as_bytes());
         }
         draw(&mut app, vec![]);
+        for key in [
+            egui::Key::PageUp,
+            egui::Key::PageDown,
+            egui::Key::ArrowUp,
+            egui::Key::ArrowDown,
+        ] {
+            draw(
+                &mut app,
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                }],
+            );
+            if matches!(key, egui::Key::PageUp | egui::Key::ArrowUp) {
+                assert!(!app.connections[0].follow);
+                assert_eq!(
+                    app.connections[0].terminal.screen().scrollback(),
+                    if key == egui::Key::PageUp {
+                        usize::from(app.connections[0].terminal.screen().size().0)
+                    } else {
+                        1
+                    },
+                );
+            } else {
+                assert!(app.connections[0].follow);
+                assert_eq!(app.connections[0].terminal.screen().scrollback(), 0);
+            }
+        }
         draw(
             &mut app,
             vec![
