@@ -9,6 +9,35 @@ use crate::wake::Wake;
 use crossbeam_channel::Receiver;
 use std::time::Duration;
 
+/// Package installations must be updated through their package manager.
+pub const PACKAGE_UPDATE_MESSAGE: &str =
+    "In-app installation is disabled for Debian package installations. Install the latest .deb package using your package manager.";
+
+/// Cache package ownership so drawing the UI never repeatedly reads the disk.
+pub fn is_debian_installation() -> bool {
+    static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *INSTALLED.get_or_init(|| {
+        if !cfg!(target_os = "linux") || std::env::var_os("APPIMAGE").is_some() {
+            return false;
+        }
+        let Ok(executable) = std::env::current_exe() else {
+            return false;
+        };
+        let Ok(files) = std::fs::read_to_string("/var/lib/dpkg/info/pigtail.list") else {
+            return false;
+        };
+        debian_package_owns(&executable, &files)
+    })
+}
+
+fn debian_package_owns(executable: &std::path::Path, files: &str) -> bool {
+    files.lines().any(|file| {
+        let path = std::path::Path::new(file);
+        path.is_absolute()
+            && (path == executable || path.canonicalize().is_ok_and(|p| p == executable))
+    })
+}
+
 /// The repository releases are published from.
 const GITHUB_REPO: &str = "rustypig91/pigtail-serial-console";
 
@@ -180,6 +209,24 @@ pub fn spawn_check(wake: Wake) -> std::io::Result<Receiver<CheckResult>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debian_ownership_requires_the_running_executable_in_the_package() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("pigtail");
+        std::fs::write(&executable, b"binary").unwrap();
+        let executable = executable.canonicalize().unwrap();
+        let files = format!("/.\n/usr/share/doc/pigtail\n{}\n", executable.display());
+        assert!(debian_package_owns(&executable, &files));
+        assert!(!debian_package_owns(&directory.path().join("portable"), &files));
+        assert!(!debian_package_owns(&executable, ""));
+        #[cfg(unix)]
+        {
+            let alias = directory.path().join("alias");
+            std::os::unix::fs::symlink(&executable, &alias).unwrap();
+            assert!(debian_package_owns(&executable, &alias.to_string_lossy()));
+        }
+    }
 
     #[test]
     fn newer_patch_minor_and_major_are_updates() {

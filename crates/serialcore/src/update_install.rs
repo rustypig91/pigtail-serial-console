@@ -65,6 +65,9 @@ fn asset_name(version: &str, os: &str, arch: &str, format: Format) -> Result<Str
 }
 
 fn destination() -> Result<(PathBuf, Format), String> {
+    if super::is_debian_installation() {
+        return Err(super::PACKAGE_UPDATE_MESSAGE.into());
+    }
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     if cfg!(target_os = "linux") {
         if let Some(appimage) = std::env::var_os("APPIMAGE") {
@@ -229,6 +232,9 @@ pub fn spawn_download(version: String, wake: Wake) -> std::io::Result<Receiver<I
 
 impl PreparedUpdate {
     fn install(self) -> Result<InstallOutcome, String> {
+        if super::is_debian_installation() {
+            return Err(super::PACKAGE_UPDATE_MESSAGE.into());
+        }
         if self.format == Format::WindowsSetup {
             return self.launch_setup();
         }

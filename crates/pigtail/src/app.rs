@@ -2508,11 +2508,18 @@ impl App {
         self.update_dialog = notice.map(|notice| match notice {
             update::Notice::Available { version, url } => UpdateDialog {
                 title: "Update available".into(),
-                message: format!(
-                    "v{} is available. You are on v{current}.\nUpdate will download, install, and restart Rusty's Pigtail - Serial Terminal. Active connections will close.",
-                    version.trim_start_matches('v')
-                ),
-                update_version: Some(version.clone()),
+                message: if update::is_debian_installation() {
+                    format!(
+                        "v{} is available. You are on v{current}.\nThis installation is managed by Debian. Download the latest .deb from the downloads page and install it using your package manager.",
+                        version.trim_start_matches('v')
+                    )
+                } else {
+                    format!(
+                        "v{} is available. You are on v{current}.\nUpdate will download, install, and restart Rusty's Pigtail - Serial Terminal. Active connections will close.",
+                        version.trim_start_matches('v')
+                    )
+                },
+                update_version: (!update::is_debian_installation()).then(|| version.clone()),
                 download_url: Some(url),
                 skip_version: Some(version),
             },
