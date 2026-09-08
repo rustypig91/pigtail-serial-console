@@ -950,22 +950,29 @@ impl App {
             Some(conn.wrap_index.start_row(entry))
         };
         let goto = conn.scroll_to.take();
-        let scroll_offset = keyboard_scroll_offset(ui, "scroll_area", pages, lines, row_height)
+        let scroll_offset = keyboard_scroll_offset(
+            ui,
+            "scroll_area",
+            pages,
+            lines,
+            row_height,
+            n_rows as f32 * row_height,
+        )
+        .or_else(|| {
+            goto.and_then(|target| {
+                Some(row_of_line(target)? as f32 * row_height - ui.available_height() * 0.5)
+            })
             .or_else(|| {
-                goto.and_then(|target| {
-                    Some(row_of_line(target)? as f32 * row_height - ui.available_height() * 0.5)
-                })
-                .or_else(|| {
-                    // Rows changed height under the reader (text resized, window
-                    // resized): put the line that was at the top back at the top,
-                    // instead of leaving the old pixel offset pointing at whatever
-                    // line now happens to live there.
-                    if !relayout || conn.follow {
-                        return None;
-                    }
-                    Some(row_of_line(conn.top_line?)? as f32 * row_height)
-                })
-            });
+                // Rows changed height under the reader (text resized, window
+                // resized): put the line that was at the top back at the top,
+                // instead of leaving the old pixel offset pointing at whatever
+                // line now happens to live there.
+                if !relayout || conn.follow {
+                    return None;
+                }
+                Some(row_of_line(conn.top_line?)? as f32 * row_height)
+            })
+        });
 
         // The user touching the wheel or dragging the scrollbar unpins.
         let user_scrolled = pages != 0.0 || lines != 0.0 || ui.input(user_scrolled);
@@ -1147,6 +1154,7 @@ impl App {
             pages,
             lines,
             row_height,
+            n_rows as f32 * row_height,
         )
         .or_else(|| {
             goto.and_then(|target| {
@@ -1292,7 +1300,14 @@ impl App {
         let mut area = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .drag_to_scroll(false);
-        if let Some(offset) = keyboard_scroll_offset(ui, "scroll_area", pages, lines, row_height) {
+        if let Some(offset) = keyboard_scroll_offset(
+            ui,
+            "scroll_area",
+            pages,
+            lines,
+            row_height,
+            rows as f32 * row_height,
+        ) {
             area = area.vertical_scroll_offset(offset);
         } else if following {
             // Pin to the bottom; see the console's forced-offset pin. Hex rows are
@@ -1821,13 +1836,18 @@ fn keyboard_scroll_offset(
     pages: f32,
     lines: f32,
     row_height: f32,
+    content_height: f32,
 ) -> Option<f32> {
     if pages == 0.0 && lines == 0.0 {
         return None;
     }
     let id = ui.make_persistent_id(egui::Id::new(salt));
     let state = egui::scroll_area::State::load(ui.ctx(), id).unwrap_or_default();
-    Some((state.offset.y + pages * ui.available_height() + lines * row_height).max(0.0))
+    let view_height = ui.available_height();
+    let max_offset = (content_height - view_height).max(0.0);
+    // Explicit offsets reach the layout callback before egui clamps them at
+    // the end of the frame. Bound both ends now to avoid rendering blank space.
+    Some((state.offset.y + pages * view_height + lines * row_height).clamp(0.0, max_offset))
 }
 
 /// Re-engage `follow` once the user's own scrolling (wheel or scrollbar drag)
@@ -2561,15 +2581,26 @@ mod tests {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         let (pages, lines) = app.consume_scroll_shortcut(ctx);
                         let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
-                        if let Some(offset) =
-                            keyboard_scroll_offset(ui, "scroll_area", pages, lines, row_height)
-                        {
+                        if let Some(offset) = keyboard_scroll_offset(
+                            ui,
+                            "scroll_area",
+                            pages,
+                            lines,
+                            row_height,
+                            2000.0,
+                        ) {
                             follow = false;
                             area = area.vertical_scroll_offset(offset);
                         } else if follow {
                             area = area.vertical_scroll_offset(2000.0 - ui.available_height());
                         }
-                        let output = area.show_viewport(ui, |ui, _| {
+                        let max_offset = (2000.0 - ui.available_height()).max(0.0);
+                        let output = area.show_viewport(ui, |ui, viewport| {
+                            assert!(
+                                viewport.min.y <= max_offset,
+                                "rendered beyond bottom: {} > {max_offset}",
+                                viewport.min.y
+                            );
                             ui.set_height(2000.0);
                         });
                         rearm_follow_at_bottom(
@@ -2587,6 +2618,11 @@ mod tests {
         };
         let modifiers = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
         let (bottom, _, _) = draw(None, modifiers);
+        for key in [egui::Key::PageDown, egui::Key::ArrowDown] {
+            let (offset, follow, _) = draw(Some(key), modifiers);
+            assert_eq!(offset, bottom);
+            assert!(follow);
+        }
         let (up, follow, remaining) = draw(Some(egui::Key::PageUp), modifiers);
         assert!(up < bottom - 200.0);
         assert!(!follow);
