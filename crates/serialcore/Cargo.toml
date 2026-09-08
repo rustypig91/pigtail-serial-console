@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "UI-agnostic core for Pigtail: sources, framing, storage, filtering, extraction."
+description = "UI-agnostic core for Rusty's Pigtail: sources, framing, storage, filtering, extraction."
 
 [lints]
 workspace = true

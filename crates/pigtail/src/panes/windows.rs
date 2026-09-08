@@ -97,6 +97,7 @@ impl App {
         let mut closed = false;
         for (name, open) in [
             ("Settings", &mut self.show_settings),
+            ("About", &mut self.show_about),
             ("Keyboard shortcuts", &mut self.show_keyboard_shortcuts),
             ("Filters", &mut self.show_filters_win),
             ("Highlight rules", &mut self.show_highlight_win),

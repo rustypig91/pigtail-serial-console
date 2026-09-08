@@ -1,4 +1,4 @@
-//! UI-agnostic core for Pigtail, a serial terminal.
+//! UI-agnostic core for Rusty's Pigtail, a serial terminal.
 //!
 //! This crate must never depend on `egui`/`eframe`. It is usable by a headless
 //! CLI recorder with no changes. See `README.md` for the full specification.

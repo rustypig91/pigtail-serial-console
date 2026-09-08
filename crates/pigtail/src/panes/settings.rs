@@ -130,7 +130,10 @@ impl App {
                 ui.separator();
                 ui.label(format!("Config: {}", self.paths.config_file.display()));
                 ui.label(format!("Sessions: {}", self.paths.sessions.display()));
-                ui.weak(concat!("pigtail v", env!("CARGO_PKG_VERSION")));
+                ui.weak(concat!(
+                    "Rusty's Pigtail - Serial Terminal v",
+                    env!("CARGO_PKG_VERSION")
+                ));
             });
 
         self.show_settings = open;

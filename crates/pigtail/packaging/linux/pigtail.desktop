@@ -1,11 +1,11 @@
 [Desktop Entry]
 Type=Application
-Name=Pigtail
+Name=Rusty's Pigtail - Serial Terminal
 GenericName=Serial Terminal
-Comment=Desktop serial terminal for embedded firmware development
+Comment=Desktop serial terminal
 Exec=pigtail
 Icon=pigtail
 Terminal=false
 Categories=Development;Electronics;
-Keywords=serial;uart;usb;terminal;embedded;firmware;console;
+Keywords=serial;uart;usb;terminal;console;
 StartupWMClass=pigtail

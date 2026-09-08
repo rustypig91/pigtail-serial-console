@@ -29,7 +29,7 @@ pub struct PreparedUpdate {
 pub enum InstallOutcome {
     /// Relaunch this executable after the old application's shutdown completes.
     Restart(PathBuf),
-    /// The installer will relaunch Pigtail after the application closes.
+    /// The installer will relaunch Rusty's Pigtail after the application closes.
     InstallerStarted,
 }
 
@@ -236,7 +236,7 @@ impl PreparedUpdate {
             replace_appimage(&self.file, &self.target)?;
         } else {
             self_replace::self_replace(&self.file).map_err(|e| format!(
-                "Could not replace Pigtail: {e}. If it is installed in a protected folder or managed by a package manager, update it using its installer or package manager."
+                "Could not replace Rusty's Pigtail - Serial Terminal: {e}. If it is installed in a protected folder or managed by a package manager, update it using its installer or package manager."
             ))?;
         }
         Ok(InstallOutcome::Restart(self.target))
@@ -305,7 +305,7 @@ try {{
     # cause us to wait on another application.
     $parent = Get-Process -Id {parent_pid} -ErrorAction SilentlyContinue
     if ($parent -and -not $parent.WaitForExit(120000)) {{
-        throw 'Pigtail did not close in time. Please try updating again.'
+        throw 'Rusty''s Pigtail - Serial Terminal did not close in time. Please try updating again.'
     }}
     $key = Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{{374D0E66-90B2-4055-A852-0AF51237DA44}}_is1' -ErrorAction SilentlyContinue
     $scope = '/ALLUSERS'
@@ -314,13 +314,13 @@ try {{
     if ($process.ExitCode -ne 0) {{ throw "The installer returned exit code $($process.ExitCode)." }}
 }} catch {{
     Add-Type -AssemblyName System.Windows.Forms
-    [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Pigtail update failed') | Out-Null
+    [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Rusty''s Pigtail - Serial Terminal update failed') | Out-Null
 }} finally {{
     # Relaunch as the original user, including after a cancelled UAC prompt.
     if (-not (Get-Process -Id {parent_pid} -ErrorAction SilentlyContinue)) {{
         try {{ Start-Process -FilePath $target -WorkingDirectory $dir }} catch {{
             Add-Type -AssemblyName System.Windows.Forms
-            [System.Windows.Forms.MessageBox]::Show('Please open Pigtail again: ' + $_.Exception.Message, 'Pigtail update') | Out-Null
+            [System.Windows.Forms.MessageBox]::Show('Please open Rusty''s Pigtail - Serial Terminal again: ' + $_.Exception.Message, 'Rusty''s Pigtail - Serial Terminal update') | Out-Null
         }}
     }}
     # Delete only the explicitly created staging folder after setup has exited.
