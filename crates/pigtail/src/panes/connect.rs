@@ -466,6 +466,9 @@ impl App {
                         ui.strong("Ctrl+Shift+Page Up / Down");
                         ui.label("Scroll console up / down one page");
                         ui.end_row();
+                        ui.strong("Ctrl+Shift+P");
+                        ui.label("Toggle plot (connection tabs)");
+                        ui.end_row();
                         ui.strong("Ctrl+Shift+Space");
                         ui.label("Pin console to bottom");
                         ui.end_row();

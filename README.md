@@ -138,3 +138,4 @@ Plain Page Up / Page Down and arrow keys retain their normal terminal behavior.
 
 Use **Ctrl+Shift+Space** to pin the console to the bottom. On connection tabs,
 **Ctrl+Shift+Q / W / E** selects the **Log / Hex / ANSI** view.
+Use **Ctrl+Shift+P** to toggle the plot on connection tabs.

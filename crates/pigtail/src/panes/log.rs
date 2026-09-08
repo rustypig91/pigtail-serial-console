@@ -502,7 +502,7 @@ impl App {
         {
             return;
         }
-        let (pin, view) = ctx.input_mut(|i| {
+        let (pin, view, plot) = ctx.input_mut(|i| {
             let modifiers = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
             let pin = i.consume_key(modifiers, egui::Key::Space);
             let mut view = None;
@@ -515,7 +515,8 @@ impl App {
                     view = Some(selection);
                 }
             }
-            (pin, view)
+            let plot = i.consume_key(modifiers, egui::Key::P);
+            (pin, view, plot)
         });
         // Merged tabs only have a log view; never change their transmit target's view.
         if self.merged_selected {
@@ -535,6 +536,9 @@ impl App {
             conn.new_since_scroll = 0;
             conn.scroll_to = None;
             conn.screen_search.scroll_to = None;
+        }
+        if plot {
+            conn.show_plot = !conn.show_plot;
         }
         if let Some((screen, hex)) = view {
             if (conn.screen_view, conn.hex_view) != (screen, hex) {
@@ -2488,10 +2492,23 @@ mod tests {
         assert_eq!(press(&mut app, egui::Key::W, egui::Modifiers::CTRL), 1);
         assert!(!app.connections[0].hex_view);
 
+        let initial_plot = app.connections[0].show_plot;
+        assert_eq!(press(&mut app, egui::Key::P, modifiers), 0);
+        assert_eq!(app.connections[0].show_plot, !initial_plot);
+        assert_eq!(press(&mut app, egui::Key::P, modifiers), 0);
+        assert_eq!(app.connections[0].show_plot, initial_plot);
+        assert_eq!(press(&mut app, egui::Key::P, egui::Modifiers::CTRL), 1);
+        assert_eq!(app.connections[0].show_plot, initial_plot);
+
         app.show_settings = true;
+        assert_eq!(press(&mut app, egui::Key::P, modifiers), 1);
+        assert_eq!(app.connections[0].show_plot, initial_plot);
         assert_eq!(press(&mut app, egui::Key::E, modifiers), 1);
         assert!(!app.connections[0].screen_view);
         app.show_settings = false;
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("text-input")));
+        assert_eq!(press(&mut app, egui::Key::P, modifiers), 1);
+        assert_eq!(app.connections[0].show_plot, initial_plot);
         ctx.memory_mut(|m| m.request_focus(egui::Id::new("text-input")));
         assert_eq!(press(&mut app, egui::Key::W, modifiers), 1);
         assert!(!app.connections[0].hex_view);
@@ -2500,6 +2517,8 @@ mod tests {
         app.merged_selected = true;
         app.merged_follow = false;
         app.merged_new_since_scroll = 12;
+        assert_eq!(press(&mut app, egui::Key::P, modifiers), 0);
+        assert_eq!(app.connections[0].show_plot, initial_plot);
         assert_eq!(press(&mut app, egui::Key::Space, modifiers), 0);
         assert!(app.merged_follow);
         assert_eq!(app.merged_new_since_scroll, 0);
