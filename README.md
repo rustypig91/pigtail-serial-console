@@ -133,4 +133,5 @@ crates/pigtail/packaging/linux/build-appimage.sh \
 MIT, see [LICENSE](LICENSE).
 
 Use **Ctrl+Shift+Page Up / Page Down** to scroll the console one page up or down.
-Plain Page Up / Page Down still sends keys to the connected device.
+Use **Ctrl+Shift+Up / Down** to scroll one line up or down.
+Plain Page Up / Page Down and arrow keys retain their normal terminal behavior.

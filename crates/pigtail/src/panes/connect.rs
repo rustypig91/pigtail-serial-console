@@ -460,6 +460,9 @@ impl App {
                         ui.strong("Ctrl+Shift+Left / Right");
                         ui.label("Previous / next tab");
                         ui.end_row();
+                        ui.strong("Ctrl+Shift+Up / Down");
+                        ui.label("Scroll console up / down one line");
+                        ui.end_row();
                         ui.strong("Ctrl+Shift+Page Up / Down");
                         ui.label("Scroll console up / down one page");
                         ui.end_row();

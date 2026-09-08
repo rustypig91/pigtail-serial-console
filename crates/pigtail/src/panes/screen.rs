@@ -92,7 +92,7 @@ impl ScreenSearch {
 
 impl App {
     pub(crate) fn show_terminal_screen(&mut self, ui: &mut egui::Ui, active: usize) {
-        let pages = self.consume_page_scroll(ui.ctx());
+        let (pages, lines) = self.consume_scroll_shortcut(ui.ctx());
         let font = FontId::monospace(f32::from(self.config.settings.console_font_size));
         let cell_size = ui.fonts(|f| Vec2::new(f.glyph_width(&font, 'M'), f.row_height(&font)));
         let available = ui.available_size();
@@ -121,7 +121,7 @@ impl App {
         } else {
             history.saturating_sub(old_offset)
         };
-        let top = (top as f32 + pages * f32::from(rows)).clamp(0.0, history as f32);
+        let top = (top as f32 + pages * f32::from(rows) + lines).clamp(0.0, history as f32);
         let output = egui::ScrollArea::vertical()
             .id_salt(("vt-scrollback", conn.id.0))
             .auto_shrink([false, false])
@@ -388,7 +388,12 @@ mod tests {
             app.connections[0].push_raw_bytes(format!("line {i}\r\n").as_bytes());
         }
         draw(&mut app, vec![]);
-        for key in [egui::Key::PageUp, egui::Key::PageDown] {
+        for key in [
+            egui::Key::PageUp,
+            egui::Key::PageDown,
+            egui::Key::ArrowUp,
+            egui::Key::ArrowDown,
+        ] {
             draw(
                 &mut app,
                 vec![egui::Event::Key {
@@ -399,11 +404,15 @@ mod tests {
                     modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
                 }],
             );
-            if key == egui::Key::PageUp {
+            if matches!(key, egui::Key::PageUp | egui::Key::ArrowUp) {
                 assert!(!app.connections[0].follow);
                 assert_eq!(
                     app.connections[0].terminal.screen().scrollback(),
-                    usize::from(app.connections[0].terminal.screen().size().0),
+                    if key == egui::Key::PageUp {
+                        usize::from(app.connections[0].terminal.screen().size().0)
+                    } else {
+                        1
+                    },
                 );
             } else {
                 assert!(app.connections[0].follow);
