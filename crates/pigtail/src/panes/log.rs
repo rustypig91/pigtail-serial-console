@@ -493,6 +493,22 @@ impl App {
         ctx.request_repaint();
     }
 
+    /// Reserve local page navigation before raw input reaches the device.
+    pub(crate) fn consume_page_scroll(&self, ctx: &egui::Context) -> f32 {
+        if self.keyboard_overlay_open(ctx)
+            || self.search_focus_request
+            || ctx.memory(|m| m.focused().is_some())
+        {
+            return 0.0;
+        }
+        ctx.input_mut(|i| {
+            let modifiers = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
+            let up = i.consume_key(modifiers, egui::Key::PageUp);
+            let down = i.consume_key(modifiers, egui::Key::PageDown);
+            f32::from(down) - f32::from(up)
+        })
+    }
+
     pub(crate) fn show_console(&mut self, ctx: &egui::Context, console_tab_claimed: bool) {
         let mut menu = MenuAction::default();
         let mut open_dialog = false;
@@ -765,6 +781,7 @@ impl App {
     }
 
     fn show_single_rows(&mut self, ui: &mut egui::Ui, active: usize, menu: &mut MenuAction) {
+        let pages = self.consume_page_scroll(ui.ctx());
         let ts_format = self.config.settings.timestamp_format;
         let m = Metrics::new(
             ui,
@@ -872,8 +889,8 @@ impl App {
             Some(conn.wrap_index.start_row(entry))
         };
         let goto = conn.scroll_to.take();
-        let scroll_offset = goto
-            .and_then(|target| {
+        let scroll_offset = page_scroll_offset(ui, "scroll_area", pages).or_else(|| {
+            goto.and_then(|target| {
                 Some(row_of_line(target)? as f32 * row_height - ui.available_height() * 0.5)
             })
             .or_else(|| {
@@ -885,10 +902,11 @@ impl App {
                     return None;
                 }
                 Some(row_of_line(conn.top_line?)? as f32 * row_height)
-            });
+            })
+        });
 
         // The user touching the wheel or dragging the scrollbar unpins.
-        let user_scrolled = ui.input(user_scrolled);
+        let user_scrolled = pages != 0.0 || ui.input(user_scrolled);
         if goto.is_some() {
             // Navigating to a specific line (search/plot) unpins so we
             // stay there instead of snapping back to the bottom. Re-pinning the
@@ -993,6 +1011,7 @@ impl App {
     }
 
     fn show_merged_rows(&mut self, ui: &mut egui::Ui, menu: &mut MenuAction) {
+        let pages = self.consume_page_scroll(ui.ctx());
         let ts_format = self.config.settings.timestamp_format;
         let filter_active = self.merged_filter_active();
         let view_generation = self.merged_view_generation();
@@ -1060,14 +1079,20 @@ impl App {
             },
         );
         let n_rows = merged_wrap.total_rows();
-        let scroll_offset = goto.and_then(|target| {
-            let entry = view
-                .binary_search_by_key(&target.seq, |entry| entry.seq)
-                .ok()?;
-            Some(merged_wrap.start_row(entry) as f32 * row_height - ui.available_height() * 0.5)
-        });
+        let scroll_offset = page_scroll_offset(ui, ("merged_scroll", merged_tab_id), pages)
+            .or_else(|| {
+                goto.and_then(|target| {
+                    let entry = view
+                        .binary_search_by_key(&target.seq, |entry| entry.seq)
+                        .ok()?;
+                    Some(
+                        merged_wrap.start_row(entry) as f32 * row_height
+                            - ui.available_height() * 0.5,
+                    )
+                })
+            });
 
-        let user_scrolled = ui.input(user_scrolled);
+        let user_scrolled = pages != 0.0 || ui.input(user_scrolled);
         if scroll_offset.is_some() || (self.merged_follow && user_scrolled) {
             self.merged_follow = false;
         }
@@ -1159,6 +1184,7 @@ impl App {
     }
 
     fn show_hex_rows(&mut self, ui: &mut egui::Ui, active: usize, menu: &mut MenuAction) {
+        let pages = self.consume_page_scroll(ui.ctx());
         let ts_format = self.config.settings.timestamp_format;
         let has_mark = self.connections[active].mark_micros.is_some();
         let bg = ui.interact(
@@ -1177,7 +1203,7 @@ impl App {
             )
         });
 
-        let user_scrolled = ui.input(user_scrolled);
+        let user_scrolled = pages != 0.0 || ui.input(user_scrolled);
         if self.connections[active].follow && user_scrolled {
             self.connections[active].follow = false;
         }
@@ -1201,7 +1227,9 @@ impl App {
         let mut area = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .drag_to_scroll(false);
-        if following {
+        if let Some(offset) = page_scroll_offset(ui, "scroll_area", pages) {
+            area = area.vertical_scroll_offset(offset);
+        } else if following {
             // Pin to the bottom; see the console's forced-offset pin. Hex rows are
             // full-height monospace labels with zero inter-row spacing, so the
             // content height is exactly `rows * row_height`.
@@ -1719,6 +1747,16 @@ fn export_menu(ui: &mut egui::Ui, menu: &mut MenuAction) {
             ui.close_menu();
         }
     });
+}
+
+/// Use the last rendered offset so paging works without hovering the console.
+fn page_scroll_offset(ui: &egui::Ui, salt: impl std::hash::Hash, pages: f32) -> Option<f32> {
+    if pages == 0.0 {
+        return None;
+    }
+    let id = ui.make_persistent_id(egui::Id::new(salt));
+    let state = egui::scroll_area::State::load(ui.ctx(), id).unwrap_or_default();
+    Some((state.offset.y + pages * ui.available_height()).max(0.0))
 }
 
 /// Re-engage `follow` once the user's own scrolling (wheel or scrollbar drag)
@@ -2326,6 +2364,68 @@ mod tests {
             wall: chrono::Utc::now(),
             micros,
         }
+    }
+
+    #[test]
+    fn page_shortcuts_scroll_without_hover_and_resume_follow_at_bottom() {
+        let (app, _enum_tx) = test_app("page-scroll");
+        let ctx = egui::Context::default();
+        let mut follow = true;
+        let mut offset = 0.0;
+        let mut draw = |key: Option<egui::Key>, modifiers| {
+            let events = key
+                .into_iter()
+                .map(|key| egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                })
+                .collect();
+            let mut remaining = 0;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(500.0, 250.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let pages = app.consume_page_scroll(ctx);
+                        let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+                        if let Some(offset) = page_scroll_offset(ui, "scroll_area", pages) {
+                            follow = false;
+                            area = area.vertical_scroll_offset(offset);
+                        } else if follow {
+                            area = area.vertical_scroll_offset(2000.0 - ui.available_height());
+                        }
+                        let output = area.show_viewport(ui, |ui, _| {
+                            ui.set_height(2000.0);
+                        });
+                        rearm_follow_at_bottom(&mut follow, pages != 0.0, &output, 20.0);
+                        offset = output.state.offset.y;
+                    });
+                    remaining = ctx.input(|i| i.events.len());
+                },
+            );
+            (offset, follow, remaining)
+        };
+        let modifiers = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
+        let (bottom, _, _) = draw(None, modifiers);
+        let (up, follow, remaining) = draw(Some(egui::Key::PageUp), modifiers);
+        assert!(up < bottom - 200.0);
+        assert!(!follow);
+        assert_eq!(remaining, 0, "shortcut must not reach serial input");
+        let (down, follow, _) = draw(Some(egui::Key::PageDown), modifiers);
+        assert_eq!(down, bottom);
+        assert!(follow);
+        let (plain, _, remaining) = draw(Some(egui::Key::PageUp), egui::Modifiers::NONE);
+        assert_eq!(plain, bottom);
+        assert_eq!(remaining, 1, "plain Page Up belongs to the device");
     }
 
     #[test]

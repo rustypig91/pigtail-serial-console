@@ -12,6 +12,7 @@
 //! before this module sees the frame's raw input.
 //! Ctrl+Shift+Left/Right likewise switches console tabs before raw input is
 //! translated into terminal escape sequences.
+//! Ctrl+Shift+Page Up/Down scrolls the console locally.
 //!
 //! `PortConfig` still governs the send line ending, optional local echo (for
 //! devices that don't echo), and whether Up/Down recall local history instead

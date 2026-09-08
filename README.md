@@ -131,3 +131,6 @@ crates/pigtail/packaging/linux/build-appimage.sh \
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+Use **Ctrl+Shift+Page Up / Page Down** to scroll the console one page up or down.
+Plain Page Up / Page Down still sends keys to the connected device.
