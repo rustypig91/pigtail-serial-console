@@ -466,6 +466,12 @@ impl App {
                         ui.strong("Ctrl+Shift+Page Up / Down");
                         ui.label("Scroll console up / down one page");
                         ui.end_row();
+                        ui.strong("Ctrl+Shift+Space");
+                        ui.label("Pin console to bottom");
+                        ui.end_row();
+                        ui.strong("Ctrl+Shift+Q / W / E");
+                        ui.label("Log / Hex / ANSI view (connection tabs)");
+                        ui.end_row();
                         ui.strong("Ctrl+Shift+F");
                         ui.label("Show or hide search");
                         ui.end_row();

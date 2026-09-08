@@ -493,6 +493,58 @@ impl App {
         ctx.request_repaint();
     }
 
+    /// Apply console commands before layout and raw serial input.
+    pub(crate) fn consume_console_view_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.keyboard_overlay_open(ctx)
+            || self.search_focus_request
+            || ctx.memory(|m| m.focused().is_some())
+            || (self.connections.is_empty() && !self.merged_selected)
+        {
+            return;
+        }
+        let (pin, view) = ctx.input_mut(|i| {
+            let modifiers = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
+            let pin = i.consume_key(modifiers, egui::Key::Space);
+            let mut view = None;
+            for (key, selection) in [
+                (egui::Key::Q, (false, false)),
+                (egui::Key::W, (false, true)),
+                (egui::Key::E, (true, false)),
+            ] {
+                if i.consume_key(modifiers, key) {
+                    view = Some(selection);
+                }
+            }
+            (pin, view)
+        });
+        // Merged tabs only have a log view; never change their transmit target's view.
+        if self.merged_selected {
+            if pin {
+                self.merged_follow = true;
+                self.merged_new_since_scroll = 0;
+                self.merged_scroll_to = None;
+            }
+            return;
+        }
+        let Some(active) = self.active_index() else {
+            return;
+        };
+        let conn = &mut self.connections[active];
+        if pin {
+            conn.follow = true;
+            conn.new_since_scroll = 0;
+            conn.scroll_to = None;
+            conn.screen_search.scroll_to = None;
+        }
+        if let Some((screen, hex)) = view {
+            if (conn.screen_view, conn.hex_view) != (screen, hex) {
+                conn.screen_view = screen;
+                conn.hex_view = hex;
+                self.save_session();
+            }
+        }
+    }
+
     /// Reserve local page and line navigation before raw input reaches the device.
     pub(crate) fn consume_scroll_shortcut(&self, ctx: &egui::Context) -> (f32, f32) {
         if self.keyboard_overlay_open(ctx)
@@ -2379,6 +2431,83 @@ mod tests {
             wall: chrono::Utc::now(),
             micros,
         }
+    }
+
+    #[test]
+    fn console_view_shortcuts_select_views_and_pin_without_transmitting() {
+        let (mut app, _enum_tx) = test_app("view-shortcuts");
+        let id = PortId(0);
+        let conn = app.make_connection(
+            id,
+            "probe".into(),
+            Default::default(),
+            Default::default(),
+            inert_handle(id),
+        );
+        app.connections.push(conn);
+        let ctx = egui::Context::default();
+        let press = |app: &mut App, key, modifiers| {
+            ctx.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            });
+            app.consume_console_view_shortcuts(&ctx);
+            let remaining = ctx.input(|i| i.events.len());
+            let _ = ctx.end_pass();
+            remaining
+        };
+        let modifiers = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
+        for (key, screen, hex) in [
+            (egui::Key::E, true, false),
+            (egui::Key::W, false, true),
+            (egui::Key::Q, false, false),
+        ] {
+            assert_eq!(press(&mut app, key, modifiers), 0);
+            assert_eq!(
+                (app.connections[0].screen_view, app.connections[0].hex_view),
+                (screen, hex)
+            );
+        }
+        app.connections[0].follow = false;
+        app.connections[0].new_since_scroll = 10;
+        app.connections[0].scroll_to = Some(1);
+        app.connections[0].screen_search.scroll_to = Some(1);
+        for _ in 0..2 {
+            assert_eq!(press(&mut app, egui::Key::Space, modifiers), 0);
+            assert!(app.connections[0].follow, "pin must not toggle off");
+        }
+        assert_eq!(app.connections[0].new_since_scroll, 0);
+        assert!(app.connections[0].scroll_to.is_none());
+        assert!(app.connections[0].screen_search.scroll_to.is_none());
+        assert_eq!(press(&mut app, egui::Key::W, egui::Modifiers::CTRL), 1);
+        assert!(!app.connections[0].hex_view);
+
+        app.show_settings = true;
+        assert_eq!(press(&mut app, egui::Key::E, modifiers), 1);
+        assert!(!app.connections[0].screen_view);
+        app.show_settings = false;
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("text-input")));
+        assert_eq!(press(&mut app, egui::Key::W, modifiers), 1);
+        assert!(!app.connections[0].hex_view);
+        ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("text-input")));
+
+        app.merged_selected = true;
+        app.merged_follow = false;
+        app.merged_new_since_scroll = 12;
+        assert_eq!(press(&mut app, egui::Key::Space, modifiers), 0);
+        assert!(app.merged_follow);
+        assert_eq!(app.merged_new_since_scroll, 0);
+        assert_eq!(press(&mut app, egui::Key::E, modifiers), 0);
+        assert!(
+            !app.connections[0].screen_view,
+            "merged view must not alter a source tab"
+        );
     }
 
     #[test]
