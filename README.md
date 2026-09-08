@@ -87,6 +87,9 @@ Windows setup installations use the setup installer and may show a Windows
 permission prompt. Portable Windows/Linux builds and writable AppImages update
 in place. Installations managed by MSI or a Linux package manager should be
 updated with that installer/package manager, especially in protected folders.
+Debian package installations still check for updates and show release notices, but disable in-app installation.
+To update, download the latest `.deb` and install it with `sudo apt install ./pigtail_<version>-1_amd64.deb`.
+
 Automatic updates require the matching release asset and its GitHub SHA-256
 digest; older releases without these assets cannot be installed automatically.
 
