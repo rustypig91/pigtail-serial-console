@@ -1,4 +1,4 @@
-//! pigtail — a desktop serial terminal for embedded firmware development.
+//! Rusty's Pigtail - Serial Terminal.
 //!
 //! This crate is a thin egui shell over `serialcore`. All logic that is not
 //! about drawing widgets belongs in the core crate (spec §12).
@@ -36,7 +36,10 @@ fn main() -> anyhow::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1100.0, 720.0])
         .with_min_inner_size([700.0, 400.0])
-        .with_title(concat!("Pigtail v", env!("CARGO_PKG_VERSION")));
+        .with_title(concat!(
+            "Rusty's Pigtail - Serial Terminal v",
+            env!("CARGO_PKG_VERSION")
+        ));
     // Application/window icon, embedded at build time.
     match eframe::icon_data::from_png_bytes(include_bytes!("icon.png")) {
         Ok(icon) => viewport = viewport.with_icon(icon),
@@ -68,7 +71,7 @@ fn main() -> anyhow::Result<()> {
             rfd::MessageDialog::new()
                 .set_title("Update installed")
                 .set_description(format!(
-                    "Pigtail was updated, but could not restart: {error}. Please open it again."
+                    "Rusty's Pigtail - Serial Terminal was updated, but could not restart: {error}. Please open it again."
                 ))
                 .set_level(rfd::MessageLevel::Error)
                 .show();

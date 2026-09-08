@@ -388,6 +388,10 @@ impl App {
                             ));
                             ui.close_menu();
                         }
+                        if ui.button("About").clicked() {
+                            self.show_about = true;
+                            ui.close_menu();
+                        }
                     });
                 });
             });
@@ -473,6 +477,28 @@ impl App {
                 ui.weak("All other keystrokes are sent to the active serial console.");
             });
         self.show_keyboard_shortcuts = open;
+    }
+
+    pub(crate) fn show_about_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_about;
+        egui::Window::new("About")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.heading("Rusty's Pigtail - Serial Terminal");
+                    ui.label(concat!("Version ", env!("CARGO_PKG_VERSION")));
+                    ui.add_space(8.0);
+                    ui.label("A desktop serial terminal.");
+                    ui.add_space(8.0);
+                    ui.hyperlink_to(
+                        "GitHub repository",
+                        "https://github.com/rustypig91/pigtail-serial-console",
+                    );
+                });
+            });
+        self.show_about = open;
     }
 
     /// The bottom status footer: connection state, view details, and the view

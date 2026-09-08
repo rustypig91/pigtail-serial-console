@@ -1,4 +1,4 @@
-; Inno Setup script for the Pigtail setup.exe.
+; Inno Setup script for Rusty's Pigtail - Serial Terminal.
 ;
 ; This is the friendly, click-through installer. The MSI next to it
 ; (../../wix/main.wxs) covers scripted and managed deployment instead.
@@ -13,7 +13,7 @@
   #error SourceBinDir must be passed to ISCC, e.g. /DSourceBinDir=target\release
 #endif
 
-#define AppName "Pigtail"
+#define AppName "Rusty's Pigtail - Serial Terminal"
 #define AppPublisher "Christoffer Zakrisson"
 #define AppURL "https://github.com/rustypig91/pigtail-serial-console"
 #define AppExeName "pigtail.exe"

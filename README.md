@@ -1,10 +1,10 @@
-# Pigtail
+# Rusty's Pigtail - Serial Terminal
 
-A desktop serial terminal for embedded firmware development, built in Rust with [egui](https://github.com/emilk/egui).
+A desktop serial terminal built in Rust with [egui](https://github.com/emilk/egui).
 
-Most serial terminals just show you text. Pigtail is built around the parts of firmware debugging that actually cause pain:
+Most serial terminals just show you text. Rusty's Pigtail is built around the parts of serial debugging that actually cause pain:
 
-- **Reconnects by device identity, not port path.** When a target resets and re-enumerates on a new port, Pigtail finds it again automatically.
+- **Reconnects by device identity, not port path.** When a target resets and re-enumerates on a new port, Rusty's Pigtail finds it again automatically.
 - **Filtering reveals history, not just new output.** Type a filter and it applies retroactively to everything already captured, not only what arrives afterward.
 - **Live plotting linked to the log.** Numeric values extracted from the stream (`temp:23.4, rpm:1200`, or a regex) are plotted live, and clicking a plot point jumps to the log line that produced it. Adding or editing a rule re-reads the whole session, so it also plots the output that already scrolled past.
 - **Nothing is lost.** Raw bytes are written to disk continuously as they arrive; the UI is just a view over that capture.
@@ -24,7 +24,7 @@ Most serial terminals just show you text. Pigtail is built around the parts of f
   connection tabs to reorder them. Closing either kind of tab asks for confirmation
   unless you have disabled that preference.
 - Hex view alongside the text view
-- Optional **ANSI/VT** screen for interactive shells and firmware menus: cursor
+- Optional **ANSI/VT** screen for interactive shells and device menus: cursor
   positioning, erase and redraw operations, scrolling regions, styled/colored
   text, and alternate screen buffers. Select **Log**, **Hex**, or **ANSI/VT** in
   the footer; Log is the default for new connections, and each connection remembers
@@ -80,7 +80,7 @@ and each keeps its own Add/Remove Programs entry.
 ### Updating
 
 Press **Update** in the update notice to download, verify, install, and restart
-Pigtail. Downloads run in the background and show progress; failed downloads
+Rusty's Pigtail. Downloads run in the background and show progress; failed downloads
 leave the current installation untouched and can be retried. Settings are saved
 before installation; active connections close when the application restarts.
 Windows setup installations use the setup installer and may show a Windows

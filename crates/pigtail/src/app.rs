@@ -1566,9 +1566,10 @@ pub struct App {
     // Floating tool windows, toggled from the console right-click menu, so the
     // main window stays uncluttered.
     pub show_settings: bool,
+    pub show_about: bool,
     pub(crate) tab_close_confirmation: Option<(TabId, bool)>,
     pub show_macros_win: bool,
-    /// Global reference for the keyboard commands Pigtail reserves.
+    /// Global reference for the keyboard commands Rusty's Pigtail reserves.
     pub show_keyboard_shortcuts: bool,
     pub(crate) macro_editor: Option<MacroEditor>,
     /// Macro definition awaiting confirmation because it is currently running.
@@ -1678,6 +1679,7 @@ impl App {
             next_merged_id: 1,
             merged_dialog: None,
             show_settings: false,
+            show_about: false,
             tab_close_confirmation: None,
             show_macros_win: false,
             show_keyboard_shortcuts: false,
@@ -2507,7 +2509,7 @@ impl App {
             update::Notice::Available { version, url } => UpdateDialog {
                 title: "Update available".into(),
                 message: format!(
-                    "v{} is available. You are on v{current}.\nUpdate will download, install, and restart Pigtail. Active connections will close.",
+                    "v{} is available. You are on v{current}.\nUpdate will download, install, and restart Rusty's Pigtail - Serial Terminal. Active connections will close.",
                     version.trim_start_matches('v')
                 ),
                 update_version: Some(version.clone()),
@@ -2541,7 +2543,7 @@ impl App {
                 self.update_progress = Some(0.0);
                 if let Some(dialog) = &mut self.update_dialog {
                     dialog.title = "Downloading update".into();
-                    dialog.message = "Downloading Pigtail...".into();
+                    dialog.message = "Downloading Rusty's Pigtail - Serial Terminal...".into();
                 }
             }
             Err(e) => self.update_install_failed(e.to_string()),
@@ -2586,7 +2588,8 @@ impl App {
                             self.update_progress = None;
                             if let Some(dialog) = &mut self.update_dialog {
                                 dialog.title = "Installing update".into();
-                                dialog.message = "Installing Pigtail...".into();
+                                dialog.message =
+                                    "Installing Rusty's Pigtail - Serial Terminal...".into();
                             }
                         }
                         Err(e) => self.update_install_failed(e.to_string()),
@@ -3366,6 +3369,7 @@ impl App {
             || !self.connect_errors.is_empty()
             || self.update_dialog.is_some()
             || self.show_settings
+            || self.show_about
             || self.show_macros_win
             || self.show_keyboard_shortcuts
             || self.macro_editor.is_some()
@@ -3522,6 +3526,7 @@ impl eframe::App for App {
         self.show_tool_windows(ctx);
         self.show_macros_window(ctx);
         self.show_settings_window(ctx);
+        self.show_about_window(ctx);
         self.show_tab_close_confirmation(ctx);
         self.show_keyboard_shortcuts_window(ctx);
         self.show_update_dialog(ctx);

@@ -204,7 +204,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
-          name: "Pigtail v${{ env.VERSION }}"
+          name: "Rusty's Pigtail - Serial Terminal v${{ env.VERSION }}"
           body: "See the assets to download this version."
           # Publish the release (with its assets) when building from a release
           # tag; keep branch/manual builds as drafts so they don't publish.
