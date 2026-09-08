@@ -835,8 +835,7 @@ impl App {
         let show_echo = conn.port_config.local_echo;
         let echo_start = conn.wrap_index.total_rows();
         let echo_rows = if show_echo {
-            // +1 for the block cursor drawn after the text.
-            u64::from(rows_for(conn.tx_input.len() as u32 + 1, m.cols))
+            u64::from(rows_for(conn.tx_input.len() as u32, m.cols))
         } else {
             0
         };
@@ -1289,7 +1288,7 @@ impl App {
                 // the allocation in an exact-height slot, as the normal
                 // console does for every row.
                 let (mut row_ui, _slot) = row_slot(ui, row_height, egui::Sense::hover(), row_id);
-                let resp = wrapped_text(&mut row_ui, job, &m, u32::MAX, row_height, row_id);
+                let resp = wrapped_text(&mut row_ui, job, &m, u32::MAX, row_height, row_id, None);
                 resp.context_menu(|ui| {
                     console_menu(
                         ui,
@@ -1759,7 +1758,7 @@ fn prev_micros_for(
     store.get(prev_abs).map(|l| l.meta.ts.micros)
 }
 
-/// The trailing local-echo line: the input typed so far plus a block cursor, in
+/// The trailing local-echo line: the input typed so far with an overlaid caret, in
 /// a slot sized like every other row's.
 fn render_echo_line(ui: &mut egui::Ui, input: &str, m: &Metrics, height: f32, row_id: egui::Id) {
     let (mut cui, _) = row_slot(ui, height, egui::Sense::hover(), row_id);
@@ -1771,22 +1770,29 @@ fn render_echo_line(ui: &mut egui::Ui, input: &str, m: &Metrics, height: f32, ro
         ..Default::default()
     };
     let mut job = LayoutJob::default();
-    job.append(input, 0.0, fmt.clone());
-    job.append("▏", 0.0, fmt);
+    job.append(input, 0.0, fmt);
     // In the text column like every other row, so what is being typed lines up
     // under the output above it.
     text_ui(&mut cui, m, row_id, |ui| {
-        wrapped_text(ui, job, m, u32::MAX, height, row_id)
+        wrapped_text(
+            ui,
+            job,
+            m,
+            u32::MAX,
+            height,
+            row_id,
+            Some((input.chars().count(), color)),
+        )
     });
 }
 
-/// The bytes a line's row count is predicted from: its own, plus room for the
-/// caret drawn on a line the device is still writing.
+/// The bytes a line's row count is predicted from. The caret overlays the
+/// text and does not occupy a column.
 pub fn wrap_len(store: &LineStore, abs: u64) -> u32 {
     match store.get(abs) {
         // A reconnect marker is drawn as a one-row separator whatever it says.
         Some(line) if line.meta.flags.contains(LineFlags::RECONNECT_MARKER) => 0,
-        Some(line) => line.meta.len + u32::from(line.meta.cursor.is_some()),
+        Some(line) => line.meta.len,
         None => 0,
     }
 }
@@ -1916,7 +1922,15 @@ fn render_row(ui: &mut egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> egui:
     }
     let job = build_job(&cui, line, rctx);
     text_ui(&mut cui, m, rctx.row_id, |ui| {
-        wrapped_text(ui, job, m, rctx.rows, height, rctx.row_id)
+        wrapped_text(
+            ui,
+            job,
+            m,
+            rctx.rows,
+            height,
+            rctx.row_id,
+            line_caret(line).map(|index| (index, line_color(ui, line))),
+        )
     })
 }
 
@@ -1969,6 +1983,7 @@ fn wrapped_text(
     max_rows: u32,
     height: f32,
     row_id: egui::Id,
+    caret: Option<(usize, egui::Color32)>,
 ) -> egui::Response {
     let fallback = ui.visuals().text_color();
     let avail = ui.available_width();
@@ -1986,17 +2001,36 @@ fn wrapped_text(
         ui,
         &response,
         rect.left_top(),
-        galley,
+        galley.clone(),
         fallback,
         egui::Stroke::NONE,
     );
+    if let Some((index, color)) = caret {
+        let cursor = egui::text::CCursor {
+            index,
+            prefer_next_row: true,
+        };
+        let caret_rect = galley
+            .pos_from_ccursor(cursor)
+            .translate(rect.min.to_vec2());
+        ui.painter().line_segment(
+            [caret_rect.left_top(), caret_rect.left_bottom()],
+            egui::Stroke::new(1.0_f32, color),
+        );
+    }
     response
 }
 
-fn build_job(ui: &egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> LayoutJob {
-    let text = line.text;
-    let font = rctx.m.font.clone();
+/// The device stores byte offsets; egui positions cursors by character index.
+fn line_caret(line: &LineRef<'_>) -> Option<usize> {
+    if !line.meta.flags.contains(LineFlags::PROVISIONAL) {
+        return None;
+    }
+    let byte = (line.meta.cursor? as usize).min(line.text.len());
+    line.text.get(..byte).map(|prefix| prefix.chars().count())
+}
 
+fn line_color(ui: &egui::Ui, line: &LineRef<'_>) -> egui::Color32 {
     // `text_color()` is egui's muted non-interactive label color (gray 140 in
     // dark theme); the console is a terminal, not UI chrome, so it wants the
     // brighter `strong_text_color()` (white/black) as its default foreground.
@@ -2006,6 +2040,14 @@ fn build_job(ui: &egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> LayoutJob 
     } else if line.meta.flags.contains(LineFlags::INVALID_UTF8) {
         base = egui::Color32::from_rgb(0xcc, 0x99, 0x66);
     }
+
+    base
+}
+
+fn build_job(ui: &egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> LayoutJob {
+    let text = line.text;
+    let font = rctx.m.font.clone();
+    let base = line_color(ui, line);
 
     let mut job = LayoutJob::default();
     // Keep every match as a separate text run. Rules remain ordered so that
@@ -2031,17 +2073,6 @@ fn build_job(ui: &egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> LayoutJob 
         None => Vec::new(),
     };
 
-    // The live edit cursor (e.g. mid-prompt on the device's own line editor),
-    // only meaningful while the line is still open.
-    let caret = if line.meta.flags.contains(LineFlags::PROVISIONAL) {
-        line.meta
-            .cursor
-            .map(|c| (c as usize).min(text.len()))
-            .filter(|&c| text.is_char_boundary(c))
-    } else {
-        None
-    };
-
     let mut cuts = vec![0usize, text.len()];
     for s in &line.meta.spans {
         cuts.push(s.start as usize);
@@ -2055,29 +2086,12 @@ fn build_job(ui: &egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> LayoutJob 
         cuts.push(*a);
         cuts.push(*b);
     }
-    if let Some(c) = caret {
-        cuts.push(c);
-    }
     cuts.retain(|&c| c <= text.len() && text.is_char_boundary(c));
     cuts.sort_unstable();
     cuts.dedup();
 
-    // Draws the caret glyph in the line's default foreground — a real
-    // terminal's block cursor doesn't tint with whatever color happens to sit
-    // under it either.
-    let caret_fmt = egui::TextFormat {
-        font_id: font.clone(),
-        color: base,
-        ..Default::default()
-    };
-    let mut caret_drawn = false;
-
     for w in cuts.windows(2) {
         let (a, b) = (w[0], w[1]);
-        if Some(a) == caret {
-            job.append("▏", 0.0, caret_fmt.clone());
-            caret_drawn = true;
-        }
         if a >= b {
             continue;
         }
@@ -2129,11 +2143,17 @@ fn build_job(ui: &egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> LayoutJob 
         }
         job.append(seg, 0.0, fmt);
     }
-    // The cursor sitting at the very end of the line (e.g. an empty prompt
-    // awaiting input) is never some window's start, since `text.len()` is
-    // always `cuts`' last element — draw it here instead.
-    if !caret_drawn && caret == Some(text.len()) {
-        job.append("▏", 0.0, caret_fmt);
+    // Keep the configured font height even for an empty live prompt.
+    if text.is_empty() {
+        job.append(
+            "",
+            0.0,
+            egui::TextFormat {
+                font_id: font,
+                color: base,
+                ..Default::default()
+            },
+        );
     }
     job
 }
@@ -2306,6 +2326,75 @@ mod tests {
             wall: chrono::Utc::now(),
             micros,
         }
+    }
+
+    #[test]
+    fn moving_the_caret_keeps_text_and_wrapping_unchanged() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let m = Metrics::new(
+                    ui,
+                    egui::FontId::monospace(12.0),
+                    TimestampFormat::None,
+                    true,
+                    0,
+                    false,
+                );
+                let m = Metrics { cols: 8, ..m };
+                for text in ["", "abcdefgh", "abcdefghijk", "åbcdefghijk"] {
+                    let mut baseline = None;
+                    for byte in text
+                        .char_indices()
+                        .map(|(i, _)| i)
+                        .chain(std::iter::once(text.len()))
+                    {
+                        let meta = LineMeta {
+                            start: 0,
+                            len: text.len() as u32,
+                            ts: ts(0),
+                            port: PortId(1),
+                            flags: LineFlags::PROVISIONAL,
+                            spans: Default::default(),
+                            cursor: Some(byte as u32),
+                        };
+                        let line = LineRef { text, meta: &meta };
+                        let rctx = RowCtx {
+                            ts_format: TimestampFormat::None,
+                            m: &m,
+                            rows: rows_for(text.len() as u32, m.cols),
+                            prev_micros: None,
+                            mark: None,
+                            highlight: &[],
+                            search_re: None,
+                            is_search_current: false,
+                            port_tag: None,
+                            row_id: egui::Id::new("caret-test"),
+                        };
+                        let mut job = build_job(ui, &line, &rctx);
+                        assert_eq!(job.text, text, "caret must not enter selectable text");
+                        job.wrap.max_width = m.wrap_width();
+                        job.wrap.break_anywhere = true;
+                        let galley = ui.fonts(|f| f.layout_job(job));
+                        let geometry: Vec<_> = galley.rows.iter().map(|row| row.rect).collect();
+                        if let Some(expected) = &baseline {
+                            assert_eq!(&geometry, expected);
+                        } else {
+                            baseline = Some(geometry);
+                        }
+                        assert_eq!(line_caret(&line), Some(text[..byte].chars().count()));
+                        if text == "abcdefgh" {
+                            assert_eq!(galley.rows.len(), 1);
+                        }
+                        let cursor_rect = galley.pos_from_ccursor(egui::text::CCursor {
+                            index: line_caret(&line).unwrap(),
+                            prefer_next_row: true,
+                        });
+                        assert!(cursor_rect.height() > 0.0);
+                    }
+                }
+            });
+        });
     }
 
     #[test]
@@ -3042,6 +3131,7 @@ mod tests {
                                     u32::MAX,
                                     row_height,
                                     row_id,
+                                    None,
                                 );
                             }
                         });
