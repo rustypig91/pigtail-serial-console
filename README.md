@@ -66,11 +66,19 @@ Every release publishes installers alongside the plain binaries on the
 
 | Platform | Asset | Notes |
 | --- | --- | --- |
-| Windows | `pigtail-v<version>-x86_64-setup.exe` | The one most people want. Install wizard with an optional desktop shortcut; installs for all users, or into your own profile if you lack admin rights. |
+| Windows | `pigtail-v<version>-x86_64-setup.exe` | The one most people want. Install wizard with an optional desktop shortcut; recommends installing for the current user in AppData, with an all-users option. |
 | Windows | `pigtail-v<version>-x86_64-pc-windows-msvc.msi` | Same application, for scripted or managed deployment (`msiexec /i ... /qn`, Group Policy). Adds a Start Menu entry and an Add/Remove Programs entry. |
 | Debian/Ubuntu | `pigtail_<version>-1_amd64.deb` | `sudo apt install ./pigtail_<version>-1_amd64.deb` — pulls in its own dependencies and registers a desktop entry. |
 | Any Linux | `pigtail-v<version>-x86_64.AppImage` | `chmod +x` and run; no installation, bundles its libraries. Needs the host's GPU drivers for OpenGL. |
 | Portable | `.zip` / `.tar.gz` | Just the binary, no installation. |
+
+The setup wizard offers the installation scope even when started as administrator
+or when Pigtail is already installed. "Install for me" defaults to
+`%LOCALAPPDATA%\Programs\Rusty's Pigtail - Serial Terminal`; "Install for all users"
+uses Program Files. Selecting a different scope creates a separate installation;
+it does not move or uninstall the previous copy. If setup is run using another
+account's administrator credentials, the per-user destination belongs to that
+account. Launch setup normally to install into your own profile.
 
 Neither Windows installer is code-signed, so SmartScreen shows an
 "unrecognized app" warning on first run; choose "More info" → "Run anyway".
@@ -112,6 +120,55 @@ cargo build --release
 Run in development with `cargo run -p pigtail`.
 
 ### Building the packages
+
+To build all release artifacts for your current platform, run one of these
+commands from the repository root:
+
+```powershell
+# Windows (Windows PowerShell 5.1 or PowerShell 7)
+.\scripts\build-release.cmd
+```
+
+```sh
+# x86_64 Linux (Debian/Ubuntu)
+bash scripts/build-release.sh
+```
+
+The Windows `.cmd` launcher runs the PowerShell build script with
+`-ExecutionPolicy Bypass` for that process only, allowing this unsigned local
+script without changing your saved execution policy. You can also run it directly:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
+```
+
+Both scripts read the workspace version automatically and build the whole
+workspace in release mode using `Cargo.lock`. Results go into
+`target/release-assets/<target>/`. Windows produces a ZIP, standalone updater
+EXE, MSI, and setup EXE; Linux produces a tar.gz, standalone updater executable,
+DEB, and AppImage. Run each script on its respective OS; these are native x64
+builds. They only build packages; they do not publish a release.
+
+Install Rust via rustup with a toolchain meeting the `rust-version` in
+`Cargo.toml`. Windows also needs Visual Studio Build Tools with the
+**Desktop development with C++** workload and Windows SDK. The Windows script
+downloads WiX 3.14.1 and portable Inno Setup 6.7.3 (matching CI) on first use
+and caches them under `target/release-tools`; no global installer-tool setup
+is needed.
+
+On Debian/Ubuntu, install the prerequisites first:
+
+```sh
+sudo apt-get install build-essential pkg-config libudev-dev python3 curl \
+    ca-certificates file binutils dpkg-dev patchelf \
+    libx11-6 libxcursor1 libxi6 libxrandr2 libxkbcommon0 libxkbcommon-x11-0
+```
+
+The Linux script installs `cargo-deb` if missing. AppImage packaging downloads
+linuxdeploy and its AppImage plugin on each run. Internet access is needed for
+uncached tools, Rust targets, and dependencies. For Linux compatibility matching
+CI, build on Ubuntu 22.04; binaries built on newer distributions may require a
+newer glibc on the destination machine.
 
 CI does this on every tag, but each one can be built by hand:
 

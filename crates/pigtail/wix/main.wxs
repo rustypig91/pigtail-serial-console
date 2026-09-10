@@ -61,7 +61,7 @@
                                 Id="StartMenuShortcut"
                                 Directory="ProgramMenuFolder"
                                 Name="Rusty's Pigtail - Serial Terminal"
-                                Description="Desktop serial terminal"
+                                Description="Rustys Pigtail - Desktop serial terminal"
                                 WorkingDirectory="APPLICATIONFOLDER"
                                 Icon="ProductIcon.ico"
                                 IconIndex="0"

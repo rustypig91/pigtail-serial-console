@@ -313,9 +313,25 @@ try {{
     if ($parent -and -not $parent.WaitForExit(120000)) {{
         throw 'Rusty''s Pigtail - Serial Terminal did not close in time. Please try updating again.'
     }}
-    $key = Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{{374D0E66-90B2-4055-A852-0AF51237DA44}}_is1' -ErrorAction SilentlyContinue
-    $scope = '/ALLUSERS'
-    if ($key -and $key.InstallLocation.TrimEnd('\') -eq $dir) {{ $scope = '/CURRENTUSER' }}
+    # Manual Setup always offers a scope choice. Updates must explicitly match
+    # the existing destination, without guessing all-users on a lookup failure.
+    function Normalize-InstallPath($path) {{
+        if (-not $path) {{ return '' }}
+        return [IO.Path]::GetFullPath($path).TrimEnd('\')
+    }}
+    $scope = $null
+    $normalizedDir = Normalize-InstallPath $dir
+    foreach ($entry in @(
+        @('HKCU:', '/CURRENTUSER'),
+        @('HKLM:', '/ALLUSERS')
+    )) {{
+        $key = Get-ItemProperty -LiteralPath ($entry[0] + '\Software\Microsoft\Windows\CurrentVersion\Uninstall\{{374D0E66-90B2-4055-A852-0AF51237DA44}}_is1') -ErrorAction SilentlyContinue
+        if ($key -and (Normalize-InstallPath $key.InstallLocation) -eq $normalizedDir) {{
+            if ($scope) {{ throw 'Both installation scopes use this folder. Please update using setup.exe.' }}
+            $scope = $entry[1]
+        }}
+    }}
+    if (-not $scope) {{ throw 'Could not determine the installation scope. Please update using setup.exe.' }}
     $process = Start-Process -FilePath $installer -ArgumentList @('/SILENT','/NORESTART','/NOCLOSEAPPLICATIONS','/NORESTARTAPPLICATIONS',$scope,('/DIR="'+$dir+'"')) -Wait -PassThru
     if ($process.ExitCode -ne 0) {{ throw "The installer returned exit code $($process.ExitCode)." }}
 }} catch {{
@@ -467,7 +483,13 @@ mod tests {
         // Run the actual generated script with only OS side effects replaced.
         let mocks = r#"
 function Get-Process { param($Id, $ErrorAction) return $null }
-function Get-ItemProperty { param($LiteralPath, $ErrorAction) return @{ InstallLocation = $dir } }
+function Get-ItemProperty {
+    param($LiteralPath, $ErrorAction)
+    if ($LiteralPath.StartsWith($env:PIGTAIL_UPDATE_TEST_HIVE)) {
+        return @{ InstallLocation = $dir.ToUpperInvariant() + '\' }
+    }
+    return $null
+}
 function Start-Process {
     param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru, $WorkingDirectory)
     @{ file = $FilePath; arguments = $ArgumentList; waited = [bool]$Wait } |
@@ -479,39 +501,50 @@ function Remove-Item { param($LiteralPath, [switch]$Recurse, [switch]$Force, $Er
         let helper = directory.path().join("test.ps1");
         let script = setup_script(&installer, &target, directory.path(), 12345).unwrap();
         std::fs::write(&helper, format!("\u{feff}{mocks}\n{script}")).unwrap();
-        let output = std::process::Command::new("powershell.exe")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-            ])
-            .arg(helper)
-            .env("PIGTAIL_UPDATE_TEST_LOG", &log)
-            .creation_flags(0x08000000)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let calls: Vec<serde_json::Value> = std::fs::read_to_string(log)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line.trim_start_matches('\u{feff}')).unwrap())
-            .collect();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0]["file"], installer.to_str().unwrap());
-        assert_eq!(calls[0]["waited"], true);
-        let arguments = calls[0]["arguments"].as_array().unwrap();
-        assert!(arguments.contains(&serde_json::json!("/CURRENTUSER")));
-        assert!(arguments.contains(&serde_json::json!(format!(
-            "/DIR=\"{}\"",
-            target.parent().unwrap().display()
-        ))));
-        assert_eq!(calls[1]["file"], target.to_str().unwrap());
+        for (hive, scope) in [("HKCU:", "/CURRENTUSER"), ("HKLM:", "/ALLUSERS")] {
+            let _ = std::fs::remove_file(&log);
+            let output = std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                ])
+                .arg(&helper)
+                .env("PIGTAIL_UPDATE_TEST_LOG", &log)
+                .env("PIGTAIL_UPDATE_TEST_HIVE", hive)
+                .creation_flags(0x08000000)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let calls: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line.trim_start_matches('\u{feff}')).unwrap())
+                .collect();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0]["file"], installer.to_str().unwrap());
+            assert_eq!(calls[0]["waited"], true);
+            let arguments = calls[0]["arguments"].as_array().unwrap();
+            assert!(arguments.contains(&serde_json::json!(scope)));
+            assert_eq!(
+                arguments
+                    .iter()
+                    .filter(|arg| *arg == "/CURRENTUSER" || *arg == "/ALLUSERS")
+                    .count(),
+                1
+            );
+            assert!(arguments.contains(&serde_json::json!(format!(
+                "/DIR=\"{}\"",
+                target.parent().unwrap().display()
+            ))));
+            assert_eq!(calls[1]["file"], target.to_str().unwrap());
+        }
     }
 
     #[test]
