@@ -35,12 +35,12 @@ try {
 
     if (-not (Test-Path "$wix/light.exe")) {
         $zip = Join-Path $toolDir 'wix-3.14.1.zip'
-        Invoke-WebRequest 'https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip' -OutFile $zip
+        Invoke-WebRequest -UseBasicParsing 'https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip' -OutFile $zip
         Expand-Archive -LiteralPath $zip -DestinationPath $wix -Force
     }
     if (-not (Test-Path "$inno/ISCC.exe")) {
         $installer = Join-Path $toolDir 'innosetup-6.7.3.exe'
-        Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe' -OutFile $installer
+        Invoke-WebRequest -UseBasicParsing 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe' -OutFile $installer
         $process = Start-Process -FilePath $installer -Wait -PassThru -WindowStyle Hidden -ArgumentList @(
             '/PORTABLE=1', '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$inno`""
         )
