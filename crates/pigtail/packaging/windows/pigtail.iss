@@ -41,12 +41,13 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-; Defaults to an all-users install, but the first wizard page lets a user
-; without admin rights install into their own profile instead.
-PrivilegesRequired=admin
+; Recommend AppData, including when Setup was started elevated. The user can
+; still explicitly select an all-users installation in Program Files.
+PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
-; In-app updates also rely on Setup detecting the existing installation scope.
-UsePreviousPrivileges=yes
+; Keep the choice available even if another installation scope already exists.
+; The updater supplies /CURRENTUSER or /ALLUSERS for its existing destination.
+UsePreviousPrivileges=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -59,8 +60,13 @@ Source: "{#SourceBinDir}\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourcePath}..\..\..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourcePath}..\..\..\..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
+[InstallDelete]
+; Remove the temporary apostrophe-free shortcut name if it was installed.
+Type: files; Name: "{group}\Rustys Pigtail - Serial Terminal.lnk"
+
 [Icons]
-Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"
+; Keep the display name and include the apostrophe-free spelling in metadata.
+Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Comment: "Rustys Pigtail - Serial Terminal"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
 
 [Run]

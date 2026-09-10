@@ -7,5 +7,5 @@ Exec=pigtail
 Icon=pigtail
 Terminal=false
 Categories=Development;Electronics;
-Keywords=serial;uart;usb;terminal;console;
+Keywords=Rustys;Rusty's;Pigtail;serial;uart;usb;terminal;console;
 StartupWMClass=pigtail
