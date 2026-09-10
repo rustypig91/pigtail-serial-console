@@ -45,6 +45,8 @@ ArchitecturesInstallIn64BitMode=x64compatible
 ; without admin rights install into their own profile instead.
 PrivilegesRequired=admin
 PrivilegesRequiredOverridesAllowed=dialog
+; In-app updates also rely on Setup detecting the existing installation scope.
+UsePreviousPrivileges=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"

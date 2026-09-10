@@ -313,10 +313,11 @@ try {{
     if ($parent -and -not $parent.WaitForExit(120000)) {{
         throw 'Rusty''s Pigtail - Serial Terminal did not close in time. Please try updating again.'
     }}
-    $key = Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{{374D0E66-90B2-4055-A852-0AF51237DA44}}_is1' -ErrorAction SilentlyContinue
-    $scope = '/ALLUSERS'
-    if ($key -and $key.InstallLocation.TrimEnd('\') -eq $dir) {{ $scope = '/CURRENTUSER' }}
-    $process = Start-Process -FilePath $installer -ArgumentList @('/SILENT','/NORESTART','/NOCLOSEAPPLICATIONS','/NORESTARTAPPLICATIONS',$scope,('/DIR="'+$dir+'"')) -Wait -PassThru
+    # Let Inno Setup preserve the existing installation's scope, just as when
+    # setup.exe is opened manually (UsePreviousPrivileges=yes). Do not force
+    # /ALLUSERS when a registry lookup or textual path comparison misses a
+    # per-user installation: that would request elevation unnecessarily.
+    $process = Start-Process -FilePath $installer -ArgumentList @('/SILENT','/NORESTART','/NOCLOSEAPPLICATIONS','/NORESTARTAPPLICATIONS',('/DIR="'+$dir+'"')) -Wait -PassThru
     if ($process.ExitCode -ne 0) {{ throw "The installer returned exit code $($process.ExitCode)." }}
 }} catch {{
     Add-Type -AssemblyName System.Windows.Forms
@@ -452,7 +453,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_helper_preserves_scope_quotes_paths_and_restarts_after_setup() {
+    fn windows_helper_defers_scope_to_setup_quotes_paths_and_restarts_after_setup() {
         use std::os::windows::process::CommandExt;
         let directory = tempfile::Builder::new()
             .prefix("pigtail-update-")
@@ -467,7 +468,7 @@ mod tests {
         // Run the actual generated script with only OS side effects replaced.
         let mocks = r#"
 function Get-Process { param($Id, $ErrorAction) return $null }
-function Get-ItemProperty { param($LiteralPath, $ErrorAction) return @{ InstallLocation = $dir } }
+function Get-ItemProperty { throw 'Installation scope must be detected by Inno Setup' }
 function Start-Process {
     param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru, $WorkingDirectory)
     @{ file = $FilePath; arguments = $ArgumentList; waited = [bool]$Wait } |
@@ -506,7 +507,8 @@ function Remove-Item { param($LiteralPath, [switch]$Recurse, [switch]$Force, $Er
         assert_eq!(calls[0]["file"], installer.to_str().unwrap());
         assert_eq!(calls[0]["waited"], true);
         let arguments = calls[0]["arguments"].as_array().unwrap();
-        assert!(arguments.contains(&serde_json::json!("/CURRENTUSER")));
+        assert!(!arguments.contains(&serde_json::json!("/CURRENTUSER")));
+        assert!(!arguments.contains(&serde_json::json!("/ALLUSERS")));
         assert!(arguments.contains(&serde_json::json!(format!(
             "/DIR=\"{}\"",
             target.parent().unwrap().display()
