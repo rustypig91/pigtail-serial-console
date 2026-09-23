@@ -200,16 +200,17 @@ Use **Ctrl+Shift+Space** to pin the console to the bottom. On connection tabs,
 **Ctrl+Shift+Q / W / E** selects the **Log / Hex / ANSI** view.
 Use **Ctrl+Shift+P** to toggle the plot on connection tabs.
 
-## Install through APT (Ubuntu)
+## Install through APT (Ubuntu 22.04 or newer, amd64)
 
 Available after the shared [Rusty APT repository](https://github.com/rustypig91/rusty-apt)
-is configured and the first package is published:
+is configured and the first package is published. Packages currently support
+x86-64 (amd64) only:
 
 ```bash
 sudo mkdir -p /etc/apt/keyrings
 curl -fsSL https://rustypig91.github.io/rusty-apt/rusty.asc | sudo tee /etc/apt/keyrings/rusty.asc >/dev/null
 sudo chmod 644 /etc/apt/keyrings/rusty.asc
-echo 'deb [signed-by=/etc/apt/keyrings/rusty.asc] https://rustypig91.github.io/rusty-apt stable main' | sudo tee /etc/apt/sources.list.d/rusty.list
+echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/rusty.asc] https://rustypig91.github.io/rusty-apt stable main' | sudo tee /etc/apt/sources.list.d/rusty.list
 sudo apt update
 sudo apt install pigtail
 ```
