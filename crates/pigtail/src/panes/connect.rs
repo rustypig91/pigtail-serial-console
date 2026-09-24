@@ -238,6 +238,8 @@ impl App {
             || self.file_transfer_dialog.is_some();
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
+            // Status and navigation labels must not join console text selection.
+            ui.style_mut().interaction.selectable_labels = false;
             ui.horizontal(|ui| {
                 // Only the tab strip and "+" are disabled: global actions
                 // below act on neither the dialog nor the set of tabs, so
@@ -530,6 +532,8 @@ impl App {
             self.long_running_macro_indicators(Instant::now(), self.macro_target_port());
         let mut stop_macro_run = None;
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
+            // Status and navigation labels must not join console text selection.
+            ui.style_mut().interaction.selectable_labels = false;
             ui.horizontal(|ui| {
                 if self.merged_selected {
                     let shown = self.merged_view().len();
