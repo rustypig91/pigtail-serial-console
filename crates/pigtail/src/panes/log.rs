@@ -749,6 +749,8 @@ impl App {
                 egui::TopBottomPanel::top("search_bar")
                     .show_separator_line(false)
                     .show_inside(ui, |ui| {
+                        // Search status labels must not join a console drag.
+                        ui.style_mut().interaction.selectable_labels = false;
                         if self.merged_selected {
                             self.show_merged_search_bar(ui, select_query);
                         } else {
@@ -1383,7 +1385,11 @@ impl App {
                 egui::Id::new(("merged_selection", merged_tab_id)),
                 first_entry..last_entry,
                 entries,
-                |i| view[i].seq,
+                // Sequence numbers are reassigned when late data interleaves
+                // with existing rows. Timestamps stay stable and sorted; the
+                // sign-bit flip preserves their signed order as u64 keys.
+                // Equal timestamps conservatively retain all tied rows.
+                |i| (view[i].micros as u64) ^ (1_u64 << 63),
             );
             rect.min.y =
                 ui.max_rect().top() + merged_wrap.start_row(retained.start) as f32 * row_height;
@@ -2771,6 +2777,80 @@ mod tests {
     use serialcore::store::{ColorSpan, IncomingLine, LineMeta};
 
     #[test]
+    fn dragging_over_search_bar_copies_only_console_text() {
+        for merged in [false, true] {
+            let (mut app, _enum_tx) = test_app("selection-search-bar");
+            let port = PortId(0);
+            let mut conn = app.make_connection(
+                port,
+                "probe".into(),
+                Default::default(),
+                Default::default(),
+                inert_handle(port),
+            );
+            conn.store.append(IncomingLine {
+                text: "console text".into(),
+                ts: ts(0),
+                port,
+                flags: LineFlags::default(),
+                spans: Default::default(),
+                cursor: None,
+            });
+            app.connections.push(conn);
+            app.merged.push(MergedEntry {
+                port,
+                abs: 0,
+                seq: 0,
+                micros: 0,
+            });
+            app.merged_selected = merged;
+            app.show_search = true;
+            app.config.settings.timestamp_format = TimestampFormat::None;
+            let ctx = egui::Context::default();
+            let draw = |app: &mut App, events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(800.0, 400.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| app.show_console(ctx, false),
+                )
+            };
+            let _ = draw(&mut app, vec![]);
+            let _ = draw(&mut app, vec![]);
+            let row = egui::Id::new((
+                if merged { "merged_row" } else { "console_row" },
+                port,
+                0_u64,
+            ));
+            let start = ctx
+                .read_response(row.with("text"))
+                .unwrap()
+                .rect
+                .right_center();
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let _ = draw(
+                &mut app,
+                vec![egui::Event::PointerMoved(start), button(start, true)],
+            );
+            let end = egui::pos2(8.0, 10.0);
+            let _ = draw(&mut app, vec![egui::Event::PointerMoved(end)]);
+            let _ = draw(&mut app, vec![button(end, false)]);
+            let output = draw(&mut app, vec![egui::Event::Copy]);
+            assert_eq!(output.platform_output.copied_text.trim(), "console text");
+        }
+    }
+
+    #[test]
     fn search_near_log_end_has_no_first_frame_jump() {
         for merged in [false, true] {
             for count in [3, 100] {
@@ -3013,13 +3093,14 @@ mod tests {
 
     #[test]
     fn selection_survives_scrolling_and_copies_offscreen_rows() {
-        for (merged, reverse, upwards) in [
-            (false, false, false),
-            (true, false, false),
-            (false, true, false),
-            (true, true, false),
-            (false, false, true),
-            (true, false, true),
+        for (merged, reverse, upwards, late_data) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (false, true, false, false),
+            (true, true, false, false),
+            (false, false, true, false),
+            (true, false, true, false),
+            (true, false, false, true),
         ] {
             let (mut app, _enum_tx) = test_app("scroll-selection");
             let port = PortId(0);
@@ -3201,6 +3282,31 @@ mod tests {
                 let _ = draw(&mut app, vec![button(end, false)]);
             }
             assert!(egui::text_selection::LabelSelectionState::load(&ctx).has_selection());
+            if late_data {
+                // A late batch from another reader is sorted before existing
+                // rows, then maintain_merged renumbers every sequence key.
+                for i in -100..0 {
+                    let abs = app.connections[0].store.append(IncomingLine {
+                        text: format!("late row {i}"),
+                        ts: ts(i),
+                        port,
+                        flags: LineFlags::default(),
+                        spans: Default::default(),
+                        cursor: None,
+                    });
+                    app.merged.push(MergedEntry {
+                        port,
+                        abs,
+                        seq: 0,
+                        micros: i,
+                    });
+                }
+                app.merged.sort_by_key(|entry| entry.micros);
+                for (seq, entry) in app.merged.iter_mut().enumerate() {
+                    entry.seq = seq as u64;
+                }
+                app.merged_generation += 1;
+            }
             // Move both endpoints off screen after releasing the mouse.
             if merged {
                 app.merged_scroll_to = Some(app.merged[90]);
