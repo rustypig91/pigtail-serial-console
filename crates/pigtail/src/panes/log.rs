@@ -146,6 +146,7 @@ fn port_color(port: PortId) -> egui::Color32 {
 /// menu closures don't need `&mut self`.
 #[derive(Default)]
 struct MenuAction {
+    selection: Option<(SelectionAction, String)>,
     set_ts: Option<TimestampFormat>,
     toggle_hex: bool,
     toggle_plot: bool,
@@ -360,6 +361,23 @@ struct SearchSelectionCapture {
     pending: Option<(egui::Id, String)>,
     ready: Option<(egui::Id, String)>,
     registered: bool,
+}
+
+#[derive(Clone, Copy)]
+enum SelectionAction {
+    Search,
+    Macro,
+    Highlight,
+}
+
+#[derive(Clone, Default)]
+struct SelectionMenu {
+    hit: bool,
+    text: String,
+}
+
+fn selection_menu_id() -> egui::Id {
+    egui::Id::new("console_selection_menu")
 }
 
 // Set the cursor before TextEdit processes input so even typing on the first
@@ -672,6 +690,13 @@ impl App {
                 .take()
         });
         if let Some((target, text)) = ready {
+            if target == selection_menu_id() {
+                ctx.data_mut(|data| {
+                    data.get_temp_mut_or_default::<SelectionMenu>(selection_menu_id())
+                        .text = text
+                });
+                return false;
+            }
             if target == self.search_target() && !text.is_empty() {
                 let query = regex::escape(&text);
                 if self.merged_selected {
@@ -710,7 +735,15 @@ impl App {
                 egui::Key::F,
             )
         });
-        let capture_selection = open_search && request_search_selection(ctx, self.search_target());
+        let context_click = ctx.input(|i| i.pointer.secondary_clicked());
+        if context_click {
+            ctx.data_mut(|data| data.insert_temp(selection_menu_id(), SelectionMenu::default()));
+        }
+        let capture_selection = if context_click {
+            request_search_selection(ctx, selection_menu_id())
+        } else {
+            open_search && request_search_selection(ctx, self.search_target())
+        };
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // Only while the pointer is actually over the console, so ctrl+wheel
@@ -1615,6 +1648,44 @@ impl App {
     /// A merged row names its own port instead, which is what keeps "toggle
     /// DTR" off a device the reader isn't even looking at.
     fn apply_menu(&mut self, active: usize, menu: MenuAction) {
+        if let Some((action, text)) = menu.selection {
+            match action {
+                SelectionAction::Search => {
+                    let query = regex::escape(&text);
+                    if self.merged_selected {
+                        self.merged_search_query = query;
+                        self.merged_search_dirty = true;
+                        self.merged_search_pos = None;
+                    } else if let Some(conn) = self.connections.get_mut(active) {
+                        conn.search_query = query;
+                        conn.search_dirty = true;
+                        conn.search_pos = None;
+                    }
+                    self.show_search = true;
+                    self.search_focus_request = true;
+                }
+                SelectionAction::Macro => {
+                    self.open_macro_editor(None);
+                    if let Some(editor) = &mut self.macro_editor {
+                        editor.draft.steps = vec![serialcore::config::MacroStep::Command { text }];
+                    }
+                }
+                SelectionAction::Highlight => {
+                    self.config
+                        .highlight
+                        .push(serialcore::config::HighlightRule {
+                            pattern: regex::escape(&text),
+                            color: "#ff5555".into(),
+                            case_sensitive: true,
+                            bold: false,
+                            enabled: true,
+                        });
+                    self.highlight_dirty = true;
+                    self.show_highlight_win = true;
+                    self.write_config();
+                }
+            }
+        }
         // The connection the port-specific actions land on. A named port that
         // has since gone away resolves to nothing at all: falling back to the
         // active tab is exactly how a merged row's action could reach the wrong
@@ -1873,6 +1944,30 @@ fn console_menu(
     has_mark: bool,
     merged_view: bool,
 ) {
+    let selection = ui
+        .ctx()
+        .data(|data| data.get_temp::<SelectionMenu>(selection_menu_id()))
+        .unwrap_or_default();
+    if selection.hit {
+        ui.add_enabled_ui(!selection.text.is_empty(), |ui| {
+            if ui.button("Copy").clicked() {
+                ui.ctx().copy_text(selection.text.clone());
+                ui.close_menu();
+            }
+            ui.separator();
+            for (label, action) in [
+                ("Search selection", SelectionAction::Search),
+                ("Add macro...", SelectionAction::Macro),
+                ("Add highlight rule...", SelectionAction::Highlight),
+            ] {
+                if ui.button(label).clicked() {
+                    menu.selection = Some((action, selection.text.clone()));
+                    ui.close_menu();
+                }
+            }
+        });
+        return;
+    }
     // Only one context menu can be open at a time, so this closure runs for the
     // one the user actually opened — recording its port once up here is enough
     // for whichever item they then pick.
@@ -2448,14 +2543,58 @@ fn wrapped_text(
     if !clip.intersects(rect) {
         ui.set_clip_rect(egui::Rect::NOTHING);
     }
+    // Label selection treats any held pointer button as a selection drag.
+    // Keep right clicks from collapsing the selection before opening its menu.
+    let mut selection_response = response.clone();
+    selection_response.is_pointer_button_down_on &= ui.input(|i| i.pointer.primary_down());
+    selection_response.sense.drag &= ui.input(|i| i.pointer.primary_down());
     egui::text_selection::LabelSelectionState::label_text_selection(
         ui,
-        &response,
+        &selection_response,
         rect.left_top(),
         galley.clone(),
         fallback,
         egui::Stroke::NONE,
     );
+    // egui 0.30 keeps selection ranges private. Its selection painter appends
+    // four rectangle vertices per selected row; compare with the original
+    // galley so search/highlight backgrounds cannot count as selected text.
+    if response.secondary_clicked() {
+        if let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) {
+            let hit = ui.ctx().graphics(|graphics| {
+                graphics
+                    .get(response.layer_id)
+                    .and_then(|list| list.all_entries().last())
+                    .is_some_and(|entry| {
+                        let egui::Shape::Text(shape) = &entry.shape else {
+                            return false;
+                        };
+                        shape
+                            .galley
+                            .rows
+                            .iter()
+                            .zip(&galley.rows)
+                            .any(|(painted, original)| {
+                                let added = &painted.visuals.mesh.vertices
+                                    [original.visuals.mesh.vertices.len()..];
+                                if added.len() != 4 {
+                                    return false;
+                                }
+                                let bounds = egui::Rect::from_min_max(added[0].pos, added[3].pos)
+                                    .translate(rect.min.to_vec2())
+                                    .intersect(clip);
+                                bounds.width() > 0.0 && bounds.contains(pointer)
+                            })
+                    })
+            });
+            if hit {
+                ui.ctx().data_mut(|data| {
+                    data.get_temp_mut_or_default::<SelectionMenu>(selection_menu_id())
+                        .hit = true
+                });
+            }
+        }
+    }
     ui.set_clip_rect(clip);
     if let Some(pointer) = saved_pointer {
         ui.ctx().input_mut(|i| i.pointer = pointer);
@@ -2928,6 +3067,158 @@ mod tests {
                 assert!((first.top() - second.top()).abs() < 0.01,
                     "search target jumped: merged={merged}, count={count}, first={first:?}, second={second:?}");
             }
+        }
+    }
+
+    #[test]
+    fn selected_text_context_menu_captures_text_and_targets_only_selection() {
+        for merged in [false, true] {
+            let (mut app, _enum_tx) = test_app("selection-menu");
+            let port = PortId(0);
+            let mut conn = app.make_connection(
+                port,
+                "probe".into(),
+                Default::default(),
+                Default::default(),
+                inert_handle(port),
+            );
+            conn.follow = false;
+            let text = "v?lue[0].*";
+            let abs = conn.store.append(IncomingLine {
+                text: text.into(),
+                ts: ts(0),
+                port,
+                flags: LineFlags::default(),
+                spans: Default::default(),
+                cursor: None,
+            });
+            app.connections.push(conn);
+            app.merged.push(MergedEntry {
+                port,
+                abs,
+                seq: 0,
+                micros: 0,
+            });
+            app.merged_selected = merged;
+            app.merged_follow = false;
+            app.config.settings.timestamp_format = TimestampFormat::None;
+            let ctx = egui::Context::default();
+            let draw = |app: &mut App, events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(800.0, 400.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        ctx.copy_text("clipboard sentinel".into());
+                        app.show_console(ctx, false);
+                    },
+                )
+            };
+            let _ = draw(&mut app, vec![]);
+            let _ = draw(&mut app, vec![]);
+            let row = egui::Id::new((if merged { "merged_row" } else { "console_row" }, port, abs));
+            let rect = ctx.read_response(row.with("text")).unwrap().rect;
+            let start = rect.left_center();
+            let end = rect.right_center() - egui::vec2(10.0, 0.0);
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let _ = draw(
+                &mut app,
+                vec![egui::Event::PointerMoved(start), button(start, true)],
+            );
+            let _ = draw(&mut app, vec![egui::Event::PointerMoved(end)]);
+            let _ = draw(&mut app, vec![button(end, false)]);
+            let point = start + egui::vec2(12.0, 0.0);
+            let secondary = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let _ = draw(
+                &mut app,
+                vec![egui::Event::PointerMoved(point), secondary(point, true)],
+            );
+            let output = draw(&mut app, vec![secondary(point, false)]);
+            assert_eq!(output.platform_output.copied_text, "clipboard sentinel");
+            let _ = draw(&mut app, vec![]);
+            let selected = ctx
+                .data(|data| data.get_temp::<SelectionMenu>(selection_menu_id()))
+                .unwrap();
+            assert!(selected.hit, "right click within selected characters");
+            assert_eq!(selected.text, text);
+            assert!(ctx.is_context_menu_open());
+            app.apply_menu(
+                0,
+                MenuAction {
+                    selection: Some((SelectionAction::Macro, selected.text.clone())),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                matches!(&app.macro_editor.as_ref().unwrap().draft.steps[0], serialcore::config::MacroStep::Command { text: value } if value == text)
+            );
+            assert!(app.config.macros.is_empty(), "macro remains a draft");
+            app.macro_editor = None;
+            app.apply_menu(
+                0,
+                MenuAction {
+                    selection: Some((SelectionAction::Highlight, selected.text.clone())),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                app.config.highlight.last().unwrap().pattern,
+                regex::escape(text)
+            );
+            app.show_highlight_win = false;
+            app.apply_menu(
+                0,
+                MenuAction {
+                    selection: Some((SelectionAction::Search, selected.text)),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                if merged {
+                    &app.merged_search_query
+                } else {
+                    &app.connections[0].search_query
+                },
+                &regex::escape(text)
+            );
+            app.show_search = false;
+            app.search_focus_request = false;
+            let _ = draw(
+                &mut app,
+                vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            let _ = draw(
+                &mut app,
+                vec![egui::Event::PointerMoved(end), secondary(end, true)],
+            );
+            let _ = draw(&mut app, vec![secondary(end, false)]);
+            assert!(
+                !ctx.data(|data| data.get_temp::<SelectionMenu>(selection_menu_id()))
+                    .unwrap()
+                    .hit,
+                "empty row margin uses the normal menu"
+            );
         }
     }
 
