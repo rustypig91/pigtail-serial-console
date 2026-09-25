@@ -147,6 +147,7 @@ fn port_color(port: PortId) -> egui::Color32 {
 #[derive(Default)]
 struct MenuAction {
     selection: Option<(SelectionAction, String)>,
+    macro_editor_open: bool,
     set_ts: Option<TimestampFormat>,
     toggle_hex: bool,
     toggle_plot: bool,
@@ -717,7 +718,10 @@ impl App {
 
     pub(crate) fn show_console(&mut self, ctx: &egui::Context, console_tab_claimed: bool) {
         let select_query = self.seed_search_from_selection(ctx);
-        let mut menu = MenuAction::default();
+        let mut menu = MenuAction {
+            macro_editor_open: self.macro_editor.is_some(),
+            ..Default::default()
+        };
         let mut open_dialog = false;
         let mut font_steps = 0;
 
@@ -1665,9 +1669,12 @@ impl App {
                     self.search_focus_request = true;
                 }
                 SelectionAction::Macro => {
-                    self.open_macro_editor(None);
-                    if let Some(editor) = &mut self.macro_editor {
-                        editor.draft.steps = vec![serialcore::config::MacroStep::Command { text }];
+                    if self.macro_editor.is_none() {
+                        self.open_macro_editor(None);
+                        if let Some(editor) = &mut self.macro_editor {
+                            editor.draft.steps =
+                                vec![serialcore::config::MacroStep::Command { text }];
+                        }
                     }
                 }
                 SelectionAction::Highlight => {
@@ -1960,7 +1967,8 @@ fn console_menu(
                 ("Add macro...", SelectionAction::Macro),
                 ("Add highlight rule...", SelectionAction::Highlight),
             ] {
-                if ui.button(label).clicked() {
+                let enabled = !matches!(action, SelectionAction::Macro) || !menu.macro_editor_open;
+                if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
                     menu.selection = Some((action, selection.text.clone()));
                     ui.close_menu();
                 }
@@ -2547,7 +2555,9 @@ fn wrapped_text(
     // Keep right clicks from collapsing the selection before opening its menu.
     let mut selection_response = response.clone();
     selection_response.is_pointer_button_down_on &= ui.input(|i| i.pointer.primary_down());
-    selection_response.sense.drag &= ui.input(|i| i.pointer.primary_down());
+    // Press and release may both arrive in one frame, leaving no button down.
+    selection_response.sense.drag &=
+        ui.input(|i| i.pointer.primary_down() || i.pointer.primary_pressed());
     egui::text_selection::LabelSelectionState::label_text_selection(
         ui,
         &selection_response,
@@ -3144,6 +3154,26 @@ mod tests {
                 pressed,
                 modifiers: egui::Modifiers::NONE,
             };
+            // A fast primary click can arrive entirely within one frame.
+            // It must still collapse the previous selection.
+            let _ = draw(&mut app, vec![button(end, true), button(end, false)]);
+            let _ = draw(
+                &mut app,
+                vec![egui::Event::PointerMoved(point), secondary(point, true)],
+            );
+            let _ = draw(&mut app, vec![secondary(point, false)]);
+            assert!(
+                !ctx.data(|data| data.get_temp::<SelectionMenu>(selection_menu_id()))
+                    .unwrap()
+                    .hit,
+                "a fast primary click must collapse the old selection"
+            );
+            let _ = draw(
+                &mut app,
+                vec![egui::Event::PointerMoved(start), button(start, true)],
+            );
+            let _ = draw(&mut app, vec![egui::Event::PointerMoved(end)]);
+            let _ = draw(&mut app, vec![button(end, false)]);
             let _ = draw(
                 &mut app,
                 vec![egui::Event::PointerMoved(point), secondary(point, true)],
@@ -3168,6 +3198,20 @@ mod tests {
                 matches!(&app.macro_editor.as_ref().unwrap().draft.steps[0], serialcore::config::MacroStep::Command { text: value } if value == text)
             );
             assert!(app.config.macros.is_empty(), "macro remains a draft");
+            app.macro_editor.as_mut().unwrap().draft.name = "Unsaved draft".into();
+            app.apply_menu(
+                0,
+                MenuAction {
+                    selection: Some((SelectionAction::Macro, "replacement".into())),
+                    ..Default::default()
+                },
+            );
+            let draft = &app.macro_editor.as_ref().unwrap().draft;
+            assert_eq!(draft.name, "Unsaved draft");
+            assert!(
+                matches!(&draft.steps[0], serialcore::config::MacroStep::Command { text: value } if value == text),
+                "selection actions must not overwrite an open macro draft"
+            );
             app.macro_editor = None;
             app.apply_menu(
                 0,
