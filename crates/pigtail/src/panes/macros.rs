@@ -7,6 +7,8 @@ use serialcore::reader::ConnState;
 use serialcore::store::{IncomingLine, LineFlags, PortId};
 use std::time::{Duration, Instant};
 
+const SHORTCUT_ORDER: [u8; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0];
+
 const MAX_DELAY_MS: u64 = 3_600_000;
 const DEFAULT_DELAY_MS: u64 = 100;
 const MACRO_INDICATOR_DELAY: Duration = Duration::from_millis(500);
@@ -206,7 +208,7 @@ impl App {
                                                     None,
                                                     "Unassigned",
                                                 );
-                                                for digit in 0..=9 {
+                                                for digit in SHORTCUT_ORDER {
                                                     let owner = shortcut_owner(
                                                         &self.config.macros,
                                                         digit,
@@ -378,7 +380,7 @@ impl App {
         }
     }
 
-    fn open_macro_editor(&mut self, index: Option<usize>) {
+    pub(super) fn open_macro_editor(&mut self, index: Option<usize>) {
         let draft = index
             .and_then(|index| self.config.macros.get(index).cloned())
             .unwrap_or_else(|| TransmitMacro {
@@ -1082,8 +1084,14 @@ fn shortcut_owner(
 
 fn save_macro(macros: &mut Vec<TransmitMacro>, mut editor: MacroEditor) -> usize {
     let target = editor.index.filter(|index| *index < macros.len());
-    // Shortcut ownership belongs to the catalog, never the definition editor.
-    editor.draft.shortcut = target.and_then(|index| macros[index].shortcut);
+    // Preserve existing ownership (including an explicit Unassigned choice).
+    // Allocate only when saving a new macro so canceled drafts reserve nothing.
+    editor.draft.shortcut = match target {
+        Some(index) => macros[index].shortcut,
+        None => SHORTCUT_ORDER
+            .into_iter()
+            .find(|digit| shortcut_owner(macros, *digit, None).is_none()),
+    };
     if let Some(index) = target {
         macros[index] = editor.draft;
         index
@@ -1490,6 +1498,63 @@ mod tests {
             ]
         );
         assert_eq!(selection_after_move(Some(2), 2, 1), Some(1));
+    }
+
+    #[test]
+    fn new_macros_take_free_shortcuts_in_keyboard_order() {
+        let mut macros = Vec::new();
+        let editor = || MacroEditor {
+            index: None,
+            draft: TransmitMacro::default(),
+            step_selection: None,
+        };
+        for digit in SHORTCUT_ORDER {
+            let index = save_macro(&mut macros, editor());
+            assert_eq!(macros[index].shortcut, Some(digit));
+        }
+        let index = save_macro(&mut macros, editor());
+        assert_eq!(macros[index].shortcut, None);
+        macros[3].shortcut = None;
+        let mut edit = editor();
+        edit.index = Some(3);
+        save_macro(&mut macros, edit);
+        assert_eq!(macros[3].shortcut, None, "editing preserves Unassigned");
+        let index = save_macro(&mut macros, editor());
+        assert_eq!(macros[index].shortcut, Some(4), "reuse the first gap");
+    }
+
+    #[test]
+    fn zero_shortcut_starts_with_logical_or_physical_zero() {
+        for (key, physical_key) in [
+            (egui::Key::Num0, None),
+            (egui::Key::Equals, Some(egui::Key::Num0)),
+        ] {
+            let mut app = app_with_macro(100);
+            app.config.macros[0].shortcut = Some(0);
+            let ctx = egui::Context::default();
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key,
+                        physical_key,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers {
+                            ctrl: true,
+                            shift: true,
+                            command: true,
+                            ..Default::default()
+                        },
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.consume_macro_shortcut(ctx);
+                    assert!(ctx.input(|input| input.events.is_empty()));
+                },
+            );
+            assert_eq!(app.macro_runs.len(), 1);
+        }
     }
 
     #[test]
