@@ -1343,6 +1343,8 @@ struct MergedTabState {
     pub merged_pruned_before: HashMap<PortId, u64>,
     /// Per-source read cursors owned by this merged tab, including while parked.
     pub merged_upto: HashMap<PortId, u64>,
+    /// Mutable source tails last observed by this view, including while parked.
+    pub merged_provisional: HashMap<PortId, u64>,
     /// Filter state owned by the loaded merged tab. A merged filter is kept
     /// separate from every port's filter so its meaning does not depend on
     /// whichever real tab happened to be active last.
@@ -1390,6 +1392,7 @@ impl Default for MergedTabState {
             merged_generation: 0,
             merged_pruned_before: HashMap::new(),
             merged_upto: HashMap::new(),
+            merged_provisional: HashMap::new(),
             merged_filter_rules: Vec::new(),
             merged_filter_combine: Combine::And,
             merged_filter_errors: Vec::new(),
@@ -1418,6 +1421,7 @@ impl MergedTabState {
     fn swap_with_app(&mut self, app: &mut App) {
         std::mem::swap(&mut self.merged, &mut app.merged);
         std::mem::swap(&mut self.merged_upto, &mut app.merged_upto);
+        std::mem::swap(&mut self.merged_provisional, &mut app.merged_provisional);
         std::mem::swap(&mut self.merged_dirty, &mut app.merged_dirty);
         std::mem::swap(&mut self.merged_wrap, &mut app.merged_wrap);
         std::mem::swap(&mut self.merged_seq, &mut app.merged_seq);
@@ -1527,6 +1531,8 @@ pub struct App {
     pub merged_pruned_before: HashMap<PortId, u64>,
     /// Per-source read cursors owned by this merged tab, including while parked.
     pub merged_upto: HashMap<PortId, u64>,
+    /// Mutable source tails last observed by the loaded merged view.
+    pub merged_provisional: HashMap<PortId, u64>,
     /// Filter state owned by the loaded merged tab. A merged filter is kept
     /// separate from every port's filter so its meaning does not depend on
     /// whichever real tab happened to be active last.
@@ -1661,6 +1667,7 @@ impl App {
             merged_generation: 0,
             merged_pruned_before: HashMap::new(),
             merged_upto: HashMap::new(),
+            merged_provisional: HashMap::new(),
             merged_filter_rules: Vec::new(),
             merged_filter_combine: Combine::And,
             merged_filter_errors: Vec::new(),
@@ -2954,6 +2961,7 @@ impl App {
             self.merged_generation += 1;
             self.merged_pruned_before.clear();
             self.merged_upto.clear();
+            self.merged_provisional.clear();
             for conn in &mut self.connections {
                 let first = conn.store.first_abs_index();
                 self.merged_upto.insert(conn.id, first);
@@ -2979,6 +2987,28 @@ impl App {
                 .unwrap_or(0)
                 .max(conn.store.first_abs_index());
             let end = conn.store.next_abs_index();
+            // A previously observed partial line can finish and be followed by
+            // more output while this view is parked. The filter/search fast
+            // paths only re-test the current tail, and wrapping only re-tests
+            // the last merged entry. Invalidate those caches when the old
+            // mutable tail has moved into the history, without rebuilding the
+            // interleaving or resetting unread counts.
+            if self
+                .merged_provisional
+                .remove(&conn.id)
+                .is_some_and(|abs| abs + 1 < end && conn.store.get(abs).is_some())
+            {
+                self.merged_generation += 1;
+            }
+            if let Some(abs) = end.checked_sub(1) {
+                if conn
+                    .store
+                    .get(abs)
+                    .is_some_and(|line| line.meta.flags.contains(LineFlags::PROVISIONAL))
+                {
+                    self.merged_provisional.insert(conn.id, abs);
+                }
+            }
             for abs in start..end {
                 if let Some(line) = conn.store.get(abs) {
                     fresh.push(MergedEntry {
@@ -4785,6 +4815,52 @@ pub(crate) mod tests {
         app.merged_search_dirty = true;
         app.maintain_merged_search(true);
         assert_eq!(app.merged_search_matches.len(), 1);
+    }
+
+    #[test]
+    fn parked_merged_views_refresh_a_finalized_previous_tail() {
+        for filtered in [false, true] {
+            let (mut app, _enum_tx) = test_app("parked-merged-finalized-tail");
+            add_merged_test_connection(
+                &mut app,
+                PortId(1),
+                "probe",
+                &[("booting", 1, LineFlags::PROVISIONAL)],
+            );
+            app.create_merged_tab(vec![PortId(1)]);
+            if filtered {
+                app.merged_filter_rules.push(FilterRule {
+                    pattern: "ERROR".into(),
+                    ..FilterRule::default()
+                });
+                app.merged_filter_dirty = true;
+            }
+            app.merged_search_query = "ERROR".into();
+            app.merged_search_dirty = true;
+            app.select_merged_tab(0);
+            assert!(app.merged_search_matches.is_empty());
+            app.create_merged_tab(vec![PortId(1)]);
+            for (text, flags) in [
+                ("booting: ERROR", LineFlags::CONTINUATION),
+                ("next line", LineFlags::default()),
+            ] {
+                app.connections[0].store.append(IncomingLine {
+                    text: text.into(),
+                    ts: app.clock.now(),
+                    port: PortId(1),
+                    flags,
+                    spans: Default::default(),
+                    cursor: None,
+                });
+            }
+            app.select_merged_tab(0);
+            assert_eq!(app.merged_search_matches.len(), 1, "filtered: {filtered}");
+            assert_eq!(app.merged_search_matches[0].abs, 0);
+            if filtered {
+                assert_eq!(app.merged_view().len(), 1);
+                assert_eq!(app.merged_view()[0].abs, 0);
+            }
+        }
     }
 
     #[test]
