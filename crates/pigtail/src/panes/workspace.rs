@@ -422,7 +422,10 @@ impl App {
                 self.workspace.split = Some(direction);
                 self.workspace.ratio = 0.5;
                 self.workspace.panes[0].tabs.retain(|tab| *tab != id);
-                self.workspace.panes[0].selected = self.workspace.panes[0].tabs.first().copied();
+                if self.workspace.panes[0].selected == Some(id) {
+                    self.workspace.panes[0].selected =
+                        self.workspace.panes[0].tabs.first().copied();
+                }
                 self.workspace.panes[1].tabs = vec![id];
                 self.workspace.panes[1].selected = Some(id);
                 self.workspace.focused = 1;
@@ -675,6 +678,50 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
         }
+    }
+
+    #[test]
+    fn splitting_a_background_tab_preserves_the_original_selection() {
+        let (mut app, _tx) = test_app("split-background-tab");
+        for id in 1..=3 {
+            add_connection(&mut app, id);
+        }
+        app.active = 1;
+        app.apply_layout_action(LayoutAction::Split(
+            TabId::Connection(PortId(3)),
+            SplitDirection::Right,
+        ));
+        assert_eq!(
+            app.workspace.panes[0].selected,
+            Some(TabId::Connection(PortId(2)))
+        );
+    }
+
+    #[test]
+    fn closing_a_background_tab_preserves_the_panes_keyboard_target() {
+        let (mut app, _tx) = test_app("split-close-background-tab");
+        for id in 1..=4 {
+            add_connection(&mut app, id);
+        }
+        app.apply_layout_action(LayoutAction::Split(
+            TabId::Connection(PortId(4)),
+            SplitDirection::Right,
+        ));
+        app.workspace.focused = 0;
+        app.select_pane_tab(TabId::Connection(PortId(2)));
+        app.reconcile_workspace();
+        app.close_connection(0);
+        app.reconcile_workspace();
+        assert_eq!(app.selected_tab_id(), Some(TabId::Connection(PortId(2))));
+        let ctx = egui::Context::default();
+        frame(
+            &mut app,
+            &ctx,
+            egui::vec2(1000.0, 600.0),
+            vec![egui::Event::Text("command".into())],
+        );
+        assert_eq!(app.connections[0].tx_input, "command");
+        assert!(app.connections[1].tx_input.is_empty());
     }
 
     #[test]

@@ -2652,7 +2652,11 @@ impl App {
             self.merged_tx_port = None;
         }
         conn.handle.shutdown();
-        if self.active >= self.connections.len() {
+        // Removing an earlier tab shifts the active connection's index. Keep
+        // keyboard input on the same device, including inside a split pane.
+        if self.active > index {
+            self.active -= 1;
+        } else if self.active >= self.connections.len() {
             self.active = self.connections.len().saturating_sub(1);
         }
         self.invalidate_merged_views();
