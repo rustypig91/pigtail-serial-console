@@ -861,6 +861,22 @@ mod tests {
     }
 
     #[test]
+    fn tab_shortcut_preserves_focus_on_closed_connection() {
+        let (mut app, _tx) = test_app("tab-closed-focus");
+        add_connection(&mut app, 1);
+        add_connection(&mut app, 2);
+        app.connections[1].state = ConnState::Closed;
+        let ctx = egui::Context::default();
+        let size = egui::vec2(1000.0, 600.0);
+        frame(&mut app, &ctx, size, vec![]);
+        frame(&mut app, &ctx, size, vec![shortcut(egui::Key::Tab)]);
+        assert_eq!(app.active, 1);
+        assert!(ctx.memory(|m| m.focused().is_none()));
+        frame(&mut app, &ctx, size, vec![shortcut(egui::Key::Tab)]);
+        assert_eq!(app.active, 0, "Tab cycling must work after a closed tab");
+    }
+
+    #[test]
     fn tab_shortcuts_stay_in_the_focused_group_and_search_is_local() {
         let (mut app, _tx) = test_app("split-tab-search");
         for id in 1..=3 {

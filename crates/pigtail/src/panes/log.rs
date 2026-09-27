@@ -487,13 +487,11 @@ impl App {
         // focus, and egui's older popup API likewise does not necessarily
         // focus one of its controls. Both still own keyboard navigation while
         // open, so neither can be inferred from `memory().focused()` below.
-        let live_console = !self.keyboard_overlay_open(ctx)
-            && !self.search_focus_request
-            && self.console_input_index().is_some();
-        let tab_pressed = ctx.input(|i| {
+        let console_available = !self.keyboard_overlay_open(ctx) && !self.search_focus_request;
+        let (tab_pressed, tab_consumed) = ctx.input(|i| {
             // Include Tab shortcuts already consumed before layout: egui has
             // still queued focus navigation for their original key events.
-            i.raw.events.iter().any(|event| {
+            let is_tab = |event: &egui::Event| {
                 matches!(
                     event,
                     egui::Event::Key {
@@ -502,9 +500,17 @@ impl App {
                         ..
                     }
                 )
-            })
+            };
+            let pressed = i.raw.events.iter().any(is_tab);
+            (pressed, pressed && !i.events.iter().any(is_tab))
         });
-        let claim = live_console && tab_pressed && ctx.memory(|m| m.focused().is_none());
+        // Cycling onto a closed connection or a merged tab without a transmit
+        // target must also cancel egui's queued Tab navigation. Otherwise a
+        // header widget takes focus and blocks subsequent tab shortcuts.
+        let claim = console_available
+            && tab_pressed
+            && (tab_consumed || self.console_input_index().is_some())
+            && ctx.memory(|m| m.focused().is_none());
         if claim {
             ctx.memory_mut(|m| m.request_focus(console_tab_guard_id()));
         }
