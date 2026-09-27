@@ -525,8 +525,6 @@ pub struct Connection {
     pub selected: Option<u64>,
     /// Scroll request: centre this absolute line on the next frame.
     pub scroll_to: Option<u64>,
-    /// How far this port has been folded into the merged view.
-    pub merged_upto: u64,
     // Plotting (spec §7.13).
     pub extract_rules: Vec<ExtractRule>,
     pub extract_compiled: Vec<CompiledExtract>,
@@ -1343,6 +1341,8 @@ struct MergedTabState {
     /// common append-only path a constant-time check per connection while still
     /// letting `prune_merged` remove dead entries from inside the interleaving.
     pub merged_pruned_before: HashMap<PortId, u64>,
+    /// Per-source read cursors owned by this merged tab, including while parked.
+    pub merged_upto: HashMap<PortId, u64>,
     /// Filter state owned by the loaded merged tab. A merged filter is kept
     /// separate from every port's filter so its meaning does not depend on
     /// whichever real tab happened to be active last.
@@ -1389,6 +1389,7 @@ impl Default for MergedTabState {
             merged_wrap: WrapIndex::new(),
             merged_generation: 0,
             merged_pruned_before: HashMap::new(),
+            merged_upto: HashMap::new(),
             merged_filter_rules: Vec::new(),
             merged_filter_combine: Combine::And,
             merged_filter_errors: Vec::new(),
@@ -1416,6 +1417,7 @@ impl Default for MergedTabState {
 impl MergedTabState {
     fn swap_with_app(&mut self, app: &mut App) {
         std::mem::swap(&mut self.merged, &mut app.merged);
+        std::mem::swap(&mut self.merged_upto, &mut app.merged_upto);
         std::mem::swap(&mut self.merged_dirty, &mut app.merged_dirty);
         std::mem::swap(&mut self.merged_wrap, &mut app.merged_wrap);
         std::mem::swap(&mut self.merged_seq, &mut app.merged_seq);
@@ -1495,6 +1497,7 @@ pub struct App {
     pub(crate) selection_rows: Option<(egui::Id, u64, u64)>,
     /// Active connection index, retained while a merged tab is selected.
     pub active: usize,
+    pub(crate) workspace: crate::panes::Workspace,
     pub next_port_id: u32,
     /// `Some` while the modal new-connection dialog is open.
     pub config_dialog: Option<ConfigDialog>,
@@ -1522,6 +1525,8 @@ pub struct App {
     /// common append-only path a constant-time check per connection while still
     /// letting `prune_merged` remove dead entries from inside the interleaving.
     pub merged_pruned_before: HashMap<PortId, u64>,
+    /// Per-source read cursors owned by this merged tab, including while parked.
+    pub merged_upto: HashMap<PortId, u64>,
     /// Filter state owned by the loaded merged tab. A merged filter is kept
     /// separate from every port's filter so its meaning does not depend on
     /// whichever real tab happened to be active last.
@@ -1642,6 +1647,7 @@ impl App {
             connections: Vec::new(),
             selection_rows: None,
             active: 0,
+            workspace: crate::panes::Workspace::default(),
             next_port_id: 0,
             config_dialog: None,
             rename_dialog: None,
@@ -1654,6 +1660,7 @@ impl App {
             merged_wrap: WrapIndex::new(),
             merged_generation: 0,
             merged_pruned_before: HashMap::new(),
+            merged_upto: HashMap::new(),
             merged_filter_rules: Vec::new(),
             merged_filter_combine: Combine::And,
             merged_filter_errors: Vec::new(),
@@ -1779,6 +1786,7 @@ impl App {
         app.active = 0;
         app.merged_selected = false;
         app.restore_merged_views();
+        app.restore_workspace();
 
         app
     }
@@ -2002,7 +2010,7 @@ impl App {
                     conn.store.finalize_last_provisional();
                     conn.set_state(ConnState::Closed);
                     conn.last_error = Some(TabError::connection(msg));
-                    self.merged_dirty = true;
+                    self.invalidate_merged_views();
                     return;
                 }
             };
@@ -2043,7 +2051,7 @@ impl App {
 
         self.active = index;
         self.merged_selected = false;
-        self.merged_dirty = true;
+        self.invalidate_merged_views();
         self.save_session();
     }
 
@@ -2129,12 +2137,12 @@ impl App {
         self.connections.push(conn);
         self.active = self.connections.len() - 1;
         self.merged_selected = false;
-        self.merged_dirty = true;
+        self.invalidate_merged_views();
         true
     }
 
     /// Restore after physical connections have received their new runtime IDs.
-    fn restore_merged_views(&mut self) {
+    pub(crate) fn restore_merged_views(&mut self) {
         for saved in &self.config.merged_views {
             let id = self.next_merged_id;
             self.next_merged_id += 1;
@@ -2238,6 +2246,7 @@ impl App {
                     .map(|index| SavedTab::Merged { index }),
             })
             .collect();
+        self.persist_workspace();
         self.write_config();
     }
 
@@ -2398,7 +2407,6 @@ impl App {
             search_tested_upto: 0,
             selected: None,
             scroll_to: None,
-            merged_upto: 0,
             extract_rules: Vec::new(),
             extract_compiled: Vec::new(),
             extract_dirty: false,
@@ -2647,7 +2655,7 @@ impl App {
         if self.active >= self.connections.len() {
             self.active = self.connections.len().saturating_sub(1);
         }
-        self.merged_dirty = true;
+        self.invalidate_merged_views();
         if self.connections.is_empty() && !self.merged_selected {
             if let Some(TabId::Merged(id)) = self.ordered_tabs().last().copied() {
                 if let Some(index) = self.merged_tabs.iter().position(|tab| tab.id == id) {
@@ -2718,7 +2726,7 @@ impl App {
     }
 
     /// Recompute search matches (incremental, per active connection only).
-    fn maintain_search(&mut self) {
+    pub(crate) fn maintain_search(&mut self) {
         let Some(conn) = self.connections.get_mut(self.active) else {
             return;
         };
@@ -2803,7 +2811,9 @@ impl App {
                 || conn.history_allocation_shrink_pending;
             history_shrank |= conn.finish_history_capacity_change();
         }
-        self.merged_dirty |= history_shrank;
+        if history_shrank {
+            self.invalidate_merged_views();
+        }
         settled_change
     }
 
@@ -2843,7 +2853,7 @@ impl App {
         // preferences, but discard navigation into the old source selection.
         self.merged_scroll_to = None;
         self.merged_search_pos = None;
-        self.merged_dirty = true;
+        self.invalidate_merged_views();
         self.maintain_merged();
         self.maintain_merged_filter(true);
         self.maintain_merged_search(true);
@@ -2863,12 +2873,12 @@ impl App {
             let mut state = std::mem::take(&mut self.merged_tabs[index].state);
             state.swap_with_app(self);
             self.loaded_merged_tab = Some(index);
-            // Sources may have changed while this tab was parked.
-            self.merged_dirty = true;
-            self.maintain_merged();
-            self.maintain_merged_filter(true);
-            self.maintain_merged_search(true);
         }
+        // A visible source pane may have added local echo since this view was
+        // last drawn, even without a new reader event or a tab switch.
+        self.maintain_merged();
+        self.maintain_merged_filter(true);
+        self.maintain_merged_search(true);
         self.merged_selected = true;
         if !self.merged_tx_port.is_some_and(|id| {
             self.merged_contains(id)
@@ -2918,6 +2928,13 @@ impl App {
         self.save_session();
     }
 
+    fn invalidate_merged_views(&mut self) {
+        self.merged_dirty = true;
+        for tab in &mut self.merged_tabs {
+            tab.state.merged_dirty = true;
+        }
+    }
+
     /// Maintain the timestamp-interleaved merged view (spec §7.12). Rebuilds on
     /// connect/close; otherwise a fast append of each port's new tail.
     fn maintain_merged(&mut self) {
@@ -2932,9 +2949,10 @@ impl App {
             self.merged_seq = 0;
             self.merged_generation += 1;
             self.merged_pruned_before.clear();
+            self.merged_upto.clear();
             for conn in &mut self.connections {
                 let first = conn.store.first_abs_index();
-                conn.merged_upto = first;
+                self.merged_upto.insert(conn.id, first);
                 self.merged_pruned_before.insert(conn.id, first);
             }
         }
@@ -2950,7 +2968,12 @@ impl App {
             {
                 continue;
             }
-            let start = conn.merged_upto.max(conn.store.first_abs_index());
+            let start = self
+                .merged_upto
+                .get(&conn.id)
+                .copied()
+                .unwrap_or(0)
+                .max(conn.store.first_abs_index());
             let end = conn.store.next_abs_index();
             for abs in start..end {
                 if let Some(line) = conn.store.get(abs) {
@@ -2963,7 +2986,7 @@ impl App {
                     });
                 }
             }
-            conn.merged_upto = end;
+            self.merged_upto.insert(conn.id, end);
         }
         self.prune_merged();
         if fresh.is_empty() {
@@ -3361,7 +3384,7 @@ impl App {
             // An empty console has nothing to scroll back to, so resume live.
             conn.follow = true;
         }
-        self.merged_dirty = true;
+        self.invalidate_merged_views();
     }
 
     /// True while any modal dialog or floating tool window is open. Their
@@ -3482,6 +3505,7 @@ impl eframe::App for App {
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
+        self.prepare_workspace(ctx);
         self.poll_file_drop(ctx);
         self.close_window_on_escape(ctx);
 
@@ -3523,10 +3547,7 @@ impl eframe::App for App {
         // event can activate that control before `show_console` gives Tab back
         // to the device.
         let console_tab_claimed = self.claim_console_tab_before_layout(ctx);
-        self.show_header(ctx);
-        self.show_footer(ctx);
-        self.show_plot(ctx); // bottom panel, only when enabled for the tab
-        self.show_console(ctx, console_tab_claimed);
+        self.show_workspace(ctx, console_tab_claimed);
         self.show_file_drop_overlay(ctx);
 
         // Floating windows.
@@ -3579,6 +3600,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist_workspace();
         self.flush_config();
     }
 }

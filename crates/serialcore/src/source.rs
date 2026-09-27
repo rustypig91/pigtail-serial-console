@@ -17,10 +17,17 @@ use std::time::Duration;
 pub const DEBUG_ECHO_PATH: &str = "pigtail://debug-echo-1";
 #[cfg(debug_assertions)]
 pub const DEBUG_ECHO_PATH_2: &str = "pigtail://debug-echo-2";
+#[cfg(debug_assertions)]
+pub const DEBUG_ECHO_PATH_3: &str = "pigtail://debug-echo-3";
+#[cfg(debug_assertions)]
+pub const DEBUG_ECHO_PATH_4: &str = "pigtail://debug-echo-4";
 
 #[cfg(debug_assertions)]
 pub fn is_debug_echo_path(path: &str) -> bool {
-    matches!(path, DEBUG_ECHO_PATH | DEBUG_ECHO_PATH_2)
+    matches!(
+        path,
+        DEBUG_ECHO_PATH | DEBUG_ECHO_PATH_2 | DEBUG_ECHO_PATH_3 | DEBUG_ECHO_PATH_4
+    )
 }
 
 /// Errors a source can surface. A `Disconnected` is the signal the reader uses

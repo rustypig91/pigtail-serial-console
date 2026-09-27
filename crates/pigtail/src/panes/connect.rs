@@ -66,7 +66,7 @@ impl App {
             return;
         }
 
-        let tabs = self.ordered_tabs();
+        let tabs = self.visible_pane_tabs();
         let tab_count = tabs.len();
         if tab_count == 0 {
             return;
@@ -207,6 +207,10 @@ impl App {
     /// The top header: one tab per connection or merged view, `+`, and global
     /// actions collected under an ellipsis menu.
     pub(crate) fn show_header(&mut self, ctx: &egui::Context) {
+        self.show_header_in(ctx, None);
+    }
+
+    pub(crate) fn show_header_in(&mut self, ctx: &egui::Context, parent: Option<&mut egui::Ui>) {
         let mut to_close: Option<usize> = None;
         let mut set_active: Option<usize> = None;
         let mut select_merged = None;
@@ -214,12 +218,10 @@ impl App {
         let mut edit_merged = None;
         let mut new_merged = false;
         let mut new_tab = false;
-        let mut choose_file = false;
         let mut port_options: Option<usize> = None;
         let mut rename_tab: Option<usize> = None;
         let mut reorder = None;
-        let macros_tooltip = macro_tooltip(&self.config.macros);
-        let tabs = self.ordered_tabs();
+        let tabs = self.visible_pane_tabs();
 
         // The config dialog is meant to be modal, but an `egui::Window` does
         // not block input to what it covers, so the header would keep acting
@@ -237,167 +239,176 @@ impl App {
             || self.rename_dialog.is_some()
             || self.file_transfer_dialog.is_some();
 
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            // Status and navigation labels must not join console text selection.
-            ui.style_mut().interaction.selectable_labels = false;
-            ui.horizontal(|ui| {
-                // Only the tab strip and "+" are disabled: global actions
-                // below act on neither the dialog nor the set of tabs, so
-                // there is nothing for them to corrupt.
-                ui.add_enabled_ui(!modal_open, |ui| {
-                    for (position, tab_id) in tabs.iter().copied().enumerate() {
-                        match tab_id {
-                            TabId::Connection(id) => {
-                                let i = self.connections.iter().position(|c| c.id == id).unwrap();
-                                let conn = &self.connections[i];
-                                let selected = !self.merged_selected && self.active == i;
-                                let display_label = conn.display_label();
-                                let label = egui::RichText::new(short_label(display_label))
-                                    .color(state_color(conn.state))
-                                    .strong();
-                                let device_details = if conn.name.is_some() {
-                                    format!("{}\n{}", display_label, conn.label)
-                                } else {
-                                    conn.label.clone()
-                                };
-                                let tooltip = format!("Status: {}\n{}", conn.state, device_details);
-                                // `on_hover_text` only fires on an *enabled* widget,
-                                // so a disabled tab needs its own tooltip to keep the
-                                // detected device name and port available.
-                                let resp = ui
-                                    .selectable_label(selected, label)
-                                    .interact(egui::Sense::click_and_drag())
-                                    .on_hover_text(&tooltip)
-                                    .on_disabled_hover_text(format!(
-                                        "{}\n(finish or cancel the open dialog first)",
-                                        tooltip
-                                    ));
-                                if !modal_open {
-                                    reorder =
-                                        tab_drag(ui, ctx, &resp, tab_id, position).or(reorder);
-                                }
-                                if resp.clicked() {
-                                    set_active = Some(i);
-                                }
-                                // Middle-click closes the tab.
-                                if resp.middle_clicked() {
-                                    to_close = Some(i);
-                                }
-                                // Right-click menu on the tab.
-                                resp.context_menu(|ui| {
-                                    if ui.button("Rename…").clicked() {
-                                        rename_tab = Some(i);
-                                        ui.close_menu();
-                                    }
-                                    if ui.button("Port options…").clicked() {
-                                        port_options = Some(i);
-                                        ui.close_menu();
-                                    }
-                                    if ui.button("Close tab").clicked() {
-                                        to_close = Some(i);
-                                        ui.close_menu();
-                                    }
-                                });
-                            }
+        super::workspace::show_panel(
+            egui::TopBottomPanel::top(self.pane_widget_id("header")),
+            ctx,
+            parent,
+            |ui| {
+                // Status and navigation labels must not join console text selection.
+                ui.style_mut().interaction.selectable_labels = false;
+                let header = ui.horizontal(|ui| {
+                    // Only the tab strip and "+" are disabled: global actions
+                    // below act on neither the dialog nor the set of tabs, so
+                    // there is nothing for them to corrupt.
+                    ui.add_enabled_ui(!modal_open, |ui| {
+                        let reserve = if self.workspace.split.is_some() {
+                            32.0
+                        } else {
+                            65.0
+                        };
+                        egui::ScrollArea::horizontal()
+                            .drag_to_scroll(false)
+                            .id_salt(self.pane_widget_id("tabs_scroll"))
+                            .max_width((ui.available_width() - reserve).max(40.0))
+                            .auto_shrink([true, true])
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    for (position, tab_id) in tabs.iter().copied().enumerate() {
+                                        match tab_id {
+                                            TabId::Connection(id) => {
+                                                let i = self
+                                                    .connections
+                                                    .iter()
+                                                    .position(|c| c.id == id)
+                                                    .unwrap();
+                                                let conn = &self.connections[i];
+                                                let selected =
+                                                    !self.merged_selected && self.active == i;
+                                                let display_label = conn.display_label();
+                                                let label =
+                                                    egui::RichText::new(short_label(display_label))
+                                                        .color(state_color(conn.state))
+                                                        .strong();
+                                                let device_details = if conn.name.is_some() {
+                                                    format!("{}\n{}", display_label, conn.label)
+                                                } else {
+                                                    conn.label.clone()
+                                                };
+                                                let tooltip = format!(
+                                                    "Status: {}\n{}",
+                                                    conn.state, device_details
+                                                );
+                                                // `on_hover_text` only fires on an *enabled* widget,
+                                                // so a disabled tab needs its own tooltip to keep the
+                                                // detected device name and port available.
+                                                let resp = ui
+                                                    .selectable_label(selected, label)
+                                                    .interact(egui::Sense::click_and_drag())
+                                                    .on_hover_text(&tooltip)
+                                                    .on_disabled_hover_text(format!(
+                                            "{}\n(finish or cancel the open dialog first)",
+                                            tooltip
+                                        ));
+                                                if !modal_open {
+                                                    reorder =
+                                                        tab_drag(ui, ctx, &resp, tab_id, position)
+                                                            .or(reorder);
+                                                }
+                                                if resp.clicked() {
+                                                    set_active = Some(i);
+                                                }
+                                                // Middle-click closes the tab.
+                                                if resp.middle_clicked() {
+                                                    to_close = Some(i);
+                                                }
+                                                // Right-click menu on the tab.
+                                                resp.context_menu(|ui| {
+                                                    self.show_tab_layout_menu(ui, tab_id);
+                                                    if ui.button("Rename…").clicked() {
+                                                        rename_tab = Some(i);
+                                                        ui.close_menu();
+                                                    }
+                                                    if ui.button("Port options…").clicked() {
+                                                        port_options = Some(i);
+                                                        ui.close_menu();
+                                                    }
+                                                    if ui.button("Close tab").clicked() {
+                                                        to_close = Some(i);
+                                                        ui.close_menu();
+                                                    }
+                                                });
+                                            }
 
-                            TabId::Merged(id) => {
-                                let i = self.merged_tabs.iter().position(|t| t.id == id).unwrap();
-                                let tab = &self.merged_tabs[i];
-                                let resp = ui
-                                    .selectable_label(
-                                        self.merged_selected && self.loaded_merged_tab == Some(i),
-                                        short_label(&tab.name),
-                                    )
-                                    .interact(egui::Sense::click_and_drag())
-                                    .on_hover_text(&tab.name);
-                                if !modal_open {
-                                    reorder =
-                                        tab_drag(ui, ctx, &resp, tab_id, position).or(reorder);
-                                }
-                                if resp.clicked() {
-                                    select_merged = Some(i);
-                                }
-                                if resp.middle_clicked() {
-                                    close_merged = Some(i);
-                                }
-                                resp.context_menu(|ui| {
-                                    if ui.button("Options").clicked() {
-                                        edit_merged = Some(i);
-                                        ui.close_menu();
-                                    }
-                                    if ui.button("Close tab").clicked() {
-                                        close_merged = Some(i);
-                                        ui.close_menu();
+                                            TabId::Merged(id) => {
+                                                let i = self
+                                                    .merged_tabs
+                                                    .iter()
+                                                    .position(|t| t.id == id)
+                                                    .unwrap();
+                                                let tab = &self.merged_tabs[i];
+                                                let resp = ui
+                                                    .selectable_label(
+                                                        self.merged_selected
+                                                            && self.loaded_merged_tab == Some(i),
+                                                        short_label(&tab.name),
+                                                    )
+                                                    .interact(egui::Sense::click_and_drag())
+                                                    .on_hover_text(&tab.name);
+                                                if !modal_open {
+                                                    reorder =
+                                                        tab_drag(ui, ctx, &resp, tab_id, position)
+                                                            .or(reorder);
+                                                }
+                                                if resp.clicked() {
+                                                    select_merged = Some(i);
+                                                }
+                                                if resp.middle_clicked() {
+                                                    close_merged = Some(i);
+                                                }
+                                                resp.context_menu(|ui| {
+                                                    self.show_tab_layout_menu(ui, tab_id);
+                                                    if ui.button("Options").clicked() {
+                                                        edit_merged = Some(i);
+                                                        ui.close_menu();
+                                                    }
+                                                    if ui.button("Close tab").clicked() {
+                                                        close_merged = Some(i);
+                                                        ui.close_menu();
+                                                    }
+                                                });
+                                            }
+                                        }
                                     }
                                 });
+                            });
+                        ui.menu_button("+", |ui| {
+                            if ui.button("New connection").clicked() {
+                                new_tab = true;
+                                ui.close_menu();
                             }
-                        }
+                            if ui.button("New merged view").clicked() {
+                                new_merged = true;
+                                ui.close_menu();
+                            }
+                        });
+                    });
+
+                    if self.workspace.split.is_none() {
+                        self.show_app_menu(ui);
                     }
-                    ui.menu_button("+", |ui| {
-                        if ui.button("New connection").clicked() {
-                            new_tab = true;
-                            ui.close_menu();
-                        }
-                        if ui.button("New merged view").clicked() {
-                            new_merged = true;
-                            ui.close_menu();
-                        }
-                    });
                 });
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.menu_button("…", |ui| {
-                        if ui
-                            .button("Send file…")
-                            .on_hover_text("Choose a file to send to the active console")
-                            .clicked()
-                        {
-                            choose_file = true;
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui.button("Macros").on_hover_text(&macros_tooltip).clicked() {
-                            self.show_macros_win = true;
-                            ui.close_menu();
-                        }
-                        if ui.button("Show keyboard shortcuts").clicked() {
-                            self.show_keyboard_shortcuts = true;
-                            ui.close_menu();
-                        }
-                        if ui.button("Settings").clicked() {
-                            self.show_settings = true;
-                            ui.close_menu();
-                        }
-                        let updating = self.update_rx.is_some() || self.install_rx.is_some();
-                        if ui
-                            .add_enabled(!updating, egui::Button::new("Check for updates"))
-                            .on_disabled_hover_text(
-                                "An update check or installation is in progress",
-                            )
-                            .clicked()
-                        {
-                            self.start_update_check(true);
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui
-                            .button("Support developer")
-                            .on_hover_text("Opens Buy Me a Coffee in your browser")
-                            .clicked()
-                        {
-                            ctx.open_url(egui::OpenUrl::new_tab(
-                                "https://buymeacoffee.com/rustypig91g",
-                            ));
-                            ui.close_menu();
-                        }
-                        if ui.button("About").clicked() {
-                            self.show_about = true;
-                            ui.close_menu();
-                        }
-                    });
-                });
-            });
-        });
+                // The unused header space accepts a drop after the last tab.
+                // Individual tabs consume their payload first, preserving the
+                // before/after insertion marker when dropping on a tab.
+                if !modal_open {
+                    let rect = egui::Rect::from_min_max(
+                        header.response.rect.min,
+                        egui::pos2(ui.max_rect().right(), header.response.rect.bottom()),
+                    );
+                    let target =
+                        ui.interact(rect, ui.id().with("tab_drop_end"), egui::Sense::hover());
+                    if target.dnd_hover_payload::<DraggedTab>().is_some() {
+                        ui.painter().line_segment(
+                            [rect.left_bottom(), rect.right_bottom()],
+                            egui::Stroke::new(2.0_f32, ui.visuals().selection.bg_fill),
+                        );
+                    }
+                    if let Some(tab) = target.dnd_release_payload::<DraggedTab>() {
+                        reorder = Some((tab.0, tabs.len()));
+                    }
+                }
+            },
+        );
 
         if let Some(i) = set_active {
             self.active = i;
@@ -426,7 +437,17 @@ impl App {
         }
         if to_close.is_none() {
             if let Some((id, boundary)) = reorder {
-                self.reorder_tab(id, boundary);
+                let full = self.ordered_tabs();
+                let boundary = tabs
+                    .get(boundary)
+                    .and_then(|next| full.iter().position(|tab| tab == next))
+                    .or_else(|| {
+                        tabs.last()
+                            .and_then(|last| full.iter().position(|tab| tab == last))
+                            .map(|i| i + 1)
+                    })
+                    .unwrap_or(full.len());
+                self.drop_tab_in_header(id, boundary);
             }
         }
         if let Some(i) = to_close {
@@ -441,9 +462,59 @@ impl App {
         if new_tab {
             self.open_config_dialog();
         }
-        if choose_file {
-            self.choose_file_transfer();
-        }
+    }
+
+    pub(crate) fn show_app_menu(&mut self, ui: &mut egui::Ui) {
+        let macros_tooltip = macro_tooltip(&self.config.macros);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.menu_button("…", |ui| {
+                if ui
+                    .button("Send file…")
+                    .on_hover_text("Choose a file to send to the active console")
+                    .clicked()
+                {
+                    self.choose_file_transfer();
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("Macros").on_hover_text(&macros_tooltip).clicked() {
+                    self.show_macros_win = true;
+                    ui.close_menu();
+                }
+                if ui.button("Show keyboard shortcuts").clicked() {
+                    self.show_keyboard_shortcuts = true;
+                    ui.close_menu();
+                }
+                if ui.button("Settings").clicked() {
+                    self.show_settings = true;
+                    ui.close_menu();
+                }
+                let updating = self.update_rx.is_some() || self.install_rx.is_some();
+                if ui
+                    .add_enabled(!updating, egui::Button::new("Check for updates"))
+                    .on_disabled_hover_text("An update check or installation is in progress")
+                    .clicked()
+                {
+                    self.start_update_check(true);
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui
+                    .button("Support developer")
+                    .on_hover_text("Opens Buy Me a Coffee in your browser")
+                    .clicked()
+                {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(
+                        "https://buymeacoffee.com/rustypig91g",
+                    ));
+                    ui.close_menu();
+                }
+                if ui.button("About").clicked() {
+                    self.show_about = true;
+                    ui.close_menu();
+                }
+            });
+        });
     }
 
     /// A compact reference for the application-wide keyboard commands. Device
@@ -521,6 +592,10 @@ impl App {
     /// The bottom status footer: connection state, view details, and the view
     /// toggles — hex, plot and Pin (autoscroll).
     pub(crate) fn show_footer(&mut self, ctx: &egui::Context) {
+        self.show_footer_in(ctx, None);
+    }
+
+    pub(crate) fn show_footer_in(&mut self, ctx: &egui::Context, parent: Option<&mut egui::Ui>) {
         let mut toggle_pin = false;
         let mut toggle_plot = false;
         let mut select_view = None;
@@ -531,57 +606,163 @@ impl App {
         let long_running_macros =
             self.long_running_macro_indicators(Instant::now(), self.macro_target_port());
         let mut stop_macro_run = None;
-        egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
-            // Status and navigation labels must not join console text selection.
-            ui.style_mut().interaction.selectable_labels = false;
-            ui.horizontal(|ui| {
-                if self.merged_selected {
-                    let shown = self.merged_view().len();
-                    ui.label(format!("merged · {} lines", self.merged.len()));
-                    show_macro_run_indicators(ui, &long_running_macros, &mut stop_macro_run);
-                    if self.merged_filter_active() {
-                        ui.separator();
-                        ui.label(format!("{shown} shown"));
+        super::workspace::show_panel(
+            egui::TopBottomPanel::bottom(self.pane_widget_id("footer")),
+            ctx,
+            parent,
+            |ui| {
+                // Status and navigation labels must not join console text selection.
+                ui.style_mut().interaction.selectable_labels = false;
+                ui.horizontal(|ui| {
+                    if self.merged_selected {
+                        let shown = self.merged_view().len();
+                        ui.label(format!("merged · {} lines", self.merged.len()));
+                        show_macro_run_indicators(ui, &long_running_macros, &mut stop_macro_run);
+                        if self.merged_filter_active() {
+                            ui.separator();
+                            ui.label(format!("{shown} shown"));
+                        }
+                        if !self.merged_search_matches.is_empty() {
+                            ui.separator();
+                            let n = self.merged_search_pos.map(|p| p + 1).unwrap_or(0);
+                            ui.label(format!("match {n}/{}", self.merged_search_matches.len()));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let label = if self.merged_follow { "Pinned" } else { "Pin" };
+                            if ui
+                                .selectable_label(self.merged_follow, label)
+                                .on_hover_text("Pin the merged view to the bottom and autoscroll")
+                                .clicked()
+                            {
+                                toggle_pin = true;
+                            }
+                            let selected_label = merged_tx_port
+                                .and_then(|id| self.connections.iter().find(|conn| conn.id == id))
+                                .map(|conn| short_label(conn.display_label()))
+                                .unwrap_or_else(|| "Select device".to_string());
+                            egui::ComboBox::from_id_salt("merged_tx_device")
+                                .selected_text(format!("Send to: {selected_label}"))
+                                .show_ui(ui, |ui| {
+                                    for conn in self
+                                        .connections
+                                        .iter()
+                                        .filter(|conn| self.merged_contains(conn.id))
+                                    {
+                                        let text = short_label(conn.display_label());
+                                        ui.add_enabled_ui(conn.state != ConnState::Closed, |ui| {
+                                            ui.selectable_value(
+                                                &mut merged_tx_port,
+                                                Some(conn.id),
+                                                text,
+                                            );
+                                        });
+                                    }
+                                });
+                            if !self.merged_follow && self.merged_new_since_scroll > 0 {
+                                ui.label(format!("{} new", self.merged_new_since_scroll));
+                                ui.separator();
+                            }
+                            if has_highlights
+                                && ui
+                                    .selectable_label(self.highlights_visible, "Highlights")
+                                    .on_hover_text("Enable or disable all highlights")
+                                    .clicked()
+                            {
+                                toggle_highlights = true;
+                            }
+                        });
+                        return;
                     }
-                    if !self.merged_search_matches.is_empty() {
+                    let Some(active) = self.active_index() else {
+                        ui.weak("no connection — press + to add one");
+                        return;
+                    };
+                    let conn = &self.connections[active];
+                    // A live error takes priority over the raw state: the reader
+                    // keeps retrying in the background (state stays Connecting /
+                    // Reconnecting so it can recover on its own), but the status
+                    // bar should say what's actually wrong rather than keep
+                    // claiming to be "connecting" while it fails over and over.
+                    //
+                    // While the link *is* up, though, the state is still worth
+                    // showing, so an error raised alongside a working connection
+                    // (a capture-file write that failed, say) sits next to it
+                    // rather than replacing it — this footer is the only place
+                    // such an error ever surfaces.
+                    if conn.state == ConnState::Connected || conn.last_error.is_none() {
+                        ui.colored_label(
+                            state_color(conn.state),
+                            format!("{} {}", state_dot(conn.state), conn.state),
+                        );
+                    }
+                    if let Some(err) = &conn.last_error {
+                        let resp = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new("⚠ error")
+                                    .color(egui::Color32::from_rgb(0xff, 0x55, 0x55)),
+                            )
+                            .sense(egui::Sense::click()),
+                        );
+                        let resp = resp
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text(err.msg.as_str());
+                        if resp.clicked() {
+                            open_error_win = Some(conn.id);
+                        }
+                    }
+                    ui.separator();
+                    ui.monospace(conn.port_config.summary());
+                    ui.separator();
+                    ui.label(format!("{} lines", conn.store.next_abs_index()));
+                    show_macro_run_indicators(ui, &long_running_macros, &mut stop_macro_run);
+                    if conn.filter_index_active() {
                         ui.separator();
-                        let n = self.merged_search_pos.map(|p| p + 1).unwrap_or(0);
-                        ui.label(format!("match {n}/{}", self.merged_search_matches.len()));
+                        ui.label(format!("{} shown", conn.filter_index.len()));
+                    }
+                    if !conn.screen_view && !conn.search_matches.is_empty() {
+                        ui.separator();
+                        let n = conn.search_pos.map(|p| p + 1).unwrap_or(0);
+                        ui.label(format!("match {n}/{}", conn.search_matches.len()));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let label = if self.merged_follow { "Pinned" } else { "Pin" };
+                        // Pin toggle: pinned = follow tail / autoscroll.
+                        let label = if conn.follow { "Pinned" } else { "Pin" };
                         if ui
-                            .selectable_label(self.merged_follow, label)
-                            .on_hover_text("Pin the merged view to the bottom and autoscroll")
+                            .selectable_label(conn.follow, label)
+                            .on_hover_text("Pin to bottom and autoscroll")
                             .clicked()
                         {
                             toggle_pin = true;
                         }
-                        let selected_label = merged_tx_port
-                            .and_then(|id| self.connections.iter().find(|conn| conn.id == id))
-                            .map(|conn| short_label(conn.display_label()))
-                            .unwrap_or_else(|| "Select device".to_string());
-                        egui::ComboBox::from_id_salt("merged_tx_device")
-                            .selected_text(format!("Send to: {selected_label}"))
-                            .show_ui(ui, |ui| {
-                                for conn in self
-                                    .connections
-                                    .iter()
-                                    .filter(|conn| self.merged_contains(conn.id))
-                                {
-                                    let text = short_label(conn.display_label());
-                                    ui.add_enabled_ui(conn.state != ConnState::Closed, |ui| {
-                                        ui.selectable_value(
-                                            &mut merged_tx_port,
-                                            Some(conn.id),
-                                            text,
-                                        );
-                                    });
-                                }
-                            });
-                        if !self.merged_follow && self.merged_new_since_scroll > 0 {
-                            ui.label(format!("{} new", self.merged_new_since_scroll));
-                            ui.separator();
+                        // Added after the pin in a right-to-left layout, so they
+                        // land to its left: Log | Hex | ANSI/VT | Plot | Pinned.
+                        if ui
+                            .selectable_label(conn.show_plot, "Plot")
+                            .on_hover_text("Show the plot pane below the console")
+                            .clicked()
+                        {
+                            toggle_plot = true;
+                        }
+                        if ui
+                            .selectable_label(conn.screen_view, "ANSI/VT")
+                            .on_hover_text("Terminal screen sized to the window")
+                            .clicked()
+                        {
+                            select_view = Some((true, false));
+                        }
+                        if ui
+                            .selectable_label(!conn.screen_view && conn.hex_view, "Hex")
+                            .on_hover_text("Show raw bytes instead of decoded lines")
+                            .clicked()
+                        {
+                            select_view = Some((false, true));
+                        }
+                        if ui
+                            .selectable_label(!conn.screen_view && !conn.hex_view, "Log")
+                            .on_hover_text("Show the chronological log")
+                            .clicked()
+                        {
+                            select_view = Some((false, false));
                         }
                         if has_highlights
                             && ui
@@ -591,135 +772,34 @@ impl App {
                         {
                             toggle_highlights = true;
                         }
-                    });
-                    return;
-                }
-                let Some(active) = self.active_index() else {
-                    ui.weak("no connection — press + to add one");
-                    return;
-                };
-                let conn = &self.connections[active];
-                // A live error takes priority over the raw state: the reader
-                // keeps retrying in the background (state stays Connecting /
-                // Reconnecting so it can recover on its own), but the status
-                // bar should say what's actually wrong rather than keep
-                // claiming to be "connecting" while it fails over and over.
-                //
-                // While the link *is* up, though, the state is still worth
-                // showing, so an error raised alongside a working connection
-                // (a capture-file write that failed, say) sits next to it
-                // rather than replacing it — this footer is the only place
-                // such an error ever surfaces.
-                if conn.state == ConnState::Connected || conn.last_error.is_none() {
-                    ui.colored_label(
-                        state_color(conn.state),
-                        format!("{} {}", state_dot(conn.state), conn.state),
-                    );
-                }
-                if let Some(err) = &conn.last_error {
-                    let resp = ui.add(
-                        egui::Label::new(
-                            egui::RichText::new("⚠ error")
-                                .color(egui::Color32::from_rgb(0xff, 0x55, 0x55)),
-                        )
-                        .sense(egui::Sense::click()),
-                    );
-                    let resp = resp
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .on_hover_text(err.msg.as_str());
-                    if resp.clicked() {
-                        open_error_win = Some(conn.id);
-                    }
-                }
-                ui.separator();
-                ui.monospace(conn.port_config.summary());
-                ui.separator();
-                ui.label(format!("{} lines", conn.store.next_abs_index()));
-                show_macro_run_indicators(ui, &long_running_macros, &mut stop_macro_run);
-                if conn.filter_index_active() {
-                    ui.separator();
-                    ui.label(format!("{} shown", conn.filter_index.len()));
-                }
-                if !conn.screen_view && !conn.search_matches.is_empty() {
-                    ui.separator();
-                    let n = conn.search_pos.map(|p| p + 1).unwrap_or(0);
-                    ui.label(format!("match {n}/{}", conn.search_matches.len()));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Pin toggle: pinned = follow tail / autoscroll.
-                    let label = if conn.follow { "Pinned" } else { "Pin" };
-                    if ui
-                        .selectable_label(conn.follow, label)
-                        .on_hover_text("Pin to bottom and autoscroll")
-                        .clicked()
-                    {
-                        toggle_pin = true;
-                    }
-                    // Added after the pin in a right-to-left layout, so they
-                    // land to its left: Log | Hex | ANSI/VT | Plot | Pinned.
-                    if ui
-                        .selectable_label(conn.show_plot, "Plot")
-                        .on_hover_text("Show the plot pane below the console")
-                        .clicked()
-                    {
-                        toggle_plot = true;
-                    }
-                    if ui
-                        .selectable_label(conn.screen_view, "ANSI/VT")
-                        .on_hover_text("Terminal screen sized to the window")
-                        .clicked()
-                    {
-                        select_view = Some((true, false));
-                    }
-                    if ui
-                        .selectable_label(!conn.screen_view && conn.hex_view, "Hex")
-                        .on_hover_text("Show raw bytes instead of decoded lines")
-                        .clicked()
-                    {
-                        select_view = Some((false, true));
-                    }
-                    if ui
-                        .selectable_label(!conn.screen_view && !conn.hex_view, "Log")
-                        .on_hover_text("Show the chronological log")
-                        .clicked()
-                    {
-                        select_view = Some((false, false));
-                    }
-                    if has_highlights
-                        && ui
-                            .selectable_label(self.highlights_visible, "Highlights")
-                            .on_hover_text("Enable or disable all highlights")
-                            .clicked()
-                    {
-                        toggle_highlights = true;
-                    }
-                    ui.separator();
-                    if !conn.follow && conn.new_since_scroll > 0 {
-                        ui.label(format!("{} new", conn.new_since_scroll));
-                    }
-                    let mut evicted = Vec::new();
-                    if conn.store.evicted_any() {
-                        evicted.push("console");
-                    }
-                    if conn.raw_evicted_any {
-                        evicted.push("hex");
-                    }
-                    if conn.series_evicted_any {
-                        evicted.push("plot");
-                    }
-                    if !evicted.is_empty() {
                         ui.separator();
-                        ui.colored_label(
-                            egui::Color32::from_rgb(0xe5, 0xc0, 0x40),
-                            format!(
-                                "{} history evicted (full capture on disk)",
-                                evicted.join("/")
-                            ),
-                        );
-                    }
+                        if !conn.follow && conn.new_since_scroll > 0 {
+                            ui.label(format!("{} new", conn.new_since_scroll));
+                        }
+                        let mut evicted = Vec::new();
+                        if conn.store.evicted_any() {
+                            evicted.push("console");
+                        }
+                        if conn.raw_evicted_any {
+                            evicted.push("hex");
+                        }
+                        if conn.series_evicted_any {
+                            evicted.push("plot");
+                        }
+                        if !evicted.is_empty() {
+                            ui.separator();
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0xe5, 0xc0, 0x40),
+                                format!(
+                                    "{} history evicted (full capture on disk)",
+                                    evicted.join("/")
+                                ),
+                            );
+                        }
+                    });
                 });
-            });
-        });
+            },
+        );
 
         self.merged_tx_port = merged_tx_port;
         if let Some(run_index) = stop_macro_run {

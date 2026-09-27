@@ -161,6 +161,10 @@ fn fit_bounds(all: &[SeriesEntry], map: AxisMap) -> Option<PlotBounds> {
 
 impl App {
     pub(crate) fn show_plot(&mut self, ctx: &egui::Context) {
+        self.show_plot_in(ctx, None);
+    }
+
+    pub(crate) fn show_plot_in(&mut self, ctx: &egui::Context, parent: Option<&mut egui::Ui>) {
         if self.merged_selected || self.connections.is_empty() {
             return;
         }
@@ -170,13 +174,17 @@ impl App {
             return;
         }
 
-        egui::TopBottomPanel::bottom("plot")
+        let max_height = parent.as_ref().map_or(f32::INFINITY, |ui| {
+            (ui.available_height() - 100.0).max(40.0)
+        });
+        let panel = egui::TopBottomPanel::bottom(self.pane_widget_id("plot"))
             .resizable(true)
             .default_height(220.0)
-            .show(ctx, |ui| {
-                self.show_plot_header(ui, active);
-                self.show_plot_body(ui, active);
-            });
+            .max_height(max_height);
+        super::workspace::show_panel(panel, ctx, parent, |ui| {
+            self.show_plot_header(ui, active);
+            self.show_plot_body(ui, active);
+        });
     }
 
     fn show_plot_header(&mut self, ui: &mut egui::Ui, active: usize) {

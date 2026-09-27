@@ -50,6 +50,16 @@ Most serial terminals just show you text. Rusty's Pigtail is built around the pa
   preserving VT history. Clear console clears VT history too. Alternate-screen
   applications retain the main screen's history but do not add their redraws to it.
   Merged views remain chronological logs.
+- Two resizable console panes, side by side or stacked, each with its own tabs,
+  status footer, search and optional plot. Open at least two tabs, then choose
+  **Split right** or **Split below** from that tab's right-click menu.
+  Click a pane to focus it; typing, macros and tab shortcuts target that pane.
+  Drag the divider to resize, or double-click it to restore equal sizes.
+  Drag tabs within a header to reorder them, or onto the other pane's header
+  to move them. You can also use **Move to other pane** in a tab's menu.
+  **Close split** in the same menu joins the tabs without disconnecting devices.
+  The split orientation, divider position, tab groups, selected tabs, and focused
+  pane are restored on restart.
 - Transmit with configurable line endings, send history, and hex input
 - Drop files onto a console, or use **Send file…**, to send raw bytes, paced text lines, or hex-decoded data
 - Named transmit macros with reorderable command, delay, and regex wait steps,
