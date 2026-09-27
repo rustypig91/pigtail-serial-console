@@ -491,7 +491,9 @@ impl App {
             && !self.search_focus_request
             && self.console_input_index().is_some();
         let tab_pressed = ctx.input(|i| {
-            i.events.iter().any(|event| {
+            // Include Tab shortcuts already consumed before layout: egui has
+            // still queued focus navigation for their original key events.
+            i.raw.events.iter().any(|event| {
                 matches!(
                     event,
                     egui::Event::Key {

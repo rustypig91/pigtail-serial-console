@@ -204,6 +204,8 @@ MIT, see [LICENSE](LICENSE).
 
 Use **Ctrl+Shift+Page Up / Page Down** to scroll the console one page up or down.
 Use **Ctrl+Shift+Up / Down** to scroll one line up or down.
+Use **Ctrl+Shift+Tab** to cycle forwards through tabs in the current pane.
+Use **F1** to switch focus between split panes.
 Plain Page Up / Page Down and arrow keys retain their normal terminal behavior.
 
 Use **Ctrl+Shift+Space** to pin the console to the bottom. On connection tabs,
