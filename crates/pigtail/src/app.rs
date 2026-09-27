@@ -1343,8 +1343,8 @@ struct MergedTabState {
     pub merged_pruned_before: HashMap<PortId, u64>,
     /// Per-source read cursors owned by this merged tab, including while parked.
     pub merged_upto: HashMap<PortId, u64>,
-    /// Mutable source tails last observed by this view, including while parked.
-    pub merged_provisional: HashMap<PortId, u64>,
+    /// Mutable source tails (absolute index, byte length), including while parked.
+    pub merged_provisional: HashMap<PortId, (u64, u32)>,
     /// Filter state owned by the loaded merged tab. A merged filter is kept
     /// separate from every port's filter so its meaning does not depend on
     /// whichever real tab happened to be active last.
@@ -1531,8 +1531,8 @@ pub struct App {
     pub merged_pruned_before: HashMap<PortId, u64>,
     /// Per-source read cursors owned by this merged tab, including while parked.
     pub merged_upto: HashMap<PortId, u64>,
-    /// Mutable source tails last observed by the loaded merged view.
-    pub merged_provisional: HashMap<PortId, u64>,
+    /// Mutable source tails (absolute index, byte length) observed by this view.
+    pub merged_provisional: HashMap<PortId, (u64, u32)>,
     /// Filter state owned by the loaded merged tab. A merged filter is kept
     /// separate from every port's filter so its meaning does not depend on
     /// whichever real tab happened to be active last.
@@ -2991,22 +2991,27 @@ impl App {
             // more output while this view is parked. The filter/search fast
             // paths only re-test the current tail, and wrapping only re-tests
             // the last merged entry. Invalidate those caches when the old
-            // mutable tail has moved into the history, without rebuilding the
-            // interleaving or resetting unread counts.
+            // mutable tail has moved into the history or changed length. Even
+            // a current source tail can precede another port's entries, where
+            // the wrap index's last-entry refresh cannot reach it. Preserve
+            // the interleaving and unread counts when invalidating the caches.
             if self
                 .merged_provisional
                 .remove(&conn.id)
-                .is_some_and(|abs| abs + 1 < end && conn.store.get(abs).is_some())
+                .is_some_and(|(abs, len)| {
+                    conn.store
+                        .get(abs)
+                        .is_some_and(|line| abs + 1 < end || line.meta.len != len)
+                })
             {
                 self.merged_generation += 1;
             }
             if let Some(abs) = end.checked_sub(1) {
-                if conn
-                    .store
-                    .get(abs)
-                    .is_some_and(|line| line.meta.flags.contains(LineFlags::PROVISIONAL))
-                {
-                    self.merged_provisional.insert(conn.id, abs);
+                if let Some(line) = conn.store.get(abs) {
+                    if line.meta.flags.contains(LineFlags::PROVISIONAL) {
+                        self.merged_provisional
+                            .insert(conn.id, (abs, line.meta.len));
+                    }
                 }
             }
             for abs in start..end {
@@ -4815,6 +4820,74 @@ pub(crate) mod tests {
         app.merged_search_dirty = true;
         app.maintain_merged_search(true);
         assert_eq!(app.merged_search_matches.len(), 1);
+    }
+
+    #[test]
+    fn parked_merged_views_rewrap_a_growing_interior_tail() {
+        for filtered in [false, true] {
+            let (mut app, _enum_tx) = test_app("parked-merged-interior-wrap");
+            add_merged_test_connection(
+                &mut app,
+                PortId(1),
+                "first",
+                &[("short", 1, LineFlags::PROVISIONAL)],
+            );
+            add_merged_test_connection(
+                &mut app,
+                PortId(2),
+                "second",
+                &[("later", 2, LineFlags::default())],
+            );
+            app.create_merged_tab(vec![PortId(1), PortId(2)]);
+            if filtered {
+                app.merged_filter_rules.push(FilterRule {
+                    pattern: ".*".into(),
+                    ..FilterRule::default()
+                });
+                app.merged_filter_dirty = true;
+                app.select_merged_tab(0);
+            }
+            let mut wrap = WrapIndex::new();
+            let sync = |wrap: &mut WrapIndex, app: &App| {
+                let view = app.merged_view();
+                wrap.sync(
+                    10,
+                    app.merged_view_generation(),
+                    view.len(),
+                    |i| view[i].seq,
+                    |i| {
+                        let entry = view[i];
+                        app.connections
+                            .iter()
+                            .find(|conn| conn.id == entry.port)
+                            .unwrap()
+                            .store
+                            .get(entry.abs)
+                            .unwrap()
+                            .meta
+                            .len
+                    },
+                );
+            };
+            sync(&mut wrap, &app);
+            assert_eq!(wrap.total_rows(), 2);
+            app.create_merged_tab(vec![PortId(2)]);
+            app.connections[0].store.append(IncomingLine {
+                text: "a partial line that grew".into(),
+                ts: app.clock.now(),
+                port: PortId(1),
+                flags: LineFlags::CONTINUATION | LineFlags::PROVISIONAL,
+                spans: Default::default(),
+                cursor: None,
+            });
+            app.select_merged_tab(0);
+            sync(&mut wrap, &app);
+            assert_eq!(wrap.rows(0), 3, "filtered: {filtered}");
+            assert_eq!(wrap.total_rows(), 4);
+            let generation = app.merged_view_generation();
+            app.select_merged_tab(0);
+            assert_eq!(app.merged_view_generation(), generation);
+        }
     }
 
     #[test]
