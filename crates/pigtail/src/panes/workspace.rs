@@ -861,6 +861,41 @@ mod tests {
     }
 
     #[test]
+    fn f1_leaves_search_focus_in_the_previous_pane() {
+        let (mut app, _tx) = test_app("split-f1-search-focus");
+        add_connection(&mut app, 1);
+        add_connection(&mut app, 2);
+        app.apply_layout_action(LayoutAction::Split(
+            TabId::Connection(PortId(2)),
+            SplitDirection::Right,
+        ));
+        let ctx = egui::Context::default();
+        let size = egui::vec2(1000.0, 600.0);
+        frame(&mut app, &ctx, size, vec![]);
+        frame(&mut app, &ctx, size, vec![shortcut(egui::Key::F)]);
+        frame(&mut app, &ctx, size, vec![]);
+        assert!(ctx.memory(|m| m.focused().is_some()));
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(
+            &mut app,
+            &ctx,
+            size,
+            vec![key(egui::Key::F1), key(egui::Key::Enter)],
+        );
+        assert_eq!(app.workspace.focused, 0);
+        assert!(
+            ctx.memory(|m| m.focused().is_none()),
+            "The old search field must not reclaim focus after F1"
+        );
+    }
+
+    #[test]
     fn tab_shortcut_preserves_focus_on_closed_connection() {
         let (mut app, _tx) = test_app("tab-closed-focus");
         add_connection(&mut app, 1);

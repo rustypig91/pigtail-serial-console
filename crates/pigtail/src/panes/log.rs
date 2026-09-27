@@ -880,6 +880,7 @@ impl App {
     }
 
     fn show_search_bar(&mut self, ui: &mut egui::Ui, active: usize, select_query: bool) {
+        let input_enabled = self.pane_input_enabled();
         let mut next = false;
         let mut prev = false;
         let mut close = false;
@@ -919,7 +920,7 @@ impl App {
             // and are *consumed* so they don't also reach the device (Enter makes
             // a singleline lose focus, which would otherwise leak it to the
             // console's raw input). Enter keeps focus so you can search again.
-            if resp.has_focus() || resp.lost_focus() {
+            if input_enabled && (resp.has_focus() || resp.lost_focus()) {
                 if ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter)) {
                     prev = true;
                     resp.request_focus();
@@ -972,6 +973,7 @@ impl App {
     }
 
     fn show_merged_search_bar(&mut self, ui: &mut egui::Ui, select_query: bool) {
+        let input_enabled = self.pane_input_enabled();
         let mut next = false;
         let mut prev = false;
         let mut close = false;
@@ -1004,7 +1006,7 @@ impl App {
                 resp.request_focus();
                 focus = false;
             }
-            if resp.has_focus() || resp.lost_focus() {
+            if input_enabled && (resp.has_focus() || resp.lost_focus()) {
                 if ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter)) {
                     prev = true;
                     resp.request_focus();
