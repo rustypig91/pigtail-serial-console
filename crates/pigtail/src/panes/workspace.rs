@@ -315,7 +315,23 @@ impl App {
         if self.workspace.split.is_none() || self.keyboard_overlay_open(ctx) {
             return;
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
+        // consume_key allows extra Shift/Alt modifiers; only plain F1 owns
+        // this shortcut. Leave modified function keys available to other input.
+        let switch_pane = ctx.input_mut(|input| {
+            let mut consumed = false;
+            input.events.retain(|event| {
+                let matches = matches!(event, egui::Event::Key {
+                    key: egui::Key::F1,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.is_none());
+                consumed |= matches;
+                !matches
+            });
+            consumed
+        });
+        if switch_pane {
             self.focus_workspace_pane(ctx, 1 - self.workspace.focused);
         }
         if let Some(pos) = ctx.input(|i| {
@@ -857,6 +873,40 @@ mod tests {
             app.apply_layout_action(LayoutAction::Join);
             frame(&mut app, &ctx, size, vec![f1()]);
             assert_eq!(app.workspace.focused, 0);
+        }
+    }
+
+    #[test]
+    fn modified_f1_does_not_switch_panes_or_consume_input() {
+        let (mut app, _tx) = test_app("split-modified-f1");
+        add_connection(&mut app, 1);
+        add_connection(&mut app, 2);
+        app.apply_layout_action(LayoutAction::Split(
+            TabId::Connection(PortId(2)),
+            SplitDirection::Right,
+        ));
+        for modifiers in [
+            egui::Modifiers::SHIFT,
+            egui::Modifiers::ALT,
+            egui::Modifiers::CTRL,
+            egui::Modifiers::COMMAND,
+        ] {
+            let ctx = egui::Context::default();
+            let event = egui::Event::Key {
+                key: egui::Key::F1,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            };
+            ctx.begin_pass(egui::RawInput {
+                events: vec![event.clone()],
+                ..Default::default()
+            });
+            app.prepare_workspace(&ctx);
+            assert_eq!(app.workspace.focused, 1, "Modifiers: {modifiers:?}");
+            assert_eq!(ctx.input(|i| i.events.clone()), vec![event]);
+            let _ = ctx.end_pass();
         }
     }
 
