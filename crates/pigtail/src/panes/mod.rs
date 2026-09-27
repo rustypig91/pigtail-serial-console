@@ -14,3 +14,6 @@ mod transfer;
 mod transmit;
 mod update;
 mod windows;
+
+mod workspace;
+pub(crate) use workspace::Workspace;

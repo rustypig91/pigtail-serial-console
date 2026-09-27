@@ -219,6 +219,7 @@ impl<'a> MenuTarget<'a> {
 /// row happens to need, because the virtualized scroll area can only skip to a
 /// row it can compute the position of — see [`crate::wrap`].
 struct Metrics {
+    selectable: bool,
     /// The console's monospace font, sized by the `console_font_size` setting.
     /// Everything in a row — gutter, port tag, text — is drawn with it, so the
     /// whole line scales together and `row_height` stays exact.
@@ -299,6 +300,7 @@ impl Metrics {
             0
         };
         Metrics {
+            selectable: true,
             font,
             row_height,
             char_w,
@@ -471,7 +473,7 @@ impl App {
     /// UI overlays that own keyboard input without necessarily taking egui's
     /// widget focus. Check this both before layout and before transmitting: an
     /// overlay can be opened by another event in the same input batch as Tab.
-    fn keyboard_overlay_open(&self, ctx: &egui::Context) -> bool {
+    pub(crate) fn keyboard_overlay_open(&self, ctx: &egui::Context) -> bool {
         self.floating_window_open()
             || ctx.is_context_menu_open()
             || ctx.memory(|memory| memory.any_popup_open())
@@ -592,7 +594,8 @@ impl App {
 
     /// Apply console commands before layout and raw serial input.
     pub(crate) fn consume_console_view_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.keyboard_overlay_open(ctx)
+        if !self.pane_input_enabled()
+            || self.keyboard_overlay_open(ctx)
             || self.search_focus_request
             || ctx.memory(|m| m.focused().is_some())
             || (self.connections.is_empty() && !self.merged_selected)
@@ -648,7 +651,8 @@ impl App {
 
     /// Reserve local page and line navigation before raw input reaches the device.
     pub(crate) fn consume_scroll_shortcut(&self, ctx: &egui::Context) -> (f32, f32) {
-        if self.keyboard_overlay_open(ctx)
+        if !self.pane_input_enabled()
+            || self.keyboard_overlay_open(ctx)
             || self.search_focus_request
             || ctx.memory(|m| m.focused().is_some())
         {
@@ -717,7 +721,17 @@ impl App {
     }
 
     pub(crate) fn show_console(&mut self, ctx: &egui::Context, console_tab_claimed: bool) {
-        let select_query = self.seed_search_from_selection(ctx);
+        self.show_console_in(ctx, console_tab_claimed, None);
+    }
+
+    pub(crate) fn show_console_in(
+        &mut self,
+        ctx: &egui::Context,
+        console_tab_claimed: bool,
+        parent: Option<&mut egui::Ui>,
+    ) {
+        let input_enabled = self.pane_input_enabled();
+        let select_query = input_enabled && self.seed_search_from_selection(ctx);
         let mut menu = MenuAction {
             macro_editor_open: self.macro_editor.is_some(),
             ..Default::default()
@@ -729,17 +743,18 @@ impl App {
         // are (see `transmit`), so plain Ctrl+F still reaches the device.
         // Consuming it here removes it from the event queue before
         // `console_key_input` runs later this frame, so it isn't also sent.
-        let open_search = ctx.input_mut(|i| {
-            i.consume_key(
-                egui::Modifiers {
-                    ctrl: true,
-                    shift: true,
-                    ..Default::default()
-                },
-                egui::Key::F,
-            )
-        });
-        let context_click = ctx.input(|i| i.pointer.secondary_clicked());
+        let open_search = input_enabled
+            && ctx.input_mut(|i| {
+                i.consume_key(
+                    egui::Modifiers {
+                        ctrl: true,
+                        shift: true,
+                        ..Default::default()
+                    },
+                    egui::Key::F,
+                )
+            });
+        let context_click = input_enabled && ctx.input(|i| i.pointer.secondary_clicked());
         if context_click {
             ctx.data_mut(|data| data.insert_temp(selection_menu_id(), SelectionMenu::default()));
         }
@@ -749,7 +764,7 @@ impl App {
             open_search && request_search_selection(ctx, self.search_target())
         };
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        let draw = |ui: &mut egui::Ui| {
             // Only while the pointer is actually over the console, so ctrl+wheel
             // still belongs to whatever else is under it (the plot panel, a
             // floating window — `rect_contains_pointer` is layer-aware, so one
@@ -783,7 +798,7 @@ impl App {
 
             // Optional search bar pinned to the top of the console.
             if self.show_search {
-                egui::TopBottomPanel::top("search_bar")
+                egui::TopBottomPanel::top(self.pane_widget_id("search_bar"))
                     .show_separator_line(false)
                     .show_inside(ui, |ui| {
                         // Search status labels must not join a console drag.
@@ -807,7 +822,12 @@ impl App {
             } else {
                 self.show_single_rows(ui, active, &mut menu);
             }
-        });
+        };
+        if let Some(ui) = parent {
+            egui::CentralPanel::default().show_inside(ui, draw);
+        } else {
+            egui::CentralPanel::default().show(ctx, draw);
+        }
 
         if capture_selection {
             // Keep the synthetic event away from device input and later windows.
@@ -836,7 +856,7 @@ impl App {
         // focus, so `memory().focused()` alone wouldn't catch it.
         let focused = ctx.memory(|m| m.focused());
         let console_owns_focus = console_tab_claimed && focused == Some(console_tab_guard_id());
-        if !self.keyboard_overlay_open(ctx) && !self.search_focus_request {
+        if input_enabled && !self.keyboard_overlay_open(ctx) && !self.search_focus_request {
             // Do not steal focus traversal unless there is a live console to
             // receive the key. With no connection (or a Closed zombie tab),
             // Tab belongs to the remaining UI controls instead.
@@ -856,7 +876,7 @@ impl App {
         let mut prev = false;
         let mut close = false;
         let mut focus = std::mem::take(&mut self.search_focus_request);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("🔍");
             let conn = &mut self.connections[active];
             let search_id = ui.make_persistent_id("search_query");
@@ -867,7 +887,7 @@ impl App {
                 egui::TextEdit::singleline(&mut conn.search_query)
                     .id(search_id)
                     .hint_text("search (regex)…")
-                    .desired_width(240.0),
+                    .desired_width((ui.available_width() - 160.0).clamp(80.0, 240.0)),
             );
             if resp.changed() {
                 conn.search_dirty = true;
@@ -948,7 +968,7 @@ impl App {
         let mut prev = false;
         let mut close = false;
         let mut focus = std::mem::take(&mut self.search_focus_request);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("🔍");
             let search_id = ui.make_persistent_id("search_query");
             if select_query {
@@ -958,7 +978,7 @@ impl App {
                 egui::TextEdit::singleline(&mut self.merged_search_query)
                     .id(search_id)
                     .hint_text("search merged view (regex)…")
-                    .desired_width(240.0),
+                    .desired_width((ui.available_width() - 160.0).clamp(80.0, 240.0)),
             );
             if resp.changed() {
                 self.merged_search_dirty = true;
@@ -1018,9 +1038,10 @@ impl App {
     }
 
     fn show_single_rows(&mut self, ui: &mut egui::Ui, active: usize, menu: &mut MenuAction) {
+        let pointer_scroll = !self.workspace.resizing && user_scrolled(ui);
         let (pages, lines) = self.consume_scroll_shortcut(ui.ctx());
         let ts_format = self.config.settings.timestamp_format;
-        let m = Metrics::new(
+        let mut m = Metrics::new(
             ui,
             self.console_font(),
             ts_format,
@@ -1028,6 +1049,7 @@ impl App {
             0,
             tx_marker(&self.connections[active]),
         );
+        m.selectable = self.pane_input_enabled();
         // Bring the row index up to date before anything asks how tall the
         // content is or which line a row belongs to.
         self.connections[active].sync_wrap(m.cols);
@@ -1156,7 +1178,7 @@ impl App {
         });
 
         // The user touching the wheel or dragging the scrollbar unpins.
-        let user_scrolled = pages != 0.0 || lines != 0.0 || ui.input(user_scrolled);
+        let user_scrolled = pages != 0.0 || lines != 0.0 || pointer_scroll;
         if goto.is_some() {
             // Navigating to a specific line (search/plot) unpins so we
             // stay there instead of snapping back to the bottom. Re-pinning the
@@ -1279,6 +1301,7 @@ impl App {
     }
 
     fn show_merged_rows(&mut self, ui: &mut egui::Ui, menu: &mut MenuAction) {
+        let pointer_scroll = !self.workspace.resizing && user_scrolled(ui);
         let (pages, lines) = self.consume_scroll_shortcut(ui.ctx());
         let ts_format = self.config.settings.timestamp_format;
         let filter_active = self.merged_filter_active();
@@ -1291,7 +1314,7 @@ impl App {
             .and_then(|pos| self.merged_search_matches.get(pos))
             .map(|entry| entry.seq);
         let tag_chars = merged_tag_width(&self.connections);
-        let m = Metrics::new(
+        let mut m = Metrics::new(
             ui,
             self.console_font(),
             ts_format,
@@ -1299,6 +1322,7 @@ impl App {
             tag_chars,
             self.connections.iter().any(tx_marker),
         );
+        m.selectable = self.pane_input_enabled();
         let merged_tab_id = self
             .loaded_merged_tab
             .and_then(|i| self.merged_tabs.get(i))
@@ -1373,7 +1397,7 @@ impl App {
                 n_rows as f32 * row_height,
             )
         });
-        let user_scrolled = pages != 0.0 || lines != 0.0 || ui.input(user_scrolled);
+        let user_scrolled = pages != 0.0 || lines != 0.0 || pointer_scroll;
         if scroll_offset.is_some() || (self.merged_follow && user_scrolled) {
             self.merged_follow = false;
         }
@@ -1484,6 +1508,7 @@ impl App {
     }
 
     fn show_hex_rows(&mut self, ui: &mut egui::Ui, active: usize, menu: &mut MenuAction) {
+        let pointer_scroll = !self.workspace.resizing && user_scrolled(ui);
         let (pages, lines) = self.consume_scroll_shortcut(ui.ctx());
         let ts_format = self.config.settings.timestamp_format;
         let has_mark = self.connections[active].mark_micros.is_some();
@@ -1503,13 +1528,13 @@ impl App {
             )
         });
 
-        let user_scrolled = pages != 0.0 || lines != 0.0 || ui.input(user_scrolled);
+        let user_scrolled = pages != 0.0 || lines != 0.0 || pointer_scroll;
         if self.connections[active].follow && user_scrolled {
             self.connections[active].follow = false;
         }
         let following = self.connections[active].follow;
         // A hex dump is already fixed at 16 bytes a row, so it never wraps.
-        let m = Metrics::new(
+        let mut m = Metrics::new(
             ui,
             self.console_font(),
             TimestampFormat::None,
@@ -1517,6 +1542,7 @@ impl App {
             0,
             false,
         );
+        m.selectable = self.pane_input_enabled();
         let font = m.font.clone();
         let conn = &self.connections[active];
         let segments = hex_segments(&conn.raw_sessions, conn.raw_base, conn.raw_ring.len());
@@ -2343,10 +2369,18 @@ fn viewport_entries(
 /// scroll; egui still reports it in `raw_scroll_delta` (it only withholds it
 /// from the smoothed delta the `ScrollArea` consumes), so it has to be excluded
 /// by hand or zooming would silently drop the tail.
-fn user_scrolled(i: &egui::InputState) -> bool {
-    let wheel =
-        !i.modifiers.command && (i.raw_scroll_delta.y != 0.0 || i.smooth_scroll_delta.y != 0.0);
-    wheel || i.pointer.is_decidedly_dragging()
+fn user_scrolled(ui: &egui::Ui) -> bool {
+    let rect = ui.max_rect().intersect(ui.clip_rect());
+    ui.rect_contains_pointer(rect)
+        && ui.input(|i| {
+            let wheel = !i.modifiers.command
+                && (i.raw_scroll_delta.y != 0.0 || i.smooth_scroll_delta.y != 0.0);
+            let drag = i.pointer.is_decidedly_dragging()
+                && i.pointer
+                    .press_origin()
+                    .is_some_and(|origin| rect.contains(origin));
+            wheel || drag
+        })
 }
 
 /// Wheel notches turned this frame with Ctrl held, as whole steps. egui folds
@@ -2558,14 +2592,20 @@ fn wrapped_text(
     // Press and release may both arrive in one frame, leaving no button down.
     selection_response.sense.drag &=
         ui.input(|i| i.pointer.primary_down() || i.pointer.primary_pressed());
-    egui::text_selection::LabelSelectionState::label_text_selection(
-        ui,
-        &selection_response,
-        rect.left_top(),
-        galley.clone(),
-        fallback,
-        egui::Stroke::NONE,
-    );
+    if m.selectable {
+        egui::text_selection::LabelSelectionState::label_text_selection(
+            ui,
+            &selection_response,
+            rect.left_top(),
+            galley.clone(),
+            fallback,
+            egui::Stroke::NONE,
+        );
+    } else {
+        ui.painter()
+            .galley(rect.left_top(), galley.clone(), fallback);
+    }
+
     // egui 0.30 keeps selection ranges private. Its selection painter appends
     // four rectangle vertices per selected row; compare with the original
     // galley so search/highlight backgrounds cannot count as selected text.
@@ -4016,6 +4056,7 @@ mod tests {
         };
         let search = regex::Regex::new("HIT").unwrap();
         let metrics = Metrics {
+            selectable: true,
             font: egui::FontId::monospace(12.0),
             row_height: 14.0,
             char_w: 8.0,
@@ -4091,6 +4132,7 @@ mod tests {
             color: highlight_color,
         }];
         let metrics = Metrics {
+            selectable: true,
             font: egui::FontId::monospace(12.0),
             row_height: 14.0,
             char_w: 8.0,
@@ -4137,6 +4179,7 @@ mod tests {
             color: highlight_color,
         }];
         let metrics = Metrics {
+            selectable: true,
             font: egui::FontId::monospace(12.0),
             row_height: 14.0,
             char_w: 8.0,

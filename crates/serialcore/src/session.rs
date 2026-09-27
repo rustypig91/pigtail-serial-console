@@ -548,7 +548,10 @@ mod tests {
         drop(writer);
 
         let old = std::time::SystemTime::now() - Duration::from_secs(2 * 86_400);
-        std::fs::File::open(&bin)
+        // Windows requires write access to update a file's timestamps.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&bin)
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(old))
             .unwrap();

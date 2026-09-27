@@ -574,6 +574,31 @@ pub enum SavedTab {
     Merged { index: usize },
 }
 
+/// Placement of the second pane relative to the first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SavedSplitDirection {
+    Right,
+    Below,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedPane {
+    #[serde(default)]
+    pub tabs: Vec<SavedTab>,
+    #[serde(default)]
+    pub selected: Option<SavedTab>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedSplit {
+    pub direction: SavedSplitDirection,
+    /// Integer thousandths keep config equality exact and avoid float drift.
+    pub ratio_per_mille: u16,
+    pub focused_pane: usize,
+    pub panes: [SavedPane; 2],
+}
+
 /// Top-level config, matching the TOML layout in spec §7.14.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
@@ -595,6 +620,8 @@ pub struct Config {
     pub merged_views: Vec<SavedMergedView>,
     #[serde(default)]
     pub tab_order: Vec<SavedTab>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split: Option<SavedSplit>,
 }
 
 impl Config {
@@ -628,6 +655,7 @@ impl Default for Config {
             last_open: Vec::new(),
             merged_views: Vec::new(),
             tab_order: Vec::new(),
+            split: None,
         }
     }
 }
@@ -910,6 +938,7 @@ bold = true
             }],
             merged_views: Vec::new(),
             tab_order: Vec::new(),
+            split: None,
         };
         let s = cfg.to_toml().unwrap();
         let back = Config::from_toml(&s).unwrap();

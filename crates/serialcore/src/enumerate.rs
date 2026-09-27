@@ -66,6 +66,14 @@ pub fn enumerate_ports() -> Vec<DiscoveredPort> {
             crate::source::DEBUG_ECHO_PATH_2,
             "pigtail debug echo port -2",
         ),
+        (
+            crate::source::DEBUG_ECHO_PATH_3,
+            "pigtail debug echo port -3",
+        ),
+        (
+            crate::source::DEBUG_ECHO_PATH_4,
+            "pigtail debug echo port -4",
+        ),
     ] {
         discovered.push(DiscoveredPort {
             path: path.into(),
