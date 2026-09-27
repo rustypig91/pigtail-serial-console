@@ -50,7 +50,7 @@ fn tab_drag(
 }
 
 impl App {
-    /// Reserve Ctrl+Shift+Left/Right for cycling the visible connection tabs.
+    /// Reserve Ctrl+Shift+Left/Right and Ctrl+Shift+Tab for cycling pane tabs.
     /// This is deliberately handled before the console sees raw input, so the
     /// terminal never receives the corresponding escape sequence.
     pub(crate) fn consume_tab_switch_shortcut(&mut self, ctx: &egui::Context) {
@@ -73,7 +73,11 @@ impl App {
         }
         let modifiers = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
         let previous = ctx.input_mut(|input| input.consume_key(modifiers, egui::Key::ArrowLeft));
-        let next = ctx.input_mut(|input| input.consume_key(modifiers, egui::Key::ArrowRight));
+        let next = ctx.input_mut(|input| {
+            let right = input.consume_key(modifiers, egui::Key::ArrowRight);
+            let tab = input.consume_key(modifiers, egui::Key::Tab);
+            right || tab
+        });
         if !previous && !next {
             return;
         }
@@ -532,6 +536,12 @@ impl App {
                     .show(ui, |ui| {
                         ui.strong("Ctrl+Shift+Left / Right");
                         ui.label("Previous / next tab");
+                        ui.end_row();
+                        ui.strong("Ctrl+Shift+Tab");
+                        ui.label("Next tab in current pane");
+                        ui.end_row();
+                        ui.strong("F1");
+                        ui.label("Switch between split panes");
                         ui.end_row();
                         ui.strong("Ctrl+Shift+Up / Down");
                         ui.label("Scroll console up / down one line");
@@ -1696,7 +1706,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_arrows_cycle_tabs_and_consume_the_terminal_input() {
+    fn ctrl_shift_arrows_and_tab_cycle_tabs_and_consume_the_terminal_input() {
         let (mut app, _enum_tx) = test_app("tab-switch-shortcuts");
         for id in [PortId(1), PortId(2)] {
             app.connections.push(app.make_connection(
@@ -1732,6 +1742,18 @@ mod tests {
         });
         app.consume_tab_switch_shortcut(&ctx);
         assert_eq!(app.active, 1, "right selects the next connection tab");
+        assert!(!app.merged_selected);
+        assert!(ctx.input(|input| input.events.is_empty()));
+        let _ = ctx.end_pass();
+
+        let ctx = egui::Context::default();
+        app.active = 0;
+        ctx.begin_pass(egui::RawInput {
+            events: vec![tab_switch(Key::Tab)],
+            ..Default::default()
+        });
+        app.consume_tab_switch_shortcut(&ctx);
+        assert_eq!(app.active, 1, "Ctrl+Shift+Tab selects the next tab");
         assert!(!app.merged_selected);
         assert!(ctx.input(|input| input.events.is_empty()));
         let _ = ctx.end_pass();

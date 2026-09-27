@@ -293,10 +293,46 @@ impl App {
         }
     }
 
+    fn focus_workspace_pane(&mut self, ctx: &egui::Context, index: usize) {
+        if index == self.workspace.focused {
+            return;
+        }
+        self.save_pane(self.workspace.focused);
+        self.workspace.panes[self.workspace.focused].search_focus_request = false;
+        let mut selection = egui::text_selection::LabelSelectionState::load(ctx);
+        selection.clear_selection();
+        selection.store(ctx);
+        self.workspace.focused = index;
+        self.load_pane(index);
+        // A search field in the old pane must not retain input.
+        if let Some(id) = ctx.memory(|m| m.focused()) {
+            ctx.memory_mut(|m| m.surrender_focus(id));
+        }
+    }
+
     pub(crate) fn prepare_workspace(&mut self, ctx: &egui::Context) {
         self.reconcile_workspace();
         if self.workspace.split.is_none() || self.keyboard_overlay_open(ctx) {
             return;
+        }
+        // consume_key allows extra Shift/Alt modifiers; only plain F1 owns
+        // this shortcut. Leave modified function keys available to other input.
+        let switch_pane = ctx.input_mut(|input| {
+            let mut consumed = false;
+            input.events.retain(|event| {
+                let matches = matches!(event, egui::Event::Key {
+                    key: egui::Key::F1,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.is_none());
+                consumed |= matches;
+                !matches
+            });
+            consumed
+        });
+        if switch_pane {
+            self.focus_workspace_pane(ctx, 1 - self.workspace.focused);
         }
         if let Some(pos) = ctx.input(|i| {
             (i.pointer.any_pressed() || !i.raw.dropped_files.is_empty())
@@ -310,19 +346,7 @@ impl App {
                     .iter()
                     .position(|rect| rect.is_some_and(|rect| rect.contains(pos)))
                 {
-                    if index != self.workspace.focused {
-                        self.save_pane(self.workspace.focused);
-                        self.workspace.panes[self.workspace.focused].search_focus_request = false;
-                        let mut selection = egui::text_selection::LabelSelectionState::load(ctx);
-                        selection.clear_selection();
-                        selection.store(ctx);
-                        self.workspace.focused = index;
-                        self.load_pane(index);
-                        // A search field in the old pane must not retain input.
-                        if let Some(id) = ctx.memory(|m| m.focused()) {
-                            ctx.memory_mut(|m| m.surrender_focus(id));
-                        }
-                    }
+                    self.focus_workspace_pane(ctx, index);
                 }
             }
         }
@@ -809,6 +833,135 @@ mod tests {
     }
 
     #[test]
+    fn f1_switches_panes_and_routes_typing_to_the_new_pane() {
+        for direction in [SplitDirection::Right, SplitDirection::Below] {
+            let (mut app, _tx) = test_app("split-f1-focus");
+            add_connection(&mut app, 1);
+            add_connection(&mut app, 2);
+            app.apply_layout_action(LayoutAction::Split(TabId::Connection(PortId(2)), direction));
+            let ctx = egui::Context::default();
+            let size = egui::vec2(1000.0, 600.0);
+            frame(&mut app, &ctx, size, vec![]);
+            let f1 = || egui::Event::Key {
+                key: egui::Key::F1,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            for (pane, text) in [(0, "left"), (1, "right")] {
+                frame(
+                    &mut app,
+                    &ctx,
+                    size,
+                    vec![f1(), egui::Event::Text(text.into())],
+                );
+                assert_eq!(app.workspace.focused, pane);
+                assert_eq!(app.connections[pane].tx_input, text);
+                assert!(!ctx.input(|i| i.events.iter().any(|event| matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::F1,
+                        ..
+                    }
+                ))));
+            }
+            app.show_keyboard_shortcuts = true;
+            frame(&mut app, &ctx, size, vec![f1()]);
+            assert_eq!(app.workspace.focused, 1);
+            app.show_keyboard_shortcuts = false;
+            app.apply_layout_action(LayoutAction::Join);
+            frame(&mut app, &ctx, size, vec![f1()]);
+            assert_eq!(app.workspace.focused, 0);
+        }
+    }
+
+    #[test]
+    fn modified_f1_does_not_switch_panes_or_consume_input() {
+        let (mut app, _tx) = test_app("split-modified-f1");
+        add_connection(&mut app, 1);
+        add_connection(&mut app, 2);
+        app.apply_layout_action(LayoutAction::Split(
+            TabId::Connection(PortId(2)),
+            SplitDirection::Right,
+        ));
+        for modifiers in [
+            egui::Modifiers::SHIFT,
+            egui::Modifiers::ALT,
+            egui::Modifiers::CTRL,
+            egui::Modifiers::COMMAND,
+        ] {
+            let ctx = egui::Context::default();
+            let event = egui::Event::Key {
+                key: egui::Key::F1,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            };
+            ctx.begin_pass(egui::RawInput {
+                events: vec![event.clone()],
+                ..Default::default()
+            });
+            app.prepare_workspace(&ctx);
+            assert_eq!(app.workspace.focused, 1, "Modifiers: {modifiers:?}");
+            assert_eq!(ctx.input(|i| i.events.clone()), vec![event]);
+            let _ = ctx.end_pass();
+        }
+    }
+
+    #[test]
+    fn f1_leaves_search_focus_in_the_previous_pane() {
+        let (mut app, _tx) = test_app("split-f1-search-focus");
+        add_connection(&mut app, 1);
+        add_connection(&mut app, 2);
+        app.apply_layout_action(LayoutAction::Split(
+            TabId::Connection(PortId(2)),
+            SplitDirection::Right,
+        ));
+        let ctx = egui::Context::default();
+        let size = egui::vec2(1000.0, 600.0);
+        frame(&mut app, &ctx, size, vec![]);
+        frame(&mut app, &ctx, size, vec![shortcut(egui::Key::F)]);
+        frame(&mut app, &ctx, size, vec![]);
+        assert!(ctx.memory(|m| m.focused().is_some()));
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(
+            &mut app,
+            &ctx,
+            size,
+            vec![key(egui::Key::F1), key(egui::Key::Enter)],
+        );
+        assert_eq!(app.workspace.focused, 0);
+        assert!(
+            ctx.memory(|m| m.focused().is_none()),
+            "The old search field must not reclaim focus after F1"
+        );
+    }
+
+    #[test]
+    fn tab_shortcut_preserves_focus_on_closed_connection() {
+        let (mut app, _tx) = test_app("tab-closed-focus");
+        add_connection(&mut app, 1);
+        add_connection(&mut app, 2);
+        app.connections[1].state = ConnState::Closed;
+        let ctx = egui::Context::default();
+        let size = egui::vec2(1000.0, 600.0);
+        frame(&mut app, &ctx, size, vec![]);
+        frame(&mut app, &ctx, size, vec![shortcut(egui::Key::Tab)]);
+        assert_eq!(app.active, 1);
+        assert!(ctx.memory(|m| m.focused().is_none()));
+        frame(&mut app, &ctx, size, vec![shortcut(egui::Key::Tab)]);
+        assert_eq!(app.active, 0, "Tab cycling must work after a closed tab");
+    }
+
+    #[test]
     fn tab_shortcuts_stay_in_the_focused_group_and_search_is_local() {
         let (mut app, _tx) = test_app("split-tab-search");
         for id in 1..=3 {
@@ -824,6 +977,11 @@ mod tests {
         let size = egui::vec2(1000.0, 600.0);
         frame(&mut app, &ctx, size, vec![shortcut(egui::Key::ArrowRight)]);
         assert_eq!(app.selected_tab_id(), Some(TabId::Connection(PortId(2))));
+        frame(&mut app, &ctx, size, vec![shortcut(egui::Key::Tab)]);
+        assert_eq!(app.selected_tab_id(), Some(TabId::Connection(PortId(1))));
+        frame(&mut app, &ctx, size, vec![shortcut(egui::Key::Tab)]);
+        assert_eq!(app.selected_tab_id(), Some(TabId::Connection(PortId(2))));
+        assert_eq!(app.workspace.focused, 0);
         frame(&mut app, &ctx, size, vec![shortcut(egui::Key::F)]);
         assert!(app.workspace.panes[0].show_search);
         assert!(!app.workspace.panes[1].show_search);
