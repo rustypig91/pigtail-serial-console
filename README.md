@@ -157,6 +157,10 @@ To build any branch manually, open Actions → release → Run workflow and choo
 the branch. Builds without a `v*` tag upload the packages and screenshot as
 artifacts on that workflow run, with a separate artifact for each platform.
 Only `v*` tag builds create a GitHub release and publish to the APT repository.
+Pull requests also build when labeled `build` (both platforms), `build-linux`
+(Linux packages and screenshot), or `build-windows` (Windows packages).
+Adding a label starts a build; subsequent commits rebuild the selected platforms.
+PR builds upload artifacts to their workflow run.
 Rerunning a tag build preserves existing release files and uploads only missing
 assets.
 
