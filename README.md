@@ -153,7 +153,7 @@ and connections are preserved. Omit `--features screenshot` to run the normal ap
 The Ubuntu release job also builds this demo after packaging the normal app,
 captures its window under Xvfb with software rendering, and attaches
 `pigtail-v<VERSION>-screenshot.png` to the release on `v*` tag builds.
-To build any branch manually, open Actions → release → Run workflow and choose
+To build any branch manually, open Actions → build → Run workflow and choose
 the branch. Builds without a `v*` tag upload the packages and screenshot as
 artifacts on that workflow run, with a separate artifact for each platform.
 Only `v*` tag builds create a GitHub release and publish to the APT repository.
