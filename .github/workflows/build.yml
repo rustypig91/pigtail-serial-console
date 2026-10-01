@@ -1,18 +1,49 @@
-name: "release"
+name: "build"
 
 on:
+  # GitHub's Run workflow branch selector chooses the branch to build.
   workflow_dispatch:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
   push:
     tags:
       - "v*"
 
 jobs:
   verify-version:
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'build') ||
+      contains(github.event.pull_request.labels.*.name, 'build-linux') ||
+      contains(github.event.pull_request.labels.*.name, 'build-windows')
+    permissions:
+      contents: read
     runs-on: ubuntu-22.04
     outputs:
       version: ${{ steps.version.outputs.version }}
+      matrix: ${{ steps.platforms.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
+      - name: Select build platforms
+        id: platforms
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          labels = json.loads(os.environ["PR_LABELS"]) or []
+          all_platforms = os.environ["EVENT_NAME"] != "pull_request" or "build" in labels
+          platforms = []
+          if all_platforms or "build-linux" in labels:
+              platforms.append({"platform": "ubuntu-22.04", "target": "x86_64-unknown-linux-gnu"})
+          if all_platforms or "build-windows" in labels:
+              platforms.append({"platform": "windows-latest", "target": "x86_64-pc-windows-msvc"})
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("matrix=" + json.dumps({"include": platforms}) + "\n")
+          PY
       - name: Read workspace version
         id: version
         run: |
@@ -31,24 +62,13 @@ jobs:
             exit 1
           fi
 
-  release:
+  build:
     needs: verify-version
     permissions:
       contents: write
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # - platform: 'macos-latest' # for Arm based macs (M1 and above).
-          #   target: 'aarch64-apple-darwin'
-          # - platform: 'macos-latest' # for Intel based macs.
-          #   target: 'x86_64-apple-darwin'
-          - platform: "ubuntu-22.04"
-            target: "x86_64-unknown-linux-gnu"
-          # - platform: 'ubuntu-22.04-arm' # Only available in public repos.
-          #   target: 'aarch64-unknown-linux-gnu'
-          - platform: "windows-latest"
-            target: "x86_64-pc-windows-msvc"
+      matrix: ${{ fromJSON(needs.verify-version.outputs.matrix) }}
 
     runs-on: ${{ matrix.platform }}
     env:
@@ -67,7 +87,8 @@ jobs:
           sudo apt-get install -y \
             libudev-dev \
             libx11-6 libxcursor1 libxi6 libxrandr2 \
-            libxkbcommon0 libxkbcommon-x11-0
+            libxkbcommon0 libxkbcommon-x11-0 \
+            xvfb xauth xdotool imagemagick libgl1-mesa-dri libglx-mesa0
 
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -202,17 +223,50 @@ jobs:
             "target/${{ matrix.target }}/release/pigtail" "$VERSION" .
           echo "APPIMAGE_ASSET=pigtail-v${VERSION}-x86_64.AppImage" >> "$GITHUB_ENV"
 
+      # Every distributable above must use the normal binary. Only now replace
+      # the build output with the demo variant; it is never packaged.
+      - name: Build demo (ubuntu only)
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: cargo build --release --locked -p pigtail --features demo --target ${{ matrix.target }}
+
+      - name: Capture release screenshot (ubuntu only)
+        if: startsWith(matrix.platform, 'ubuntu')
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          SCREENSHOT="pigtail-v${VERSION}-screenshot.png"
+          bash scripts/capture-screenshot.sh \
+            "target/${{ matrix.target }}/release/pigtail" "$SCREENSHOT"
+          echo "SCREENSHOT_ASSET=$SCREENSHOT" >> "$GITHUB_ENV"
+
+      - name: Upload build artifacts (non-release builds)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: pigtail-v${{ env.VERSION }}-${{ matrix.target }}-build-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.UPDATE_ASSET }}
+            ${{ env.SETUP_ASSET }}
+            ${{ env.MSI_ASSET }}
+            ${{ env.DEB_ASSET }}
+            ${{ env.APPIMAGE_ASSET }}
+            ${{ env.SCREENSHOT_ASSET }}
+
       - name: Release
         uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
           tag_name: v${{ env.VERSION }}
           name: "Rusty's Pigtail - Serial Terminal v${{ env.VERSION }}"
           body: "See the assets to download this version."
           generate_release_notes: true
-          # Publish the release (with its assets) when building from a release
-          # tag; keep branch/manual builds as drafts so they don't publish.
-          draft: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          draft: false
           prerelease: false
+          # Reruns may add missing assets, but must preserve published files.
+          overwrite_files: false
           # Unset variables expand to nothing, so each platform uploads only the
           # assets it actually produced.
           files: |
@@ -222,9 +276,10 @@ jobs:
             ${{ env.MSI_ASSET }}
             ${{ env.DEB_ASSET }}
             ${{ env.APPIMAGE_ASSET }}
+            ${{ env.SCREENSHOT_ASSET }}
 
   publish-apt:
-    needs: release
+    needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     permissions: {}

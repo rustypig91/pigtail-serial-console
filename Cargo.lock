@@ -2462,6 +2462,7 @@ dependencies = [
  "rfd",
  "serde",
  "serialcore",
+ "tempfile",
  "toml",
  "tracing",
  "tracing-subscriber",

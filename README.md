@@ -129,6 +129,49 @@ cargo build --release
 
 Run in development with `cargo run -p pigtail`.
 
+### Demo build
+
+Start a ready-to-capture demo without serial hardware:
+
+```sh
+cargo run -p pigtail --release --features demo
+```
+
+This special build always opens a 1280 × 900 dark window with generic output
+from “device 1” and “device 2”, colored prompts and sensor labels, and temperature
+and humidity plots.
+The sample output stays still while you arrange the window and take screenshots.
+Log, ANSI, and hex views use the same sample bytes; switching tabs and exploring
+the display controls works as usual. The connections are simulated and do not
+respond to commands.
+Applying port options cannot reconnect these simulated devices or open real ports.
+
+Demo builds use temporary app directories, skip port discovery, disable
+updates, and do not save settings or session captures. Your regular settings
+and connections are preserved. Omit `--features demo` to run the normal app.
+
+The Ubuntu release job also builds this demo after packaging the normal app,
+captures its window under Xvfb with software rendering, and attaches
+`pigtail-v<VERSION>-screenshot.png` to the release on `v*` tag builds.
+To build any branch manually, open Actions → build → Run workflow and choose
+the branch. Builds without a `v*` tag upload the packages and screenshot as
+artifacts on that workflow run, with a separate artifact for each platform.
+Only `v*` tag builds create a GitHub release and publish to the APT repository.
+Pull requests also build when labeled `build` (both platforms), `build-linux`
+(Linux packages and screenshot), or `build-windows` (Windows packages).
+Adding a label starts a build; subsequent commits rebuild the selected platforms.
+PR builds upload artifacts to their workflow run.
+Rerunning a tag build preserves existing release files and uploads only missing
+assets.
+
+To capture it locally on Linux, install `xvfb`, `xauth`, `xdotool`, `imagemagick`,
+and Mesa's software rendering libraries, then run:
+
+```sh
+cargo build -p pigtail --release --features demo
+bash scripts/capture-screenshot.sh target/release/pigtail /tmp/pigtail-screenshot.png
+```
+
 ### Building the packages
 
 To build all release artifacts for your current platform, run one of these

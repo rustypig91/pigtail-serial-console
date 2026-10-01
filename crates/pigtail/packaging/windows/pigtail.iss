@@ -3,7 +3,7 @@
 ; This is the friendly, click-through installer. The MSI next to it
 ; (../../wix/main.wxs) covers scripted and managed deployment instead.
 ;
-; Built in CI (see .github/workflows/release.yml), and locally with:
+; Built in CI (see .github/workflows/build.yml), and locally with:
 ;   ISCC /DAppVersion=0.2.0 /DSourceBinDir=<dir holding pigtail.exe> pigtail.iss
 
 #ifndef AppVersion

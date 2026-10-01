@@ -26,6 +26,10 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "demo")]
+#[path = "demo.rs"]
+mod demo;
+
 const CONFIG_WRITE_DELAY: Duration = Duration::from_secs(1);
 
 /// Retention limits derived from the single user-facing memory setting.
@@ -1484,6 +1488,7 @@ impl MergedTabState {
 }
 
 pub struct App {
+    pub(crate) demo_mode: bool,
     pub clock: SessionClock,
     pub config: Config,
     pub paths: AppPaths,
@@ -1643,6 +1648,7 @@ impl App {
     /// place instead of two struct literals kept in sync by hand.
     fn assemble(config: Config, paths: AppPaths, wake: Wake, enum_rx: Receiver<EnumEvent>) -> App {
         App {
+            demo_mode: false,
             clock: SessionClock::new(),
             config,
             paths,
@@ -1742,6 +1748,13 @@ impl App {
         });
 
         let (tx, rx) = crossbeam_channel::unbounded();
+        #[cfg(feature = "demo")]
+        if cfg!(feature = "demo") {
+            drop(tx);
+            let mut app = App::assemble(config, paths, wake, rx);
+            app.seed_demo().expect("preparing demo scene");
+            return app;
+        }
         // A failure here means the OS refused to create the thread (resource
         // exhaustion) — rare, and not fatal: the app still runs, it just won't
         // discover new ports until restarted with more headroom.
@@ -1880,6 +1893,12 @@ impl App {
         config: &PortConfig,
         initial_path: Option<String>,
     ) -> std::io::Result<reader::ReaderHandle> {
+        if self.demo_mode {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Demo builds only support simulated connections.",
+            ));
+        }
         let meta = SessionMeta {
             identity: identity.clone(),
             config: config.clone(),
@@ -1956,6 +1975,15 @@ impl App {
         initial_path: Option<String>,
         config: PortConfig,
     ) {
+        // Demo handles are deliberately inert. Replacing one with a serial
+        // reader would lose the fixed scene and start recording session files.
+        if self.demo_mode {
+            self.record_connect_error(
+                "Couldn't reconnect",
+                "Demo connections are simulated and cannot be reconnected.".into(),
+            );
+            return;
+        }
         let Some(index) = self.connections.iter().position(|c| c.id == port_id) else {
             // The tab the dialog was editing is gone. `show_header` disables
             // closing a tab while the dialog is up, so this should not be
@@ -2443,6 +2471,10 @@ impl App {
     ///
     /// Failed writes stay dirty so a later update or shutdown can retry them.
     fn flush_config(&mut self) -> bool {
+        if self.demo_mode {
+            self.config_dirty_since = None;
+            return true;
+        }
         if self.config_dirty_since.is_none() {
             return true;
         }
@@ -2491,8 +2523,8 @@ impl App {
     /// Menu → "Check for updates" action, which reports a result either way;
     /// the startup check only speaks up when there is a new version.
     pub fn start_update_check(&mut self, manual: bool) {
-        if self.update_rx.is_some() || self.install_rx.is_some() {
-            return; // one already in flight
+        if self.demo_mode || self.update_rx.is_some() || self.install_rx.is_some() {
+            return; // demo builds cannot update; otherwise, one is already in flight
         }
         self.update_manual = manual;
         match update::spawn_check(self.wake.clone()) {
@@ -2558,7 +2590,7 @@ impl App {
     }
 
     pub(crate) fn start_update_download(&mut self, version: String) {
-        if self.install_rx.is_some() || self.update_rx.is_some() {
+        if self.demo_mode || self.install_rx.is_some() || self.update_rx.is_some() {
             return;
         }
         match update::spawn_download(version, self.wake.clone()) {
