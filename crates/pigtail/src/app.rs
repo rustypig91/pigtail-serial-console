@@ -1488,7 +1488,7 @@ impl MergedTabState {
 }
 
 pub struct App {
-    screenshot_mode: bool,
+    pub(crate) screenshot_mode: bool,
     pub clock: SessionClock,
     pub config: Config,
     pub paths: AppPaths,
@@ -2523,8 +2523,8 @@ impl App {
     /// Menu → "Check for updates" action, which reports a result either way;
     /// the startup check only speaks up when there is a new version.
     pub fn start_update_check(&mut self, manual: bool) {
-        if self.update_rx.is_some() || self.install_rx.is_some() {
-            return; // one already in flight
+        if self.screenshot_mode || self.update_rx.is_some() || self.install_rx.is_some() {
+            return; // demo builds cannot update; otherwise, one is already in flight
         }
         self.update_manual = manual;
         match update::spawn_check(self.wake.clone()) {
@@ -2590,7 +2590,7 @@ impl App {
     }
 
     pub(crate) fn start_update_download(&mut self, version: String) {
-        if self.install_rx.is_some() || self.update_rx.is_some() {
+        if self.screenshot_mode || self.install_rx.is_some() || self.update_rx.is_some() {
             return;
         }
         match update::spawn_download(version, self.wake.clone()) {

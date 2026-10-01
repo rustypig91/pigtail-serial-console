@@ -7,7 +7,10 @@ if [[ ${1:-} != --under-xvfb ]]; then
     echo "Usage: bash $0 <screenshot-build-binary> <output.png>" >&2
     exit 2
   fi
-  exec env -u WAYLAND_DISPLAY LIBGL_ALWAYS_SOFTWARE=1 TZ=Europe/Stockholm \
+  # winit accepts WAYLAND_SOCKET independently of WAYLAND_DISPLAY and honors
+  # a caller's X11 scale override even when Xvfb specifies 96 DPI.
+  exec env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+    WINIT_X11_SCALE_FACTOR=1 LIBGL_ALWAYS_SOFTWARE=1 TZ=Europe/Stockholm \
     xvfb-run --auto-servernum --server-args="-screen 0 1280x900x24 -dpi 96" \
     bash "$0" --under-xvfb "$@"
 fi

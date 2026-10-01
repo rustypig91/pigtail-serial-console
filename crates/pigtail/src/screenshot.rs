@@ -253,4 +253,29 @@ mod tests {
         assert_eq!(app.connections.len(), 2);
         assert!(!app.paths.sessions.exists());
     }
+
+    #[test]
+    fn demo_cannot_check_for_or_download_a_normal_app_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_file: dir.path().join("pigtail.toml"),
+            sessions: dir.path().join("sessions"),
+            crash_log: dir.path().join("crash.log"),
+        };
+        let (_, rx) = crossbeam_channel::unbounded();
+        let mut app = App::assemble(Config::default(), paths, Wake::new(|| {}), rx);
+        app.seed_screenshot().unwrap();
+
+        // Even enabling the preference or calling the manual action must not
+        // launch an updater that could replace the demo with a normal build.
+        app.config.settings.check_updates = true;
+        app.start_update_check(false);
+        assert!(app.update_rx.is_none());
+        app.start_update_check(true);
+        assert!(app.update_rx.is_none());
+        app.start_update_download("999.0.0".into());
+        assert!(app.install_rx.is_none());
+        assert!(app.update_progress.is_none());
+        assert!(app.update_dialog.is_none());
+    }
 }
