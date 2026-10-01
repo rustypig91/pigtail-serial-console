@@ -1,10 +1,10 @@
-//! Fixed demonstration data, compiled only into screenshot builds.
+//! Fixed demonstration data, compiled only into demo builds.
 use super::*;
 use serialcore::config::{ExtractMode, TimestampFormat};
 
 impl App {
-    pub(super) fn seed_screenshot(&mut self) -> std::io::Result<()> {
-        self.screenshot_mode = true;
+    pub(super) fn seed_demo(&mut self) -> std::io::Result<()> {
+        self.demo_mode = true;
         self.config.settings.theme = "dark".into();
         self.config.settings.console_font_size = 16;
         self.config.settings.timestamp_format = TimestampFormat::Time;
@@ -44,9 +44,9 @@ impl App {
         samples.extend(tail);
         samples.push("[info] Capture complete: 6 samples; total: 90".into());
         samples.push("\x1b[96mdevice 1>\x1b[0m ".into());
-        self.add_screenshot_console("device 1", samples, true)?;
+        self.add_demo_console("device 1", samples, true)?;
 
-        self.add_screenshot_console(
+        self.add_demo_console(
             "device 2",
             [
                 "Device 2 initialized",
@@ -81,7 +81,7 @@ impl App {
         Ok(())
     }
 
-    fn add_screenshot_console(
+    fn add_demo_console(
         &mut self,
         label: &str,
         lines: Vec<String>,
@@ -124,10 +124,10 @@ impl App {
             .with_timezone(&chrono::Local)
             .date_naive()
             .and_hms_opt(13, 37, 0)
-            .expect("valid screenshot time")
+            .expect("valid demo time")
             .and_local_timezone(chrono::Local)
             .earliest()
-            .expect("local screenshot time")
+            .expect("local demo time")
             .with_timezone(&chrono::Utc);
         let start_wall = end_wall - chrono::Duration::seconds(lines.len() as i64 - 1);
         conn.open_live_raw_session();
@@ -195,7 +195,7 @@ mod tests {
         };
         let (_, rx) = crossbeam_channel::unbounded();
         let mut app = App::assemble(Config::default(), paths, Wake::new(|| {}), rx);
-        app.seed_screenshot().unwrap();
+        app.seed_demo().unwrap();
 
         for active in 0..2 {
             app.active = active;
@@ -226,7 +226,7 @@ mod tests {
         };
         let (_, rx) = crossbeam_channel::unbounded();
         let mut app = App::assemble(Config::default(), paths, Wake::new(|| {}), rx);
-        app.seed_screenshot().unwrap();
+        app.seed_demo().unwrap();
         let file = dir.path().join("send.txt");
         std::fs::write(&file, "sample data").unwrap();
 
@@ -259,7 +259,7 @@ mod tests {
         };
         let (_, rx) = crossbeam_channel::unbounded();
         let mut app = App::assemble(Config::default(), paths, Wake::new(|| {}), rx);
-        app.seed_screenshot().unwrap();
+        app.seed_demo().unwrap();
 
         assert_eq!(app.connections.len(), 2);
         assert_eq!(app.config.settings.timestamp_format, TimestampFormat::Time);
@@ -299,7 +299,7 @@ mod tests {
         };
         let (_, rx) = crossbeam_channel::unbounded();
         let mut app = App::assemble(Config::default(), paths, Wake::new(|| {}), rx);
-        app.seed_screenshot().unwrap();
+        app.seed_demo().unwrap();
         let id = app.connections[0].id;
         let raw = app.connections[0].raw_ring.clone();
 
@@ -329,7 +329,7 @@ mod tests {
         };
         let (_, rx) = crossbeam_channel::unbounded();
         let mut app = App::assemble(Config::default(), paths, Wake::new(|| {}), rx);
-        app.seed_screenshot().unwrap();
+        app.seed_demo().unwrap();
 
         // Even enabling the preference or calling the manual action must not
         // launch an updater that could replace the demo with a normal build.

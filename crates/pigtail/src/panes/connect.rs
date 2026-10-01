@@ -494,14 +494,14 @@ impl App {
                     ui.close_menu();
                 }
                 let updating = self.update_rx.is_some() || self.install_rx.is_some();
-                let update_unavailable = if self.screenshot_mode {
-                    "Updates are disabled in screenshot builds"
+                let update_unavailable = if self.demo_mode {
+                    "Updates are disabled in demo builds"
                 } else {
                     "An update check or installation is in progress"
                 };
                 if ui
                     .add_enabled(
-                        !self.screenshot_mode && !updating,
+                        !self.demo_mode && !updating,
                         egui::Button::new("Check for updates"),
                     )
                     .on_disabled_hover_text(update_unavailable)

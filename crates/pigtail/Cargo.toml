@@ -10,8 +10,8 @@ description = "A desktop serial terminal."
 workspace = true
 
 [features]
-# A hardware-free, repeatable scene for promotional screenshots.
-screenshot = ["dep:tempfile"]
+# A hardware-free, repeatable scene for promotional demos.
+demo = ["dep:tempfile"]
 
 [dependencies]
 anyhow = "1.0.104"

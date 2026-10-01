@@ -21,26 +21,26 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // Keep screenshot builds completely separate from the user's config and captures.
-    #[cfg(feature = "screenshot")]
-    let screenshot_dir = tempfile::tempdir().context("creating screenshot directory")?;
-    #[cfg(feature = "screenshot")]
+    // Keep demo builds completely separate from the user's config and captures.
+    #[cfg(feature = "demo")]
+    let demo_dir = tempfile::tempdir().context("creating demo directory")?;
+    #[cfg(feature = "demo")]
     let dirs = paths::AppPaths {
-        config_file: screenshot_dir.path().join("pigtail.toml"),
-        sessions: screenshot_dir.path().join("sessions"),
-        crash_log: screenshot_dir.path().join("crash.log"),
+        config_file: demo_dir.path().join("pigtail.toml"),
+        sessions: demo_dir.path().join("sessions"),
+        crash_log: demo_dir.path().join("crash.log"),
     };
-    #[cfg(not(feature = "screenshot"))]
+    #[cfg(not(feature = "demo"))]
     let dirs = paths::AppPaths::resolve().context("resolving app directories")?;
     install_panic_hook(dirs.crash_log.clone());
 
     // Best-effort retention cleanup at startup (spec §7.5).
-    let cfg = if cfg!(feature = "screenshot") {
+    let cfg = if cfg!(feature = "demo") {
         serialcore::config::Config::default()
     } else {
         app::load_config(&dirs)
     };
-    if !cfg!(feature = "screenshot") {
+    if !cfg!(feature = "demo") {
         if let Err(e) = serialcore::session::cleanup_old_sessions(
             &dirs.sessions,
             cfg.settings.session_retention_days,
@@ -50,7 +50,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size(if cfg!(feature = "screenshot") {
+        .with_inner_size(if cfg!(feature = "demo") {
             [1280.0, 900.0]
         } else {
             [1100.0, 720.0]

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Capture a screenshot-feature build in an isolated, software-rendered X11 display.
+# Capture a demo-feature build in an isolated, software-rendered X11 display.
 set -euo pipefail
 
 if [[ ${1:-} != --under-xvfb ]]; then
   if [[ $# != 2 ]]; then
-    echo "Usage: bash $0 <screenshot-build-binary> <output.png>" >&2
+    echo "Usage: bash $0 <demo-build-binary> <output.png>" >&2
     exit 2
   fi
   # winit accepts WAYLAND_SOCKET independently of WAYLAND_DISPLAY and honors
@@ -41,7 +41,7 @@ app_pid=$!
 window_id=""
 for ((attempt = 0; attempt < 150; attempt++)); do
   if ! kill -0 "$app_pid" 2>/dev/null; then
-    echo "Screenshot application exited before capture" >&2
+    echo "Demo application exited before capture" >&2
     exit 1
   fi
   window_id=$(xdotool search --all --onlyvisible --pid "$app_pid" \
@@ -52,7 +52,7 @@ for ((attempt = 0; attempt < 150; attempt++)); do
   sleep 0.2
 done
 if [[ -z $window_id ]]; then
-  echo "Timed out waiting for the screenshot window" >&2
+  echo "Timed out waiting for the demo window" >&2
   exit 1
 fi
 

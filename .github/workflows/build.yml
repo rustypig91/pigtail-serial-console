@@ -224,10 +224,10 @@ jobs:
           echo "APPIMAGE_ASSET=pigtail-v${VERSION}-x86_64.AppImage" >> "$GITHUB_ENV"
 
       # Every distributable above must use the normal binary. Only now replace
-      # the build output with the screenshot variant; it is never packaged.
-      - name: Build screenshot demo (ubuntu only)
+      # the build output with the demo variant; it is never packaged.
+      - name: Build demo (ubuntu only)
         if: startsWith(matrix.platform, 'ubuntu')
-        run: cargo build --release --locked -p pigtail --features screenshot --target ${{ matrix.target }}
+        run: cargo build --release --locked -p pigtail --features demo --target ${{ matrix.target }}
 
       - name: Capture release screenshot (ubuntu only)
         if: startsWith(matrix.platform, 'ubuntu')
