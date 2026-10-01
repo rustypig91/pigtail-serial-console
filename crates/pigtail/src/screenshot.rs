@@ -223,4 +223,34 @@ mod tests {
         assert!(!app.paths.config_file.exists());
         assert!(!app.paths.sessions.exists());
     }
+
+    #[test]
+    fn demo_reconnect_does_not_start_a_serial_reader_or_create_captures() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_file: dir.path().join("pigtail.toml"),
+            sessions: dir.path().join("sessions"),
+            crash_log: dir.path().join("crash.log"),
+        };
+        let (_, rx) = crossbeam_channel::unbounded();
+        let mut app = App::assemble(Config::default(), paths, Wake::new(|| {}), rx);
+        app.seed_screenshot().unwrap();
+        let id = app.connections[0].id;
+        let raw = app.connections[0].raw_ring.clone();
+
+        app.reconnect_with_config(id, None, PortConfig::default());
+
+        assert_eq!(app.connections[0].state, ConnState::Connected);
+        assert_eq!(app.connections[0].raw_ring, raw);
+        assert!(!app.connections[0].drain_events(1_000_000));
+        assert!(!app.connect_errors.is_empty());
+        let identity = app.connections[0].identity.clone();
+        assert!(matches!(
+            app.spawn_serial_reader(id, &identity, &PortConfig::default(), None),
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported
+        ));
+        app.open_connection(identity, None, PortConfig::default());
+        assert_eq!(app.connections.len(), 2);
+        assert!(!app.paths.sessions.exists());
+    }
 }

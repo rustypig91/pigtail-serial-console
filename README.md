@@ -144,6 +144,7 @@ The sample output stays still while you arrange the window and take screenshots.
 Log, ANSI, and hex views use the same sample bytes; switching tabs and exploring
 the display controls works as usual. The connections are simulated and do not
 respond to commands.
+Applying port options cannot reconnect these simulated devices or open real ports.
 
 Screenshot builds use temporary app directories, skip port discovery and startup
 update checks, and do not save settings or session captures. Your regular settings

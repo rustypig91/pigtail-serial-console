@@ -1893,6 +1893,12 @@ impl App {
         config: &PortConfig,
         initial_path: Option<String>,
     ) -> std::io::Result<reader::ReaderHandle> {
+        if self.screenshot_mode {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Screenshot builds only support simulated connections.",
+            ));
+        }
         let meta = SessionMeta {
             identity: identity.clone(),
             config: config.clone(),
@@ -1969,6 +1975,15 @@ impl App {
         initial_path: Option<String>,
         config: PortConfig,
     ) {
+        // Demo handles are deliberately inert. Replacing one with a serial
+        // reader would lose the fixed scene and start recording session files.
+        if self.screenshot_mode {
+            self.record_connect_error(
+                "Couldn't reconnect",
+                "Screenshot connections are simulated and cannot be reconnected.".into(),
+            );
+            return;
+        }
         let Some(index) = self.connections.iter().position(|c| c.id == port_id) else {
             // The tab the dialog was editing is gone. `show_header` disables
             // closing a tab while the dialog is up, so this should not be
