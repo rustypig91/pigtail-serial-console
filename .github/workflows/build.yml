@@ -62,7 +62,7 @@ jobs:
             exit 1
           fi
 
-  release:
+  build:
     needs: verify-version
     permissions:
       contents: write
@@ -279,7 +279,7 @@ jobs:
             ${{ env.SCREENSHOT_ASSET }}
 
   publish-apt:
-    needs: release
+    needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     permissions: {}
