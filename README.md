@@ -129,6 +129,39 @@ cargo build --release
 
 Run in development with `cargo run -p pigtail`.
 
+### Screenshot build
+
+Start a ready-to-capture demo without serial hardware:
+
+```sh
+cargo run -p pigtail --release --features screenshot
+```
+
+This special build always opens a 1280 × 900 dark window with generic output
+from “device 1” and “device 2”, colored prompts and sensor labels, and temperature
+and humidity plots.
+The sample output stays still while you arrange the window and take screenshots.
+Log, ANSI, and hex views use the same sample bytes; switching tabs and exploring
+the display controls works as usual. The connections are simulated and do not
+respond to commands.
+
+Screenshot builds use temporary app directories, skip port discovery and startup
+update checks, and do not save settings or session captures. Your regular settings
+and connections are preserved. Omit `--features screenshot` to run the normal app.
+
+The Ubuntu release job also builds this demo after packaging the normal app,
+captures its window under Xvfb with software rendering, and attaches
+`pigtail-v<VERSION>-screenshot.png` to the release. Manual workflow runs attach
+the screenshot to the draft release.
+
+To capture it locally on Linux, install `xvfb`, `xauth`, `xdotool`, `imagemagick`,
+and Mesa's software rendering libraries, then run:
+
+```sh
+cargo build -p pigtail --release --features screenshot
+bash scripts/capture-screenshot.sh target/release/pigtail /tmp/pigtail-screenshot.png
+```
+
 ### Building the packages
 
 To build all release artifacts for your current platform, run one of these

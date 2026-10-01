@@ -67,7 +67,8 @@ jobs:
           sudo apt-get install -y \
             libudev-dev \
             libx11-6 libxcursor1 libxi6 libxrandr2 \
-            libxkbcommon0 libxkbcommon-x11-0
+            libxkbcommon0 libxkbcommon-x11-0 \
+            xvfb xauth xdotool imagemagick libgl1-mesa-dri libglx-mesa0
 
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -202,6 +203,23 @@ jobs:
             "target/${{ matrix.target }}/release/pigtail" "$VERSION" .
           echo "APPIMAGE_ASSET=pigtail-v${VERSION}-x86_64.AppImage" >> "$GITHUB_ENV"
 
+      # Every distributable above must use the normal binary. Only now replace
+      # the build output with the screenshot variant; it is never packaged.
+      - name: Build screenshot demo (ubuntu only)
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: cargo build --release --locked -p pigtail --features screenshot --target ${{ matrix.target }}
+
+      - name: Capture release screenshot (ubuntu only)
+        if: startsWith(matrix.platform, 'ubuntu')
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          SCREENSHOT="pigtail-v${VERSION}-screenshot.png"
+          bash scripts/capture-screenshot.sh \
+            "target/${{ matrix.target }}/release/pigtail" "$SCREENSHOT"
+          echo "SCREENSHOT_ASSET=$SCREENSHOT" >> "$GITHUB_ENV"
+
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
@@ -222,6 +240,7 @@ jobs:
             ${{ env.MSI_ASSET }}
             ${{ env.DEB_ASSET }}
             ${{ env.APPIMAGE_ASSET }}
+            ${{ env.SCREENSHOT_ASSET }}
 
   publish-apt:
     needs: release

@@ -9,6 +9,10 @@ description = "A desktop serial terminal."
 [lints]
 workspace = true
 
+[features]
+# A hardware-free, repeatable scene for promotional screenshots.
+screenshot = ["dep:tempfile"]
+
 [dependencies]
 anyhow = "1.0.104"
 chrono = { version = "0.4.45", features = ["serde"] }
@@ -25,6 +29,7 @@ toml = "1.0.7"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 vt100 = "0.16.2"
+tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
 

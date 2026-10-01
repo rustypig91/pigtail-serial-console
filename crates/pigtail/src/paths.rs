@@ -1,5 +1,6 @@
 //! Platform config/data paths via `directories`.
 
+#[cfg(not(feature = "screenshot"))]
 use anyhow::Context;
 use std::path::PathBuf;
 
@@ -14,6 +15,7 @@ pub struct AppPaths {
     pub crash_log: PathBuf,
 }
 
+#[cfg(not(feature = "screenshot"))]
 impl AppPaths {
     pub fn resolve() -> anyhow::Result<AppPaths> {
         let dirs = directories::ProjectDirs::from("dev", "pigtail", "pigtail")

@@ -26,6 +26,10 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "screenshot")]
+#[path = "screenshot.rs"]
+mod screenshot;
+
 const CONFIG_WRITE_DELAY: Duration = Duration::from_secs(1);
 
 /// Retention limits derived from the single user-facing memory setting.
@@ -1484,6 +1488,7 @@ impl MergedTabState {
 }
 
 pub struct App {
+    screenshot_mode: bool,
     pub clock: SessionClock,
     pub config: Config,
     pub paths: AppPaths,
@@ -1643,6 +1648,7 @@ impl App {
     /// place instead of two struct literals kept in sync by hand.
     fn assemble(config: Config, paths: AppPaths, wake: Wake, enum_rx: Receiver<EnumEvent>) -> App {
         App {
+            screenshot_mode: false,
             clock: SessionClock::new(),
             config,
             paths,
@@ -1742,6 +1748,13 @@ impl App {
         });
 
         let (tx, rx) = crossbeam_channel::unbounded();
+        #[cfg(feature = "screenshot")]
+        if cfg!(feature = "screenshot") {
+            drop(tx);
+            let mut app = App::assemble(config, paths, wake, rx);
+            app.seed_screenshot().expect("preparing screenshot scene");
+            return app;
+        }
         // A failure here means the OS refused to create the thread (resource
         // exhaustion) — rare, and not fatal: the app still runs, it just won't
         // discover new ports until restarted with more headroom.
@@ -2443,6 +2456,10 @@ impl App {
     ///
     /// Failed writes stay dirty so a later update or shutdown can retry them.
     fn flush_config(&mut self) -> bool {
+        if self.screenshot_mode {
+            self.config_dirty_since = None;
+            return true;
+        }
         if self.config_dirty_since.is_none() {
             return true;
         }

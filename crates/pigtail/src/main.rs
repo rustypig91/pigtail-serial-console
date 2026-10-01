@@ -21,20 +21,40 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Keep screenshot builds completely separate from the user's config and captures.
+    #[cfg(feature = "screenshot")]
+    let screenshot_dir = tempfile::tempdir().context("creating screenshot directory")?;
+    #[cfg(feature = "screenshot")]
+    let dirs = paths::AppPaths {
+        config_file: screenshot_dir.path().join("pigtail.toml"),
+        sessions: screenshot_dir.path().join("sessions"),
+        crash_log: screenshot_dir.path().join("crash.log"),
+    };
+    #[cfg(not(feature = "screenshot"))]
     let dirs = paths::AppPaths::resolve().context("resolving app directories")?;
     install_panic_hook(dirs.crash_log.clone());
 
     // Best-effort retention cleanup at startup (spec §7.5).
-    let cfg = app::load_config(&dirs);
-    if let Err(e) = serialcore::session::cleanup_old_sessions(
-        &dirs.sessions,
-        cfg.settings.session_retention_days,
-    ) {
-        tracing::warn!("session cleanup failed: {e}");
+    let cfg = if cfg!(feature = "screenshot") {
+        serialcore::config::Config::default()
+    } else {
+        app::load_config(&dirs)
+    };
+    if !cfg!(feature = "screenshot") {
+        if let Err(e) = serialcore::session::cleanup_old_sessions(
+            &dirs.sessions,
+            cfg.settings.session_retention_days,
+        ) {
+            tracing::warn!("session cleanup failed: {e}");
+        }
     }
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1100.0, 720.0])
+        .with_inner_size(if cfg!(feature = "screenshot") {
+            [1280.0, 900.0]
+        } else {
+            [1100.0, 720.0]
+        })
         .with_min_inner_size([700.0, 400.0])
         .with_title(concat!(
             "Rusty's Pigtail - Serial Terminal v",
