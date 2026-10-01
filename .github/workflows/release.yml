@@ -246,6 +246,8 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: false
+          # Reruns may add missing assets, but must preserve published files.
+          overwrite_files: false
           # Unset variables expand to nothing, so each platform uploads only the
           # assets it actually produced.
           files: |

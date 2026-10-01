@@ -157,6 +157,8 @@ To build any branch manually, open Actions → release → Run workflow and choo
 the branch. Builds without a `v*` tag upload the packages and screenshot as
 artifacts on that workflow run, with a separate artifact for each platform.
 Only `v*` tag builds create a GitHub release and publish to the APT repository.
+Rerunning a tag build preserves existing release files and uploads only missing
+assets.
 
 To capture it locally on Linux, install `xvfb`, `xauth`, `xdotool`, `imagemagick`,
 and Mesa's software rendering libraries, then run:
