@@ -130,6 +130,7 @@ impl App {
             .expect("local screenshot time")
             .with_timezone(&chrono::Utc);
         let start_wall = end_wall - chrono::Duration::seconds(lines.len() as i64 - 1);
+        conn.open_live_raw_session();
         let mut framer = Framer::with_mode(conn.port_config.terminal);
         let mut framed = Vec::new();
         for (i, line) in lines.iter().enumerate() {
@@ -183,6 +184,70 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn demo_hex_view_renders_sample_bytes_for_both_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_file: dir.path().join("pigtail.toml"),
+            sessions: dir.path().join("sessions"),
+            crash_log: dir.path().join("crash.log"),
+        };
+        let (_, rx) = crossbeam_channel::unbounded();
+        let mut app = App::assemble(Config::default(), paths, Wake::new(|| {}), rx);
+        app.seed_screenshot().unwrap();
+
+        for active in 0..2 {
+            app.active = active;
+            app.connections[active].hex_view = true;
+            app.connections[active].follow = false;
+            let ctx = egui::Context::default();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                app.show_console(ctx, false);
+            });
+            assert!(
+                output.shapes.iter().any(|shape| {
+                    matches!(&shape.shape, egui::Shape::Text(text)
+                    if text.galley.text().contains("00000000"))
+                }),
+                "device {} has no hex rows",
+                active + 1
+            );
+        }
+    }
+
+    #[test]
+    fn demo_rejects_file_transfers_instead_of_waiting_for_a_dead_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_file: dir.path().join("pigtail.toml"),
+            sessions: dir.path().join("sessions"),
+            crash_log: dir.path().join("crash.log"),
+        };
+        let (_, rx) = crossbeam_channel::unbounded();
+        let mut app = App::assemble(Config::default(), paths, Wake::new(|| {}), rx);
+        app.seed_screenshot().unwrap();
+        let file = dir.path().join("send.txt");
+        std::fs::write(&file, "sample data").unwrap();
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                dropped_files: vec![egui::DroppedFile {
+                    path: Some(file),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            |ctx| app.poll_file_drop(ctx),
+        );
+        assert!(app.file_transfer_dialog.is_none());
+        assert!(app
+            .connections
+            .iter()
+            .all(|conn| conn.transfer_progress.is_none()));
+        assert!(!app.connect_errors.is_empty());
+    }
 
     #[test]
     fn scene_has_colored_history_plots_and_never_persists_config() {

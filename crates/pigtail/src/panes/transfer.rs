@@ -122,6 +122,10 @@ impl App {
     }
 
     fn file_transfer_target(&self) -> Option<PortId> {
+        // Demo readers have already shut down and cannot send completion events.
+        if self.screenshot_mode {
+            return None;
+        }
         let conn = if self.merged_selected {
             let port = self.merged_tx_port?;
             self.connections.iter().find(|conn| conn.id == port)?
