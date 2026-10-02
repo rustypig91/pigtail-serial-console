@@ -235,7 +235,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          SCREENSHOT="pigtail-v${VERSION}-screenshot.png"
+          SCREENSHOT="pigtail-screenshot.png"
           bash scripts/capture-screenshot.sh \
             "target/${{ matrix.target }}/release/pigtail" "$SCREENSHOT"
           echo "SCREENSHOT_ASSET=$SCREENSHOT" >> "$GITHUB_ENV"
