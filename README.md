@@ -24,10 +24,18 @@ Most serial terminals just show you text. Rusty's Pigtail is built around the pa
   connection tabs to reorder them. Closing either kind of tab asks for confirmation
   unless you have disabled that preference.
 - Hex view alongside the text view
+- Custom window header with draggable device tabs, status dots, close buttons,
+  and minimize/maximize/close controls. Drag empty header space to move the window,
+  double-click it to maximize or restore, and drag an edge or corner to resize.
+  View controls, search, clear, export, and the app menu sit above the console;
+  ANSI/VT sits beside Hex; highlights are in the overflow menu. A thin footer shows
+  connection status, line counts, port settings, and view diagnostics, with a
+  clickable pin icon for autoscroll. The header tint blends subtly
+  with scrolling terminal history underneath it.
 - Optional **ANSI/VT** screen for interactive shells and device menus: cursor
   positioning, erase and redraw operations, scrolling regions, styled/colored
   text, and alternate screen buffers. Select **Log**, **Hex**, or **ANSI/VT** in
-  the footer; Log is the default for new connections, and each connection remembers
+  the toolbar; Log is the default for new connections, and each connection remembers
   its selected view across restarts. **Settings → VT scrollback rows** controls retained
   VT history per connection (default 2,000, range 0–100,000; 0 disables scrollback).
   The setting persists across restarts and applies to open connections when editing
@@ -39,7 +47,8 @@ Most serial terminals just show you text. Rusty's Pigtail is built around the pa
   remains on disk. Use the mouse wheel or scrollbar to review it;
   **Pin** or typing returns to live output. New output preserves your scroll position.
   **Ctrl+Shift+F** in ANSI/VT searches the screen and retained scrollback
-  with regex and optional case sensitivity; **Next**/**Prev** (Enter/Shift+Enter)
+  using plain text by default, with `.*` to toggle regex and **Aa** for case sensitivity.
+  Invalid regex patterns show an amber warning; hover for details. **Next**/**Prev** (Enter/Shift+Enter)
   scroll to highlighted matches. Switch to Log to search older output. Raw capture and chronological
   history continue in every mode. Screen mode supports application cursor keys
   and bracketed paste, and sends Up/Down to the device even when local history is enabled.
@@ -51,7 +60,7 @@ Most serial terminals just show you text. Rusty's Pigtail is built around the pa
   applications retain the main screen's history but do not add their redraws to it.
   Merged views remain chronological logs.
 - Two resizable console panes, side by side or stacked, each with its own tabs,
-  status footer, search and optional plot. Open at least two tabs, then choose
+  toolbar, status footer, search and optional plot. Open at least two tabs, then choose
   **Split right** or **Split below** from that tab's right-click menu.
   Click a pane to focus it; typing, macros and tab shortcuts target that pane.
   Drag the divider to resize, or double-click it to restore equal sizes.
@@ -251,12 +260,14 @@ MIT, see [LICENSE](LICENSE).
 Use **Ctrl+Shift+Page Up / Page Down** to scroll the console one page up or down.
 Use **Ctrl+Shift+Up / Down** to scroll one line up or down.
 Use **Ctrl+Shift+Tab** to cycle forwards through tabs in the current pane.
-Use **F1** to switch focus between split panes.
+Use **F6** to switch focus between split panes.
+Use **F1** for About, **F2** for Settings, and **Ctrl+Shift+S** to save the current view as text.
 Plain Page Up / Page Down and arrow keys retain their normal terminal behavior.
 
 Use **Ctrl+Shift+Space** to pin the console to the bottom. On connection tabs,
 **Ctrl+Shift+Q / W / E** selects the **Log / Hex / ANSI** view.
 Use **Ctrl+Shift+P** to toggle the plot on connection tabs.
+Use **Ctrl+Shift+M** to open the transmit macros window.
 
 ## Install through APT (Ubuntu 22.04 or newer, amd64)
 

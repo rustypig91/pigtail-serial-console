@@ -61,11 +61,11 @@ pub(super) fn show_panel(
     ctx: &egui::Context,
     parent: Option<&mut egui::Ui>,
     draw: impl FnOnce(&mut egui::Ui),
-) {
+) -> egui::Rect {
     if let Some(ui) = parent {
-        panel.show_inside(ui, draw);
+        panel.show_inside(ui, draw).response.rect
     } else {
-        panel.show(ctx, draw);
+        panel.show(ctx, draw).response.rect
     }
 }
 
@@ -315,13 +315,13 @@ impl App {
         if self.workspace.split.is_none() || self.keyboard_overlay_open(ctx) {
             return;
         }
-        // consume_key allows extra Shift/Alt modifiers; only plain F1 owns
+        // consume_key allows extra Shift/Alt modifiers; only plain F6 owns
         // this shortcut. Leave modified function keys available to other input.
         let switch_pane = ctx.input_mut(|input| {
             let mut consumed = false;
             input.events.retain(|event| {
                 let matches = matches!(event, egui::Event::Key {
-                    key: egui::Key::F1,
+                    key: egui::Key::F6,
                     pressed: true,
                     modifiers,
                     ..
@@ -500,13 +500,29 @@ impl App {
         self.reconcile_workspace();
         self.workspace.resizing = false;
         if let Some(direction) = self.workspace.split {
-            egui::TopBottomPanel::top("workspace_toolbar").show(ctx, |ui| {
-                ui.style_mut().interaction.selectable_labels = false;
-                ui.horizontal(|ui| {
-                    ui.weak("Click a pane to direct keyboard input");
-                    self.show_app_menu(ui);
+            egui::TopBottomPanel::top("workspace_toolbar")
+                .frame(
+                    egui::Frame::none()
+                        .fill(super::chrome::header_fill(
+                            ctx.style().visuals.dark_mode,
+                            false,
+                        ))
+                        .inner_margin(egui::Margin::symmetric(8.0, 3.0)),
+                )
+                .show(ctx, |ui| {
+                    ui.style_mut().interaction.selectable_labels = false;
+                    ui.horizontal(|ui| {
+                        ui.weak("Rusty's Pigtail");
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 36.0),
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                super::chrome::window_controls(ui);
+                                super::chrome::drag_window(ui);
+                            },
+                        );
+                    });
                 });
-            });
             egui::CentralPanel::default()
                 .frame(egui::Frame::none())
                 .show(ctx, |ui| {
@@ -594,7 +610,8 @@ impl App {
                             .selected_tab_id()
                             .is_some_and(|id| self.visible_pane_tabs().contains(&id))
                         {
-                            self.show_footer_in(ctx, Some(&mut pane));
+                            self.show_toolbar_in(ctx, Some(&mut pane));
+                            self.show_status_footer_in(ctx, Some(&mut pane));
                             self.show_plot_in(ctx, Some(&mut pane));
                             self.show_console_in(ctx, console_tab_claimed, Some(&mut pane));
                         }
@@ -613,7 +630,8 @@ impl App {
         } else {
             self.workspace.rects = [None; 2];
             self.show_header(ctx);
-            self.show_footer(ctx);
+            self.show_toolbar(ctx);
+            self.show_status_footer(ctx);
             self.show_plot(ctx);
             self.show_console(ctx, console_tab_claimed);
         }
@@ -621,6 +639,7 @@ impl App {
             self.apply_layout_action(action);
         }
         self.persist_workspace();
+        self.show_window_resize(ctx);
     }
 }
 
@@ -675,6 +694,7 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
+                app.consume_app_shortcuts(ctx);
                 app.prepare_workspace(ctx);
                 app.consume_tab_switch_shortcut(ctx);
                 app.consume_console_view_shortcuts(ctx);
@@ -843,7 +863,7 @@ mod tests {
             let size = egui::vec2(1000.0, 600.0);
             frame(&mut app, &ctx, size, vec![]);
             let f1 = || egui::Event::Key {
-                key: egui::Key::F1,
+                key: egui::Key::F6,
                 physical_key: None,
                 pressed: true,
                 repeat: false,
@@ -861,7 +881,7 @@ mod tests {
                 assert!(!ctx.input(|i| i.events.iter().any(|event| matches!(
                     event,
                     egui::Event::Key {
-                        key: egui::Key::F1,
+                        key: egui::Key::F6,
                         ..
                     }
                 ))));
@@ -893,7 +913,7 @@ mod tests {
         ] {
             let ctx = egui::Context::default();
             let event = egui::Event::Key {
-                key: egui::Key::F1,
+                key: egui::Key::F6,
                 physical_key: None,
                 pressed: true,
                 repeat: false,
@@ -936,12 +956,12 @@ mod tests {
             &mut app,
             &ctx,
             size,
-            vec![key(egui::Key::F1), key(egui::Key::Enter)],
+            vec![key(egui::Key::F6), key(egui::Key::Enter)],
         );
         assert_eq!(app.workspace.focused, 0);
         assert!(
             ctx.memory(|m| m.focused().is_none()),
-            "The old search field must not reclaim focus after F1"
+            "The old search field must not reclaim focus after F6"
         );
     }
 
@@ -1038,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn both_orientations_keep_headers_and_footers_inside_their_panes() {
+    fn both_orientations_keep_headers_and_toolbars_inside_their_panes() {
         let (mut app, _tx) = test_app("split-layout-bounds");
         add_connection(&mut app, 1);
         add_connection(&mut app, 2);
@@ -1052,12 +1072,12 @@ mod tests {
             for size in [egui::vec2(800.0, 600.0), egui::vec2(500.0, 400.0)] {
                 frame(&mut app, &ctx, size, vec![]);
                 let output = frame(&mut app, &ctx, size, vec![]);
-                let mut pins = 0;
+                let mut view_buttons = 0;
                 let mut headers = 0;
                 for shape in &output.shapes {
                     if let egui::Shape::Text(text) = &shape.shape {
                         let label = text.galley.text();
-                        if matches!(label, "Pin" | "Pinned") || label.starts_with("device-") {
+                        if label == "Log" || label.starts_with("device-") {
                             let bounds = text.galley.rect.translate(text.pos.to_vec2());
                             assert!(
                                 app.workspace
@@ -1067,15 +1087,15 @@ mod tests {
                                     .any(|pane| pane.contains_rect(bounds)),
                                 "{label} outside pane: {bounds:?}"
                             );
-                            if matches!(label, "Pin" | "Pinned") {
-                                pins += 1;
+                            if label == "Log" {
+                                view_buttons += 1;
                             } else {
                                 headers += 1;
                             }
                         }
                     }
                 }
-                assert_eq!(pins, 2);
+                assert_eq!(view_buttons, 2);
                 assert_eq!(headers, 2);
             }
         }
@@ -1334,7 +1354,8 @@ mod tests {
             add_connection(&mut app, id);
         }
         let ctx = egui::Context::default();
-        let size = egui::vec2(360.0, 600.0);
+        // Keep two full modern tabs visible while the remaining six overflow.
+        let size = egui::vec2(520.0, 600.0);
         frame(&mut app, &ctx, size, vec![]);
         let output = frame(&mut app, &ctx, size, vec![]);
         let start = text_rect(&output, "device-1").center();
@@ -1487,5 +1508,88 @@ mod tests {
             app.workspace.panes[1].tabs,
             vec![TabId::Connection(PortId(2))]
         );
+    }
+    #[test]
+    fn header_backdrop_uses_terminal_history_without_selecting_hidden_text() {
+        for mode in ["log", "hex", "vt", "merged"] {
+            let (mut app, _tx) = test_app("header-backdrop");
+            add_connection(&mut app, 1);
+            app.config.settings.timestamp_format = serialcore::config::TimestampFormat::None;
+            app.connections[0]
+                .raw_sessions
+                .push(crate::app::RawSession {
+                    start: 0,
+                    label: None,
+                });
+            for row in 0..100 {
+                let text = format!("terminal output row {row}");
+                append(&mut app, 0, &text);
+                app.connections[0].push_raw_bytes(format!("{text}\r\n").as_bytes());
+            }
+            match mode {
+                "hex" => app.connections[0].hex_view = true,
+                "vt" => app.connections[0].screen_view = true,
+                "merged" => app.create_merged_tab(vec![PortId(1)]),
+                _ => {}
+            }
+            let ctx = egui::Context::default();
+            let size = egui::vec2(1000.0, 400.0);
+            frame(&mut app, &ctx, size, vec![]);
+            let output = frame(&mut app, &ctx, size, vec![]);
+            let backdrop = ctx
+                .data(|data| {
+                    data.get_temp::<super::super::chrome::HeaderBackdrop>(
+                        app.pane_widget_id("header_backdrop"),
+                    )
+                })
+                .unwrap();
+            let (index, text) = output
+                .shapes
+                .iter()
+                .enumerate()
+                .find_map(|(index, clipped)| {
+                    if clipped.clip_rect == backdrop.rect {
+                        if let egui::Shape::Vec(shapes) = &clipped.shape {
+                            return Some((index, shapes));
+                        }
+                    }
+                    None
+                })
+                .unwrap();
+            assert!(
+                text.iter()
+                    .any(|shape| matches!(shape, egui::Shape::Text(_))),
+                "missing history under {mode} header"
+            );
+            let controls = output.shapes.iter().position(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "Log")).unwrap();
+            assert!(
+                index < controls,
+                "{mode} backdrop must paint below header controls"
+            );
+            // The blank toolbar is visually over the terminal, but clicking
+            // it must not start a console text selection or unpin the view.
+            let pos = egui::pos2(100.0, backdrop.rect.bottom() - 15.0);
+            frame(
+                &mut app,
+                &ctx,
+                size,
+                vec![egui::Event::PointerMoved(pos), pointer(pos, true)],
+            );
+            let output = frame(
+                &mut app,
+                &ctx,
+                size,
+                vec![pointer(pos, false), egui::Event::Copy],
+            );
+            assert!(
+                output.platform_output.copied_text.is_empty(),
+                "header selected hidden {mode} output"
+            );
+            assert!(if mode == "merged" {
+                app.merged_follow
+            } else {
+                app.connections[0].follow
+            });
+        }
     }
 }

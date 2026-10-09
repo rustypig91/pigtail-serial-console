@@ -10,11 +10,20 @@ pub(crate) struct ScreenSearch {
     pub scroll_to: Option<usize>,
     query: String,
     case_sensitive: bool,
+    regex_mode: bool,
 }
 
 impl ScreenSearch {
-    pub fn refresh(&mut self, screen: &vt100::Screen, query: &str, case_sensitive: bool) {
-        let changed = self.query != query || self.case_sensitive != case_sensitive;
+    pub fn refresh(
+        &mut self,
+        screen: &vt100::Screen,
+        query: &str,
+        case_sensitive: bool,
+        regex_mode: bool,
+    ) {
+        let changed = self.query != query
+            || self.case_sensitive != case_sensitive
+            || self.regex_mode != regex_mode;
         if !changed && !self.dirty {
             return;
         }
@@ -22,8 +31,9 @@ impl ScreenSearch {
         let selected = self.position.and_then(|i| self.matches.get(i)).cloned();
         self.query = query.to_owned();
         self.case_sensitive = case_sensitive;
+        self.regex_mode = regex_mode;
         self.matches.clear();
-        if let Some(re) = crate::app::compile_search(query, case_sensitive) {
+        if let Some(re) = crate::app::compile_search(query, case_sensitive, regex_mode) {
             let mut screen = screen.clone();
             let (rows, cols) = screen.size();
             screen.set_scrollback(usize::MAX);
@@ -92,6 +102,10 @@ impl ScreenSearch {
 
 impl App {
     pub(crate) fn show_terminal_screen(&mut self, ui: &mut egui::Ui, active: usize) {
+        let backdrop = super::chrome::HeaderBackdrop::current(
+            ui.ctx(),
+            self.pane_widget_id("header_backdrop"),
+        );
         let (pages, lines) = self.consume_scroll_shortcut(ui.ctx());
         let font = FontId::monospace(f32::from(self.config.settings.console_font_size));
         let cell_size = ui.fonts(|f| Vec2::new(f.glyph_width(&font, 'M'), f.row_height(&font)));
@@ -108,8 +122,12 @@ impl App {
         screen.set_scrollback(usize::MAX);
         let history = screen.scrollback();
         screen.set_scrollback(old_offset);
-        conn.screen_search
-            .refresh(screen, &conn.search_query, conn.search_case_sensitive);
+        conn.screen_search.refresh(
+            screen,
+            &conn.search_query,
+            conn.search_case_sensitive,
+            conn.search_regex,
+        );
         let requested = conn.screen_search.scroll_to.take();
         if requested.is_some() {
             conn.follow = false;
@@ -149,6 +167,62 @@ impl App {
                     });
                 }
                 let painter = ui.painter_at(rect);
+                if let Some(backdrop) = &backdrop {
+                    // Read real VT scrollback immediately above this viewport;
+                    // the screen dimensions and interactive rows stay unchanged.
+                    let count = ((rect.top() - backdrop.rect.top()) / cell_size.y).ceil() as usize;
+                    let before = first.saturating_sub(count);
+                    for row in 0..first.saturating_sub(before) {
+                        screen.set_scrollback(history - (before + row));
+                        for col in 0..cols {
+                            let Some(cell) = screen.cell(0, col) else {
+                                continue;
+                            };
+                            if cell.is_wide_continuation() || cell.contents().is_empty() {
+                                continue;
+                            }
+                            let pos = rect.min
+                                + Vec2::new(
+                                    f32::from(col) * cell_size.x,
+                                    (before + row) as f32 * cell_size.y
+                                        - first as f32 * cell_size.y,
+                                );
+                            let mut fg = color(cell.fgcolor(), Color32::LIGHT_GRAY);
+                            let mut bg = color(cell.bgcolor(), Color32::BLACK);
+                            if cell.inverse() {
+                                std::mem::swap(&mut fg, &mut bg);
+                            }
+                            if cell.dim() {
+                                fg = fg.gamma_multiply(0.5);
+                            }
+                            let size = Vec2::new(
+                                cell_size.x * if cell.is_wide() { 2.0 } else { 1.0 },
+                                cell_size.y,
+                            );
+                            ui.painter()
+                                .rect_filled(Rect::from_min_size(pos, size), 0.0, bg);
+                            let mut format = egui::TextFormat {
+                                font_id: font.clone(),
+                                color: fg,
+                                italics: cell.italic(),
+                                ..Default::default()
+                            };
+                            if cell.underline() {
+                                format.underline = Stroke::new(1.0_f32, fg);
+                            }
+                            let job = egui::text::LayoutJob::single_section(
+                                cell.contents().to_owned(),
+                                format,
+                            );
+                            let galley = ui.fonts(|fonts| fonts.layout_job(job));
+                            ui.painter().galley(pos, galley.clone(), fg);
+                            if cell.bold() {
+                                ui.painter().galley(pos + Vec2::new(0.5, 0.0), galley, fg);
+                            }
+                        }
+                    }
+                    screen.set_scrollback(history - first);
+                }
                 painter.rect_filled(rect, 0.0, Color32::BLACK);
                 for row in 0..rows {
                     let line = first + usize::from(row);
@@ -340,7 +414,7 @@ mod tests {
         conn.mark_raw_discontinuity();
         assert_eq!(conn.terminal.screen().contents(), before);
         conn.screen_search
-            .refresh(conn.terminal.screen(), r"line 100\b", true);
+            .refresh(conn.terminal.screen(), r"line 100\b", true, true);
         assert_eq!(conn.screen_search.matches.len(), 1);
         conn.screen_search.step(1);
         assert!(conn.screen_search.scroll_to.is_some());
@@ -440,6 +514,7 @@ mod tests {
         );
         assert_eq!(app.connections[0].terminal.screen().scrollback(), 0);
         app.connections[0].screen_view = true;
+        app.connections[0].search_regex = true;
         app.connections[0].search_query = r"line 0\b".into();
         app.search_step(1);
         draw(&mut app, vec![]);
@@ -456,21 +531,21 @@ mod tests {
         let mut terminal = vt100::Parser::new(5, 30, 0);
         terminal.process("界e\u{301} Error error".as_bytes());
         let mut search = ScreenSearch::default();
-        search.refresh(terminal.screen(), "e\u{301}", true);
+        search.refresh(terminal.screen(), "e\u{301}", true, true);
         assert_eq!(search.matches, vec![(0, 2..3)]);
-        search.refresh(terminal.screen(), "界", true);
+        search.refresh(terminal.screen(), "界", true, true);
         assert_eq!(search.matches, vec![(0, 0..2)]);
-        search.refresh(terminal.screen(), "error", false);
+        search.refresh(terminal.screen(), "error", false, true);
         assert_eq!(search.matches, vec![(0, 4..9), (0, 10..15)]);
         search.step(1);
         assert_eq!(search.position, Some(0));
         search.step(-1);
         assert_eq!(search.position, Some(1));
-        search.refresh(terminal.screen(), "error", false);
+        search.refresh(terminal.screen(), "error", false, true);
         assert_eq!(search.position, Some(1));
         terminal.process(b"\r\x1b[2Kdone");
         search.dirty = true;
-        search.refresh(terminal.screen(), "error", false);
+        search.refresh(terminal.screen(), "error", false, true);
         assert!(search.matches.is_empty());
         assert_eq!(search.position, None);
     }
@@ -480,20 +555,27 @@ mod tests {
         let mut terminal = vt100::Parser::new(5, 30, 0);
         terminal.process(b"Error error [\x1b[31mred");
         let mut search = ScreenSearch::default();
-        search.refresh(terminal.screen(), "Error|red", true);
+        search.refresh(terminal.screen(), "Error|red", true, false);
+        assert!(search.matches.is_empty());
+        search.refresh(terminal.screen(), "Error|red", true, true);
         assert_eq!(search.matches.len(), 2);
-        search.refresh(terminal.screen(), "[", true);
+        search.refresh(terminal.screen(), "[", true, false);
         assert_eq!(search.matches, vec![(0, 12..13)]);
-        search.refresh(terminal.screen(), "^", true);
+        search.refresh(terminal.screen(), "[", true, true);
+        assert!(
+            search.matches.is_empty(),
+            "Invalid regex must clear previous matches"
+        );
+        search.refresh(terminal.screen(), "^", true, true);
         assert!(search.matches.is_empty());
         terminal.process(b"\x1b[?1049hmenu");
-        search.refresh(terminal.screen(), "Error", false);
+        search.refresh(terminal.screen(), "Error", false, true);
         assert!(search.matches.is_empty());
         terminal.process(b"\x1b[?1049l");
         search.dirty = true;
-        search.refresh(terminal.screen(), "Error", false);
+        search.refresh(terminal.screen(), "Error", false, true);
         assert_eq!(search.matches.len(), 2);
-        search.refresh(terminal.screen(), "", false);
+        search.refresh(terminal.screen(), "", false, true);
         assert!(search.matches.is_empty());
     }
 

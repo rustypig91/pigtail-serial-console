@@ -104,7 +104,9 @@ impl App {
             .open(&mut open)
             .default_width(460.0)
             .default_height(360.0)
+            .frame(super::chrome::dialog_frame(ctx))
             .show(ctx, |ui| {
+                super::chrome::dialog_style(ui);
                 ui.weak(
                     "Each command uses the selected device's line ending. Shortcuts run only \
                      while the console has keyboard focus.",
@@ -203,6 +205,7 @@ impl App {
                                         .show_ui(
                                             ui,
                                             |ui| {
+                                                super::chrome::popup_style(ui);
                                                 ui.selectable_value(
                                                     &mut selected,
                                                     None,
@@ -355,7 +358,9 @@ impl App {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .frame(super::chrome::dialog_frame(ctx))
             .show(ctx, |ui| {
+                super::chrome::dialog_style(ui);
                 let terminals = if running_count == 1 {
                     "terminal"
                 } else {
@@ -415,7 +420,9 @@ impl App {
             .collapsible(false)
             .default_width(520.0)
             .default_height(420.0)
+            .frame(super::chrome::dialog_frame(ctx))
             .show(ctx, |ui| {
+                super::chrome::dialog_style(ui);
                 egui::Grid::new("macro-editor-fields")
                     .num_columns(2)
                     .spacing([12.0, 6.0])
@@ -499,7 +506,9 @@ impl App {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .frame(super::chrome::dialog_frame(ctx))
             .show(ctx, |ui| {
+                super::chrome::dialog_style(ui);
                 ui.label(format!(
                     "{} is already used by \"{owner_name}\".",
                     shortcut_label(Some(digit))

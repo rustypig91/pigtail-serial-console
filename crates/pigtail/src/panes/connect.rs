@@ -1,4 +1,4 @@
-//! Minimal chrome: the header (tabs + new/save/settings), the status footer,
+//! Custom chrome: device tabs, console toolbar,
 //! and the modal new-connection dialog with preset management.
 
 use crate::app::{available_port_is_added, App, ConfigDialog, MergedDialog, TabId};
@@ -50,6 +50,56 @@ fn tab_drag(
 }
 
 impl App {
+    /// Application accelerators are handled before terminal input, including
+    /// when a text field is focused or no connection is open.
+    pub(crate) fn consume_app_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.tab_close_confirmation.is_some()
+            || self.retention_cleanup_confirmation.is_some()
+            || self.show_keyboard_shortcuts
+            || self.update_dialog.is_some()
+            || !self.connect_errors.is_empty()
+        {
+            return;
+        }
+        let plain_key = |key| {
+            ctx.input_mut(|input| {
+            let mut consumed = false;
+            input.events.retain(|event| {
+                let matches = matches!(event, egui::Event::Key { key: pressed_key, pressed: true, modifiers, .. }
+                    if *pressed_key == key && modifiers.is_none());
+                consumed |= matches;
+                !matches
+            });
+            consumed
+        })
+        };
+        if plain_key(egui::Key::F1) {
+            self.show_about = true;
+            self.show_settings = false;
+        }
+        if plain_key(egui::Key::F2) {
+            self.show_settings = true;
+            self.show_about = false;
+        }
+        if self.show_about || self.show_settings {
+            return;
+        }
+        if ctx.input_mut(|input| {
+            input.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::S)
+        }) {
+            if self.merged_selected {
+                self.export_merged_view(false);
+            } else if let Some(active) = self.active_index() {
+                self.export_active_view(active, false);
+            }
+        }
+        if ctx.input_mut(|input| {
+            input.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::M)
+        }) {
+            self.show_macros_win = true;
+        }
+    }
+
     /// Reserve Ctrl+Shift+Left/Right and Ctrl+Shift+Tab for cycling pane tabs.
     /// This is deliberately handled before the console sees raw input, so the
     /// terminal never receives the corresponding escape sequence.
@@ -132,7 +182,9 @@ impl App {
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .open(&mut open)
+        .frame(super::chrome::dialog_frame(ctx))
         .show(ctx, |ui| {
+            super::chrome::dialog_style(ui);
             ui.horizontal(|ui| {
                 ui.label("Name:");
                 ui.text_edit_singleline(&mut dialog.name);
@@ -215,6 +267,11 @@ impl App {
     }
 
     pub(crate) fn show_header_in(&mut self, ctx: &egui::Context, parent: Option<&mut egui::Ui>) {
+        let painter = parent
+            .as_ref()
+            .map(|ui| ui.painter().clone())
+            .unwrap_or_else(|| ctx.layer_painter(egui::LayerId::background()));
+        let mut backdrop = super::chrome::HeaderBackdrop::reserve(painter);
         let mut to_close: Option<usize> = None;
         let mut set_active: Option<usize> = None;
         let mut select_merged = None;
@@ -243,13 +300,26 @@ impl App {
             || self.rename_dialog.is_some()
             || self.file_transfer_dialog.is_some();
 
-        super::workspace::show_panel(
-            egui::TopBottomPanel::top(self.pane_widget_id("header")),
+        let header_rect = super::workspace::show_panel(
+            egui::TopBottomPanel::top(self.pane_widget_id("header")).frame(
+                egui::Frame::none()
+                    .fill(super::chrome::header_fill(
+                        ctx.style().visuals.dark_mode,
+                        false,
+                    ))
+                    .inner_margin(egui::Margin {
+                        left: 10.0,
+                        right: 8.0,
+                        top: 6.0,
+                        bottom: 0.0,
+                    }),
+            ),
             ctx,
             parent,
             |ui| {
                 // Status and navigation labels must not join console text selection.
                 ui.style_mut().interaction.selectable_labels = false;
+                ui.spacing_mut().interact_size.y = 30.0;
                 let header = ui.horizontal(|ui| {
                     // Only the tab strip and "+" are disabled: global actions
                     // below act on neither the dialog nor the set of tabs, so
@@ -258,7 +328,7 @@ impl App {
                         let reserve = if self.workspace.split.is_some() {
                             32.0
                         } else {
-                            65.0
+                            145.0
                         };
                         egui::ScrollArea::horizontal()
                             .drag_to_scroll(false)
@@ -279,10 +349,6 @@ impl App {
                                                 let selected =
                                                     !self.merged_selected && self.active == i;
                                                 let display_label = conn.display_label();
-                                                let label =
-                                                    egui::RichText::new(short_label(display_label))
-                                                        .color(state_color(conn.state))
-                                                        .strong();
                                                 let device_details = if conn.name.is_some() {
                                                     format!("{}\n{}", display_label, conn.label)
                                                 } else {
@@ -295,14 +361,9 @@ impl App {
                                                 // `on_hover_text` only fires on an *enabled* widget,
                                                 // so a disabled tab needs its own tooltip to keep the
                                                 // detected device name and port available.
-                                                let resp = ui
-                                                    .selectable_label(selected, label)
-                                                    .interact(egui::Sense::click_and_drag())
-                                                    .on_hover_text(&tooltip)
-                                                    .on_disabled_hover_text(format!(
-                                            "{}\n(finish or cancel the open dialog first)",
-                                            tooltip
-                                        ));
+                                                let (resp, close) = super::chrome::device_tab(ui, &short_label(display_label), selected, state_color(conn.state));
+                                                let resp = resp.on_hover_text(&tooltip).on_disabled_hover_text(format!("{tooltip}\n(finish or cancel the open dialog first)"));
+                                                if close { to_close = Some(i); }
                                                 if !modal_open {
                                                     reorder =
                                                         tab_drag(ui, ctx, &resp, tab_id, position)
@@ -317,6 +378,7 @@ impl App {
                                                 }
                                                 // Right-click menu on the tab.
                                                 resp.context_menu(|ui| {
+                                                    super::chrome::menu_style(ui);
                                                     self.show_tab_layout_menu(ui, tab_id);
                                                     if ui.button("Rename…").clicked() {
                                                         rename_tab = Some(i);
@@ -340,14 +402,9 @@ impl App {
                                                     .position(|t| t.id == id)
                                                     .unwrap();
                                                 let tab = &self.merged_tabs[i];
-                                                let resp = ui
-                                                    .selectable_label(
-                                                        self.merged_selected
-                                                            && self.loaded_merged_tab == Some(i),
-                                                        short_label(&tab.name),
-                                                    )
-                                                    .interact(egui::Sense::click_and_drag())
-                                                    .on_hover_text(&tab.name);
+                                                let (resp, close) = super::chrome::device_tab(ui, &short_label(&tab.name), self.merged_selected && self.loaded_merged_tab == Some(i), egui::Color32::from_rgb(120, 145, 180));
+                                                let resp = resp.on_hover_text(&tab.name);
+                                                if close { close_merged = Some(i); }
                                                 if !modal_open {
                                                     reorder =
                                                         tab_drag(ui, ctx, &resp, tab_id, position)
@@ -360,6 +417,7 @@ impl App {
                                                     close_merged = Some(i);
                                                 }
                                                 resp.context_menu(|ui| {
+                                                    super::chrome::menu_style(ui);
                                                     self.show_tab_layout_menu(ui, tab_id);
                                                     if ui.button("Options").clicked() {
                                                         edit_merged = Some(i);
@@ -375,7 +433,8 @@ impl App {
                                     }
                                 });
                             });
-                        ui.menu_button("+", |ui| {
+                        ui.menu_button(egui::RichText::new("+").size(20.0), |ui| {
+                            super::chrome::menu_style(ui);
                             if ui.button("New connection").clicked() {
                                 new_tab = true;
                                 ui.close_menu();
@@ -388,7 +447,14 @@ impl App {
                     });
 
                     if self.workspace.split.is_none() {
-                        self.show_app_menu(ui);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 36.0),
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                super::chrome::window_controls(ui);
+                                super::chrome::drag_window(ui);
+                            },
+                        );
                     }
                 });
                 // The unused header space accepts a drop after the last tab.
@@ -413,6 +479,9 @@ impl App {
                 }
             },
         );
+
+        backdrop.rect = header_rect;
+        ctx.data_mut(|data| data.insert_temp(self.pane_widget_id("header_backdrop"), backdrop));
 
         if let Some(i) = set_active {
             self.active = i;
@@ -468,10 +537,64 @@ impl App {
         }
     }
 
+    fn show_console_actions(&mut self, ui: &mut egui::Ui) {
+        self.show_app_menu(ui);
+        let export = ui
+            .menu_button("     ", |ui| {
+                super::chrome::menu_style(ui);
+                for (label, csv) in [("Export text…", false), ("Export CSV…", true)] {
+                    if super::chrome::menu_item(ui, label, if csv { "" } else { "Ctrl+Shift+S" })
+                        .clicked()
+                    {
+                        if self.merged_selected {
+                            self.export_merged_view(csv);
+                        } else if let Some(active) = self.active_index() {
+                            self.export_active_view(active, csv);
+                        }
+                        ui.close_menu();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Export current view");
+        super::chrome::paint_export(ui, export.rect);
+        if super::chrome::action_button(
+            ui,
+            super::chrome::ActionIcon::Clear,
+            false,
+            "Clear console",
+        )
+        .clicked()
+        {
+            let port = if self.merged_selected {
+                None
+            } else {
+                self.active_index().map(|i| self.connections[i].id)
+            };
+            self.clear_console(port);
+        }
+        if super::chrome::action_button(
+            ui,
+            super::chrome::ActionIcon::Search,
+            self.show_search,
+            "Search · Ctrl+Shift+F",
+        )
+        .clicked()
+        {
+            self.show_search = !self.show_search;
+            if self.show_search {
+                self.search_focus_request = true;
+            }
+        }
+        ui.separator();
+    }
+
     pub(crate) fn show_app_menu(&mut self, ui: &mut egui::Ui) {
         let macros_tooltip = macro_tooltip(&self.config.macros);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.menu_button("…", |ui| {
+        let menu = ui
+            .menu_button("     ", |ui| {
+                super::chrome::menu_style(ui);
+                self.show_console_options(ui);
                 if ui
                     .button("Send file…")
                     .on_hover_text("Choose a file to send to the active console")
@@ -481,7 +604,10 @@ impl App {
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button("Macros").on_hover_text(&macros_tooltip).clicked() {
+                if super::chrome::menu_item(ui, "Macros", "Ctrl+Shift+M")
+                    .on_hover_text(&macros_tooltip)
+                    .clicked()
+                {
                     self.show_macros_win = true;
                     ui.close_menu();
                 }
@@ -489,7 +615,7 @@ impl App {
                     self.show_keyboard_shortcuts = true;
                     ui.close_menu();
                 }
-                if ui.button("Settings").clicked() {
+                if super::chrome::menu_item(ui, "Settings", "F2").clicked() {
                     self.show_settings = true;
                     ui.close_menu();
                 }
@@ -521,340 +647,453 @@ impl App {
                     ));
                     ui.close_menu();
                 }
-                if ui.button("About").clicked() {
+                if super::chrome::menu_item(ui, "About", "F1").clicked() {
                     self.show_about = true;
                     ui.close_menu();
                 }
-            });
-        });
+            })
+            .response
+            .on_hover_text("More options");
+        super::chrome::paint_overflow(ui, menu.rect);
     }
 
     /// A compact reference for the application-wide keyboard commands. Device
     /// input remains intentionally separate: unlisted keystrokes go to the
     /// active serial console.
     pub(crate) fn show_keyboard_shortcuts_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_keyboard_shortcuts;
-        egui::Window::new("Keyboard shortcuts")
-            .open(&mut open)
-            .resizable(false)
-            .show(ctx, |ui| {
-                egui::Grid::new("keyboard_shortcuts_grid")
-                    .num_columns(2)
-                    .spacing([16.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.strong("Ctrl+Shift+Left / Right");
-                        ui.label("Previous / next tab");
-                        ui.end_row();
-                        ui.strong("Ctrl+Shift+Tab");
-                        ui.label("Next tab in current pane");
-                        ui.end_row();
-                        ui.strong("F1");
-                        ui.label("Switch between split panes");
-                        ui.end_row();
-                        ui.strong("Ctrl+Shift+Up / Down");
-                        ui.label("Scroll console up / down one line");
-                        ui.end_row();
-                        ui.strong("Ctrl+Shift+Page Up / Down");
-                        ui.label("Scroll console up / down one page");
-                        ui.end_row();
-                        ui.strong("Ctrl+Shift+P");
-                        ui.label("Toggle plot (connection tabs)");
-                        ui.end_row();
-                        ui.strong("Ctrl+Shift+Space");
-                        ui.label("Pin console to bottom");
-                        ui.end_row();
-                        ui.strong("Ctrl+Shift+Q / W / E");
-                        ui.label("Log / Hex / ANSI view (connection tabs)");
-                        ui.end_row();
-                        ui.strong("Ctrl+Shift+F");
-                        ui.label("Show or hide search");
-                        ui.end_row();
-                        ui.strong("Ctrl+Shift+C / V");
-                        ui.label("Copy selected text / paste to console");
-                        ui.end_row();
-                        ui.strong("Ctrl+mouse wheel");
-                        ui.label("Change console text size");
-                        ui.end_row();
-                        ui.strong("Ctrl+Shift+0–9");
-                        ui.label("Run the assigned macro");
-                        ui.end_row();
-                    });
-                ui.separator();
-                ui.weak("All other keystrokes are sent to the active serial console.");
-            });
-        self.show_keyboard_shortcuts = open;
+        if !self.show_keyboard_shortcuts {
+            return;
+        }
+        let mut open = true;
+        let response = super::chrome::app_modal(ctx, "Keyboard shortcuts").show(ctx, |ui| {
+            ui.set_width(540.0);
+            super::chrome::dialog_style(ui);
+            let scrollbar = &mut ui.spacing_mut().scroll;
+            scrollbar.floating_allocated_width = scrollbar.bar_width + 8.0;
+            super::chrome::modal_header(ui, "Keyboard shortcuts", &mut open);
+            let height = (ctx.screen_rect().height() - 160.0).clamp(180.0, 600.0);
+            egui::ScrollArea::vertical()
+                .max_height(height)
+                .min_scrolled_height(height)
+                .show(ui, |ui| {
+                    for (action, shortcut) in [
+                        ("Previous / next tab", "Ctrl+Shift+Left / Right"),
+                        ("Next tab in current pane", "Ctrl+Shift+Tab"),
+                        ("About", "F1"),
+                        ("Settings", "F2"),
+                        ("Save current view as text", "Ctrl+Shift+S"),
+                        ("Switch between split panes", "F6"),
+                        ("Scroll console up / down one line", "Ctrl+Shift+Up / Down"),
+                        (
+                            "Scroll console up / down one page",
+                            "Ctrl+Shift+Page Up / Down",
+                        ),
+                        ("Toggle plot (connection tabs)", "Ctrl+Shift+P"),
+                        ("Pin console to bottom", "Ctrl+Shift+Space"),
+                        (
+                            "Log / Hex / ANSI view (connection tabs)",
+                            "Ctrl+Shift+Q / W / E",
+                        ),
+                        ("Show or hide search", "Ctrl+Shift+F"),
+                        ("Copy selected text / paste to console", "Ctrl+Shift+C / V"),
+                        ("Change console text size", "Ctrl+mouse wheel"),
+                        ("Open transmit macros", "Ctrl+Shift+M"),
+                        ("Run the assigned macro", "Ctrl+Shift+0–9"),
+                    ] {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 32.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.label(action);
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.weak(shortcut);
+                                    },
+                                );
+                            },
+                        );
+                    }
+                });
+            ui.separator();
+            ui.weak("All other keystrokes are sent to the active serial console.");
+        });
+        self.show_keyboard_shortcuts = open && !response.should_close();
     }
 
     pub(crate) fn show_about_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_about;
-        egui::Window::new("About")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.heading("Rusty's Pigtail - Serial Terminal");
-                    ui.label(concat!("Version ", env!("CARGO_PKG_VERSION")));
-                    ui.add_space(8.0);
-                    ui.label("A desktop serial terminal.");
-                    ui.add_space(8.0);
-                    ui.hyperlink_to(
-                        "GitHub repository",
-                        "https://github.com/rustypig91/pigtail-serial-console",
-                    );
-                });
+        if !self.show_about {
+            return;
+        }
+        let logo_id = egui::Id::new("about_logo");
+        let logo = ctx
+            .data(|data| data.get_temp::<Option<egui::TextureHandle>>(logo_id))
+            .unwrap_or_else(|| {
+                let texture = match eframe::icon_data::from_png_bytes(include_bytes!("../icon.png"))
+                {
+                    Ok(icon) => Some(ctx.load_texture(
+                        "Pigtail logo",
+                        egui::ColorImage::from_rgba_unmultiplied(
+                            [icon.width as usize, icon.height as usize],
+                            &icon.rgba,
+                        ),
+                        egui::TextureOptions::LINEAR,
+                    )),
+                    Err(error) => {
+                        tracing::warn!("loading About logo: {error}");
+                        None
+                    }
+                };
+                ctx.data_mut(|data| data.insert_temp(logo_id, texture.clone()));
+                texture
             });
-        self.show_about = open;
+        let mut open = true;
+        let response = super::chrome::app_modal(ctx, "About").show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.spacing_mut().button_padding = egui::vec2(10.0, 7.0);
+            ui.spacing_mut().item_spacing = egui::vec2(12.0, 10.0);
+            super::chrome::modal_header(ui, "About", &mut open);
+            ui.add_space(12.0);
+            ui.vertical_centered(|ui| {
+                if let Some(logo) = &logo {
+                    ui.add(egui::Image::new(logo).fit_to_exact_size(egui::vec2(104.0, 104.0)));
+                    ui.add_space(8.0);
+                }
+                ui.heading("Rusty's Pigtail");
+                ui.weak(concat!("Serial Terminal · v", env!("CARGO_PKG_VERSION")));
+                ui.add_space(14.0);
+                ui.label("A desktop serial terminal.");
+                ui.add_space(14.0);
+                ui.hyperlink_to(
+                    "GitHub repository",
+                    "https://github.com/rustypig91/pigtail-serial-console",
+                );
+            });
+            ui.add_space(20.0);
+        });
+        self.show_about = open && !response.should_close();
     }
 
-    /// The bottom status footer: connection state, view details, and the view
-    /// toggles — hex, plot and Pin (autoscroll).
-    pub(crate) fn show_footer(&mut self, ctx: &egui::Context) {
-        self.show_footer_in(ctx, None);
+    /// The reference toolbar leaves the left side empty and groups the primary
+    /// view switches and icon actions on the right.
+    pub(crate) fn show_toolbar(&mut self, ctx: &egui::Context) {
+        self.show_toolbar_in(ctx, None);
     }
 
-    pub(crate) fn show_footer_in(&mut self, ctx: &egui::Context, parent: Option<&mut egui::Ui>) {
-        let mut toggle_pin = false;
-        let mut toggle_plot = false;
-        let mut select_view = None;
-        let mut toggle_highlights = false;
-        let has_highlights = self.config.highlight.iter().any(|rule| rule.enabled);
-        let mut merged_tx_port = self.merged_tx_port;
-        let mut open_error_win: Option<serialcore::store::PortId> = None;
+    pub(crate) fn show_toolbar_in(&mut self, ctx: &egui::Context, parent: Option<&mut egui::Ui>) {
         let long_running_macros =
             self.long_running_macro_indicators(Instant::now(), self.macro_target_port());
         let mut stop_macro_run = None;
-        super::workspace::show_panel(
-            egui::TopBottomPanel::bottom(self.pane_widget_id("footer")),
+        let mut select_view = None;
+        let mut toggle_plot = false;
+        let toolbar_rect = super::workspace::show_panel(
+            egui::TopBottomPanel::top(self.pane_widget_id("console_toolbar")).frame(
+                egui::Frame::none()
+                    .fill(super::chrome::header_fill(
+                        ctx.style().visuals.dark_mode,
+                        true,
+                    ))
+                    .stroke(egui::Stroke::new(
+                        1.0_f32,
+                        if ctx.style().visuals.dark_mode {
+                            egui::Color32::from_rgb(39, 49, 61)
+                        } else {
+                            egui::Color32::from_rgb(211, 220, 232)
+                        },
+                    ))
+                    .rounding(egui::Rounding {
+                        nw: 6.0,
+                        ne: 6.0,
+                        sw: 0.0,
+                        se: 0.0,
+                    })
+                    .inner_margin(egui::Margin::symmetric(8.0, 5.0)),
+            ),
             ctx,
             parent,
             |ui| {
-                // Status and navigation labels must not join console text selection.
                 ui.style_mut().interaction.selectable_labels = false;
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.spacing_mut().interact_size = egui::vec2(32.0, 32.0);
+                ui.spacing_mut().button_padding = egui::vec2(8.0, 6.0);
+                let mut search_in_header = false;
                 ui.horizontal(|ui| {
-                    if self.merged_selected {
-                        let shown = self.merged_view().len();
-                        ui.label(format!("merged · {} lines", self.merged.len()));
-                        show_macro_run_indicators(ui, &long_running_macros, &mut stop_macro_run);
-                        if self.merged_filter_active() {
-                            ui.separator();
-                            ui.label(format!("{shown} shown"));
-                        }
-                        if !self.merged_search_matches.is_empty() {
-                            ui.separator();
-                            let n = self.merged_search_pos.map(|p| p + 1).unwrap_or(0);
-                            ui.label(format!("match {n}/{}", self.merged_search_matches.len()));
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let label = if self.merged_follow { "Pinned" } else { "Pin" };
-                            if ui
-                                .selectable_label(self.merged_follow, label)
-                                .on_hover_text("Pin the merged view to the bottom and autoscroll")
-                                .clicked()
-                            {
-                                toggle_pin = true;
-                            }
-                            let selected_label = merged_tx_port
-                                .and_then(|id| self.connections.iter().find(|conn| conn.id == id))
-                                .map(|conn| short_label(conn.display_label()))
-                                .unwrap_or_else(|| "Select device".to_string());
-                            egui::ComboBox::from_id_salt("merged_tx_device")
-                                .selected_text(format!("Send to: {selected_label}"))
-                                .show_ui(ui, |ui| {
-                                    for conn in self
-                                        .connections
-                                        .iter()
-                                        .filter(|conn| self.merged_contains(conn.id))
-                                    {
-                                        let text = short_label(conn.display_label());
-                                        ui.add_enabled_ui(conn.state != ConnState::Closed, |ui| {
-                                            ui.selectable_value(
-                                                &mut merged_tx_port,
-                                                Some(conn.id),
-                                                text,
-                                            );
-                                        });
-                                    }
-                                });
-                            if !self.merged_follow && self.merged_new_since_scroll > 0 {
-                                ui.label(format!("{} new", self.merged_new_since_scroll));
-                                ui.separator();
-                            }
-                            if has_highlights
-                                && ui
-                                    .selectable_label(self.highlights_visible, "Highlights")
-                                    .on_hover_text("Enable or disable all highlights")
-                                    .clicked()
-                            {
-                                toggle_highlights = true;
-                            }
-                        });
-                        return;
-                    }
-                    let Some(active) = self.active_index() else {
-                        ui.weak("no connection — press + to add one");
-                        return;
-                    };
-                    let conn = &self.connections[active];
-                    // A live error takes priority over the raw state: the reader
-                    // keeps retrying in the background (state stays Connecting /
-                    // Reconnecting so it can recover on its own), but the status
-                    // bar should say what's actually wrong rather than keep
-                    // claiming to be "connecting" while it fails over and over.
-                    //
-                    // While the link *is* up, though, the state is still worth
-                    // showing, so an error raised alongside a working connection
-                    // (a capture-file write that failed, say) sits next to it
-                    // rather than replacing it — this footer is the only place
-                    // such an error ever surfaces.
-                    if conn.state == ConnState::Connected || conn.last_error.is_none() {
-                        ui.colored_label(
-                            state_color(conn.state),
-                            format!("{} {}", state_dot(conn.state), conn.state),
-                        );
-                    }
-                    if let Some(err) = &conn.last_error {
-                        let resp = ui.add(
-                            egui::Label::new(
-                                egui::RichText::new("⚠ error")
-                                    .color(egui::Color32::from_rgb(0xff, 0x55, 0x55)),
-                            )
-                            .sense(egui::Sense::click()),
-                        );
-                        let resp = resp
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .on_hover_text(err.msg.as_str());
-                        if resp.clicked() {
-                            open_error_win = Some(conn.id);
-                        }
-                    }
-                    ui.separator();
-                    ui.monospace(conn.port_config.summary());
-                    ui.separator();
-                    ui.label(format!("{} lines", conn.store.next_abs_index()));
                     show_macro_run_indicators(ui, &long_running_macros, &mut stop_macro_run);
-                    if conn.filter_index_active() {
-                        ui.separator();
-                        ui.label(format!("{} shown", conn.filter_index.len()));
-                    }
-                    if !conn.screen_view && !conn.search_matches.is_empty() {
-                        ui.separator();
-                        let n = conn.search_pos.map(|p| p + 1).unwrap_or(0);
-                        ui.label(format!("match {n}/{}", conn.search_matches.len()));
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Pin toggle: pinned = follow tail / autoscroll.
-                        let label = if conn.follow { "Pinned" } else { "Pin" };
-                        if ui
-                            .selectable_label(conn.follow, label)
-                            .on_hover_text("Pin to bottom and autoscroll")
-                            .clicked()
-                        {
-                            toggle_pin = true;
-                        }
-                        // Added after the pin in a right-to-left layout, so they
-                        // land to its left: Log | Hex | ANSI/VT | Plot | Pinned.
-                        if ui
-                            .selectable_label(conn.show_plot, "Plot")
-                            .on_hover_text("Show the plot pane below the console")
-                            .clicked()
-                        {
-                            toggle_plot = true;
-                        }
-                        if ui
-                            .selectable_label(conn.screen_view, "ANSI/VT")
-                            .on_hover_text("Terminal screen sized to the window")
-                            .clicked()
-                        {
-                            select_view = Some((true, false));
-                        }
-                        if ui
-                            .selectable_label(!conn.screen_view && conn.hex_view, "Hex")
-                            .on_hover_text("Show raw bytes instead of decoded lines")
-                            .clicked()
-                        {
-                            select_view = Some((false, true));
-                        }
-                        if ui
-                            .selectable_label(!conn.screen_view && !conn.hex_view, "Log")
-                            .on_hover_text("Show the chronological log")
-                            .clicked()
-                        {
-                            select_view = Some((false, false));
-                        }
-                        if has_highlights
-                            && ui
-                                .selectable_label(self.highlights_visible, "Highlights")
-                                .on_hover_text("Enable or disable all highlights")
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center).with_main_wrap(true),
+                        |ui| {
+                            self.show_console_actions(ui);
+                            if self.merged_selected {
+                                super::chrome::view_button(
+                                    ui,
+                                    super::chrome::ViewIcon::Log,
+                                    "Log",
+                                    true,
+                                )
+                                .on_hover_text("Merged chronological log");
+                            } else if let Some(active) = self.active_index() {
+                                let conn = &self.connections[active];
+                                if super::chrome::view_button(
+                                    ui,
+                                    super::chrome::ViewIcon::Plot,
+                                    "Plot",
+                                    conn.show_plot,
+                                )
+                                .on_hover_text("Toggle plot · Ctrl+Shift+P")
                                 .clicked()
-                        {
-                            toggle_highlights = true;
-                        }
-                        ui.separator();
-                        if !conn.follow && conn.new_since_scroll > 0 {
-                            ui.label(format!("{} new", conn.new_since_scroll));
-                        }
-                        let mut evicted = Vec::new();
-                        if conn.store.evicted_any() {
-                            evicted.push("console");
-                        }
-                        if conn.raw_evicted_any {
-                            evicted.push("hex");
-                        }
-                        if conn.series_evicted_any {
-                            evicted.push("plot");
-                        }
-                        if !evicted.is_empty() {
-                            ui.separator();
-                            ui.colored_label(
-                                egui::Color32::from_rgb(0xe5, 0xc0, 0x40),
-                                format!(
-                                    "{} history evicted (full capture on disk)",
-                                    evicted.join("/")
-                                ),
-                            );
-                        }
-                    });
+                                {
+                                    toggle_plot = true;
+                                }
+                                if super::chrome::view_button(
+                                    ui,
+                                    super::chrome::ViewIcon::Terminal,
+                                    "ANSI/VT",
+                                    conn.screen_view,
+                                )
+                                .on_hover_text("Terminal screen · Ctrl+Shift+E")
+                                .clicked()
+                                {
+                                    select_view = Some((true, false));
+                                }
+                                if super::chrome::view_button(
+                                    ui,
+                                    super::chrome::ViewIcon::Hex,
+                                    "Hex",
+                                    conn.hex_view && !conn.screen_view,
+                                )
+                                .on_hover_text("Raw bytes · Ctrl+Shift+W")
+                                .clicked()
+                                {
+                                    select_view = Some((false, true));
+                                }
+                                if super::chrome::view_button(
+                                    ui,
+                                    super::chrome::ViewIcon::Log,
+                                    "Log",
+                                    !conn.hex_view && !conn.screen_view,
+                                )
+                                .on_hover_text("Chronological log · Ctrl+Shift+Q")
+                                .clicked()
+                                {
+                                    select_view = Some((false, false));
+                                }
+                            }
+                            if self.show_search && ui.available_size_before_wrap().x >= 280.0 {
+                                let width = ui.available_size_before_wrap().x;
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(width, 32.0),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| self.show_header_search(ui),
+                                );
+                                search_in_header = true;
+                            }
+                        },
+                    );
                 });
+                // Narrow split panes keep the search controls in the header,
+                // on a second row when the view buttons use the first row.
+                if self.show_search && !search_in_header {
+                    self.show_header_search(ui);
+                }
             },
         );
-
-        self.merged_tx_port = merged_tx_port;
+        let backdrop_id = self.pane_widget_id("header_backdrop");
+        if let Some(mut backdrop) = super::chrome::HeaderBackdrop::current(ctx, backdrop_id) {
+            backdrop.rect = backdrop.rect.union(toolbar_rect);
+            ctx.data_mut(|data| data.insert_temp(backdrop_id, backdrop));
+        }
         if let Some(run_index) = stop_macro_run {
             self.stop_macro_run(run_index);
         }
-        if toggle_highlights {
-            self.highlights_visible = !self.highlights_visible;
-        }
-        if toggle_pin && self.merged_selected {
-            self.merged_follow = !self.merged_follow;
-            if self.merged_follow {
-                self.merged_new_since_scroll = 0;
+        if let Some(active) = self.active_index() {
+            if toggle_plot {
+                self.connections[active].show_plot = !self.connections[active].show_plot;
+            }
+            if let Some((screen, hex)) = select_view {
+                self.connections[active].screen_view = screen;
+                self.connections[active].hex_view = hex;
+                self.save_session();
             }
         }
-        if (!self.merged_selected && toggle_pin) || toggle_plot || select_view.is_some() {
-            if let Some(active) = self.active_index() {
+    }
+
+    /// A slim status strip with a compact pin-to-bottom toggle.
+    pub(crate) fn show_status_footer(&mut self, ctx: &egui::Context) {
+        self.show_status_footer_in(ctx, None);
+    }
+
+    pub(crate) fn show_status_footer_in(
+        &mut self,
+        ctx: &egui::Context,
+        parent: Option<&mut egui::Ui>,
+    ) {
+        let dark = ctx.style().visuals.dark_mode;
+        let mut toggle_pin = false;
+        super::workspace::show_panel(
+            egui::TopBottomPanel::bottom(self.pane_widget_id("status_footer")).frame(
+                egui::Frame::none()
+                    .fill(if dark {
+                        egui::Color32::from_rgb(18, 24, 31)
+                    } else {
+                        egui::Color32::from_rgb(239, 243, 248)
+                    })
+                    .stroke(egui::Stroke::new(
+                        1.0_f32,
+                        if dark {
+                            egui::Color32::from_rgb(39, 49, 61)
+                        } else {
+                            egui::Color32::from_rgb(211, 220, 232)
+                        },
+                    ))
+                    .inner_margin(egui::Margin::symmetric(10.0, 3.0)),
+            ),
+            ctx,
+            parent,
+            |ui| {
+                ui.style_mut().interaction.selectable_labels = false;
+                ui.style_mut().override_text_style = Some(egui::TextStyle::Small);
+                ui.style_mut()
+                    .text_styles
+                    .insert(egui::TextStyle::Small, egui::FontId::proportional(11.0));
+                ui.spacing_mut().interact_size.y = 14.0;
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.horizontal(|ui| {
+                    let width = ui.available_width();
+                    let (follow, unread) = if self.merged_selected {
+                        ui.weak("Merged");
+                        ui.weak(format!("{} lines", self.merged.len()));
+                        if width > 400.0 && self.merged_filter_active() {
+                            ui.weak(format!("{} shown", self.merged_view().len()));
+                        }
+                        if width > 500.0 && !self.merged_search_matches.is_empty() {
+                            ui.weak(format!(
+                                "match {}/{}",
+                                self.merged_search_pos.map_or(0, |p| p + 1),
+                                self.merged_search_matches.len()
+                            ));
+                        }
+                        (self.merged_follow, self.merged_new_since_scroll)
+                    } else if let Some(active) = self.active_index() {
+                        let conn = &self.connections[active];
+                        ui.colored_label(state_color(conn.state), conn.state.to_string());
+                        ui.weak(format!("{} lines", conn.store.next_abs_index()));
+                        if width > 450.0 {
+                            ui.weak(conn.port_config.summary());
+                        }
+                        if let Some(err) = &conn.last_error {
+                            ui.colored_label(egui::Color32::from_rgb(255, 95, 95), "Error")
+                                .on_hover_text(&err.msg);
+                        }
+                        if width > 550.0 && conn.filter_index_active() {
+                            ui.weak(format!("{} shown", conn.filter_index.len()));
+                        }
+                        if width > 650.0 && !conn.screen_view && !conn.search_matches.is_empty() {
+                            ui.weak(format!(
+                                "match {}/{}",
+                                conn.search_pos.map_or(0, |p| p + 1),
+                                conn.search_matches.len()
+                            ));
+                        }
+                        if width > 750.0
+                            && (conn.store.evicted_any()
+                                || conn.raw_evicted_any
+                                || conn.series_evicted_any)
+                        {
+                            ui.weak("History limited")
+                                .on_hover_text("Older history evicted; full capture on disk");
+                        }
+                        (conn.follow, conn.new_since_scroll)
+                    } else {
+                        ui.weak("No connection");
+                        return;
+                    };
+                    if ui.available_width() > 28.0 {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if super::chrome::pin_button(ui, follow).clicked() {
+                                toggle_pin = true;
+                            }
+                            if !follow && unread > 0 && ui.available_width() > 80.0 {
+                                ui.weak(format!("{unread} new"));
+                            }
+                        });
+                    }
+                });
+            },
+        );
+        if toggle_pin {
+            if self.merged_selected {
+                self.merged_follow = !self.merged_follow;
+                if self.merged_follow {
+                    self.merged_new_since_scroll = 0;
+                }
+            } else if let Some(active) = self.active_index() {
                 let conn = &mut self.connections[active];
-                if toggle_pin {
-                    conn.follow = !conn.follow;
-                    if conn.follow {
-                        conn.new_since_scroll = 0;
+                conn.follow = !conn.follow;
+                if conn.follow {
+                    conn.new_since_scroll = 0;
+                }
+            }
+        }
+    }
+
+    /// Secondary controls stay in the overflow menu rather than crowding the
+    /// primary Log / Hex / ANSI/VT / Plot group.
+    fn show_console_options(&mut self, ui: &mut egui::Ui) {
+        let mut has_options = false;
+        if !self.merged_selected {
+            if let Some(active) = self.active_index() {
+                if let Some(err) = &self.connections[active].last_error {
+                    has_options = true;
+                    if ui
+                        .button("Show error details…")
+                        .on_hover_text(&err.msg)
+                        .clicked()
+                    {
+                        self.show_error_win = Some(self.connections[active].id);
+                        ui.close_menu();
                     }
                 }
-                if toggle_plot {
-                    conn.show_plot = !conn.show_plot;
-                }
-                if let Some((screen, hex)) = select_view {
-                    conn.screen_view = screen;
-                    conn.hex_view = hex;
-                }
             }
         }
-        if let Some(id) = open_error_win {
-            self.show_error_win = Some(id);
+        if self.merged_selected {
+            has_options = true;
+            let selected_label = self
+                .merged_tx_port
+                .and_then(|id| self.connections.iter().find(|conn| conn.id == id))
+                .map(|conn| short_label(conn.display_label()))
+                .unwrap_or_else(|| "Select device".into());
+            let mut selected = self.merged_tx_port;
+            egui::ComboBox::from_id_salt(self.pane_widget_id("merged_tx_device"))
+                .selected_text(format!("Send to: {selected_label}"))
+                .show_ui(ui, |ui| {
+                    super::chrome::popup_style(ui);
+                    for conn in self
+                        .connections
+                        .iter()
+                        .filter(|conn| self.merged_contains(conn.id))
+                    {
+                        if ui
+                            .add_enabled(
+                                conn.state != ConnState::Closed,
+                                egui::SelectableLabel::new(
+                                    selected == Some(conn.id),
+                                    short_label(conn.display_label()),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            selected = Some(conn.id);
+                        }
+                    }
+                });
+            self.merged_tx_port = selected;
         }
-        if select_view.is_some() {
-            self.save_session();
+        if self.config.highlight.iter().any(|rule| rule.enabled) {
+            has_options = true;
+            ui.checkbox(&mut self.highlights_visible, "Highlights");
+        }
+        if has_options {
+            ui.separator();
         }
     }
 
@@ -897,7 +1136,9 @@ impl App {
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .frame(super::chrome::dialog_frame(ctx))
                 .show(ctx, |ui| {
+                    super::chrome::dialog_style(ui);
                     ui.label("Port");
                     egui::ComboBox::from_id_salt("dlg_port")
                         .width(260.0)
@@ -908,6 +1149,7 @@ impl App {
                                 .unwrap_or_else(|| "select a port…".into()),
                         )
                         .show_ui(ui, |ui| {
+                            super::chrome::popup_style(ui);
                             for (index, p) in available.iter().enumerate() {
                                 let added = available_port_is_added(
                                     index,
@@ -942,6 +1184,7 @@ impl App {
                         egui::ComboBox::from_id_salt("dlg_preset")
                             .selected_text("Load…")
                             .show_ui(ui, |ui| {
+                                super::chrome::popup_style(ui);
                                 for (i, preset) in config.presets.iter().enumerate() {
                                     if ui.selectable_label(false, &preset.name).clicked() {
                                         load_preset = Some(i);
@@ -1045,7 +1288,9 @@ impl App {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .frame(super::chrome::dialog_frame(ctx))
             .show(ctx, |ui| {
+                super::chrome::dialog_style(ui);
                 ui.label("Tab name");
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut dialog.name)
@@ -1086,6 +1331,7 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
                 egui::ComboBox::from_id_salt("baud")
                     .selected_text(cfg.baud.to_string())
                     .show_ui(ui, |ui| {
+                        super::chrome::popup_style(ui);
                         for &b in COMMON_BAUDS {
                             ui.selectable_value(&mut cfg.baud, b, b.to_string());
                         }
@@ -1104,6 +1350,7 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
             egui::ComboBox::from_id_salt("databits")
                 .selected_text(format!("{}", u8::from(cfg.data_bits)))
                 .show_ui(ui, |ui| {
+                    super::chrome::popup_style(ui);
                     for b in [
                         DataBits::Five,
                         DataBits::Six,
@@ -1119,6 +1366,7 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
             egui::ComboBox::from_id_salt("parity")
                 .selected_text(parity_label(cfg.parity))
                 .show_ui(ui, |ui| {
+                    super::chrome::popup_style(ui);
                     for p in [Parity::None, Parity::Odd, Parity::Even] {
                         ui.selectable_value(&mut cfg.parity, p, parity_label(p));
                     }
@@ -1129,6 +1377,7 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
             egui::ComboBox::from_id_salt("stopbits")
                 .selected_text(format!("{}", u8::from(cfg.stop_bits)))
                 .show_ui(ui, |ui| {
+                    super::chrome::popup_style(ui);
                     for s in [StopBits::One, StopBits::Two] {
                         ui.selectable_value(&mut cfg.stop_bits, s, format!("{}", u8::from(s)));
                     }
@@ -1139,6 +1388,7 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
             egui::ComboBox::from_id_salt("flow")
                 .selected_text(flow_label(cfg.flow_control))
                 .show_ui(ui, |ui| {
+                    super::chrome::popup_style(ui);
                     for f in [
                         FlowControl::None,
                         FlowControl::Software,
@@ -1153,6 +1403,7 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
             egui::ComboBox::from_id_salt("terminal")
                 .selected_text(cfg.terminal.label())
                 .show_ui(ui, |ui| {
+                    super::chrome::popup_style(ui);
                     for m in [
                         TerminalMode::Vt100,
                         TerminalMode::LfOnly,
@@ -1172,6 +1423,7 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
             egui::ComboBox::from_id_salt("line_ending")
                 .selected_text(cfg.line_ending.label())
                 .show_ui(ui, |ui| {
+                    super::chrome::popup_style(ui);
                     for e in [
                         LineEnding::None,
                         LineEnding::Lf,
@@ -1212,13 +1464,6 @@ fn flow_label(f: FlowControl) -> &'static str {
         FlowControl::None => "none",
         FlowControl::Software => "software (XON/XOFF)",
         FlowControl::Hardware => "hardware (RTS/CTS)",
-    }
-}
-
-fn state_dot(state: ConnState) -> char {
-    match state {
-        ConnState::Connected | ConnState::Connecting | ConnState::Reconnecting => '•',
-        ConnState::Lost | ConnState::Disconnected | ConnState::Closed => '·',
     }
 }
 
@@ -1345,6 +1590,112 @@ mod tests {
             pressed: true,
             repeat: false,
             modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+        }
+    }
+
+    #[test]
+    fn about_and_settings_accelerators_are_exclusive_and_consume_the_key() {
+        let (mut app, _enum_tx) = test_app("dialog-accelerators");
+        let ctx = egui::Context::default();
+        for key in [Key::F1, Key::F2] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.consume_app_shortcuts(ctx);
+                    assert_eq!(app.show_about, key == Key::F1);
+                    assert_eq!(app.show_settings, key == Key::F2);
+                    assert!(ctx.input(|input| input.events.is_empty()));
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn about_and_settings_modals_block_background_clicks() {
+        for settings in [false, true] {
+            let (mut app, _enum_tx) = test_app(if settings {
+                "settings-modal"
+            } else {
+                "about-modal"
+            });
+            app.show_settings = settings;
+            app.show_about = !settings;
+            let ctx = egui::Context::default();
+            let mut clicked = false;
+            let mut render = |events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1000.0, 900.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            clicked |= ui.button("Background action").clicked();
+                        });
+                        app.show_settings_window(ctx);
+                        app.show_about_window(ctx);
+                    },
+                )
+            };
+            for _ in 0..3 {
+                render(vec![]);
+            }
+            let pos = egui::pos2(50.0, 18.0);
+            for pressed in [true, false] {
+                render(vec![
+                    Event::PointerMoved(pos),
+                    Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]);
+            }
+            assert!(!clicked, "Modal must block background controls");
+        }
+    }
+
+    #[test]
+    fn macros_accelerator_opens_without_connection_and_consumes_only_ctrl_shift_m() {
+        let (mut app, _enum_tx) = test_app("macros-accelerator");
+        let ctx = egui::Context::default();
+        for modifiers in [
+            egui::Modifiers::CTRL,
+            egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+        ] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![Event::Key {
+                        key: Key::M,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("text-field")));
+                    app.consume_app_shortcuts(ctx);
+                    let is_accelerator = modifiers.shift;
+                    assert_eq!(app.show_macros_win, is_accelerator);
+                    assert_eq!(ctx.input(|input| input.events.is_empty()), is_accelerator);
+                },
+            );
         }
     }
 
@@ -1624,7 +1975,7 @@ mod tests {
                 .unwrap()
         };
         let start = tab_center(if merged { "Merged 1" } else { "Tab 1" });
-        let end = tab_center(if merged { "Tab 1" } else { "Tab 3" }) + egui::vec2(5.0, 0.0);
+        let end = tab_center(if merged { "Tab 1" } else { "Tab 3" }) + egui::vec2(25.0, 0.0);
         let button = |pos, pressed| Event::PointerButton {
             pos,
             button: drag_button,

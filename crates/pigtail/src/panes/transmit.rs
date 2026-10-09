@@ -338,6 +338,7 @@ mod tests {
             |ctx| {
                 let console_tab_claimed = app.claim_console_tab_before_layout(ctx);
                 app.show_header(ctx);
+                app.show_toolbar(ctx);
                 app.show_console(ctx, console_tab_claimed);
                 app.release_console_tab_after_layout(ctx, console_tab_claimed);
             },
@@ -817,8 +818,8 @@ mod tests {
 
         let ctx = egui::Context::default();
         frame(&mut app, &ctx, Vec::new());
-        // Text field -> case -> Prev -> Next -> Close.
-        for _ in 0..4 {
+        // Text field -> regex -> case -> Prev -> Next -> Close.
+        for _ in 0..5 {
             frame(&mut app, &ctx, vec![tab()]);
         }
         frame(&mut app, &ctx, vec![enter()]);

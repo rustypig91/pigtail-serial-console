@@ -30,23 +30,28 @@ impl App {
         let mut open = true;
         let mut close = false;
         let mut cancel = false;
-        egui::Window::new("Close tab?")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.label(format!("Are you sure you want to close \"{}\"?", label));
-                if matches!(id, TabId::Connection(_)) {
-                    ui.label("Closing the tab disconnects this connection.");
-                } else {
-                    ui.label("The connections included in this view will stay open.");
-                }
-                ui.checkbox(&mut do_not_ask, "Do not ask me again");
-                ui.horizontal(|ui| {
-                    cancel = ui.button("Cancel").clicked();
-                    close = ui.button("Close tab").clicked();
-                });
+        let response = super::chrome::app_modal(ctx, "Close tab?").show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.spacing_mut().button_padding = egui::vec2(10.0, 7.0);
+            ui.spacing_mut().interact_size.y = 32.0;
+            ui.spacing_mut().item_spacing = egui::vec2(12.0, 10.0);
+            super::chrome::modal_header(ui, "Close tab?", &mut open);
+            ui.label(format!("Are you sure you want to close \"{}\"?", label));
+            if matches!(id, TabId::Connection(_)) {
+                ui.weak("Closing the tab disconnects this connection.");
+            } else {
+                ui.weak("The connections included in this view will stay open.");
+            }
+            ui.add_space(8.0);
+            ui.checkbox(&mut do_not_ask, "Do not ask me again");
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                close = ui
+                    .add(egui::Button::new("Close tab").fill(ui.visuals().selection.bg_fill))
+                    .clicked();
+                cancel = ui.button("Cancel").clicked();
             });
+        });
         if close {
             self.tab_close_confirmation = None;
             if do_not_ask {
@@ -65,7 +70,7 @@ impl App {
                     }
                 }
             }
-        } else if cancel || !open {
+        } else if cancel || !open || response.should_close() {
             self.tab_close_confirmation = None;
         } else {
             self.tab_close_confirmation = Some((id, do_not_ask));
@@ -74,6 +79,15 @@ impl App {
 
     /// Handle Escape before console input or text fields can consume it.
     pub(crate) fn close_window_on_escape(&mut self, ctx: &egui::Context) {
+        if self.show_about
+            || self.show_settings
+            || self.show_keyboard_shortcuts
+            || self.update_dialog.is_some()
+            || !self.connect_errors.is_empty()
+            || self.tab_close_confirmation.is_some()
+        {
+            return; // Modal dialogs handle Escape themselves.
+        }
         if ctx.is_context_menu_open() || !ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             return;
         }
@@ -211,7 +225,9 @@ impl App {
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
+            .frame(super::chrome::dialog_frame(ctx))
             .show(ctx, |ui| {
+                super::chrome::dialog_style(ui);
                 ui.label(err.msg.as_str());
                 // Nothing else ever clears a session-scoped error: the
                 // connection recovering doesn't fix a capture file that
@@ -240,7 +256,9 @@ impl App {
         egui::Window::new("Filters")
             .open(&mut open)
             .default_width(300.0)
+            .frame(super::chrome::dialog_frame(ctx))
             .show(ctx, |ui| {
+                super::chrome::dialog_style(ui);
                 if self.merged_selected {
                     ui.weak("Rules here apply only to the merged view.");
                     show_filter_controls(
@@ -277,7 +295,9 @@ impl App {
         egui::Window::new("Highlight rules")
             .open(&mut open)
             .default_width(320.0)
+            .frame(super::chrome::dialog_frame(ctx))
             .show(ctx, |ui| {
+                super::chrome::dialog_style(ui);
                 ui.weak("First matching rule wins. Applied to every connection.");
                 let mut remove: Option<usize> = None;
                 for (i, rule) in self.config.highlight.iter_mut().enumerate() {
@@ -349,7 +369,9 @@ impl App {
         egui::Window::new("Plot extraction")
             .open(&mut open)
             .default_width(360.0)
+            .frame(super::chrome::dialog_frame(ctx))
             .show(ctx, |ui| {
+                super::chrome::dialog_style(ui);
                 let Some(active) = self.active_index() else {
                     ui.weak("Connect a port to extract series.");
                     return;
@@ -619,6 +641,44 @@ mod tests {
     use crate::app::tests::test_app;
 
     #[test]
+    fn escape_cancels_close_modal_without_changing_connection_or_preferences() {
+        let (mut app, _enum_tx) = test_app("close-modal-escape");
+        let id = serialcore::store::PortId(1);
+        app.connections.push(app.make_connection(
+            id,
+            "Device 1".into(),
+            Default::default(),
+            Default::default(),
+            crate::app::tests::inert_handle(id),
+        ));
+        app.tab_close_confirmation = Some((crate::app::TabId::Connection(id), true));
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_tab_close_confirmation(ctx);
+        });
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                app.close_window_on_escape(ctx);
+                app.show_tab_close_confirmation(ctx);
+                assert!(!ctx.input(|input| input.key_pressed(egui::Key::Escape)));
+            },
+        );
+        assert!(app.tab_close_confirmation.is_none());
+        assert_eq!(app.connections.len(), 1);
+        assert!(app.config.settings.confirm_tab_close);
+    }
+
+    #[test]
     fn escape_closes_only_frontmost_window_and_consumes_key() {
         let (mut app, _enum_tx) = test_app("escape-windows");
         let ctx = egui::Context::default();
@@ -627,12 +687,6 @@ mod tests {
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             app.show_tool_windows(ctx);
             app.show_settings_window(ctx);
-        });
-        ctx.memory_mut(|m| {
-            m.areas_mut().move_to_top(egui::LayerId::new(
-                egui::Order::Middle,
-                egui::Id::new("Settings"),
-            ));
         });
         let input = egui::RawInput {
             events: vec![egui::Event::Key {
@@ -646,6 +700,7 @@ mod tests {
         };
         let _ = ctx.run(input.clone(), |ctx| {
             app.close_window_on_escape(ctx);
+            app.show_settings_window(ctx);
             assert!(!app.show_settings);
             assert!(app.show_filters_win);
             assert!(!ctx.input(|i| i.key_pressed(egui::Key::Escape)));
