@@ -617,7 +617,7 @@ impl App {
 
             let mut transmitted_raw_start = None;
             if let Some((completed, raw_start)) = &run.pending_transmit {
-                match completed.try_recv() {
+                match completed.receiver.try_recv() {
                     Ok(_) => {
                         transmitted_raw_start = Some(*raw_start);
                         run.pending_transmit = None;
@@ -767,7 +767,7 @@ impl App {
         &mut self,
         port: PortId,
         command: &str,
-        pending: &mut Option<(crossbeam_channel::Receiver<Instant>, u64)>,
+        pending: &mut Option<(serialcore::reader::TransmitCompletion, u64)>,
     ) -> bool {
         let now = self.clock.now();
         let Some(conn) = self
@@ -1230,7 +1230,12 @@ mod tests {
         app.maintain_macro_runs_at(started, &ctx);
         assert_eq!(echoed(&app), ["first"]);
         let (tx, rx) = crossbeam_channel::bounded(1);
-        app.macro_runs[0].pending_transmit = Some((rx, 0));
+        app.macro_runs[0]
+            .pending_transmit
+            .as_mut()
+            .unwrap()
+            .0
+            .receiver = rx;
         let finished = started + Duration::from_secs(1);
         app.maintain_macro_runs_at(finished, &ctx);
         assert_eq!(app.macro_runs[0].next_step, 1);
@@ -1264,9 +1269,13 @@ mod tests {
             let ctx = egui::Context::default();
             app.start_macro(0, started);
             app.maintain_macro_runs_at(started, &ctx);
-            let raw_start = app.macro_runs[0].pending_transmit.as_ref().unwrap().1;
             let (tx, rx) = crossbeam_channel::bounded(1);
-            app.macro_runs[0].pending_transmit = Some((rx, raw_start));
+            app.macro_runs[0]
+                .pending_transmit
+                .as_mut()
+                .unwrap()
+                .0
+                .receiver = rx;
             if early_response {
                 app.connections[0].push_raw_bytes(b"READY");
             }
@@ -1299,7 +1308,12 @@ mod tests {
         app.start_macro(0, started);
         app.maintain_macro_runs_at(started, &ctx);
         let (tx, rx) = crossbeam_channel::bounded(1);
-        app.macro_runs[0].pending_transmit = Some((rx, 0));
+        app.macro_runs[0]
+            .pending_transmit
+            .as_mut()
+            .unwrap()
+            .0
+            .receiver = rx;
         app.maintain_macro_runs_at(started + Duration::from_secs(10), &ctx);
         assert_eq!(echoed(&app), ["first"]);
         drop(tx);

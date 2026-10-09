@@ -21,6 +21,8 @@ use crate::wake::Wake;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -141,10 +143,46 @@ impl ReaderEvent {
     }
 }
 
+/// Completion of a tracked transmit. Dropping this receipt cancels any bytes
+/// that have not yet been written; a write already in progress cannot be undone.
+#[derive(Debug)]
+pub struct TransmitCompletion {
+    /// Receives the final write time, or disconnects if the transmit fails.
+    pub receiver: Receiver<Instant>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for TransmitCompletion {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingCompletion {
+    sender: Sender<Instant>,
+    cancelled: Arc<AtomicBool>,
+}
+
+fn transmit_completion() -> (PendingCompletion, TransmitCompletion) {
+    let (sender, receiver) = crossbeam_channel::bounded(1);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    (
+        PendingCompletion {
+            sender,
+            cancelled: cancelled.clone(),
+        },
+        TransmitCompletion {
+            receiver,
+            cancelled,
+        },
+    )
+}
+
 /// Commands from the UI to a reader thread.
 #[derive(Clone, Debug)]
 enum ReaderCommand {
-    Transmit(Vec<u8>, Duration, Option<Sender<Instant>>),
+    Transmit(Vec<u8>, Duration, Option<PendingCompletion>),
     StartTransfer(PreparedTransfer, Duration),
     CancelTransfer,
     SetDtr(bool),
@@ -204,13 +242,14 @@ impl ReaderHandle {
         let _ = self.cmd.send(ReaderCommand::Transmit(bytes, delay, None));
     }
     /// Notify the caller after the final byte is written. Dropping the sender
-    /// without a timestamp means the batch failed or was discarded.
-    pub fn transmit_paced_tracked(&self, bytes: Vec<u8>, delay: Duration) -> Receiver<Instant> {
-        let (tx, rx) = crossbeam_channel::bounded(1);
+    /// without a timestamp means the batch failed or was discarded. Keeping the
+    /// returned receipt alive permits sending; dropping it cancels unsent bytes.
+    pub fn transmit_paced_tracked(&self, bytes: Vec<u8>, delay: Duration) -> TransmitCompletion {
+        let (tx, receipt) = transmit_completion();
         let _ = self
             .cmd
             .send(ReaderCommand::Transmit(bytes, delay, Some(tx)));
-        rx
+        receipt
     }
     pub fn start_transfer(&self, transfer: PreparedTransfer) {
         self.start_transfer_paced(transfer, Duration::ZERO);
@@ -742,22 +781,30 @@ enum CommandOutcome {
 /// unsent bytes are discarded on disconnect rather than replayed on reconnect.
 #[derive(Default)]
 struct PacedTransmit {
-    queue: VecDeque<(Vec<u8>, Duration, Option<Sender<Instant>>)>,
+    queue: VecDeque<(Vec<u8>, Duration, Option<PendingCompletion>)>,
     offset: usize,
     next_write: Option<Instant>,
 }
 
 impl PacedTransmit {
-    fn enqueue(&mut self, bytes: Vec<u8>, delay: Duration, completed: Option<Sender<Instant>>) {
+    fn enqueue(&mut self, bytes: Vec<u8>, delay: Duration, completed: Option<PendingCompletion>) {
         if !bytes.is_empty() {
             self.queue.push_back((bytes, delay, completed));
         } else if let Some(completed) = completed {
-            let _ = completed.send(Instant::now());
+            let _ = completed.sender.send(Instant::now());
         }
     }
 
     fn advance(&mut self, now: Instant, source: &mut dyn ByteSource, event_tx: &EventTx) {
-        while let Some((bytes, delay, _)) = self.queue.front() {
+        while let Some((bytes, delay, completed)) = self.queue.front() {
+            if completed
+                .as_ref()
+                .is_some_and(|completed| completed.cancelled.load(Ordering::Relaxed))
+            {
+                self.queue.pop_front();
+                self.offset = 0;
+                continue;
+            }
             if self.next_write.is_some_and(|deadline| now < deadline) {
                 return;
             }
@@ -767,9 +814,11 @@ impl PacedTransmit {
                 self.offset + 1
             };
             if let Err(e) = source.write(&bytes[self.offset..end]) {
-                event_tx.send(ReaderEvent::session_error(format!("transmit: {e}")));
                 self.queue.clear();
                 self.offset = 0;
+                // Publish failure only after receipts become disconnected, so
+                // a UI awakened by the error cannot miss the failed completion.
+                event_tx.send(ReaderEvent::session_error(format!("transmit: {e}")));
                 return;
             }
             // Schedule from the actual write, never catch up with a burst after
@@ -782,7 +831,7 @@ impl PacedTransmit {
             self.offset = end;
             if end == bytes.len() {
                 if let Some((_, _, Some(completed))) = self.queue.pop_front() {
-                    let _ = completed.send(Instant::now());
+                    let _ = completed.sender.send(Instant::now());
                     event_tx.wake.signal();
                 }
                 self.offset = 0;
@@ -1273,7 +1322,8 @@ mod tests {
         let mut pending = PacedTransmit::default();
         let mut sink = WriteSink::default();
         let events = pacing_events();
-        let (tx, rx) = crossbeam_channel::bounded(1);
+        let (tx, receipt) = transmit_completion();
+        let rx = &receipt.receiver;
         pending.enqueue(b"ab".to_vec(), Duration::from_secs(1), Some(tx));
         pending.advance(Instant::now(), &mut sink, &events);
         assert!(matches!(
@@ -1290,7 +1340,8 @@ mod tests {
         let mut pending = PacedTransmit::default();
         let mut source = ScriptedSource::new(vec![]);
         let events = pacing_events();
-        let (tx, rx) = crossbeam_channel::bounded(1);
+        let (tx, receipt) = transmit_completion();
+        let rx = &receipt.receiver;
         pending.enqueue(b"ab".to_vec(), Duration::from_secs(1), Some(tx));
         pending.advance(Instant::now(), &mut source, &events);
         assert!(matches!(
@@ -1298,6 +1349,67 @@ mod tests {
             Err(crossbeam_channel::TryRecvError::Disconnected)
         ));
         assert!(pending.queue.is_empty());
+    }
+
+    #[test]
+    fn cancelled_transmit_before_first_write_preserves_other_batches() {
+        let mut pending = PacedTransmit::default();
+        let mut sink = WriteSink::default();
+        let events = pacing_events();
+        let (tx, receipt) = transmit_completion();
+        pending.enqueue(b"macro".to_vec(), Duration::from_secs(1), Some(tx));
+        pending.enqueue(b"typed".to_vec(), Duration::ZERO, None);
+        drop(receipt);
+        pending.advance(Instant::now(), &mut sink, &events);
+        assert_eq!(sink.writes, [b"typed".to_vec()]);
+        assert!(pending.queue.is_empty());
+    }
+
+    #[test]
+    fn cancelled_transmit_mid_command_keeps_the_gap_and_resets_the_offset() {
+        let mut pending = PacedTransmit::default();
+        let mut sink = WriteSink::default();
+        let events = pacing_events();
+        let (tx, receipt) = transmit_completion();
+        let (next_tx, next_receipt) = transmit_completion();
+        pending.enqueue(b"macro".to_vec(), Duration::from_secs(1), Some(tx));
+        pending.enqueue(b"next".to_vec(), Duration::ZERO, Some(next_tx));
+        pending.advance(Instant::now(), &mut sink, &events);
+        assert_eq!(sink.writes, [b"m".to_vec()]);
+        let deadline = pending.next_write.unwrap();
+        drop(receipt);
+        pending.advance(deadline - Duration::from_nanos(1), &mut sink, &events);
+        assert_eq!(sink.writes, [b"m".to_vec()]);
+        pending.advance(deadline, &mut sink, &events);
+        assert_eq!(sink.writes, [b"m".to_vec(), b"next".to_vec()]);
+        assert!(next_receipt.receiver.try_recv().is_ok());
+        assert!(pending.queue.is_empty());
+    }
+
+    #[test]
+    fn failed_transmit_disconnects_all_receipts_before_waking_the_ui() {
+        let mut pending = PacedTransmit::default();
+        let mut source = ScriptedSource::new(vec![]);
+        let (tx, receipt) = transmit_completion();
+        let (next_tx, next_receipt) = transmit_completion();
+        let receivers = [receipt.receiver.clone(), next_receipt.receiver.clone()];
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_by_wake = observed.clone();
+        let (event_tx, _events) = crossbeam_channel::unbounded();
+        let events = EventTx {
+            tx: event_tx,
+            wake: Wake::new(move || {
+                assert!(receivers.iter().all(|rx| matches!(
+                    rx.try_recv(),
+                    Err(crossbeam_channel::TryRecvError::Disconnected)
+                )));
+                observed_by_wake.store(true, Ordering::Relaxed);
+            }),
+        };
+        pending.enqueue(b"macro".to_vec(), Duration::from_secs(1), Some(tx));
+        pending.enqueue(b"next".to_vec(), Duration::from_secs(1), Some(next_tx));
+        pending.advance(Instant::now(), &mut source, &events);
+        assert!(observed.load(Ordering::Relaxed));
     }
 
     fn paced_file(global_delay: Duration) -> Option<ActiveTransfer> {
