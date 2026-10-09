@@ -333,7 +333,13 @@ impl App {
                     ui.label(format!(
                         "Will send {} · estimated duration {}",
                         format_bytes(prepared.total_bytes() as u64),
-                        format_duration(prepared.estimated_duration().saturating_add(wire_time))
+                        format_duration(
+                            prepared
+                                .estimated_duration_with_delay(Duration::from_millis(
+                                    self.config.settings.send_delay_ms
+                                ))
+                                .saturating_add(wire_time)
+                        )
                     ));
                 } else {
                     ui.horizontal(|ui| {
@@ -398,7 +404,10 @@ impl App {
             sent: 0,
             total,
         });
-        conn.handle.start_transfer(prepared);
+        conn.handle.start_transfer_paced(
+            prepared,
+            Duration::from_millis(self.config.settings.send_delay_ms),
+        );
     }
 
     fn show_file_transfer_progress(&mut self, ctx: &egui::Context) {

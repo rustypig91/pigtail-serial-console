@@ -364,6 +364,9 @@ fn default_vt_scrollback_rows() -> usize {
 /// Global settings.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
+    /// Minimum pause between outgoing serial bytes (0 disables pacing).
+    #[serde(default)]
+    pub send_delay_ms: u64,
     /// Retained rendered VT scrollback rows per connection.
     #[serde(default = "default_vt_scrollback_rows")]
     pub vt_scrollback_rows: usize,
@@ -398,6 +401,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            send_delay_ms: 0,
             vt_scrollback_rows: default_vt_scrollback_rows(),
             confirm_tab_close: true,
             max_lines: default_max_lines(),
@@ -804,6 +808,16 @@ enabled = true
         let s = cfg.to_toml().unwrap();
         let back = Config::from_toml(&s).unwrap();
         assert!(back.highlight.is_empty());
+    }
+
+    #[test]
+    fn send_delay_defaults_to_zero_and_round_trips() {
+        let mut settings: Settings = toml::from_str("max_lines = 1000").unwrap();
+        assert_eq!(settings.send_delay_ms, 0);
+        assert_eq!(Settings::default().send_delay_ms, 0);
+        settings.send_delay_ms = 25;
+        let restored: Settings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(restored.send_delay_ms, 25);
     }
 
     #[test]

@@ -1283,6 +1283,10 @@ pub(crate) struct MacroRun {
     pub(crate) next_step: usize,
     pub(crate) next_at: Instant,
     pub(crate) wait_for: Option<MacroWait>,
+    /// Completion plus the receive position before sending, preserving early replies.
+    pub(crate) pending_transmit: Option<(reader::TransmitCompletion, u64)>,
+    /// Early replies to the completed command survive intervening delay steps.
+    pub(crate) transmitted_raw_start: Option<u64>,
 }
 
 /// A receive condition starts at an absolute raw-byte position, so output

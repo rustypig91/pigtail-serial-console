@@ -21,6 +21,8 @@ use crate::wake::Wake;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -141,11 +143,47 @@ impl ReaderEvent {
     }
 }
 
+/// Completion of a tracked transmit. Dropping this receipt cancels any bytes
+/// that have not yet been written; a write already in progress cannot be undone.
+#[derive(Debug)]
+pub struct TransmitCompletion {
+    /// Receives the final write time, or disconnects if the transmit fails.
+    pub receiver: Receiver<Instant>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for TransmitCompletion {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingCompletion {
+    sender: Sender<Instant>,
+    cancelled: Arc<AtomicBool>,
+}
+
+fn transmit_completion() -> (PendingCompletion, TransmitCompletion) {
+    let (sender, receiver) = crossbeam_channel::bounded(1);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    (
+        PendingCompletion {
+            sender,
+            cancelled: cancelled.clone(),
+        },
+        TransmitCompletion {
+            receiver,
+            cancelled,
+        },
+    )
+}
+
 /// Commands from the UI to a reader thread.
 #[derive(Clone, Debug)]
 enum ReaderCommand {
-    Transmit(Vec<u8>),
-    StartTransfer(PreparedTransfer),
+    Transmit(Vec<u8>, Duration, Option<PendingCompletion>),
+    StartTransfer(PreparedTransfer, Duration),
     CancelTransfer,
     SetDtr(bool),
     SetRts(bool),
@@ -192,14 +230,51 @@ pub struct ReaderHandle {
     pub events: Receiver<ReaderEvent>,
     cmd: Sender<ReaderCommand>,
     join: Option<JoinHandle<()>>,
+    pacing_used: AtomicBool,
 }
 
 impl ReaderHandle {
     pub fn transmit(&self, bytes: Vec<u8>) {
-        let _ = self.cmd.send(ReaderCommand::Transmit(bytes));
+        self.transmit_paced(bytes, Duration::ZERO);
+    }
+    /// Queue bytes in order, with a minimum pause between writes of each byte.
+    /// Pacing belongs to the reader so receiving and UI work remain responsive.
+    pub fn transmit_paced(&self, bytes: Vec<u8>, delay: Duration) {
+        if !bytes.is_empty() && !delay.is_zero() {
+            self.pacing_used.store(true, Ordering::Relaxed);
+        }
+        let _ = self.cmd.send(ReaderCommand::Transmit(bytes, delay, None));
+    }
+    /// Once pacing has been used, even zero-delay sends can wait behind queued
+    /// bytes or the gap after a previous write. Macro scheduling must track
+    /// completion from then on. Keep this conservative for the handle's lifetime
+    /// rather than racing the reader to decide whether its queue is empty.
+    pub fn has_used_pacing(&self) -> bool {
+        self.pacing_used.load(Ordering::Relaxed)
+    }
+    /// Notify the caller after the final byte is written. Dropping the sender
+    /// without a timestamp means the batch failed or was discarded. Keeping the
+    /// returned receipt alive permits sending; dropping it cancels unsent bytes.
+    pub fn transmit_paced_tracked(&self, bytes: Vec<u8>, delay: Duration) -> TransmitCompletion {
+        if !bytes.is_empty() && !delay.is_zero() {
+            self.pacing_used.store(true, Ordering::Relaxed);
+        }
+        let (tx, receipt) = transmit_completion();
+        let _ = self
+            .cmd
+            .send(ReaderCommand::Transmit(bytes, delay, Some(tx)));
+        receipt
     }
     pub fn start_transfer(&self, transfer: PreparedTransfer) {
-        let _ = self.cmd.send(ReaderCommand::StartTransfer(transfer));
+        self.start_transfer_paced(transfer, Duration::ZERO);
+    }
+    /// Apply global pacing while keeping file-specific pauses separate from typing.
+    pub fn start_transfer_paced(&self, mut transfer: PreparedTransfer, delay: Duration) {
+        if !transfer.data.is_empty() && !delay.is_zero() {
+            self.pacing_used.store(true, Ordering::Relaxed);
+        }
+        transfer.char_delay = transfer.char_delay.max(delay);
+        let _ = self.cmd.send(ReaderCommand::StartTransfer(transfer, delay));
     }
     pub fn cancel_transfer(&self) {
         let _ = self.cmd.send(ReaderCommand::CancelTransfer);
@@ -276,6 +351,7 @@ pub fn spawn(config: ReaderConfig, spec: SourceSpec) -> std::io::Result<ReaderHa
         events: event_rx,
         cmd: cmd_tx,
         join: Some(join),
+        pacing_used: AtomicBool::new(false),
     })
 }
 
@@ -563,6 +639,7 @@ fn run(
         let mut last_byte = Instant::now();
         let mut provisional_flushed = false;
         let mut transfer: Option<ActiveTransfer> = None;
+        let mut transmit = PacedTransmit::default();
 
         loop {
             // Handle any queued commands.
@@ -572,7 +649,14 @@ fn run(
                 pending: &mut pending,
                 backlog: &mut backlog,
             };
-            match drain_commands(&cmd_rx, source.as_mut(), targets, &mut transfer, &event_tx) {
+            match drain_commands(
+                &cmd_rx,
+                source.as_mut(),
+                targets,
+                &mut transfer,
+                &mut transmit,
+                &event_tx,
+            ) {
                 CommandOutcome::Shutdown => {
                     // Flush and exit.
                     framer.flush_final(&mut pending.lines);
@@ -587,7 +671,7 @@ fn run(
                 CommandOutcome::Continue => {}
             }
 
-            advance_transfer(&mut transfer, source.as_mut(), &event_tx);
+            advance_outgoing(&mut transmit, &mut transfer, source.as_mut(), &event_tx);
 
             match source.read(&mut buf) {
                 Ok(0) => {
@@ -638,6 +722,9 @@ fn run(
             drain_backlog(&mut backlog, &event_tx);
         }
 
+        if !transmit.queue.is_empty() {
+            report_dropped_command(&event_tx, "transmit");
+        }
         if transfer.take().is_some() {
             event_tx.send(ReaderEvent::TransferEnded);
         }
@@ -707,11 +794,91 @@ enum CommandOutcome {
     Shutdown,
 }
 
+/// The deadline survives an empty queue, so fast typing across separate UI
+/// frames is paced just like a single paste. The queue is connection-local:
+/// unsent bytes are discarded on disconnect rather than replayed on reconnect.
+#[derive(Default)]
+struct PacedTransmit {
+    queue: VecDeque<(Vec<u8>, Duration, Option<PendingCompletion>)>,
+    offset: usize,
+    next_write: Option<Instant>,
+    last_write: Option<Instant>,
+}
+
+impl PacedTransmit {
+    fn enqueue(&mut self, bytes: Vec<u8>, delay: Duration, completed: Option<PendingCompletion>) {
+        if !bytes.is_empty() {
+            self.queue.push_back((bytes, delay, completed));
+        } else if let Some(completed) = completed {
+            let _ = completed.sender.send(Instant::now());
+        }
+    }
+
+    fn advance(&mut self, now: Instant, source: &mut dyn ByteSource, event_tx: &EventTx) {
+        while let Some((bytes, delay, completed)) = self.queue.front() {
+            if completed
+                .as_ref()
+                .is_some_and(|completed| completed.cancelled.load(Ordering::Relaxed))
+            {
+                self.queue.pop_front();
+                self.offset = 0;
+                continue;
+            }
+            if self.next_write.is_some_and(|deadline| now < deadline) {
+                return;
+            }
+            // A newly enabled or increased delay also applies before this
+            // batch's first byte. The preceding batch (or file write) may
+            // have left a shorter gap, so respect both sides of the boundary.
+            if !delay.is_zero()
+                && self.last_write.is_some_and(|written_at| {
+                    written_at
+                        .checked_add(*delay)
+                        .is_some_and(|deadline| now < deadline)
+                })
+            {
+                return;
+            }
+            let end = if delay.is_zero() {
+                bytes.len()
+            } else {
+                self.offset + 1
+            };
+            if let Err(e) = source.write(&bytes[self.offset..end]) {
+                self.queue.clear();
+                self.offset = 0;
+                // Publish failure only after receipts become disconnected, so
+                // a UI awakened by the error cannot miss the failed completion.
+                event_tx.send(ReaderEvent::session_error(format!("transmit: {e}")));
+                return;
+            }
+            // Schedule from the actual write, never catch up with a burst after
+            // a slow read or write. Keep the gap after the final byte too.
+            let written_at = now.max(Instant::now());
+            self.last_write = Some(written_at);
+            self.next_write = if delay.is_zero() {
+                None
+            } else {
+                written_at.checked_add(*delay)
+            };
+            self.offset = end;
+            if end == bytes.len() {
+                if let Some((_, _, Some(completed))) = self.queue.pop_front() {
+                    let _ = completed.sender.send(Instant::now());
+                    event_tx.wake.signal();
+                }
+                self.offset = 0;
+            }
+        }
+    }
+}
+
 /// Reader-owned cursor over a prepared file.  Keeping pacing here means an
 /// open transfer shares the same short loop as reads, commands, reconnect, and
 /// shutdown instead of occupying a second writer that could outlive the port.
 struct ActiveTransfer {
     prepared: PreparedTransfer,
+    global_delay: Duration,
     sent: usize,
     next_line_end: usize,
     next_write: Instant,
@@ -723,6 +890,7 @@ impl ActiveTransfer {
         let now = Instant::now();
         Self {
             prepared,
+            global_delay: Duration::ZERO,
             sent: 0,
             next_line_end: 0,
             next_write: now,
@@ -759,6 +927,7 @@ fn drain_commands(
     source: &mut dyn ByteSource,
     targets: ClearTargets<'_>,
     transfer: &mut Option<ActiveTransfer>,
+    transmit: &mut PacedTransmit,
     event_tx: &EventTx,
 ) -> CommandOutcome {
     let ClearTargets {
@@ -780,12 +949,17 @@ fn drain_commands(
                 },
                 event_tx,
             ),
-            ReaderCommand::Transmit(bytes) => {
-                if let Err(e) = source.write(&bytes) {
-                    event_tx.send(ReaderEvent::session_error(format!("transmit: {e}")));
+            ReaderCommand::Transmit(bytes, delay, completed) => {
+                // Preserve immediate unpaced writes before subsequent control
+                // commands or shutdown, while respecting queued bytes and the
+                // final-byte gap of an earlier paced send.
+                let immediate = delay.is_zero() && transmit.queue.is_empty();
+                transmit.enqueue(bytes, delay, completed);
+                if immediate {
+                    transmit.advance(Instant::now(), source, event_tx);
                 }
             }
-            ReaderCommand::StartTransfer(prepared) => {
+            ReaderCommand::StartTransfer(prepared, delay) => {
                 if transfer.is_some() {
                     event_tx.send(ReaderEvent::session_error(
                         "file transfer: another transfer is already active",
@@ -794,7 +968,9 @@ fn drain_commands(
                     event_tx.send(ReaderEvent::TransferEnded);
                 } else {
                     let total = prepared.total_bytes();
-                    *transfer = Some(ActiveTransfer::new(prepared));
+                    let mut active = ActiveTransfer::new(prepared);
+                    active.global_delay = delay;
+                    *transfer = Some(active);
                     let _ = event_tx.try_send(ReaderEvent::TransferProgress { sent: 0, total });
                 }
             }
@@ -823,6 +999,43 @@ fn drain_commands(
     CommandOutcome::Continue
 }
 
+/// Only the global delay is shared with interactive sends. File-specific
+/// character and line pauses must not hold up typing when global pacing is off.
+fn advance_outgoing(
+    transmit: &mut PacedTransmit,
+    transfer: &mut Option<ActiveTransfer>,
+    source: &mut dyn ByteSource,
+    event_tx: &EventTx,
+) {
+    transmit.advance(Instant::now(), source, event_tx);
+    if transmit.queue.is_empty()
+        && transmit
+            .next_write
+            .is_none_or(|deadline| Instant::now() >= deadline)
+    {
+        let delay = transfer
+            .as_ref()
+            .map_or(Duration::ZERO, |active| active.global_delay);
+        // A file retains its starting global delay even if later typing uses
+        // a smaller setting. Its next byte must respect that delay after the
+        // latest interactive write as well as after its own previous byte.
+        if transmit.last_write.is_some_and(|written_at| {
+            written_at
+                .checked_add(delay)
+                .is_some_and(|deadline| Instant::now() < deadline)
+        }) {
+            return;
+        }
+        if advance_transfer(transfer, source, event_tx) {
+            let written_at = Instant::now();
+            transmit.last_write = Some(written_at);
+            if !delay.is_zero() {
+                transmit.next_write = written_at.checked_add(delay);
+            }
+        }
+    }
+}
+
 /// Write at most one paced unit. A zero character delay sends a bounded block
 /// up to the next line boundary; a non-zero delay sends one byte. Either way,
 /// the surrounding loop gets another chance to read and handle commands before
@@ -831,13 +1044,13 @@ fn advance_transfer(
     transfer: &mut Option<ActiveTransfer>,
     source: &mut dyn ByteSource,
     event_tx: &EventTx,
-) {
+) -> bool {
     let Some(active) = transfer.as_mut() else {
-        return;
+        return false;
     };
     let now = Instant::now();
     if now < active.next_write {
-        return;
+        return false;
     }
 
     // A blank line with no outgoing line ending can share its byte offset with
@@ -854,7 +1067,7 @@ fn advance_transfer(
                 && !active.prepared.line_delay.is_zero()
             {
                 active.next_write = now + active.prepared.line_delay;
-                return;
+                return false;
             }
             continue;
         }
@@ -883,7 +1096,7 @@ fn advance_transfer(
         event_tx.send(ReaderEvent::session_error(format!("file transfer: {e}")));
         *transfer = None;
         event_tx.send(ReaderEvent::TransferEnded);
-        return;
+        return false;
     }
     active.sent = chunk_end;
     let finished = active.sent == active.prepared.data.len();
@@ -903,7 +1116,7 @@ fn advance_transfer(
     if finished {
         *transfer = None;
         event_tx.send(ReaderEvent::TransferEnded);
-        return;
+        return true;
     }
 
     let mut delay = active.prepared.char_delay;
@@ -911,7 +1124,8 @@ fn advance_transfer(
         delay = delay.saturating_add(active.prepared.line_delay);
         active.next_line_end += 1;
     }
-    active.next_write = now + delay;
+    active.next_write = Instant::now() + delay;
+    true
 }
 
 /// Move `pending` into the backlog, then try to push backlog entries onto the
@@ -1028,11 +1242,11 @@ fn wait_or_shutdown(
         // Nothing to write to while disconnected, and staying here until
         // reconnect would just delay input the user typed against a stale
         // idea of the link. Report it instead of silently eating it.
-        Ok(ReaderCommand::Transmit(_)) => {
+        Ok(ReaderCommand::Transmit(_, _, _)) => {
             report_dropped_command(event_tx, "transmit");
             false
         }
-        Ok(ReaderCommand::StartTransfer(_)) => {
+        Ok(ReaderCommand::StartTransfer(_, _)) => {
             report_dropped_command(event_tx, "file transfer");
             event_tx.send(ReaderEvent::TransferEnded);
             false
@@ -1094,6 +1308,327 @@ mod tests {
         fn write(&mut self, bytes: &[u8]) -> Result<(), SourceError> {
             self.writes.push(bytes.to_vec());
             Ok(())
+        }
+    }
+
+    fn pacing_events() -> EventTx {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        EventTx {
+            tx,
+            wake: Wake::default(),
+        }
+    }
+
+    #[test]
+    fn transmit_pacing_preserves_order_and_never_catches_up_in_a_burst() {
+        let mut pending = PacedTransmit::default();
+        let mut sink = WriteSink::default();
+        let events = pacing_events();
+        let delay = Duration::from_millis(20);
+        pending.enqueue(b"ab".to_vec(), delay, None);
+        pending.enqueue(b"cd".to_vec(), delay, None);
+        pending.advance(Instant::now(), &mut sink, &events);
+        assert_eq!(sink.writes, [b"a".to_vec()]);
+        let deadline = pending.next_write.unwrap();
+        pending.advance(deadline - Duration::from_nanos(1), &mut sink, &events);
+        assert_eq!(sink.writes.len(), 1);
+        // A late reader iteration still sends only one byte.
+        pending.advance(deadline + Duration::from_secs(1), &mut sink, &events);
+        assert_eq!(sink.writes, [b"a".to_vec(), b"b".to_vec()]);
+        pending.advance(pending.next_write.unwrap(), &mut sink, &events);
+        pending.advance(pending.next_write.unwrap(), &mut sink, &events);
+        assert_eq!(sink.writes.concat(), b"abcd");
+        assert!(pending.queue.is_empty());
+    }
+
+    #[test]
+    fn transmit_pacing_keeps_the_gap_between_separate_keystrokes() {
+        let mut pending = PacedTransmit::default();
+        let mut sink = WriteSink::default();
+        let events = pacing_events();
+        let delay = Duration::from_millis(20);
+        pending.enqueue(b"a".to_vec(), delay, None);
+        pending.advance(Instant::now(), &mut sink, &events);
+        assert!(pending.queue.is_empty());
+        let deadline = pending.next_write.unwrap();
+        pending.enqueue(b"b".to_vec(), delay, None);
+        pending.advance(deadline - Duration::from_nanos(1), &mut sink, &events);
+        assert_eq!(sink.writes, [b"a".to_vec()]);
+        pending.advance(deadline, &mut sink, &events);
+        assert_eq!(sink.writes.concat(), b"ab");
+    }
+
+    #[test]
+    fn increased_transmit_delay_applies_before_the_first_byte_of_the_next_batch() {
+        for previous_delay in [Duration::ZERO, Duration::from_millis(20)] {
+            let mut pending = PacedTransmit::default();
+            let mut sink = WriteSink::default();
+            let events = pacing_events();
+            pending.enqueue(b"a".to_vec(), previous_delay, None);
+            pending.advance(Instant::now(), &mut sink, &events);
+            let written_at = pending.last_write.unwrap();
+            let delay = Duration::from_secs(1);
+            pending.enqueue(b"bc".to_vec(), delay, None);
+            pending.advance(written_at + previous_delay, &mut sink, &events);
+            assert_eq!(sink.writes, [b"a".to_vec()]);
+            pending.advance(written_at + delay, &mut sink, &events);
+            assert_eq!(sink.writes, [b"a".to_vec(), b"b".to_vec()]);
+            pending.advance(pending.next_write.unwrap(), &mut sink, &events);
+            assert_eq!(sink.writes.concat(), b"abc");
+        }
+    }
+
+    #[test]
+    fn zero_transmit_delay_keeps_whole_batches() {
+        let mut pending = PacedTransmit::default();
+        let mut sink = WriteSink::default();
+        let events = pacing_events();
+        pending.enqueue(Vec::new(), Duration::ZERO, None);
+        pending.enqueue(b"hello".to_vec(), Duration::ZERO, None);
+        pending.enqueue(b"world".to_vec(), Duration::ZERO, None);
+        pending.advance(Instant::now(), &mut sink, &events);
+        assert_eq!(sink.writes, [b"hello".to_vec(), b"world".to_vec()]);
+        assert!(pending.queue.is_empty());
+    }
+
+    #[test]
+    fn unpaced_transmit_precedes_control_commands_and_shutdown() {
+        #[derive(Default)]
+        struct OrderedSink(Vec<&'static str>);
+
+        impl ByteSource for OrderedSink {
+            fn read(&mut self, _buf: &mut [u8]) -> Result<usize, SourceError> {
+                Ok(0)
+            }
+
+            fn description(&self) -> String {
+                "ordered sink".into()
+            }
+
+            fn write(&mut self, _bytes: &[u8]) -> Result<(), SourceError> {
+                self.0.push("write");
+                Ok(())
+            }
+
+            fn set_dtr(&mut self, _on: bool) -> Result<(), SourceError> {
+                self.0.push("dtr");
+                Ok(())
+            }
+
+            fn set_rts(&mut self, _on: bool) -> Result<(), SourceError> {
+                self.0.push("rts");
+                Ok(())
+            }
+
+            fn send_break(&mut self) -> Result<(), SourceError> {
+                self.0.push("break");
+                Ok(())
+            }
+        }
+
+        for (queued, gap) in [(false, false), (true, false), (false, true)] {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            for command in [
+                ReaderCommand::Transmit(b"hello".to_vec(), Duration::ZERO, None),
+                ReaderCommand::SetDtr(true),
+                ReaderCommand::SetRts(true),
+                ReaderCommand::SendBreak,
+                ReaderCommand::Shutdown,
+            ] {
+                tx.send(command).unwrap();
+            }
+            let mut sink = OrderedSink::default();
+            let mut writer = None;
+            let mut framer = Framer::with_mode(crate::config::TerminalMode::default());
+            let mut pending = Batch::default();
+            let mut backlog = Backlog::default();
+            let mut transfer = None;
+            let mut transmit = PacedTransmit::default();
+            if queued {
+                transmit.enqueue(b"earlier".to_vec(), Duration::from_secs(60), None);
+            }
+            if gap {
+                transmit.next_write = Some(Instant::now() + Duration::from_secs(60));
+            }
+            let outcome = drain_commands(
+                &rx,
+                &mut sink,
+                ClearTargets {
+                    writer: &mut writer,
+                    framer: &mut framer,
+                    pending: &mut pending,
+                    backlog: &mut backlog,
+                },
+                &mut transfer,
+                &mut transmit,
+                &pacing_events(),
+            );
+            assert!(matches!(outcome, CommandOutcome::Shutdown));
+            if queued || gap {
+                assert_eq!(sink.0, ["dtr", "rts", "break"]);
+                assert_eq!(transmit.queue.len(), 1 + usize::from(queued));
+            } else {
+                assert_eq!(sink.0, ["write", "dtr", "rts", "break"]);
+                assert!(transmit.queue.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn tracked_transmit_completes_only_after_the_final_byte() {
+        let mut pending = PacedTransmit::default();
+        let mut sink = WriteSink::default();
+        let events = pacing_events();
+        let (tx, receipt) = transmit_completion();
+        let rx = &receipt.receiver;
+        pending.enqueue(b"ab".to_vec(), Duration::from_secs(1), Some(tx));
+        pending.advance(Instant::now(), &mut sink, &events);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Empty)
+        ));
+        pending.advance(pending.next_write.unwrap(), &mut sink, &events);
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(sink.writes.concat(), b"ab");
+    }
+
+    #[test]
+    fn failed_transmit_drops_completion_and_queued_bytes() {
+        let mut pending = PacedTransmit::default();
+        let mut source = ScriptedSource::new(vec![]);
+        let events = pacing_events();
+        let (tx, receipt) = transmit_completion();
+        let rx = &receipt.receiver;
+        pending.enqueue(b"ab".to_vec(), Duration::from_secs(1), Some(tx));
+        pending.advance(Instant::now(), &mut source, &events);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        ));
+        assert!(pending.queue.is_empty());
+    }
+
+    #[test]
+    fn cancelled_transmit_before_first_write_preserves_other_batches() {
+        let mut pending = PacedTransmit::default();
+        let mut sink = WriteSink::default();
+        let events = pacing_events();
+        let (tx, receipt) = transmit_completion();
+        pending.enqueue(b"macro".to_vec(), Duration::from_secs(1), Some(tx));
+        pending.enqueue(b"typed".to_vec(), Duration::ZERO, None);
+        drop(receipt);
+        pending.advance(Instant::now(), &mut sink, &events);
+        assert_eq!(sink.writes, [b"typed".to_vec()]);
+        assert!(pending.queue.is_empty());
+    }
+
+    #[test]
+    fn cancelled_transmit_mid_command_keeps_the_gap_and_resets_the_offset() {
+        let mut pending = PacedTransmit::default();
+        let mut sink = WriteSink::default();
+        let events = pacing_events();
+        let (tx, receipt) = transmit_completion();
+        let (next_tx, next_receipt) = transmit_completion();
+        pending.enqueue(b"macro".to_vec(), Duration::from_secs(1), Some(tx));
+        pending.enqueue(b"next".to_vec(), Duration::ZERO, Some(next_tx));
+        pending.advance(Instant::now(), &mut sink, &events);
+        assert_eq!(sink.writes, [b"m".to_vec()]);
+        let deadline = pending.next_write.unwrap();
+        drop(receipt);
+        pending.advance(deadline - Duration::from_nanos(1), &mut sink, &events);
+        assert_eq!(sink.writes, [b"m".to_vec()]);
+        pending.advance(deadline, &mut sink, &events);
+        assert_eq!(sink.writes, [b"m".to_vec(), b"next".to_vec()]);
+        assert!(next_receipt.receiver.try_recv().is_ok());
+        assert!(pending.queue.is_empty());
+    }
+
+    #[test]
+    fn failed_transmit_disconnects_all_receipts_before_waking_the_ui() {
+        let mut pending = PacedTransmit::default();
+        let mut source = ScriptedSource::new(vec![]);
+        let (tx, receipt) = transmit_completion();
+        let (next_tx, next_receipt) = transmit_completion();
+        let receivers = [receipt.receiver.clone(), next_receipt.receiver.clone()];
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_by_wake = observed.clone();
+        let (event_tx, _events) = crossbeam_channel::unbounded();
+        let events = EventTx {
+            tx: event_tx,
+            wake: Wake::new(move || {
+                assert!(receivers.iter().all(|rx| matches!(
+                    rx.try_recv(),
+                    Err(crossbeam_channel::TryRecvError::Disconnected)
+                )));
+                observed_by_wake.store(true, Ordering::Relaxed);
+            }),
+        };
+        pending.enqueue(b"macro".to_vec(), Duration::from_secs(1), Some(tx));
+        pending.enqueue(b"next".to_vec(), Duration::from_secs(1), Some(next_tx));
+        pending.advance(Instant::now(), &mut source, &events);
+        assert!(observed.load(Ordering::Relaxed));
+    }
+
+    fn paced_file(global_delay: Duration) -> Option<ActiveTransfer> {
+        let mut active = ActiveTransfer::new(PreparedTransfer {
+            path: PathBuf::from("paced.txt"),
+            data: b"ab".to_vec(),
+            line_ends: vec![],
+            line_delay: Duration::ZERO,
+            char_delay: Duration::from_secs(1),
+        });
+        active.global_delay = global_delay;
+        Some(active)
+    }
+
+    #[test]
+    fn file_character_delay_does_not_pause_unpaced_typing() {
+        let mut transfer = paced_file(Duration::ZERO);
+        let mut pending = PacedTransmit::default();
+        let mut sink = WriteSink::default();
+        let events = pacing_events();
+        advance_outgoing(&mut pending, &mut transfer, &mut sink, &events);
+        pending.enqueue(b"typed".to_vec(), Duration::ZERO, None);
+        advance_outgoing(&mut pending, &mut transfer, &mut sink, &events);
+        assert_eq!(sink.writes, [b"a".to_vec(), b"typed".to_vec()]);
+        assert_eq!(transfer.as_ref().unwrap().sent, 1);
+    }
+
+    #[test]
+    fn global_delay_is_shared_with_typing_even_after_file_completion() {
+        let mut transfer = paced_file(Duration::from_secs(1));
+        transfer.as_mut().unwrap().prepared.data = b"a".to_vec();
+        let mut pending = PacedTransmit::default();
+        let mut sink = WriteSink::default();
+        let events = pacing_events();
+        advance_outgoing(&mut pending, &mut transfer, &mut sink, &events);
+        assert!(transfer.is_none());
+        pending.enqueue(b"b".to_vec(), Duration::from_secs(1), None);
+        advance_outgoing(&mut pending, &mut transfer, &mut sink, &events);
+        assert_eq!(sink.writes, [b"a".to_vec()]);
+        pending.advance(pending.next_write.unwrap(), &mut sink, &events);
+        assert_eq!(sink.writes.concat(), b"ab");
+    }
+
+    #[test]
+    fn active_file_keeps_its_global_gap_after_typing_delay_is_reduced() {
+        for typing_delay in [Duration::ZERO, Duration::from_millis(1)] {
+            let mut transfer = paced_file(Duration::from_secs(60));
+            let mut pending = PacedTransmit::default();
+            let mut sink = WriteSink::default();
+            let events = pacing_events();
+            pending.enqueue(b"x".to_vec(), typing_delay, None);
+            pending.advance(Instant::now(), &mut sink, &events);
+            // The current setting can be reduced while a file still retains
+            // the global delay selected when its transfer started.
+            pending.next_write = None;
+            advance_outgoing(&mut pending, &mut transfer, &mut sink, &events);
+            assert_eq!(sink.writes, [b"x".to_vec()]);
+            assert_eq!(transfer.as_ref().unwrap().sent, 0);
+            pending.last_write = Some(Instant::now() - Duration::from_secs(61));
+            advance_outgoing(&mut pending, &mut transfer, &mut sink, &events);
+            assert_eq!(sink.writes, [b"x".to_vec(), b"a".to_vec()]);
+            assert_eq!(transfer.as_ref().unwrap().sent, 1);
         }
     }
 
@@ -1617,7 +2152,10 @@ mod tests {
     #[test]
     fn commands_dropped_while_reconnecting_are_reported() {
         for (cmd, expected_label) in [
-            (ReaderCommand::Transmit(b"hi".to_vec()), "transmit"),
+            (
+                ReaderCommand::Transmit(b"hi".to_vec(), Duration::ZERO, None),
+                "transmit",
+            ),
             (ReaderCommand::SetDtr(true), "dtr"),
             (ReaderCommand::SetRts(true), "rts"),
             (ReaderCommand::SendBreak, "break"),
