@@ -558,6 +558,7 @@ impl App {
             next_at: now,
             wait_for: None,
             pending_transmit: None,
+            transmitted_raw_start: None,
         });
         true
     }
@@ -615,11 +616,10 @@ impl App {
                 continue;
             }
 
-            let mut transmitted_raw_start = None;
             if let Some((completed, raw_start)) = &run.pending_transmit {
                 match completed.receiver.try_recv() {
                     Ok(_) => {
-                        transmitted_raw_start = Some(*raw_start);
+                        run.transmitted_raw_start = Some(*raw_start);
                         run.pending_transmit = None;
                         run.next_at = now;
                         advanced_any = true;
@@ -661,7 +661,7 @@ impl App {
                         // An early reply belongs only to the command that
                         // just completed. A later command may be unpaced if
                         // the global setting changed while this run was sending.
-                        transmitted_raw_start = None;
+                        run.transmitted_raw_start = None;
                         target_exists =
                             self.send_macro_command(run.port, &text, &mut run.pending_transmit);
                         if !target_exists || run.pending_transmit.is_some() {
@@ -697,7 +697,8 @@ impl App {
                             break;
                         };
                         let wait = MacroWait {
-                            raw_start: transmitted_raw_start
+                            raw_start: run
+                                .transmitted_raw_start
                                 .take()
                                 .unwrap_or_else(|| conn.raw_next()),
                             regex,
@@ -721,6 +722,7 @@ impl App {
                         *remaining -= 1;
                     }
                     run.next_step = 0;
+                    run.transmitted_raw_start = None;
                     // Continue on a fresh frame. This prevents an indefinitely
                     // looping macro with no delay or wait step from locking the
                     // UI in this scheduler call.
@@ -1254,13 +1256,14 @@ mod tests {
 
     #[test]
     fn paced_macro_wait_retains_early_responses_and_ignores_old_output() {
-        for early_response in [false, true] {
+        for (early_response, delay_ms) in [(false, 0), (true, 0), (false, 100), (true, 100)] {
             let mut app = app_with_macro(100);
             app.config.settings.send_delay_ms = 20;
             app.config.macros[0].steps = vec![
                 MacroStep::Command {
                     text: "reboot".into(),
                 },
+                MacroStep::Delay { delay_ms },
                 MacroStep::WaitFor {
                     pattern: "READY".into(),
                 },
@@ -1285,7 +1288,9 @@ mod tests {
             }
             tx.send(started).unwrap();
             app.maintain_macro_runs_at(started, &ctx);
-            app.maintain_macro_runs_at(started, &ctx);
+            let after_delay = started + Duration::from_millis(delay_ms);
+            app.maintain_macro_runs_at(after_delay, &ctx);
+            app.maintain_macro_runs_at(after_delay, &ctx);
             if !early_response {
                 assert_eq!(
                     echoed(&app),
@@ -1293,7 +1298,7 @@ mod tests {
                     "old output cannot release the wait"
                 );
                 app.connections[0].push_raw_bytes(b"READY");
-                app.maintain_macro_runs_at(started, &ctx);
+                app.maintain_macro_runs_at(after_delay, &ctx);
             }
             assert_eq!(echoed(&app), ["reboot", "status"]);
         }
