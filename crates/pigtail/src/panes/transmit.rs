@@ -192,7 +192,10 @@ impl App {
                 conn.terminal.process(&out);
                 conn.screen_search.dirty = true;
             }
-            conn.handle.transmit(out);
+            conn.handle.transmit_paced(
+                out,
+                std::time::Duration::from_millis(self.config.settings.send_delay_ms),
+            );
         }
         for line in echo_lines {
             conn.store.append(IncomingLine {

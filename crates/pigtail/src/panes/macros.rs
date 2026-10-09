@@ -751,7 +751,10 @@ impl App {
         let mut bytes = command.as_bytes().to_vec();
         bytes.extend_from_slice(conn.port_config.line_ending.bytes());
         if !bytes.is_empty() {
-            conn.handle.transmit(bytes);
+            conn.handle.transmit_paced(
+                bytes,
+                Duration::from_millis(self.config.settings.send_delay_ms),
+            );
         }
         let mut line = std::mem::take(&mut conn.tx_input);
         line.push_str(command);

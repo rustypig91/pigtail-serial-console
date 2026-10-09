@@ -144,7 +144,7 @@ impl ReaderEvent {
 /// Commands from the UI to a reader thread.
 #[derive(Clone, Debug)]
 enum ReaderCommand {
-    Transmit(Vec<u8>),
+    Transmit(Vec<u8>, Duration),
     StartTransfer(PreparedTransfer),
     CancelTransfer,
     SetDtr(bool),
@@ -196,7 +196,12 @@ pub struct ReaderHandle {
 
 impl ReaderHandle {
     pub fn transmit(&self, bytes: Vec<u8>) {
-        let _ = self.cmd.send(ReaderCommand::Transmit(bytes));
+        self.transmit_paced(bytes, Duration::ZERO);
+    }
+    /// Queue bytes in order, with a minimum pause between writes of each byte.
+    /// Pacing belongs to the reader so receiving and UI work remain responsive.
+    pub fn transmit_paced(&self, bytes: Vec<u8>, delay: Duration) {
+        let _ = self.cmd.send(ReaderCommand::Transmit(bytes, delay));
     }
     pub fn start_transfer(&self, transfer: PreparedTransfer) {
         let _ = self.cmd.send(ReaderCommand::StartTransfer(transfer));
@@ -563,6 +568,7 @@ fn run(
         let mut last_byte = Instant::now();
         let mut provisional_flushed = false;
         let mut transfer: Option<ActiveTransfer> = None;
+        let mut transmit = PacedTransmit::default();
 
         loop {
             // Handle any queued commands.
@@ -572,7 +578,14 @@ fn run(
                 pending: &mut pending,
                 backlog: &mut backlog,
             };
-            match drain_commands(&cmd_rx, source.as_mut(), targets, &mut transfer, &event_tx) {
+            match drain_commands(
+                &cmd_rx,
+                source.as_mut(),
+                targets,
+                &mut transfer,
+                &mut transmit,
+                &event_tx,
+            ) {
                 CommandOutcome::Shutdown => {
                     // Flush and exit.
                     framer.flush_final(&mut pending.lines);
@@ -587,7 +600,24 @@ fn run(
                 CommandOutcome::Continue => {}
             }
 
-            advance_transfer(&mut transfer, source.as_mut(), &event_tx);
+            transmit.advance(Instant::now(), source.as_mut(), &event_tx);
+            // Share the transmit deadline with file sends, so typing cannot
+            // bypass pacing while a file transfer is in progress.
+            if transmit.queue.is_empty()
+                && transmit
+                    .next_write
+                    .is_none_or(|deadline| Instant::now() >= deadline)
+            {
+                let before = transfer
+                    .as_ref()
+                    .map(|active| (active.sent, active.prepared.char_delay));
+                advance_transfer(&mut transfer, source.as_mut(), &event_tx);
+                if let Some((sent, delay)) = before {
+                    if transfer.as_ref().is_none_or(|active| active.sent != sent) {
+                        transmit.next_write = Instant::now().checked_add(delay);
+                    }
+                }
+            }
 
             match source.read(&mut buf) {
                 Ok(0) => {
@@ -638,6 +668,9 @@ fn run(
             drain_backlog(&mut backlog, &event_tx);
         }
 
+        if !transmit.queue.is_empty() {
+            report_dropped_command(&event_tx, "transmit");
+        }
         if transfer.take().is_some() {
             event_tx.send(ReaderEvent::TransferEnded);
         }
@@ -707,6 +740,55 @@ enum CommandOutcome {
     Shutdown,
 }
 
+/// The deadline survives an empty queue, so fast typing across separate UI
+/// frames is paced just like a single paste. The queue is connection-local:
+/// unsent bytes are discarded on disconnect rather than replayed on reconnect.
+#[derive(Default)]
+struct PacedTransmit {
+    queue: VecDeque<(Vec<u8>, Duration)>,
+    offset: usize,
+    next_write: Option<Instant>,
+}
+
+impl PacedTransmit {
+    fn enqueue(&mut self, bytes: Vec<u8>, delay: Duration) {
+        if !bytes.is_empty() {
+            self.queue.push_back((bytes, delay));
+        }
+    }
+
+    fn advance(&mut self, now: Instant, source: &mut dyn ByteSource, event_tx: &EventTx) {
+        while let Some((bytes, delay)) = self.queue.front() {
+            if self.next_write.is_some_and(|deadline| now < deadline) {
+                return;
+            }
+            let end = if delay.is_zero() {
+                bytes.len()
+            } else {
+                self.offset + 1
+            };
+            if let Err(e) = source.write(&bytes[self.offset..end]) {
+                event_tx.send(ReaderEvent::session_error(format!("transmit: {e}")));
+                self.queue.clear();
+                self.offset = 0;
+                return;
+            }
+            // Schedule from the actual write, never catch up with a burst after
+            // a slow read or write. Keep the gap after the final byte too.
+            self.next_write = if delay.is_zero() {
+                None
+            } else {
+                now.max(Instant::now()).checked_add(*delay)
+            };
+            self.offset = end;
+            if end == bytes.len() {
+                self.queue.pop_front();
+                self.offset = 0;
+            }
+        }
+    }
+}
+
 /// Reader-owned cursor over a prepared file.  Keeping pacing here means an
 /// open transfer shares the same short loop as reads, commands, reconnect, and
 /// shutdown instead of occupying a second writer that could outlive the port.
@@ -759,6 +841,7 @@ fn drain_commands(
     source: &mut dyn ByteSource,
     targets: ClearTargets<'_>,
     transfer: &mut Option<ActiveTransfer>,
+    transmit: &mut PacedTransmit,
     event_tx: &EventTx,
 ) -> CommandOutcome {
     let ClearTargets {
@@ -780,10 +863,8 @@ fn drain_commands(
                 },
                 event_tx,
             ),
-            ReaderCommand::Transmit(bytes) => {
-                if let Err(e) = source.write(&bytes) {
-                    event_tx.send(ReaderEvent::session_error(format!("transmit: {e}")));
-                }
+            ReaderCommand::Transmit(bytes, delay) => {
+                transmit.enqueue(bytes, delay);
             }
             ReaderCommand::StartTransfer(prepared) => {
                 if transfer.is_some() {
@@ -1028,7 +1109,7 @@ fn wait_or_shutdown(
         // Nothing to write to while disconnected, and staying here until
         // reconnect would just delay input the user typed against a stale
         // idea of the link. Report it instead of silently eating it.
-        Ok(ReaderCommand::Transmit(_)) => {
+        Ok(ReaderCommand::Transmit(_, _)) => {
             report_dropped_command(event_tx, "transmit");
             false
         }
@@ -1095,6 +1176,66 @@ mod tests {
             self.writes.push(bytes.to_vec());
             Ok(())
         }
+    }
+
+    fn pacing_events() -> EventTx {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        EventTx {
+            tx,
+            wake: Wake::default(),
+        }
+    }
+
+    #[test]
+    fn transmit_pacing_preserves_order_and_never_catches_up_in_a_burst() {
+        let mut pending = PacedTransmit::default();
+        let mut sink = WriteSink::default();
+        let events = pacing_events();
+        let delay = Duration::from_millis(20);
+        pending.enqueue(b"ab".to_vec(), delay);
+        pending.enqueue(b"cd".to_vec(), delay);
+        pending.advance(Instant::now(), &mut sink, &events);
+        assert_eq!(sink.writes, [b"a".to_vec()]);
+        let deadline = pending.next_write.unwrap();
+        pending.advance(deadline - Duration::from_nanos(1), &mut sink, &events);
+        assert_eq!(sink.writes.len(), 1);
+        // A late reader iteration still sends only one byte.
+        pending.advance(deadline + Duration::from_secs(1), &mut sink, &events);
+        assert_eq!(sink.writes, [b"a".to_vec(), b"b".to_vec()]);
+        pending.advance(pending.next_write.unwrap(), &mut sink, &events);
+        pending.advance(pending.next_write.unwrap(), &mut sink, &events);
+        assert_eq!(sink.writes.concat(), b"abcd");
+        assert!(pending.queue.is_empty());
+    }
+
+    #[test]
+    fn transmit_pacing_keeps_the_gap_between_separate_keystrokes() {
+        let mut pending = PacedTransmit::default();
+        let mut sink = WriteSink::default();
+        let events = pacing_events();
+        let delay = Duration::from_millis(20);
+        pending.enqueue(b"a".to_vec(), delay);
+        pending.advance(Instant::now(), &mut sink, &events);
+        assert!(pending.queue.is_empty());
+        let deadline = pending.next_write.unwrap();
+        pending.enqueue(b"b".to_vec(), delay);
+        pending.advance(deadline - Duration::from_nanos(1), &mut sink, &events);
+        assert_eq!(sink.writes, [b"a".to_vec()]);
+        pending.advance(deadline, &mut sink, &events);
+        assert_eq!(sink.writes.concat(), b"ab");
+    }
+
+    #[test]
+    fn zero_transmit_delay_keeps_whole_batches() {
+        let mut pending = PacedTransmit::default();
+        let mut sink = WriteSink::default();
+        let events = pacing_events();
+        pending.enqueue(Vec::new(), Duration::ZERO);
+        pending.enqueue(b"hello".to_vec(), Duration::ZERO);
+        pending.enqueue(b"world".to_vec(), Duration::ZERO);
+        pending.advance(Instant::now(), &mut sink, &events);
+        assert_eq!(sink.writes, [b"hello".to_vec(), b"world".to_vec()]);
+        assert!(pending.queue.is_empty());
     }
 
     fn test_meta() -> SessionMeta {
@@ -1617,7 +1758,10 @@ mod tests {
     #[test]
     fn commands_dropped_while_reconnecting_are_reported() {
         for (cmd, expected_label) in [
-            (ReaderCommand::Transmit(b"hi".to_vec()), "transmit"),
+            (
+                ReaderCommand::Transmit(b"hi".to_vec(), Duration::ZERO),
+                "transmit",
+            ),
             (ReaderCommand::SetDtr(true), "dtr"),
             (ReaderCommand::SetRts(true), "rts"),
             (ReaderCommand::SendBreak, "break"),
