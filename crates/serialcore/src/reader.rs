@@ -935,7 +935,14 @@ fn drain_commands(
                 event_tx,
             ),
             ReaderCommand::Transmit(bytes, delay, completed) => {
+                // Preserve immediate unpaced writes before subsequent control
+                // commands or shutdown, while respecting queued bytes and the
+                // final-byte gap of an earlier paced send.
+                let immediate = delay.is_zero() && transmit.queue.is_empty();
                 transmit.enqueue(bytes, delay, completed);
+                if immediate {
+                    transmit.advance(Instant::now(), source, event_tx);
+                }
             }
             ReaderCommand::StartTransfer(prepared, delay) => {
                 if transfer.is_some() {
@@ -1333,6 +1340,89 @@ mod tests {
         pending.advance(Instant::now(), &mut sink, &events);
         assert_eq!(sink.writes, [b"hello".to_vec(), b"world".to_vec()]);
         assert!(pending.queue.is_empty());
+    }
+
+    #[test]
+    fn unpaced_transmit_precedes_control_commands_and_shutdown() {
+        #[derive(Default)]
+        struct OrderedSink(Vec<&'static str>);
+
+        impl ByteSource for OrderedSink {
+            fn read(&mut self, _buf: &mut [u8]) -> Result<usize, SourceError> {
+                Ok(0)
+            }
+
+            fn description(&self) -> String {
+                "ordered sink".into()
+            }
+
+            fn write(&mut self, _bytes: &[u8]) -> Result<(), SourceError> {
+                self.0.push("write");
+                Ok(())
+            }
+
+            fn set_dtr(&mut self, _on: bool) -> Result<(), SourceError> {
+                self.0.push("dtr");
+                Ok(())
+            }
+
+            fn set_rts(&mut self, _on: bool) -> Result<(), SourceError> {
+                self.0.push("rts");
+                Ok(())
+            }
+
+            fn send_break(&mut self) -> Result<(), SourceError> {
+                self.0.push("break");
+                Ok(())
+            }
+        }
+
+        for (queued, gap) in [(false, false), (true, false), (false, true)] {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            for command in [
+                ReaderCommand::Transmit(b"hello".to_vec(), Duration::ZERO, None),
+                ReaderCommand::SetDtr(true),
+                ReaderCommand::SetRts(true),
+                ReaderCommand::SendBreak,
+                ReaderCommand::Shutdown,
+            ] {
+                tx.send(command).unwrap();
+            }
+            let mut sink = OrderedSink::default();
+            let mut writer = None;
+            let mut framer = Framer::with_mode(crate::config::TerminalMode::default());
+            let mut pending = Batch::default();
+            let mut backlog = Backlog::default();
+            let mut transfer = None;
+            let mut transmit = PacedTransmit::default();
+            if queued {
+                transmit.enqueue(b"earlier".to_vec(), Duration::from_secs(60), None);
+            }
+            if gap {
+                transmit.next_write = Some(Instant::now() + Duration::from_secs(60));
+            }
+            let outcome = drain_commands(
+                &rx,
+                &mut sink,
+                ClearTargets {
+                    writer: &mut writer,
+                    framer: &mut framer,
+                    pending: &mut pending,
+                    backlog: &mut backlog,
+                },
+                &mut transfer,
+                &mut transmit,
+                &pacing_events(),
+            );
+            assert!(matches!(outcome, CommandOutcome::Shutdown));
+            if queued || gap {
+                assert_eq!(sink.0, ["dtr", "rts", "break"]);
+                assert_eq!(transmit.queue.len(), 1 + usize::from(queued));
+            } else {
+                assert_eq!(sink.0, ["write", "dtr", "rts", "break"]);
+                assert!(transmit.queue.is_empty());
+            }
+        }
     }
 
     #[test]
