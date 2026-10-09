@@ -658,6 +658,10 @@ impl App {
                 advanced_any = true;
                 match step {
                     MacroStep::Command { text } => {
+                        // An early reply belongs only to the command that
+                        // just completed. A later command may be unpaced if
+                        // the global setting changed while this run was sending.
+                        transmitted_raw_start = None;
                         target_exists =
                             self.send_macro_command(run.port, &text, &mut run.pending_transmit);
                         if !target_exists || run.pending_transmit.is_some() {
@@ -1293,6 +1297,51 @@ mod tests {
             }
             assert_eq!(echoed(&app), ["reboot", "status"]);
         }
+    }
+
+    #[test]
+    fn disabling_pacing_does_not_reuse_the_previous_commands_receive_start() {
+        let mut app = app_with_macro(0);
+        app.config.settings.send_delay_ms = 20;
+        app.config.macros[0].steps = vec![
+            MacroStep::Command {
+                text: "first".into(),
+            },
+            MacroStep::Command {
+                text: "second".into(),
+            },
+            MacroStep::WaitFor {
+                pattern: "READY".into(),
+            },
+            MacroStep::Command {
+                text: "third".into(),
+            },
+        ];
+        let started = Instant::now();
+        let ctx = egui::Context::default();
+        app.start_macro(0, started);
+        app.maintain_macro_runs_at(started, &ctx);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        app.macro_runs[0]
+            .pending_transmit
+            .as_mut()
+            .unwrap()
+            .0
+            .receiver = rx;
+        // The first command's reply arrives while it is still sending. The
+        // next command uses the newly disabled pacing setting.
+        app.connections[0].push_raw_bytes(b"READY");
+        app.config.settings.send_delay_ms = 0;
+        tx.send(started).unwrap();
+        app.maintain_macro_runs_at(started, &ctx);
+        app.maintain_macro_runs_at(started, &ctx);
+        assert_eq!(echoed(&app), ["first", "second"]);
+        assert!(app.macro_runs[0].wait_for.is_some());
+
+        app.connections[0].push_raw_bytes(b"READY");
+        app.maintain_macro_runs_at(started, &ctx);
+        assert_eq!(echoed(&app), ["first", "second", "third"]);
+        assert!(app.macro_runs.is_empty());
     }
 
     #[test]
