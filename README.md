@@ -150,19 +150,20 @@ Demo builds use temporary app directories, skip port discovery, disable
 updates, and do not save settings or session captures. Your regular settings
 and connections are preserved. Omit `--features demo` to run the normal app.
 
-The Ubuntu release job also builds this demo after packaging the normal app,
+The Ubuntu build job also builds this demo after packaging the normal app,
 captures its window under Xvfb with software rendering, and attaches
 `pigtail-screenshot.png` to the release on `v*` tag builds.
 To build any branch manually, open Actions → build → Run workflow and choose
-the branch. Builds without a `v*` tag upload the packages and screenshot as
+the branch. All builds upload the packages and screenshot as
 artifacts on that workflow run, with a separate artifact for each platform.
-Only `v*` tag builds create a GitHub release and publish to the APT repository.
+Only `v*` tag builds create a GitHub release, after both Linux and Windows
+builds succeed. APT publishing runs after the release succeeds.
 Pull requests also build when labeled `build` (both platforms), `build-linux`
 (Linux packages and screenshot), or `build-windows` (Windows packages).
 Adding a label starts a build; subsequent commits rebuild the selected platforms.
 PR builds upload artifacts to their workflow run.
-Rerunning a tag build preserves existing release files and uploads only missing
-assets.
+Rerunning a failed platform replaces its workflow artifacts while retaining
+successful platforms' artifacts from earlier attempts of the same run.
 
 To capture it locally on Linux, install `xvfb`, `xauth`, `xdotool`, `imagemagick`,
 and Mesa's software rendering libraries, then run:
