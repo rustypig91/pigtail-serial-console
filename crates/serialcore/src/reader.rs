@@ -802,6 +802,7 @@ struct PacedTransmit {
     queue: VecDeque<(Vec<u8>, Duration, Option<PendingCompletion>)>,
     offset: usize,
     next_write: Option<Instant>,
+    last_write: Option<Instant>,
 }
 
 impl PacedTransmit {
@@ -841,10 +842,12 @@ impl PacedTransmit {
             }
             // Schedule from the actual write, never catch up with a burst after
             // a slow read or write. Keep the gap after the final byte too.
+            let written_at = now.max(Instant::now());
+            self.last_write = Some(written_at);
             self.next_write = if delay.is_zero() {
                 None
             } else {
-                now.max(Instant::now()).checked_add(*delay)
+                written_at.checked_add(*delay)
             };
             self.offset = end;
             if end == bytes.len() {
@@ -1001,8 +1004,22 @@ fn advance_outgoing(
         let delay = transfer
             .as_ref()
             .map_or(Duration::ZERO, |active| active.global_delay);
-        if advance_transfer(transfer, source, event_tx) && !delay.is_zero() {
-            transmit.next_write = Instant::now().checked_add(delay);
+        // A file retains its starting global delay even if later typing uses
+        // a smaller setting. Its next byte must respect that delay after the
+        // latest interactive write as well as after its own previous byte.
+        if transmit.last_write.is_some_and(|written_at| {
+            written_at
+                .checked_add(delay)
+                .is_some_and(|deadline| Instant::now() < deadline)
+        }) {
+            return;
+        }
+        if advance_transfer(transfer, source, event_tx) {
+            let written_at = Instant::now();
+            transmit.last_write = Some(written_at);
+            if !delay.is_zero() {
+                transmit.next_write = written_at.checked_add(delay);
+            }
         }
     }
 }
@@ -1559,6 +1576,28 @@ mod tests {
         assert_eq!(sink.writes, [b"a".to_vec()]);
         pending.advance(pending.next_write.unwrap(), &mut sink, &events);
         assert_eq!(sink.writes.concat(), b"ab");
+    }
+
+    #[test]
+    fn active_file_keeps_its_global_gap_after_typing_delay_is_reduced() {
+        for typing_delay in [Duration::ZERO, Duration::from_millis(1)] {
+            let mut transfer = paced_file(Duration::from_secs(60));
+            let mut pending = PacedTransmit::default();
+            let mut sink = WriteSink::default();
+            let events = pacing_events();
+            pending.enqueue(b"x".to_vec(), typing_delay, None);
+            pending.advance(Instant::now(), &mut sink, &events);
+            // The current setting can be reduced while a file still retains
+            // the global delay selected when its transfer started.
+            pending.next_write = None;
+            advance_outgoing(&mut pending, &mut transfer, &mut sink, &events);
+            assert_eq!(sink.writes, [b"x".to_vec()]);
+            assert_eq!(transfer.as_ref().unwrap().sent, 0);
+            pending.last_write = Some(Instant::now() - Duration::from_secs(61));
+            advance_outgoing(&mut pending, &mut transfer, &mut sink, &events);
+            assert_eq!(sink.writes, [b"x".to_vec(), b"a".to_vec()]);
+            assert_eq!(transfer.as_ref().unwrap().sent, 1);
+        }
     }
 
     fn test_meta() -> SessionMeta {
