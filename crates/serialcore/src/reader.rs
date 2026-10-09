@@ -827,6 +827,18 @@ impl PacedTransmit {
             if self.next_write.is_some_and(|deadline| now < deadline) {
                 return;
             }
+            // A newly enabled or increased delay also applies before this
+            // batch's first byte. The preceding batch (or file write) may
+            // have left a shorter gap, so respect both sides of the boundary.
+            if !delay.is_zero()
+                && self.last_write.is_some_and(|written_at| {
+                    written_at
+                        .checked_add(*delay)
+                        .is_some_and(|deadline| now < deadline)
+                })
+            {
+                return;
+            }
             let end = if delay.is_zero() {
                 bytes.len()
             } else {
@@ -1344,6 +1356,26 @@ mod tests {
         assert_eq!(sink.writes, [b"a".to_vec()]);
         pending.advance(deadline, &mut sink, &events);
         assert_eq!(sink.writes.concat(), b"ab");
+    }
+
+    #[test]
+    fn increased_transmit_delay_applies_before_the_first_byte_of_the_next_batch() {
+        for previous_delay in [Duration::ZERO, Duration::from_millis(20)] {
+            let mut pending = PacedTransmit::default();
+            let mut sink = WriteSink::default();
+            let events = pacing_events();
+            pending.enqueue(b"a".to_vec(), previous_delay, None);
+            pending.advance(Instant::now(), &mut sink, &events);
+            let written_at = pending.last_write.unwrap();
+            let delay = Duration::from_secs(1);
+            pending.enqueue(b"bc".to_vec(), delay, None);
+            pending.advance(written_at + previous_delay, &mut sink, &events);
+            assert_eq!(sink.writes, [b"a".to_vec()]);
+            pending.advance(written_at + delay, &mut sink, &events);
+            assert_eq!(sink.writes, [b"a".to_vec(), b"b".to_vec()]);
+            pending.advance(pending.next_write.unwrap(), &mut sink, &events);
+            assert_eq!(sink.writes.concat(), b"abc");
+        }
     }
 
     #[test]
