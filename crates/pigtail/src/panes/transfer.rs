@@ -186,12 +186,7 @@ impl App {
         };
         dialog.prepare_rx = None;
         match result {
-            Ok(mut prepared) => {
-                prepared.char_delay = prepared.char_delay.max(std::time::Duration::from_millis(
-                    self.config.settings.send_delay_ms,
-                ));
-                dialog.prepared = Some(prepared);
-            }
+            Ok(prepared) => dialog.prepared = Some(prepared),
             Err(error) => dialog.prepare_error = Some(error),
         }
     }
@@ -338,7 +333,13 @@ impl App {
                     ui.label(format!(
                         "Will send {} · estimated duration {}",
                         format_bytes(prepared.total_bytes() as u64),
-                        format_duration(prepared.estimated_duration().saturating_add(wire_time))
+                        format_duration(
+                            prepared
+                                .estimated_duration_with_delay(Duration::from_millis(
+                                    self.config.settings.send_delay_ms
+                                ))
+                                .saturating_add(wire_time)
+                        )
                     ));
                 } else {
                     ui.horizontal(|ui| {
@@ -386,7 +387,7 @@ impl App {
         let Some(mut dialog) = self.file_transfer_dialog.take() else {
             return;
         };
-        let Some(mut prepared) = dialog.prepared.take() else {
+        let Some(prepared) = dialog.prepared.take() else {
             return;
         };
         let Some(conn) = self
@@ -403,10 +404,10 @@ impl App {
             sent: 0,
             total,
         });
-        prepared.char_delay = prepared.char_delay.max(std::time::Duration::from_millis(
-            self.config.settings.send_delay_ms,
-        ));
-        conn.handle.start_transfer(prepared);
+        conn.handle.start_transfer_paced(
+            prepared,
+            Duration::from_millis(self.config.settings.send_delay_ms),
+        );
     }
 
     fn show_file_transfer_progress(&mut self, ctx: &egui::Context) {

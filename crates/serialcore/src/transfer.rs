@@ -88,9 +88,19 @@ impl PreparedTransfer {
     /// intentionally omitted because flow control and driver buffering make it
     /// less predictable than the explicit delays the user selected.
     pub fn estimated_duration(&self) -> Duration {
-        duration_mul(self.char_delay, self.data.len().saturating_sub(1)).saturating_add(
-            duration_mul(self.line_delay, self.line_ends.len().saturating_sub(1)),
+        self.estimated_duration_with_delay(Duration::ZERO)
+    }
+
+    /// Include the current global pacing setting without mutating prepared data.
+    pub fn estimated_duration_with_delay(&self, delay: Duration) -> Duration {
+        duration_mul(
+            self.char_delay.max(delay),
+            self.data.len().saturating_sub(1),
         )
+        .saturating_add(duration_mul(
+            self.line_delay,
+            self.line_ends.len().saturating_sub(1),
+        ))
     }
 }
 
@@ -203,6 +213,26 @@ fn prepare_hex(input: &[u8]) -> Result<(Vec<u8>, Vec<usize>), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_delay_estimate_uses_current_setting_without_changing_preparation() {
+        let prepared = PreparedTransfer {
+            path: PathBuf::from("commands.txt"),
+            data: b"abc".to_vec(),
+            line_ends: vec![],
+            char_delay: Duration::from_millis(10),
+            line_delay: Duration::ZERO,
+        };
+        assert_eq!(
+            prepared.estimated_duration_with_delay(Duration::from_millis(100)),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            prepared.estimated_duration_with_delay(Duration::ZERO),
+            Duration::from_millis(20)
+        );
+        assert_eq!(prepared.char_delay, Duration::from_millis(10));
+    }
 
     #[test]
     fn text_normalizes_mixed_line_endings() {

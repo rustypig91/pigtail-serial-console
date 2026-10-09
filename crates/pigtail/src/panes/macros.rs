@@ -557,6 +557,7 @@ impl App {
             next_step: 0,
             next_at: now,
             wait_for: None,
+            pending_transmit: None,
         });
         true
     }
@@ -614,6 +615,27 @@ impl App {
                 continue;
             }
 
+            let mut transmitted_raw_start = None;
+            if let Some((completed, raw_start)) = &run.pending_transmit {
+                match completed.try_recv() {
+                    Ok(_) => {
+                        transmitted_raw_start = Some(*raw_start);
+                        run.pending_transmit = None;
+                        run.next_at = now;
+                        advanced_any = true;
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                        pending.push(run);
+                        continue;
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        // A failed or discarded send must not advance the macro.
+                        advanced_any = true;
+                        continue;
+                    }
+                }
+            }
+
             if let Some(wait) = &run.wait_for {
                 let matched = self
                     .connections
@@ -636,8 +658,9 @@ impl App {
                 advanced_any = true;
                 match step {
                     MacroStep::Command { text } => {
-                        target_exists = self.send_macro_command(run.port, &text);
-                        if !target_exists {
+                        target_exists =
+                            self.send_macro_command(run.port, &text, &mut run.pending_transmit);
+                        if !target_exists || run.pending_transmit.is_some() {
                             break;
                         }
                     }
@@ -670,7 +693,9 @@ impl App {
                             break;
                         };
                         let wait = MacroWait {
-                            raw_start: conn.raw_next(),
+                            raw_start: transmitted_raw_start
+                                .take()
+                                .unwrap_or_else(|| conn.raw_next()),
                             regex,
                         };
                         if wait.regex.is_match("") {
@@ -682,10 +707,10 @@ impl App {
                 }
             }
             if target_exists {
-                if run.wait_for.is_some() {
+                if run.wait_for.is_some() || run.pending_transmit.is_some() {
                     // A wait remains part of the current execution even when it
                     // is the final step. Do not complete (or begin the next
-                    // repetition) until its receive condition has matched.
+                    // repetition) until the send or receive wait has completed.
                     pending.push(run);
                 } else if run.next_step >= run.steps.len() && macro_run_will_repeat(&run) {
                     if let Some(remaining) = &mut run.repetitions_remaining {
@@ -712,7 +737,7 @@ impl App {
         if let Some(next_at) = self
             .macro_runs
             .iter()
-            .filter(|run| run.wait_for.is_none())
+            .filter(|run| run.wait_for.is_none() && run.pending_transmit.is_none())
             .map(|run| run.next_at)
             .min()
         {
@@ -738,7 +763,12 @@ impl App {
     /// suffix of the same real device line rather than a separate line. Commit
     /// the combined text here so local echo, history, and `tx_input` continue to
     /// describe the bytes that were actually sent.
-    fn send_macro_command(&mut self, port: PortId, command: &str) -> bool {
+    fn send_macro_command(
+        &mut self,
+        port: PortId,
+        command: &str,
+        pending: &mut Option<(crossbeam_channel::Receiver<Instant>, u64)>,
+    ) -> bool {
         let now = self.clock.now();
         let Some(conn) = self
             .connections
@@ -751,10 +781,15 @@ impl App {
         let mut bytes = command.as_bytes().to_vec();
         bytes.extend_from_slice(conn.port_config.line_ending.bytes());
         if !bytes.is_empty() {
-            conn.handle.transmit_paced(
-                bytes,
-                Duration::from_millis(self.config.settings.send_delay_ms),
-            );
+            let delay = Duration::from_millis(self.config.settings.send_delay_ms);
+            if delay.is_zero() {
+                conn.handle.transmit(bytes);
+            } else {
+                *pending = Some((
+                    conn.handle.transmit_paced_tracked(bytes, delay),
+                    conn.raw_next(),
+                ));
+            }
         }
         let mut line = std::mem::take(&mut conn.tx_input);
         line.push_str(command);
@@ -1183,6 +1218,94 @@ mod tests {
             .filter(|line| line.meta.flags.contains(LineFlags::TX_ECHO))
             .map(|line| line.text.to_string())
             .collect()
+    }
+
+    #[test]
+    fn paced_command_finishes_before_starting_its_delay() {
+        let mut app = app_with_macro(100);
+        app.config.settings.send_delay_ms = 20;
+        let ctx = egui::Context::default();
+        let started = Instant::now();
+        assert!(app.start_macro(0, started));
+        app.maintain_macro_runs_at(started, &ctx);
+        assert_eq!(echoed(&app), ["first"]);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        app.macro_runs[0].pending_transmit = Some((rx, 0));
+        let finished = started + Duration::from_secs(1);
+        app.maintain_macro_runs_at(finished, &ctx);
+        assert_eq!(app.macro_runs[0].next_step, 1);
+        tx.send(finished).unwrap();
+        app.maintain_macro_runs_at(finished, &ctx);
+        app.maintain_macro_runs_at(finished + Duration::from_millis(99), &ctx);
+        assert_eq!(echoed(&app), ["first"]);
+        app.maintain_macro_runs_at(finished + Duration::from_millis(100), &ctx);
+        assert_eq!(echoed(&app), ["first", "second"]);
+        assert_eq!(app.macro_runs.len(), 1, "last command is still sending");
+    }
+
+    #[test]
+    fn paced_macro_wait_retains_early_responses_and_ignores_old_output() {
+        for early_response in [false, true] {
+            let mut app = app_with_macro(100);
+            app.config.settings.send_delay_ms = 20;
+            app.config.macros[0].steps = vec![
+                MacroStep::Command {
+                    text: "reboot".into(),
+                },
+                MacroStep::WaitFor {
+                    pattern: "READY".into(),
+                },
+                MacroStep::Command {
+                    text: "status".into(),
+                },
+            ];
+            app.connections[0].push_raw_bytes(b"READY");
+            let started = Instant::now();
+            let ctx = egui::Context::default();
+            app.start_macro(0, started);
+            app.maintain_macro_runs_at(started, &ctx);
+            let raw_start = app.macro_runs[0].pending_transmit.as_ref().unwrap().1;
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            app.macro_runs[0].pending_transmit = Some((rx, raw_start));
+            if early_response {
+                app.connections[0].push_raw_bytes(b"READY");
+            }
+            tx.send(started).unwrap();
+            app.maintain_macro_runs_at(started, &ctx);
+            app.maintain_macro_runs_at(started, &ctx);
+            if !early_response {
+                assert_eq!(
+                    echoed(&app),
+                    ["reboot"],
+                    "old output cannot release the wait"
+                );
+                app.connections[0].push_raw_bytes(b"READY");
+                app.maintain_macro_runs_at(started, &ctx);
+            }
+            assert_eq!(echoed(&app), ["reboot", "status"]);
+        }
+    }
+
+    #[test]
+    fn paced_macro_does_not_repeat_or_advance_after_a_failed_send() {
+        let mut app = app_with_macro(0);
+        app.config.settings.send_delay_ms = 20;
+        app.config.macros[0].repeat_indefinitely = true;
+        app.config.macros[0].steps = vec![MacroStep::Command {
+            text: "first".into(),
+        }];
+        let started = Instant::now();
+        let ctx = egui::Context::default();
+        app.start_macro(0, started);
+        app.maintain_macro_runs_at(started, &ctx);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        app.macro_runs[0].pending_transmit = Some((rx, 0));
+        app.maintain_macro_runs_at(started + Duration::from_secs(10), &ctx);
+        assert_eq!(echoed(&app), ["first"]);
+        drop(tx);
+        app.maintain_macro_runs_at(started + Duration::from_secs(10), &ctx);
+        assert!(app.macro_runs.is_empty());
+        assert_eq!(echoed(&app), ["first"]);
     }
 
     #[test]
