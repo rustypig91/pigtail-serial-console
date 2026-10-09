@@ -230,6 +230,7 @@ pub struct ReaderHandle {
     pub events: Receiver<ReaderEvent>,
     cmd: Sender<ReaderCommand>,
     join: Option<JoinHandle<()>>,
+    pacing_used: AtomicBool,
 }
 
 impl ReaderHandle {
@@ -239,12 +240,25 @@ impl ReaderHandle {
     /// Queue bytes in order, with a minimum pause between writes of each byte.
     /// Pacing belongs to the reader so receiving and UI work remain responsive.
     pub fn transmit_paced(&self, bytes: Vec<u8>, delay: Duration) {
+        if !bytes.is_empty() && !delay.is_zero() {
+            self.pacing_used.store(true, Ordering::Relaxed);
+        }
         let _ = self.cmd.send(ReaderCommand::Transmit(bytes, delay, None));
+    }
+    /// Once pacing has been used, even zero-delay sends can wait behind queued
+    /// bytes or the gap after a previous write. Macro scheduling must track
+    /// completion from then on. Keep this conservative for the handle's lifetime
+    /// rather than racing the reader to decide whether its queue is empty.
+    pub fn has_used_pacing(&self) -> bool {
+        self.pacing_used.load(Ordering::Relaxed)
     }
     /// Notify the caller after the final byte is written. Dropping the sender
     /// without a timestamp means the batch failed or was discarded. Keeping the
     /// returned receipt alive permits sending; dropping it cancels unsent bytes.
     pub fn transmit_paced_tracked(&self, bytes: Vec<u8>, delay: Duration) -> TransmitCompletion {
+        if !bytes.is_empty() && !delay.is_zero() {
+            self.pacing_used.store(true, Ordering::Relaxed);
+        }
         let (tx, receipt) = transmit_completion();
         let _ = self
             .cmd
@@ -256,6 +270,9 @@ impl ReaderHandle {
     }
     /// Apply global pacing while keeping file-specific pauses separate from typing.
     pub fn start_transfer_paced(&self, mut transfer: PreparedTransfer, delay: Duration) {
+        if !transfer.data.is_empty() && !delay.is_zero() {
+            self.pacing_used.store(true, Ordering::Relaxed);
+        }
         transfer.char_delay = transfer.char_delay.max(delay);
         let _ = self.cmd.send(ReaderCommand::StartTransfer(transfer, delay));
     }
@@ -334,6 +351,7 @@ pub fn spawn(config: ReaderConfig, spec: SourceSpec) -> std::io::Result<ReaderHa
         events: event_rx,
         cmd: cmd_tx,
         join: Some(join),
+        pacing_used: AtomicBool::new(false),
     })
 }
 

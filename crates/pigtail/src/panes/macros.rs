@@ -788,7 +788,7 @@ impl App {
         bytes.extend_from_slice(conn.port_config.line_ending.bytes());
         if !bytes.is_empty() {
             let delay = Duration::from_millis(self.config.settings.send_delay_ms);
-            if delay.is_zero() {
+            if delay.is_zero() && !conn.handle.has_used_pacing() {
                 conn.handle.transmit(bytes);
             } else {
                 *pending = Some((
@@ -1227,6 +1227,53 @@ mod tests {
     }
 
     #[test]
+    fn unpaced_macro_waits_for_queued_paced_output_before_starting_its_delay() {
+        for file_transfer in [false, true] {
+            let mut app = app_with_macro(100);
+            // Output queued with the previous setting can still pace a macro
+            // after the user disables the global delay.
+            if file_transfer {
+                app.connections[0].handle.start_transfer_paced(
+                    serialcore::transfer::PreparedTransfer {
+                        path: "paced.txt".into(),
+                        data: b"ab".to_vec(),
+                        line_ends: vec![],
+                        line_delay: Duration::ZERO,
+                        char_delay: Duration::ZERO,
+                    },
+                    Duration::from_secs(60),
+                );
+            } else {
+                app.connections[0]
+                    .handle
+                    .transmit_paced(b"typed".to_vec(), Duration::from_secs(60));
+            }
+            let ctx = egui::Context::default();
+            let started = Instant::now();
+            app.start_macro(0, started);
+            app.maintain_macro_runs_at(started, &ctx);
+            assert_eq!(echoed(&app), ["first"]);
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            app.macro_runs[0]
+                .pending_transmit
+                .as_mut()
+                .expect("unpaced command must track completion behind paced output")
+                .0
+                .receiver = rx;
+            let finished = started + Duration::from_secs(120);
+            app.maintain_macro_runs_at(finished, &ctx);
+            assert_eq!(echoed(&app), ["first"]);
+            tx.send(finished).unwrap();
+            app.maintain_macro_runs_at(finished, &ctx);
+            app.maintain_macro_runs_at(finished + Duration::from_millis(99), &ctx);
+            assert_eq!(echoed(&app), ["first"]);
+            app.maintain_macro_runs_at(finished + Duration::from_millis(100), &ctx);
+            assert_eq!(echoed(&app), ["first", "second"]);
+            assert!(app.macro_runs[0].pending_transmit.is_some());
+        }
+    }
+
+    #[test]
     fn paced_command_finishes_before_starting_its_delay() {
         let mut app = app_with_macro(100);
         app.config.settings.send_delay_ms = 20;
@@ -1339,13 +1386,32 @@ mod tests {
         app.config.settings.send_delay_ms = 0;
         tx.send(started).unwrap();
         app.maintain_macro_runs_at(started, &ctx);
-        app.maintain_macro_runs_at(started, &ctx);
         assert_eq!(echoed(&app), ["first", "second"]);
+        assert!(app.macro_runs[0].wait_for.is_none());
+        let (second_tx, second_rx) = crossbeam_channel::bounded(1);
+        app.macro_runs[0]
+            .pending_transmit
+            .as_mut()
+            .expect("second command can still wait behind the first command's gap")
+            .0
+            .receiver = second_rx;
+        second_tx.send(started).unwrap();
+        app.maintain_macro_runs_at(started, &ctx);
+        app.maintain_macro_runs_at(started, &ctx);
         assert!(app.macro_runs[0].wait_for.is_some());
 
         app.connections[0].push_raw_bytes(b"READY");
         app.maintain_macro_runs_at(started, &ctx);
         assert_eq!(echoed(&app), ["first", "second", "third"]);
+        let (third_tx, third_rx) = crossbeam_channel::bounded(1);
+        app.macro_runs[0]
+            .pending_transmit
+            .as_mut()
+            .unwrap()
+            .0
+            .receiver = third_rx;
+        third_tx.send(started).unwrap();
+        app.maintain_macro_runs_at(started, &ctx);
         assert!(app.macro_runs.is_empty());
     }
 
