@@ -666,7 +666,16 @@ fn run(
                     // Flush and exit.
                     framer.flush_final(&mut pending.lines);
                     flush_batch(&mut pending, &mut backlog, &event_tx, &framer, clock.now());
-                    finish_backlog(&mut backlog, &event_tx);
+                    finish_backlog(
+                        &cmd_rx,
+                        ClearTargets {
+                            writer: &mut writer,
+                            framer: &mut framer,
+                            pending: &mut pending,
+                            backlog: &mut backlog,
+                        },
+                        &event_tx,
+                    );
                     if let Some(w) = &mut writer {
                         let _ = w.flush();
                     }
@@ -747,9 +756,22 @@ fn run(
         // still presenting itself as the live one.
         framer.flush_final(&mut pending.lines);
         flush_batch(&mut pending, &mut backlog, &event_tx, &framer, clock.now());
-        finish_backlog(&mut backlog, &event_tx);
+        let shutdown = finish_backlog(
+            &cmd_rx,
+            ClearTargets {
+                writer: &mut writer,
+                framer: &mut framer,
+                pending: &mut pending,
+                backlog: &mut backlog,
+            },
+            &event_tx,
+        );
         if let Some(w) = &mut writer {
             let _ = w.flush();
+        }
+        if shutdown {
+            event_tx.send(ReaderEvent::State(ConnState::Closed));
+            break 'outer;
         }
         event_tx.send(ReaderEvent::connection_error(connection_error));
 
@@ -1270,18 +1292,67 @@ fn drain_backlog(backlog: &mut Backlog, event_tx: &EventTx) {
 /// Once reading has stopped, deliver every retained batch before announcing
 /// the stream boundary. A nonblocking drain can leave unsent data behind at
 /// EOF or put old data after reconnect events. Blocking here cannot delay
-/// active reads; ReaderHandle's shutdown drains the channel while joining.
-fn finish_backlog(backlog: &mut Backlog, event_tx: &EventTx) {
-    if let Some(at) = backlog.dropped.at {
-        event_tx.send(ReaderEvent::OutputDropped {
-            raw_bytes: backlog.dropped.raw_bytes,
-            line_updates: backlog.dropped.line_updates,
-            at,
-        });
-        backlog.dropped = DroppedOutput::default();
-    }
-    while let Some(queued) = backlog.pop_front() {
-        event_tx.send(ReaderEvent::Batch(queued.batch));
+/// active reads. Continue accepting commands while waiting for channel space:
+/// a clear must still discard these bytes and truncate their capture at EOF.
+/// Returns whether shutdown was requested before delivery completed.
+fn finish_backlog(
+    cmd_rx: &Receiver<ReaderCommand>,
+    targets: ClearTargets<'_>,
+    event_tx: &EventTx,
+) -> bool {
+    let ClearTargets {
+        writer,
+        framer,
+        pending,
+        backlog,
+    } = targets;
+    loop {
+        let event = if let Some(at) = backlog.dropped.at {
+            let event = ReaderEvent::OutputDropped {
+                raw_bytes: backlog.dropped.raw_bytes,
+                line_updates: backlog.dropped.line_updates,
+                at,
+            };
+            backlog.dropped = DroppedOutput::default();
+            event
+        } else if let Some(queued) = backlog.pop_front() {
+            ReaderEvent::Batch(queued.batch)
+        } else {
+            return false;
+        };
+        loop {
+            // Prefer commands already waiting over sending another old batch.
+            crossbeam_channel::select_biased! {
+                recv(cmd_rx) -> command => {
+                    let Ok(command) = command else { return true; };
+                    let cleared = matches!(command, ReaderCommand::ClearLog);
+                    if handle_disconnected_command(
+                        command,
+                        ClearTargets {
+                            writer: &mut *writer,
+                            framer: &mut *framer,
+                            pending: &mut *pending,
+                            backlog: &mut *backlog,
+                        },
+                        event_tx,
+                    ) {
+                        return true;
+                    }
+                    if cleared {
+                        // The event removed above also belongs to the clear.
+                        break;
+                    }
+                }
+                send(event_tx.tx, event) -> result => {
+                    if result.is_err() {
+                        backlog.clear();
+                        return true;
+                    }
+                    event_tx.wake.signal();
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -1293,41 +1364,51 @@ fn wait_or_shutdown(
     event_tx: &EventTx,
 ) -> bool {
     match cmd_rx.recv_timeout(dur) {
-        Ok(ReaderCommand::Shutdown) => true,
+        Ok(command) => handle_disconnected_command(command, targets, event_tx),
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => false,
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => true,
+    }
+}
+
+fn handle_disconnected_command(
+    command: ReaderCommand,
+    targets: ClearTargets<'_>,
+    event_tx: &EventTx,
+) -> bool {
+    match command {
+        ReaderCommand::Shutdown => true,
         // Handled even while disconnected: the capture is still on disk, and a
         // console cleared during an outage must not have its history reappear
         // as preloaded output on the next launch.
-        Ok(ReaderCommand::ClearLog) => {
+        ReaderCommand::ClearLog => {
             clear_log(targets, event_tx);
             false
         }
         // Nothing to write to while disconnected, and staying here until
         // reconnect would just delay input the user typed against a stale
         // idea of the link. Report it instead of silently eating it.
-        Ok(ReaderCommand::Transmit(_, _, _)) => {
+        ReaderCommand::Transmit(_, _, _) => {
             report_dropped_command(event_tx, "transmit");
             false
         }
-        Ok(ReaderCommand::StartTransfer(_, _)) => {
+        ReaderCommand::StartTransfer(_, _) => {
             report_dropped_command(event_tx, "file transfer");
             event_tx.send(ReaderEvent::TransferEnded);
             false
         }
-        Ok(ReaderCommand::CancelTransfer) => false,
-        Ok(ReaderCommand::SetDtr(_)) => {
+        ReaderCommand::CancelTransfer => false,
+        ReaderCommand::SetDtr(_) => {
             report_dropped_command(event_tx, "dtr");
             false
         }
-        Ok(ReaderCommand::SetRts(_)) => {
+        ReaderCommand::SetRts(_) => {
             report_dropped_command(event_tx, "rts");
             false
         }
-        Ok(ReaderCommand::SendBreak) => {
+        ReaderCommand::SendBreak => {
             report_dropped_command(event_tx, "break");
             false
         }
-        Err(crossbeam_channel::RecvTimeoutError::Timeout) => false,
-        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => true,
     }
 }
 
@@ -1907,6 +1988,57 @@ mod tests {
             assert_eq!(lines, READ_BUF);
             handle.shutdown();
         }
+    }
+
+    #[test]
+    fn clearing_while_eof_is_draining_discards_backlog_and_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let (eof, eof_rx) = crossbeam_channel::bounded(1);
+        let src = NotifyingSource {
+            source: ScriptedSource::new(vec![(vec![b'\n'; READ_BUF], Duration::ZERO)])
+                .eof_when_done(),
+            eof,
+        };
+        let config = ReaderConfig {
+            port_id: PortId(0),
+            clock: SessionClock::new(),
+            session_dir: Some(dir.path().to_path_buf()),
+            meta: test_meta(),
+            terminal: crate::config::TerminalMode::Classic,
+            wake: Wake::none(),
+        };
+        let handle = spawn(config, SourceSpec::OneShot(Box::new(src))).unwrap();
+        eof_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        handle.clear_log();
+        // Mimic clearing the UI's snapshot of already queued output.
+        for _ in 0..handle.events.len() {
+            handle.events.try_recv().unwrap();
+        }
+        let mut remaining_raw = 0;
+        loop {
+            match handle.events.recv_timeout(Duration::from_secs(5)).unwrap() {
+                ReaderEvent::Batch(batch) => remaining_raw += batch.raw.len(),
+                ReaderEvent::State(ConnState::Closed) => break,
+                _ => {}
+            }
+        }
+        handle.shutdown();
+        let capture = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "bin"))
+            .unwrap();
+        assert!(
+            crate::session::read_tail_records(&capture, READ_BUF)
+                .unwrap()
+                .is_empty(),
+            "clear must truncate the capture even while EOF is draining"
+        );
+        assert!(crate::session::read_meta(&capture).unwrap().cleared);
+        assert!(
+            remaining_raw <= BATCH_MAX_RAW,
+            "cleared backlog must not reappear"
+        );
     }
 
     #[test]

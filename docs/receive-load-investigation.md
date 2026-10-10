@@ -10,6 +10,10 @@ implemented; the diagnostic tests remain available for comparison.
   heap each: at most 8 MiB of queued batch allocations per port. The separate
   backlog retains its 8 MiB limit and ordered dropped-output notices. Channel
   slots, allocator overhead and the UI's current batch are additional.
+- After disconnect or EOF, retained batches finish before the stream boundary.
+  This final drain still accepts clear and shutdown commands while waiting for
+  channel space. Clearing then drops the backlog and truncates the capture,
+  instead of replaying cleared output or leaving its on-disk bytes intact.
 - Reads are framed in 1 KiB pieces. Batches flush at 256 KiB allocated heap,
   at 64 KiB raw input, or before exceeding 4,000 line updates. A defensive
   admission check drops oversized batches with a gap notice. Capture writes

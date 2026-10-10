@@ -3523,9 +3523,9 @@ impl App {
     /// every port (that is what the window is showing) and a single tab clears
     /// itself.
     ///
-    /// Bytes already in flight (read but not yet drained from the reader
-    /// channel) still land afterwards. That's a line or two at most, and they
-    /// are output that arrived after the click.
+    /// Discard output already owned by the UI and ask the reader to discard
+    /// its backlog. Bytes concurrently handed to the channel can still arrive
+    /// before the reader processes the clear command.
     pub fn clear_console(&mut self, port: Option<PortId>) {
         let targets: Vec<usize> = match port {
             Some(id) => self
