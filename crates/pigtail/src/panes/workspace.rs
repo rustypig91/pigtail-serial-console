@@ -501,6 +501,7 @@ impl App {
         self.workspace.resizing = false;
         if let Some(direction) = self.workspace.split {
             egui::TopBottomPanel::top("workspace_toolbar")
+                .default_height(super::chrome::HEADER_HEIGHT + 6.0)
                 .frame(
                     egui::Frame::none()
                         .fill(super::chrome::header_fill(

@@ -38,6 +38,17 @@ impl App {
                         }
                         ui.end_row();
 
+                        ui.label("Header opacity");
+                        let mut opacity = (f32::from(self.config.settings.header_opacity) * 100.0 / 255.0).round();
+                        if ui.add(egui::Slider::new(&mut opacity, 0.0..=100.0).suffix("%").integer())
+                            .on_hover_text("Opacity of the active tab and lower toolbar/search area. 100% is fully opaque.")
+                            .changed()
+                        {
+                            self.config.settings.header_opacity = (opacity * 255.0 / 100.0).round() as u8;
+                            changed = true;
+                        }
+                        ui.end_row();
+
                         ui.label("Console text size");
                         changed |= ui
                             .add(
@@ -57,6 +68,13 @@ impl App {
                                 "Off: a long line runs past the right edge and is clipped",
                             )
                             .changed();
+                        ui.end_row();
+                        ui.label("");
+                        if ui.button("Reset to defaults").on_hover_text("Reset all Appearance settings").clicked() {
+                            reset_appearance(&mut self.config.settings);
+                            ctx.set_visuals(super::app_visuals(self.config.settings.theme != "light"));
+                            changed = true;
+                        }
                         ui.end_row();
                         });
                         ui.add_space(10.0);
@@ -260,6 +278,14 @@ impl App {
     }
 }
 
+fn reset_appearance(settings: &mut serialcore::config::Settings) {
+    let defaults = serialcore::config::Settings::default();
+    settings.theme = defaults.theme;
+    settings.header_opacity = defaults.header_opacity;
+    settings.console_font_size = defaults.console_font_size;
+    settings.wrap_lines = defaults.wrap_lines;
+}
+
 fn settings_section(
     ui: &mut egui::Ui,
     title: &str,
@@ -297,6 +323,27 @@ fn format_bytes(bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use crate::app::tests::test_app;
+
+    #[test]
+    fn appearance_reset_preserves_other_settings() {
+        let mut settings = serialcore::config::Settings {
+            theme: "light".into(),
+            header_opacity: 0,
+            console_font_size: 20,
+            wrap_lines: false,
+            send_delay_ms: 123,
+            max_lines: 50_000,
+            ..Default::default()
+        };
+        super::reset_appearance(&mut settings);
+        let defaults = serialcore::config::Settings::default();
+        assert_eq!(settings.theme, defaults.theme);
+        assert_eq!(settings.header_opacity, 224);
+        assert_eq!(settings.console_font_size, defaults.console_font_size);
+        assert_eq!(settings.wrap_lines, defaults.wrap_lines);
+        assert_eq!(settings.send_delay_ms, 123);
+        assert_eq!(settings.max_lines, 50_000);
+    }
 
     #[test]
     fn failed_retention_preview_keeps_the_saved_setting() {

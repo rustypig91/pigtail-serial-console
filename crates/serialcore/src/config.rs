@@ -365,37 +365,95 @@ fn default_vt_scrollback_rows() -> usize {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     /// Minimum pause between outgoing serial bytes (0 disables pacing).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub send_delay_ms: u64,
     /// Retained rendered VT scrollback rows per connection.
-    #[serde(default = "default_vt_scrollback_rows")]
+    #[serde(
+        default = "default_vt_scrollback_rows",
+        skip_serializing_if = "is_default_vt_scrollback_rows"
+    )]
     pub vt_scrollback_rows: usize,
     /// Ask before disconnecting and closing a connection tab.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub confirm_tab_close: bool,
-    #[serde(default = "default_max_lines")]
+    #[serde(
+        default = "default_max_lines",
+        skip_serializing_if = "is_default_max_lines"
+    )]
     pub max_lines: usize,
     /// Point size of the console's monospace text (see the bounds above).
-    #[serde(default = "default_console_font_size")]
+    #[serde(
+        default = "default_console_font_size",
+        skip_serializing_if = "is_default_console_font_size"
+    )]
     pub console_font_size: u8,
+    /// Opacity of the active tab and lower header (0 transparent, 255 opaque).
+    #[serde(
+        default = "default_header_opacity",
+        skip_serializing_if = "is_default_header_opacity"
+    )]
+    pub header_opacity: u8,
     /// Fold a line too long for the window onto further rows instead of letting
     /// it run off the right edge.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub wrap_lines: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub timestamp_format: TimestampFormat,
-    #[serde(default = "default_retention")]
+    #[serde(
+        default = "default_retention",
+        skip_serializing_if = "is_default_retention"
+    )]
     pub session_retention_days: u32,
-    #[serde(default = "default_theme")]
+    #[serde(default = "default_theme", skip_serializing_if = "is_default_theme")]
     pub theme: String,
     /// Ask GitHub for a newer release at startup. This is pigtail's only
     /// outbound network request; off means it makes none.
-    #[serde(default = "default_check_updates")]
+    #[serde(
+        default = "default_check_updates",
+        skip_serializing_if = "is_default_check_updates"
+    )]
     pub check_updates: bool,
     /// A release the user chose to skip, which silences the startup notice until
     /// something newer than this is published.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped_version: Option<String>,
+}
+
+// Saved settings contain only overrides; missing fields use the current defaults.
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+
+fn is_true(value: &bool) -> bool {
+    *value == default_true()
+}
+
+fn is_default_vt_scrollback_rows(value: &usize) -> bool {
+    *value == default_vt_scrollback_rows()
+}
+
+fn is_default_max_lines(value: &usize) -> bool {
+    *value == default_max_lines()
+}
+
+fn is_default_console_font_size(value: &u8) -> bool {
+    *value == default_console_font_size()
+}
+
+fn is_default_header_opacity(value: &u8) -> bool {
+    *value == default_header_opacity()
+}
+
+fn is_default_retention(value: &u32) -> bool {
+    *value == default_retention()
+}
+
+fn is_default_theme(value: &String) -> bool {
+    *value == default_theme()
+}
+
+fn is_default_check_updates(value: &bool) -> bool {
+    *value == default_check_updates()
 }
 
 impl Default for Settings {
@@ -406,6 +464,7 @@ impl Default for Settings {
             confirm_tab_close: true,
             max_lines: default_max_lines(),
             console_font_size: default_console_font_size(),
+            header_opacity: default_header_opacity(),
             wrap_lines: true,
             timestamp_format: TimestampFormat::default(),
             session_retention_days: default_retention(),
@@ -606,7 +665,7 @@ pub struct SavedSplit {
 /// Top-level config, matching the TOML layout in spec §7.14.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub settings: Settings,
     /// Global highlight rules applied to every connection (spec §7.9).
     #[serde(default)]
@@ -696,6 +755,11 @@ fn default_true() -> bool {
 fn default_max_lines() -> usize {
     1_000_000
 }
+fn default_header_opacity() -> u8 {
+    // 88%, rounded to the nearest alpha byte.
+    224
+}
+
 /// Matches egui's own monospace text style, so an existing install looks
 /// unchanged until the size is touched.
 fn default_console_font_size() -> u8 {
@@ -836,6 +900,96 @@ enabled = true
         settings.confirm_tab_close = false;
         let back: Settings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
         assert!(!back.confirm_tab_close);
+    }
+
+    #[test]
+    fn default_settings_are_omitted() {
+        assert!(toml::to_string(&Settings::default()).unwrap().is_empty());
+        let config = Config::default();
+        let saved = config.to_toml().unwrap();
+        let table: toml::Table = toml::from_str(&saved).unwrap();
+        assert!(!table.contains_key("settings"));
+        assert_eq!(Config::from_toml(&saved).unwrap(), config);
+    }
+
+    #[test]
+    fn every_setting_override_round_trips_and_reset_removes_it() {
+        let overrides: toml::Table = toml::from_str(
+            r#"
+            send_delay_ms = 123
+            vt_scrollback_rows = 123
+            confirm_tab_close = false
+            max_lines = 123
+            console_font_size = 20
+            header_opacity = 0
+            wrap_lines = false
+            timestamp_format = "none"
+            session_retention_days = 123
+            theme = "light"
+            check_updates = false
+            skipped_version = "2.0.0"
+        "#,
+        )
+        .unwrap();
+        for (key, value) in overrides {
+            let mut input = toml::Table::new();
+            input.insert(key.clone(), value);
+            let settings: Settings = toml::from_str(&toml::to_string(&input).unwrap()).unwrap();
+            let saved = toml::to_string(&settings).unwrap();
+            let saved_table: toml::Table = toml::from_str(&saved).unwrap();
+            assert_eq!(saved_table, input, "only {key} should be saved");
+            assert_eq!(toml::from_str::<Settings>(&saved).unwrap(), settings);
+            let mut config = Config {
+                settings,
+                ..Default::default()
+            };
+            config.settings = Settings::default();
+            let reset: toml::Table = toml::from_str(&config.to_toml().unwrap()).unwrap();
+            assert!(!reset.contains_key("settings"), "reset must remove {key}");
+        }
+    }
+
+    #[test]
+    fn existing_explicit_defaults_are_removed_on_save() {
+        let defaults = Settings::default();
+        let mut table = toml::Table::new();
+        macro_rules! insert_defaults {
+            ($($field:ident),+ $(,)?) => {
+                $(table.insert(stringify!($field).into(),
+                    toml::Value::try_from(&defaults.$field).unwrap());)+
+            };
+        }
+        insert_defaults!(
+            send_delay_ms,
+            vt_scrollback_rows,
+            confirm_tab_close,
+            max_lines,
+            console_font_size,
+            header_opacity,
+            wrap_lines,
+            timestamp_format,
+            session_retention_days,
+            theme,
+            check_updates
+        );
+        let legacy = toml::to_string(&table).unwrap();
+        let loaded: Settings = toml::from_str(&legacy).unwrap();
+        assert_eq!(loaded, defaults);
+        assert!(toml::to_string(&loaded).unwrap().is_empty());
+    }
+
+    #[test]
+    fn header_opacity_defaults_and_round_trips() {
+        let settings: Settings = toml::from_str("").unwrap();
+        assert_eq!(settings.header_opacity, 224);
+        for opacity in [0, 128, 225, 255] {
+            let settings = Settings {
+                header_opacity: opacity,
+                ..Default::default()
+            };
+            let restored: Settings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(restored.header_opacity, opacity);
+        }
     }
 
     #[test]
