@@ -653,6 +653,41 @@ mod tests {
         store::{IncomingLine, LineFlags, PortId},
     };
 
+    #[test]
+    fn search_keeps_focus_when_toolbar_changes_rows() {
+        for merged in [false, true] {
+            let (mut app, _tx) = test_app("search-toolbar-resize");
+            add_connection(&mut app, 1);
+            if merged {
+                app.create_merged_tab(vec![PortId(1)]);
+            }
+            app.show_search = true;
+            app.search_focus_request = true;
+            let ctx = egui::Context::default();
+            frame(&mut app, &ctx, egui::vec2(1200.0, 600.0), vec![]);
+            frame(&mut app, &ctx, egui::vec2(1200.0, 600.0), vec![]);
+            let focused = ctx.memory(|m| m.focused());
+            assert!(focused.is_some());
+            for width in [700.0, 1200.0] {
+                frame(&mut app, &ctx, egui::vec2(width, 600.0), vec![]);
+                frame(&mut app, &ctx, egui::vec2(width, 600.0), vec![]);
+                assert_eq!(ctx.memory(|m| m.focused()), focused);
+                frame(
+                    &mut app,
+                    &ctx,
+                    egui::vec2(width, 600.0),
+                    vec![egui::Event::Text("needle".into())],
+                );
+            }
+            let query = if merged {
+                &app.merged_search_query
+            } else {
+                &app.connections[0].search_query
+            };
+            assert_eq!(query, "needleneedle");
+        }
+    }
+
     fn add_connection(app: &mut App, number: u32) {
         let id = PortId(number);
         let mut conn = app.make_connection(

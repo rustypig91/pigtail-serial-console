@@ -939,11 +939,13 @@ impl App {
         let mut prev = false;
         let mut close = false;
         let mut focus = std::mem::take(&mut self.search_focus_request);
+        // The toolbar can move search between rows as the window resizes.
+        // Keep its identity tied to the pane rather than the layout's parent UI.
+        let search_id = self.pane_widget_id("search_query");
         ui.horizontal(|ui| {
             let show_count = ui.available_width() >= 360.0;
             let reserved = if show_count { 234.0 } else { 204.0 };
             let conn = &mut self.connections[active];
-            let search_id = ui.make_persistent_id("search_query");
             if select_query {
                 select_search_query(ui.ctx(), search_id, &conn.search_query);
             }
@@ -1082,10 +1084,10 @@ impl App {
         let mut prev = false;
         let mut close = false;
         let mut focus = std::mem::take(&mut self.search_focus_request);
+        let search_id = self.pane_widget_id("search_query");
         ui.horizontal(|ui| {
             let show_count = ui.available_width() >= 360.0;
             let reserved = if show_count { 234.0 } else { 204.0 };
-            let search_id = ui.make_persistent_id("search_query");
             if select_query {
                 select_search_query(ui.ctx(), search_id, &self.merged_search_query);
             }

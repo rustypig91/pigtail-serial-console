@@ -202,7 +202,11 @@ pub(super) fn drag_window(ui: &mut Ui) {
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
     }
-    if response.drag_started_by(egui::PointerButton::Primary) {
+    // Native window dragging must start on the press, before egui's
+    // click-and-drag motion threshold (and never again while moving).
+    if response.is_pointer_button_down_on()
+        && ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary))
+    {
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
     }
     response.on_hover_text("Drag to move · Double-click to maximize");
@@ -743,6 +747,40 @@ pub(super) fn modal_header(ui: &mut Ui, title: &str, open: &mut bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_drag_starts_on_primary_press_without_waiting_for_motion() {
+        let ctx = egui::Context::default();
+        let render = |events| {
+            ctx.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::TopBottomPanel::top("drag_header").show(ctx, drag_window);
+                },
+            )
+        };
+        render(vec![]);
+        let pos = egui::pos2(100.0, 15.0);
+        let output = render(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::StartDrag));
+        let output = render(vec![egui::Event::PointerMoved(pos + Vec2::new(20.0, 0.0))]);
+        assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::StartDrag));
+    }
 
     #[test]
     fn window_buttons_use_the_native_close_minimize_and_maximize_commands() {
