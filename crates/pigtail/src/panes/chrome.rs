@@ -15,16 +15,20 @@ pub(super) fn header_style(ui: &mut Ui) {
         .min(((HEADER_HEIGHT - 20.0) / 2.0).max(0.0));
 }
 
-/// The tab strip blends with terminal text beneath it; the toolbar and active
-/// tab share an opaque surface so they join without a seam. The footer uses
-/// the same surface color.
+/// Opaque surfaces for the tab strip and footer.
 pub(super) fn header_fill(dark: bool, toolbar: bool) -> Color32 {
     match (dark, toolbar) {
-        (true, false) => Color32::from_rgba_unmultiplied(15, 20, 27, 225),
+        (true, false) => Color32::from_rgb(15, 20, 27),
         (true, true) => Color32::from_rgb(32, 41, 52),
-        (false, false) => Color32::from_rgba_unmultiplied(235, 239, 245, 225),
+        (false, false) => Color32::from_rgb(235, 239, 245),
         (false, true) => Color32::from_rgb(248, 250, 253),
     }
+}
+
+/// The lower header lets console text show through behind the toolbar/search.
+pub(super) fn toolbar_fill(dark: bool, opacity: u8) -> Color32 {
+    let surface = header_fill(dark, true);
+    Color32::from_rgba_unmultiplied(surface.r(), surface.g(), surface.b(), opacity)
 }
 
 /// A paint slot underneath the header. The console populates it later in the
@@ -72,7 +76,8 @@ pub(super) fn device_tab(
     label: &str,
     selected: bool,
     status: Color32,
-) -> (Response, bool) {
+    opacity: u8,
+) -> (Response, bool, Rect) {
     let label_color = if selected {
         ui.visuals().text_color()
     } else {
@@ -106,7 +111,7 @@ pub(super) fn device_tab(
         )
     });
     let fill = if selected {
-        header_fill(ui.visuals().dark_mode, true)
+        toolbar_fill(ui.visuals().dark_mode, opacity)
     } else if !ui.visuals().dark_mode {
         if response.hovered() {
             Color32::from_rgb(229, 235, 243)
@@ -148,7 +153,11 @@ pub(super) fn device_tab(
             Stroke::new(1.1_f32, color),
         );
     }
-    (response, close.on_hover_text("Close tab").clicked())
+    (
+        response,
+        close.on_hover_text("Close tab").clicked(),
+        rect.intersect(ui.clip_rect()),
+    )
 }
 
 pub(super) fn window_controls(ui: &mut Ui) -> [Response; 3] {

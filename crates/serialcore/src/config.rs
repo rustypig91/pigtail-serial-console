@@ -378,6 +378,9 @@ pub struct Settings {
     /// Point size of the console's monospace text (see the bounds above).
     #[serde(default = "default_console_font_size")]
     pub console_font_size: u8,
+    /// Opacity of the active tab and lower header (0 transparent, 255 opaque).
+    #[serde(default = "default_header_opacity")]
+    pub header_opacity: u8,
     /// Fold a line too long for the window onto further rows instead of letting
     /// it run off the right edge.
     #[serde(default = "default_true")]
@@ -406,6 +409,7 @@ impl Default for Settings {
             confirm_tab_close: true,
             max_lines: default_max_lines(),
             console_font_size: default_console_font_size(),
+            header_opacity: default_header_opacity(),
             wrap_lines: true,
             timestamp_format: TimestampFormat::default(),
             session_retention_days: default_retention(),
@@ -696,6 +700,11 @@ fn default_true() -> bool {
 fn default_max_lines() -> usize {
     1_000_000
 }
+fn default_header_opacity() -> u8 {
+    // 88%, rounded to the nearest alpha byte.
+    224
+}
+
 /// Matches egui's own monospace text style, so an existing install looks
 /// unchanged until the size is touched.
 fn default_console_font_size() -> u8 {
@@ -836,6 +845,20 @@ enabled = true
         settings.confirm_tab_close = false;
         let back: Settings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
         assert!(!back.confirm_tab_close);
+    }
+
+    #[test]
+    fn header_opacity_defaults_and_round_trips() {
+        let settings: Settings = toml::from_str("").unwrap();
+        assert_eq!(settings.header_opacity, 224);
+        for opacity in [0, 128, 225, 255] {
+            let settings = Settings {
+                header_opacity: opacity,
+                ..Default::default()
+            };
+            let restored: Settings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(restored.header_opacity, opacity);
+        }
     }
 
     #[test]
