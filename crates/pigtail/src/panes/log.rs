@@ -2741,7 +2741,10 @@ fn row_slot(
 // Labels normally skip painting outside the viewport. Retained rows above it
 // still need their markers in the header backdrop, just like their text.
 fn paint_row_label(ui: &mut egui::Ui, text: egui::RichText) {
-    let (pos, galley, _) = egui::Label::new(text).layout_in_ui(ui);
+    let (pos, galley, response) = egui::Label::new(text).layout_in_ui(ui);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), galley.text())
+    });
     ui.painter().galley(pos, galley, ui.visuals().text_color());
 }
 

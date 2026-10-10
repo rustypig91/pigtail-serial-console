@@ -218,7 +218,10 @@ mod tests {
         let executable = executable.canonicalize().unwrap();
         let files = format!("/.\n/usr/share/doc/pigtail\n{}\n", executable.display());
         assert!(debian_package_owns(&executable, &files));
-        assert!(!debian_package_owns(&directory.path().join("portable"), &files));
+        assert!(!debian_package_owns(
+            &directory.path().join("portable"),
+            &files
+        ));
         assert!(!debian_package_owns(&executable, ""));
         #[cfg(unix)]
         {
