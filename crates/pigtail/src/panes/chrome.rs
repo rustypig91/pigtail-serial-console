@@ -372,14 +372,28 @@ impl App {
         }
         // Hover must also work on the first frame after the pointer enters
         // the window or its bounds change, before widget hit tests settle.
-        if let Some((direction, cursor)) = hovered_target {
+        if let Some((_, cursor)) = hovered_target {
             ctx.set_cursor_icon(cursor);
-            // Widget hit tests use the previous frame's rectangles. Use the
-            // current bounds for the initiating press too, so resizing works
-            // immediately after a window size change or on its first frame.
-            if ctx.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary)) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
-            }
+        }
+        // Use the press event's position: subsequent motion in the same frame
+        // can move the pointer into or out of an edge. Hit-test current bounds
+        // so presses also work immediately after a window size change.
+        let pressed_target = ctx.input(|input| {
+            input.events.iter().find_map(|event| match event {
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    ..
+                } => targets
+                    .iter()
+                    .find(|(target, _, _)| target.contains(*pos))
+                    .map(|(_, direction, _)| *direction),
+                _ => None,
+            })
+        });
+        if let Some(direction) = pressed_target {
+            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
         }
     }
 }
@@ -1094,6 +1108,42 @@ mod tests {
                     .iter()
                     .any(|command| matches!(command, egui::ViewportCommand::Maximized(_))));
             }
+        }
+    }
+
+    #[test]
+    fn resize_uses_press_position_before_batched_pointer_motion() {
+        let edge = Pos2::new(6.0, 200.0);
+        let content = Pos2::new(350.0, 200.0);
+        for (press, motion, expected) in [(edge, content, true), (content, edge, false)] {
+            let (app, _tx) = crate::app::tests::test_app("resize-batched-motion");
+            let ctx = egui::Context::default();
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 400.0))),
+                    events: vec![
+                        egui::Event::PointerMoved(press),
+                        egui::Event::PointerButton {
+                            pos: press,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                        egui::Event::PointerMoved(motion),
+                    ],
+                    ..Default::default()
+                },
+                |ctx| app.show_window_resize(ctx),
+            );
+            assert_eq!(
+                output.viewport_output[&egui::ViewportId::ROOT]
+                    .commands
+                    .contains(&egui::ViewportCommand::BeginResize(
+                        egui::ResizeDirection::West
+                    )),
+                expected,
+                "press={press:?}, motion={motion:?}"
+            );
         }
     }
 
