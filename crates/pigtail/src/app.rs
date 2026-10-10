@@ -103,22 +103,34 @@ pub struct CompiledHighlight {
     pub color: egui::Color32,
 }
 
-/// Compile a search exactly as both indexing and row highlighting understand
-/// it. An invalid regex is treated as literal text, preserving the search
-/// bar's existing forgiving behaviour.
-pub(crate) fn compile_search(query: &str, case_sensitive: bool) -> Option<regex::Regex> {
+/// Compile the selected search mode consistently for indexing and highlighting.
+pub(crate) fn search_pattern(
+    query: &str,
+    case_sensitive: bool,
+    regex_mode: bool,
+) -> Result<Option<regex::Regex>, regex::Error> {
     if query.is_empty() {
-        return None;
+        return Ok(None);
     }
-    regex::RegexBuilder::new(query)
+    let pattern = if regex_mode {
+        query.to_owned()
+    } else {
+        regex::escape(query)
+    };
+    regex::RegexBuilder::new(&pattern)
         .case_insensitive(!case_sensitive)
         .build()
-        .or_else(|_| {
-            regex::RegexBuilder::new(&regex::escape(query))
-                .case_insensitive(!case_sensitive)
-                .build()
-        })
+        .map(Some)
+}
+
+pub(crate) fn compile_search(
+    query: &str,
+    case_sensitive: bool,
+    regex_mode: bool,
+) -> Option<regex::Regex> {
+    search_pattern(query, case_sensitive, regex_mode)
         .ok()
+        .flatten()
 }
 
 /// One entry in the timestamp-interleaved merged view.
@@ -519,6 +531,7 @@ pub struct Connection {
     // Search (spec §7.8).
     pub search_query: String,
     pub search_case_sensitive: bool,
+    pub search_regex: bool,
     pub search_matches: Vec<u64>,
     pub search_pos: Option<usize>,
     pub search_dirty: bool,
@@ -1371,6 +1384,7 @@ struct MergedTabState {
     /// merged key so navigation can identify both the port and its line.
     pub merged_search_query: String,
     pub merged_search_case_sensitive: bool,
+    pub merged_search_regex: bool,
     pub merged_search_matches: Vec<MergedEntry>,
     pub merged_search_pos: Option<usize>,
     pub merged_search_dirty: bool,
@@ -1411,6 +1425,7 @@ impl Default for MergedTabState {
             merged_filter_upto_seq: 0,
             merged_search_query: String::new(),
             merged_search_case_sensitive: false,
+            merged_search_regex: false,
             merged_search_matches: Vec::new(),
             merged_search_pos: None,
             merged_search_dirty: true,
@@ -1462,6 +1477,7 @@ impl MergedTabState {
             &mut app.merged_filter_upto_seq,
         );
         std::mem::swap(&mut self.merged_search_query, &mut app.merged_search_query);
+        std::mem::swap(&mut self.merged_search_regex, &mut app.merged_search_regex);
         std::mem::swap(
             &mut self.merged_search_case_sensitive,
             &mut app.merged_search_case_sensitive,
@@ -1560,6 +1576,7 @@ pub struct App {
     /// merged key so navigation can identify both the port and its line.
     pub merged_search_query: String,
     pub merged_search_case_sensitive: bool,
+    pub merged_search_regex: bool,
     pub merged_search_matches: Vec<MergedEntry>,
     pub merged_search_pos: Option<usize>,
     pub merged_search_dirty: bool,
@@ -1688,6 +1705,7 @@ impl App {
             merged_filter_upto_seq: 0,
             merged_search_query: String::new(),
             merged_search_case_sensitive: false,
+            merged_search_regex: false,
             merged_search_matches: Vec::new(),
             merged_search_pos: None,
             merged_search_dirty: true,
@@ -1735,14 +1753,12 @@ impl App {
 
     pub fn new(cc: &eframe::CreationContext<'_>, paths: AppPaths, config: Config) -> App {
         cc.egui_ctx.set_fonts(app_font_definitions());
+        cc.egui_ctx
+            .style_mut(|style| style.spacing.menu_margin = egui::Margin::same(8.0));
 
         // Theme from settings.
         let dark = config.settings.theme != "light";
-        cc.egui_ctx.set_visuals(if dark {
-            egui::Visuals::dark()
-        } else {
-            egui::Visuals::light()
-        });
+        cc.egui_ctx.set_visuals(crate::panes::app_visuals(dark));
 
         // The wake every background thread gets: an idle UI schedules no frames
         // of its own, so a repaint request is the only thing that brings it back.
@@ -2440,6 +2456,7 @@ impl App {
             filter_errors: Vec::new(),
             search_query: String::new(),
             search_case_sensitive: false,
+            search_regex: false,
             search_matches: Vec::new(),
             search_pos: None,
             search_dirty: false,
@@ -2783,7 +2800,14 @@ impl App {
             conn.search_tested_upto = conn.store.next_abs_index();
             return;
         }
-        let Some(re) = compile_search(&conn.search_query, conn.search_case_sensitive) else {
+        let Some(re) = compile_search(
+            &conn.search_query,
+            conn.search_case_sensitive,
+            conn.search_regex,
+        ) else {
+            conn.search_matches.clear();
+            conn.search_pos = None;
+            conn.scroll_to = None;
             return;
         };
 
@@ -3246,8 +3270,7 @@ impl App {
     }
 
     /// Maintain search matches over exactly what the merged view displays.
-    /// Like the per-port search, regex errors fall back to a literal search.
-    fn maintain_merged_search(&mut self, any_data: bool) {
+    pub(crate) fn maintain_merged_search(&mut self, any_data: bool) {
         let source_generation = self.merged_view_generation();
         if self.merged_search_query.is_empty() {
             self.merged_search_matches.clear();
@@ -3257,8 +3280,14 @@ impl App {
             self.merged_search_upto_seq = self.merged_seq;
             return;
         }
-        let Some(re) = compile_search(&self.merged_search_query, self.merged_search_case_sensitive)
-        else {
+        let Some(re) = compile_search(
+            &self.merged_search_query,
+            self.merged_search_case_sensitive,
+            self.merged_search_regex,
+        ) else {
+            self.merged_search_matches.clear();
+            self.merged_search_pos = None;
+            self.merged_scroll_to = None;
             return;
         };
 
@@ -3520,6 +3549,7 @@ impl App {
                 conn.terminal.screen(),
                 &conn.search_query,
                 conn.search_case_sensitive,
+                conn.search_regex,
             );
             conn.screen_search.step(dir);
             return;
@@ -3580,6 +3610,7 @@ impl eframe::App for App {
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
+        self.consume_app_shortcuts(ctx);
         self.prepare_workspace(ctx);
         self.poll_file_drop(ctx);
         self.close_window_on_escape(ctx);
@@ -3614,8 +3645,8 @@ impl eframe::App for App {
         }
         self.maintain_search();
 
-        // Minimal chrome: a header of tabs on top, a status footer at the
-        // bottom, and the console filling everything in between. Tool panels are
+        // Tabs and console actions share the custom window header; the console
+        // fills the remaining space. Tool panels are
         // floating windows toggled from the console's right-click menu.
         // Claim a console-owned Tab before any focusable widgets see the frame.
         // Otherwise egui can focus a header control, and a batched Enter/Space
@@ -3785,23 +3816,31 @@ pub(crate) mod tests {
             1 << 20,
         );
         let conn = &mut app.connections[0];
-        conn.screen_search
-            .refresh(conn.terminal.screen(), "old session|new session", true);
+        conn.screen_search.refresh(
+            conn.terminal.screen(),
+            "old session|new session",
+            true,
+            true,
+        );
         assert_eq!(conn.screen_search.matches.len(), 2);
         assert_eq!(
             conn.raw_ring.iter().copied().collect::<Vec<_>>(),
             [first.as_slice(), second.as_slice()].concat()
         );
         conn.push_raw_bytes(b"\x1b[2J\x1b[Hlive");
-        conn.screen_search
-            .refresh(conn.terminal.screen(), "old session|new session|live", true);
+        conn.screen_search.refresh(
+            conn.terminal.screen(),
+            "old session|new session|live",
+            true,
+            true,
+        );
         assert_eq!(
             conn.screen_search.matches.len(),
             3,
             "live redraw must preserve replayed history"
         );
         conn.screen_search
-            .refresh(conn.terminal.screen(), "previous session", true);
+            .refresh(conn.terminal.screen(), "previous session", true, true);
         assert_eq!(conn.screen_search.matches.len(), 2);
 
         // Persist a clear, then simulate another launch from the same files.
@@ -3826,6 +3865,7 @@ pub(crate) mod tests {
         reopened.screen_search.refresh(
             reopened.terminal.screen(),
             "old session|new session|after clear|unrelated",
+            true,
             true,
         );
         assert_eq!(reopened.screen_search.matches.len(), 1);
@@ -4435,6 +4475,7 @@ pub(crate) mod tests {
             vec![PortId(1), PortId(2)]
         );
         app.merged_search_query = "first".into();
+        app.merged_search_regex = true;
         app.merged_search_case_sensitive = true;
         app.merged_follow = false;
         app.merged_tx_port = Some(PortId(2));
@@ -4450,6 +4491,7 @@ pub(crate) mod tests {
         app.merged_search_query = "second".into();
         app.select_merged_tab(0);
         assert_eq!(app.merged_search_query, "first");
+        assert!(app.merged_search_regex);
         assert!(app.merged_search_case_sensitive);
         assert!(!app.merged_follow);
         assert_eq!(app.merged_tx_port, Some(PortId(2)));
@@ -4461,6 +4503,7 @@ pub(crate) mod tests {
         assert_eq!(app.connections[2].store.len(), 1);
         app.select_merged_tab(1);
         assert_eq!(app.merged_search_query, "second");
+        assert!(!app.merged_search_regex);
         assert_eq!(app.merged.len(), 1);
         assert_eq!(app.merged[0].port, PortId(3));
         app.close_merged_tab(0);
@@ -4745,11 +4788,55 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn search_case_sensitivity_also_applies_to_literal_fallback() {
-        let insensitive = compile_search("[A", false).unwrap();
+    fn search_modes_and_invalid_regex_clear_matches_in_single_and_merged_views() {
+        let (mut app, _enum_tx) = test_app("search-modes");
+        add_merged_test_connection(
+            &mut app,
+            PortId(1),
+            "probe",
+            &[
+                ("v1", 1, LineFlags::default()),
+                ("v.", 2, LineFlags::default()),
+                ("[", 3, LineFlags::default()),
+            ],
+        );
+        app.maintain_merged();
+        for (query, regex_mode, expected) in [
+            ("v.", false, vec![1]),
+            ("v.", true, vec![0, 1]),
+            ("[", true, vec![]),
+            ("[", false, vec![2]),
+        ] {
+            app.connections[0].search_query = query.into();
+            app.connections[0].search_regex = regex_mode;
+            app.connections[0].search_dirty = true;
+            app.maintain_search();
+            assert_eq!(app.connections[0].search_matches, expected);
+            app.merged_search_query = query.into();
+            app.merged_search_regex = regex_mode;
+            app.merged_search_dirty = true;
+            app.maintain_merged_search(false);
+            assert_eq!(
+                app.merged_search_matches
+                    .iter()
+                    .map(|entry| entry.abs)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            if query == "[" && regex_mode {
+                assert!(search_pattern(query, false, true).is_err());
+                assert!(app.connections[0].search_pos.is_none());
+                assert!(app.merged_search_pos.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn plain_search_honors_case_and_treats_metacharacters_literally() {
+        let insensitive = compile_search("[A", false, false).unwrap();
         assert!(insensitive.is_match("prefix [a suffix"));
 
-        let sensitive = compile_search("[A", true).unwrap();
+        let sensitive = compile_search("[A", true, false).unwrap();
         assert!(sensitive.is_match("prefix [A suffix"));
         assert!(!sensitive.is_match("prefix [a suffix"));
     }

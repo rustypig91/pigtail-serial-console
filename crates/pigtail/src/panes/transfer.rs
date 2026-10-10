@@ -216,7 +216,9 @@ impl App {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .frame(super::chrome::dialog_frame(ctx))
             .show(ctx, |ui| {
+                super::chrome::dialog_style(ui);
                 egui::Grid::new("file_transfer_details")
                     .num_columns(2)
                     .spacing([16.0, 5.0])
@@ -239,6 +241,7 @@ impl App {
                     egui::ComboBox::from_id_salt("file_transfer_mode")
                         .selected_text(dialog.options.mode.label())
                         .show_ui(ui, |ui| {
+                            super::chrome::popup_style(ui);
                             for mode in [TransferMode::Raw, TransferMode::Text, TransferMode::Hex] {
                                 options_changed |= ui
                                     .selectable_value(&mut dialog.options.mode, mode, mode.label())
@@ -252,6 +255,7 @@ impl App {
                         egui::ComboBox::from_id_salt("file_transfer_line_ending")
                             .selected_text(dialog.options.line_ending.label())
                             .show_ui(ui, |ui| {
+                                super::chrome::popup_style(ui);
                                 for ending in [
                                     LineEnding::None,
                                     LineEnding::Lf,
@@ -273,6 +277,7 @@ impl App {
                         egui::ComboBox::from_id_salt("file_transfer_decoding")
                             .selected_text(dialog.options.text_decoding.label())
                             .show_ui(ui, |ui| {
+                                super::chrome::popup_style(ui);
                                 for decoding in [
                                     TextDecoding::Utf8Strict,
                                     TextDecoding::Utf8Lossy,
@@ -436,7 +441,9 @@ impl App {
             .collapsible(false)
             .resizable(false)
             .default_pos(egui::pos2(20.0, 70.0))
+            .frame(super::chrome::dialog_frame(ctx))
             .show(ctx, |ui| {
+                super::chrome::dialog_style(ui);
                 ui.label(format!("{file_name} → {device}"));
                 ui.add(egui::ProgressBar::new(fraction).text(text));
                 if ui.button("Cancel transfer").clicked() {

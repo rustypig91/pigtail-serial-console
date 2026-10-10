@@ -56,6 +56,7 @@ fn main() -> anyhow::Result<()> {
             [1100.0, 720.0]
         })
         .with_min_inner_size([700.0, 400.0])
+        .with_decorations(false)
         .with_title(concat!(
             "Rusty's Pigtail - Serial Terminal v",
             env!("CARGO_PKG_VERSION")

@@ -37,6 +37,39 @@ fn surrender_search_focus_on_close(
     }
 }
 
+fn search_query_field(
+    ui: &mut egui::Ui,
+    query: &mut String,
+    id: egui::Id,
+    regex: bool,
+    width: f32,
+) -> egui::Response {
+    let margin = egui::vec2(8.0, 6.0);
+    let width = width.min((ui.available_width() - 2.0 * margin.x).max(24.0));
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let height = (ui.fonts(|fonts| fonts.row_height(&font)) + 2.0 * margin.y)
+        .max(ui.spacing().interact_size.y);
+    let (_, rect) = ui.allocate_space(egui::vec2(width + 2.0 * margin.x, height));
+    // egui 0.30 allocates the full galley width even for clipped single-line
+    // edits. Keep that extra allocation in a child so it cannot move controls.
+    let mut field_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    field_ui.add(
+        egui::TextEdit::singleline(query)
+            .id(id)
+            .hint_text(if regex {
+                "Search regex…"
+            } else {
+                "Search text…"
+            })
+            .margin(margin)
+            .desired_width(width),
+    )
+}
+
 /// One run of bytes as the hex view lays it out: the 16-byte rows it still has
 /// resident, and the boundary that closes it.
 struct HexSegment {
@@ -154,6 +187,7 @@ struct MenuAction {
     open_filters: bool,
     open_highlight: bool,
     open_extract: bool,
+    open_macros: bool,
     toggle_search: bool,
     set_mark: bool,
     /// Line the mark goes on: whichever row the menu was opened over, or `None`
@@ -711,13 +745,22 @@ impl App {
                 return false;
             }
             if target == self.search_target() && !text.is_empty() {
-                let query = regex::escape(&text);
                 if self.merged_selected {
+                    let query = if self.merged_search_regex {
+                        regex::escape(&text)
+                    } else {
+                        text.clone()
+                    };
                     self.merged_search_query = query;
                     self.merged_search_dirty = true;
                     self.merged_search_pos = None;
                     return true;
                 } else if let Some(conn) = self.connections.get_mut(self.active) {
+                    let query = if conn.search_regex {
+                        regex::escape(&text)
+                    } else {
+                        text
+                    };
                     conn.search_query = query;
                     conn.search_dirty = true;
                     conn.search_pos = None;
@@ -739,7 +782,11 @@ impl App {
         parent: Option<&mut egui::Ui>,
     ) {
         let input_enabled = self.pane_input_enabled();
-        let select_query = input_enabled && self.seed_search_from_selection(ctx);
+        if input_enabled && !self.show_search {
+            // Selection context menus also consume captured text, even when
+            // the header search field is hidden.
+            self.seed_search_from_selection(ctx);
+        }
         let mut menu = MenuAction {
             macro_editor_open: self.macro_editor.is_some(),
             ..Default::default()
@@ -804,23 +851,14 @@ impl App {
             let active = self.active.min(self.connections.len().saturating_sub(1));
             self.active = active;
 
-            // Optional search bar pinned to the top of the console.
-            if self.show_search {
-                egui::TopBottomPanel::top(self.pane_widget_id("search_bar"))
-                    .show_separator_line(false)
-                    .show_inside(ui, |ui| {
-                        // Search status labels must not join a console drag.
-                        ui.style_mut().interaction.selectable_labels = false;
-                        if self.merged_selected {
-                            self.show_merged_search_bar(ui, select_query);
-                        } else {
-                            self.show_search_bar(ui, active, select_query);
-                        }
-                    });
-            }
-
-            // The console body fills the remaining space. The send prompt is now
-            // an inline REPL row at the end of the single-connection view.
+            // Render a small continuation of scrollback above the viewport,
+            // with input still clipped below the controls. Paint it into the
+            // reserved slot so header widgets are always drawn on top.
+            let backdrop =
+                super::chrome::HeaderBackdrop::current(ctx, self.pane_widget_id("header_backdrop"));
+            let layer = ui.layer_id();
+            let start =
+                ctx.graphics(|graphics| graphics.get(layer).map_or(0, |list| list.next_idx().0));
             if self.merged_selected {
                 self.show_merged_rows(ui, &mut menu);
             } else if self.connections[active].screen_view {
@@ -829,6 +867,39 @@ impl App {
                 self.show_hex_rows(ui, active, &mut menu);
             } else {
                 self.show_single_rows(ui, active, &mut menu);
+            }
+            if let Some(backdrop) = backdrop {
+                let mut shapes = ctx.graphics(|graphics| {
+                    graphics
+                        .get(layer)
+                        .map(|list| {
+                            list.all_entries()
+                                .skip(start)
+                                .filter(|entry| {
+                                    matches!(
+                                        entry.shape,
+                                        egui::Shape::Text(_) | egui::Shape::Rect(_)
+                                    ) && entry
+                                        .shape
+                                        .visual_bounding_rect()
+                                        .intersects(backdrop.rect)
+                                })
+                                .map(|entry| entry.shape.clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                });
+                shapes.insert(
+                    0,
+                    egui::Shape::rect_filled(backdrop.rect, 0.0, ui.visuals().panel_fill),
+                );
+                ctx.graphics_mut(|graphics| {
+                    graphics.entry(backdrop.painter.layer_id()).set(
+                        backdrop.slot,
+                        backdrop.rect,
+                        egui::Shape::Vec(shapes),
+                    )
+                });
             }
         };
         if let Some(ui) = parent {
@@ -879,36 +950,83 @@ impl App {
         }
     }
 
+    pub(crate) fn show_header_search(&mut self, ui: &mut egui::Ui) {
+        if !self.show_search {
+            return;
+        }
+        let select_query = self.pane_input_enabled() && self.seed_search_from_selection(ui.ctx());
+        ui.style_mut().interaction.selectable_labels = false;
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().interact_size = egui::vec2(26.0, 28.0);
+        ui.spacing_mut().button_padding = egui::vec2(6.0, 4.0);
+        if self.merged_selected {
+            self.show_merged_search_bar(ui, select_query);
+        } else if let Some(active) = self.active_index() {
+            self.show_search_bar(ui, active, select_query);
+        }
+    }
+
     fn show_search_bar(&mut self, ui: &mut egui::Ui, active: usize, select_query: bool) {
-        let input_enabled = self.pane_input_enabled();
+        // A modal can remove text-field focus this frame. Its Escape/Enter
+        // must not be consumed by the search field's lost-focus handler.
+        let input_enabled = self.pane_input_enabled() && !self.keyboard_overlay_open(ui.ctx());
         let mut next = false;
         let mut prev = false;
         let mut close = false;
         let mut focus = std::mem::take(&mut self.search_focus_request);
+        // The toolbar can move search between rows as the window resizes.
+        // Keep its identity tied to the pane rather than the layout's parent UI.
+        let search_id = self.pane_widget_id("search_query");
         ui.horizontal_wrapped(|ui| {
-            ui.label("🔍");
+            let show_count = ui.available_width() >= 360.0;
+            let reserved = if show_count { 234.0 } else { 204.0 };
             let conn = &mut self.connections[active];
-            let search_id = ui.make_persistent_id("search_query");
             if select_query {
                 select_search_query(ui.ctx(), search_id, &conn.search_query);
             }
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut conn.search_query)
-                    .id(search_id)
-                    .hint_text("search (regex)…")
-                    .desired_width((ui.available_width() - 160.0).clamp(80.0, 240.0)),
+            let resp = search_query_field(
+                ui,
+                &mut conn.search_query,
+                search_id,
+                conn.search_regex,
+                (ui.available_width() - reserved).clamp(40.0, 320.0),
             );
             if resp.changed() {
                 conn.search_dirty = true;
                 conn.search_pos = None;
             }
             if ui
-                .checkbox(&mut conn.search_case_sensitive, "case")
-                .on_hover_text("Match uppercase and lowercase exactly")
-                .changed()
+                .selectable_label(conn.search_regex, ".*")
+                .on_hover_text("Regular expression search · Off searches plain text")
+                .clicked()
             {
+                conn.search_regex = !conn.search_regex;
                 conn.search_dirty = true;
                 conn.search_pos = None;
+            }
+            if ui
+                .selectable_label(conn.search_case_sensitive, "Aa")
+                .on_hover_text("Match uppercase and lowercase exactly")
+                .clicked()
+            {
+                conn.search_case_sensitive = !conn.search_case_sensitive;
+                conn.search_dirty = true;
+                conn.search_pos = None;
+            }
+            let error = crate::app::search_pattern(
+                &conn.search_query,
+                conn.search_case_sensitive,
+                conn.search_regex,
+            )
+            .err();
+            if let Some(error) = &error {
+                ui.painter().rect_stroke(
+                    resp.rect,
+                    5.0,
+                    egui::Stroke::new(1.0_f32, ui.visuals().warn_fg_color),
+                );
+                resp.clone()
+                    .on_hover_text(format!("Invalid regex\n{error}"));
             }
             // Focus only when explicitly requested (opening), not every frame —
             // otherwise the search box would keep grabbing focus.
@@ -932,33 +1050,52 @@ impl App {
                     close = true;
                 }
             }
-            if ui.small_button("Prev").clicked() {
+            if ui
+                .add_enabled_ui(error.is_none(), |ui| {
+                    super::chrome::search_control(ui, super::chrome::SearchControl::Previous)
+                })
+                .inner
+                .clicked()
+            {
                 prev = true;
             }
-            if ui.small_button("Next").clicked() {
+            if ui
+                .add_enabled_ui(error.is_none(), |ui| {
+                    super::chrome::search_control(ui, super::chrome::SearchControl::Next)
+                })
+                .inner
+                .clicked()
+            {
                 next = true;
             }
-            if conn.screen_view {
+            if let Some(error) = &error {
+                super::chrome::search_warning(ui, &error.to_string());
+            } else if conn.screen_view {
                 conn.screen_search.refresh(
                     conn.terminal.screen(),
                     &conn.search_query,
                     conn.search_case_sensitive,
+                    conn.search_regex,
                 );
                 let n = conn.screen_search.position.map_or(0, |p| p + 1);
-                ui.weak(format!(
-                    "{n}/{} in VT history",
-                    conn.screen_search.matches.len()
-                ));
-            } else if !conn.search_matches.is_empty() {
+                if show_count {
+                    ui.weak(format!("{n}/{}", conn.screen_search.matches.len()))
+                        .on_hover_text("Matches in VT history");
+                }
+            } else if show_count && !conn.search_matches.is_empty() {
                 let n = conn.search_pos.map(|p| p + 1).unwrap_or(0);
                 ui.weak(format!("{n}/{}", conn.search_matches.len()));
             }
-            let close_button = ui.small_button("Close");
+            let close_button =
+                super::chrome::search_control(ui, super::chrome::SearchControl::Close);
             if close_button.clicked() {
                 close = true;
             }
             surrender_search_focus_on_close(&resp, &close_button, close);
         });
+        if next || prev {
+            self.maintain_search();
+        }
         if next {
             self.search_step(1);
         }
@@ -973,34 +1110,63 @@ impl App {
     }
 
     fn show_merged_search_bar(&mut self, ui: &mut egui::Ui, select_query: bool) {
-        let input_enabled = self.pane_input_enabled();
+        // A modal can remove text-field focus this frame. Its Escape/Enter
+        // must not be consumed by the search field's lost-focus handler.
+        let input_enabled = self.pane_input_enabled() && !self.keyboard_overlay_open(ui.ctx());
         let mut next = false;
         let mut prev = false;
         let mut close = false;
         let mut focus = std::mem::take(&mut self.search_focus_request);
+        let search_id = self.pane_widget_id("search_query");
         ui.horizontal_wrapped(|ui| {
-            ui.label("🔍");
-            let search_id = ui.make_persistent_id("search_query");
+            let show_count = ui.available_width() >= 360.0;
+            let reserved = if show_count { 234.0 } else { 204.0 };
             if select_query {
                 select_search_query(ui.ctx(), search_id, &self.merged_search_query);
             }
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.merged_search_query)
-                    .id(search_id)
-                    .hint_text("search merged view (regex)…")
-                    .desired_width((ui.available_width() - 160.0).clamp(80.0, 240.0)),
+            let resp = search_query_field(
+                ui,
+                &mut self.merged_search_query,
+                search_id,
+                self.merged_search_regex,
+                (ui.available_width() - reserved).clamp(40.0, 320.0),
             );
             if resp.changed() {
                 self.merged_search_dirty = true;
                 self.merged_search_pos = None;
             }
             if ui
-                .checkbox(&mut self.merged_search_case_sensitive, "case")
-                .on_hover_text("Match uppercase and lowercase exactly")
-                .changed()
+                .selectable_label(self.merged_search_regex, ".*")
+                .on_hover_text("Regular expression search · Off searches plain text")
+                .clicked()
             {
+                self.merged_search_regex = !self.merged_search_regex;
                 self.merged_search_dirty = true;
                 self.merged_search_pos = None;
+            }
+            if ui
+                .selectable_label(self.merged_search_case_sensitive, "Aa")
+                .on_hover_text("Match uppercase and lowercase exactly")
+                .clicked()
+            {
+                self.merged_search_case_sensitive = !self.merged_search_case_sensitive;
+                self.merged_search_dirty = true;
+                self.merged_search_pos = None;
+            }
+            let error = crate::app::search_pattern(
+                &self.merged_search_query,
+                self.merged_search_case_sensitive,
+                self.merged_search_regex,
+            )
+            .err();
+            if let Some(error) = &error {
+                ui.painter().rect_stroke(
+                    resp.rect,
+                    5.0,
+                    egui::Stroke::new(1.0_f32, ui.visuals().warn_fg_color),
+                );
+                resp.clone()
+                    .on_hover_text(format!("Invalid regex\n{error}"));
             }
             if focus {
                 resp.request_focus();
@@ -1018,22 +1184,40 @@ impl App {
                     close = true;
                 }
             }
-            if ui.small_button("Prev").clicked() {
+            if ui
+                .add_enabled_ui(error.is_none(), |ui| {
+                    super::chrome::search_control(ui, super::chrome::SearchControl::Previous)
+                })
+                .inner
+                .clicked()
+            {
                 prev = true;
             }
-            if ui.small_button("Next").clicked() {
+            if ui
+                .add_enabled_ui(error.is_none(), |ui| {
+                    super::chrome::search_control(ui, super::chrome::SearchControl::Next)
+                })
+                .inner
+                .clicked()
+            {
                 next = true;
             }
-            if !self.merged_search_matches.is_empty() {
+            if let Some(error) = &error {
+                super::chrome::search_warning(ui, &error.to_string());
+            } else if show_count && !self.merged_search_matches.is_empty() {
                 let n = self.merged_search_pos.map(|p| p + 1).unwrap_or(0);
                 ui.weak(format!("{n}/{}", self.merged_search_matches.len()));
             }
-            let close_button = ui.small_button("Close");
+            let close_button =
+                super::chrome::search_control(ui, super::chrome::SearchControl::Close);
             if close_button.clicked() {
                 close = true;
             }
             surrender_search_focus_on_close(&resp, &close_button, close);
         });
+        if next || prev {
+            self.maintain_merged_search(false);
+        }
         if next {
             self.search_step(1);
         }
@@ -1048,6 +1232,13 @@ impl App {
     }
 
     fn show_single_rows(&mut self, ui: &mut egui::Ui, active: usize, menu: &mut MenuAction) {
+        let header_height = super::chrome::HeaderBackdrop::current(
+            ui.ctx(),
+            self.pane_widget_id("header_backdrop"),
+        )
+        .map_or(0.0, |backdrop| {
+            (ui.max_rect().top() - backdrop.rect.top()).max(0.0)
+        });
         let pointer_scroll = !self.workspace.resizing && user_scrolled(ui);
         let (pages, lines) = self.consume_scroll_shortcut(ui.ctx());
         let ts_format = self.config.settings.timestamp_format;
@@ -1100,7 +1291,11 @@ impl App {
             .iter()
             .all(|r| !r.enabled || r.pattern.is_empty());
 
-        let search_re = compile_search(&conn.search_query, conn.search_case_sensitive);
+        let search_re = compile_search(
+            &conn.search_query,
+            conn.search_case_sensitive,
+            conn.search_regex,
+        );
         let cur_match_abs = conn
             .search_pos
             .and_then(|p| conn.search_matches.get(p))
@@ -1227,7 +1422,8 @@ impl App {
             area = area.vertical_scroll_offset(bottom);
         }
 
-        let output = area.show_viewport(ui, |ui, viewport| {
+        let output = area.show_viewport(ui, |ui, mut viewport| {
+            viewport.min.y = (viewport.min.y - header_height).max(0.0);
             ui.set_width(ui.available_width());
             ui.set_height(n_rows as f32 * row_height);
             let (first_entry, mut rect) =
@@ -1311,14 +1507,24 @@ impl App {
     }
 
     fn show_merged_rows(&mut self, ui: &mut egui::Ui, menu: &mut MenuAction) {
+        let header_height = super::chrome::HeaderBackdrop::current(
+            ui.ctx(),
+            self.pane_widget_id("header_backdrop"),
+        )
+        .map_or(0.0, |backdrop| {
+            (ui.max_rect().top() - backdrop.rect.top()).max(0.0)
+        });
         let pointer_scroll = !self.workspace.resizing && user_scrolled(ui);
         let (pages, lines) = self.consume_scroll_shortcut(ui.ctx());
         let ts_format = self.config.settings.timestamp_format;
         let filter_active = self.merged_filter_active();
         let view_generation = self.merged_view_generation();
         let goto = self.merged_scroll_to.take();
-        let search_re =
-            compile_search(&self.merged_search_query, self.merged_search_case_sensitive);
+        let search_re = compile_search(
+            &self.merged_search_query,
+            self.merged_search_case_sensitive,
+            self.merged_search_regex,
+        );
         let cur_match_seq = self
             .merged_search_pos
             .and_then(|pos| self.merged_search_matches.get(pos))
@@ -1441,7 +1647,8 @@ impl App {
             let bottom = ((n_rows as f32) * row_height - view_h).max(0.0);
             area = area.vertical_scroll_offset(bottom);
         }
-        let output = area.show_viewport(ui, |ui, viewport| {
+        let output = area.show_viewport(ui, |ui, mut viewport| {
+            viewport.min.y = (viewport.min.y - header_height).max(0.0);
             ui.set_width(ui.available_width());
             ui.set_height(n_rows as f32 * row_height);
             let (first_entry, mut rect) = viewport_entries(ui, viewport, merged_wrap, row_height);
@@ -1518,6 +1725,13 @@ impl App {
     }
 
     fn show_hex_rows(&mut self, ui: &mut egui::Ui, active: usize, menu: &mut MenuAction) {
+        let header_height = super::chrome::HeaderBackdrop::current(
+            ui.ctx(),
+            self.pane_widget_id("header_backdrop"),
+        )
+        .map_or(0.0, |backdrop| {
+            (ui.max_rect().top() - backdrop.rect.top()).max(0.0)
+        });
         let pointer_scroll = !self.workspace.resizing && user_scrolled(ui);
         let (pages, lines) = self.consume_scroll_shortcut(ui.ctx());
         let ts_format = self.config.settings.timestamp_format;
@@ -1584,94 +1798,103 @@ impl App {
             let bottom = ((rows as f32) * row_height - view_h).max(0.0);
             area = area.vertical_scroll_offset(bottom);
         }
-        let output = area.show_rows(ui, row_height, rows, |ui, row_range| {
-            let conn = &self.connections[active];
-            ui.set_width(ui.available_width());
-            for row in row_range {
-                let Some(item) = hex_row(&segments, row) else {
-                    continue;
-                };
-                // Full-width interactive row so the right-click menu works
-                // over hex content, not just empty margins. The id is keyed on
-                // `row` (a stable byte offset) rather than egui's default
-                // per-frame allocation-order id, so the row keeps its identity
-                // — and thus its open context menu — as the pinned view
-                // scrolls a different row into this same screen slot every
-                // time new bytes arrive.
-                let row_id = ui.id().with(("hex_row", active, row));
-                let (text, color) = match item {
-                    HexRow::Boundary(label) => (format!("── {label} ──"), BOUNDARY_COLOR),
-                    HexRow::Bytes { origin, end, row } => {
-                        let offset = row * 16;
-                        let mut hex = String::with_capacity(48);
-                        let mut ascii = String::with_capacity(16);
-                        for col in 0..16 {
-                            // Addressed from the run's own origin, so a byte
-                            // belonging to the run below — or one already
-                            // evicted from the front — leaves a hole rather
-                            // than being pulled into this dump.
-                            let abs = origin + (offset + col) as u64;
-                            let byte = if abs >= conn.raw_base && abs < end {
-                                conn.raw_ring.get((abs - conn.raw_base) as usize).copied()
-                            } else {
-                                None
-                            };
-                            match byte {
-                                Some(b) => {
-                                    hex.push_str(&format!("{b:02X} "));
-                                    ascii.push(if (0x20..0x7f).contains(&b) {
-                                        b as char
-                                    } else {
-                                        '.'
-                                    });
-                                }
-                                None => {
-                                    hex.push_str("   ");
-                                    ascii.push(' ');
+        let output = show_rows_with_header(
+            area,
+            ui,
+            row_height,
+            rows,
+            header_height,
+            |ui, row_range| {
+                let conn = &self.connections[active];
+                ui.set_width(ui.available_width());
+                for row in row_range {
+                    let Some(item) = hex_row(&segments, row) else {
+                        continue;
+                    };
+                    // Full-width interactive row so the right-click menu works
+                    // over hex content, not just empty margins. The id is keyed on
+                    // `row` (a stable byte offset) rather than egui's default
+                    // per-frame allocation-order id, so the row keeps its identity
+                    // — and thus its open context menu — as the pinned view
+                    // scrolls a different row into this same screen slot every
+                    // time new bytes arrive.
+                    let row_id = ui.id().with(("hex_row", active, row));
+                    let (text, color) = match item {
+                        HexRow::Boundary(label) => (format!("── {label} ──"), BOUNDARY_COLOR),
+                        HexRow::Bytes { origin, end, row } => {
+                            let offset = row * 16;
+                            let mut hex = String::with_capacity(48);
+                            let mut ascii = String::with_capacity(16);
+                            for col in 0..16 {
+                                // Addressed from the run's own origin, so a byte
+                                // belonging to the run below — or one already
+                                // evicted from the front — leaves a hole rather
+                                // than being pulled into this dump.
+                                let abs = origin + (offset + col) as u64;
+                                let byte = if abs >= conn.raw_base && abs < end {
+                                    conn.raw_ring.get((abs - conn.raw_base) as usize).copied()
+                                } else {
+                                    None
+                                };
+                                match byte {
+                                    Some(b) => {
+                                        hex.push_str(&format!("{b:02X} "));
+                                        ascii.push(if (0x20..0x7f).contains(&b) {
+                                            b as char
+                                        } else {
+                                            '.'
+                                        });
+                                    }
+                                    None => {
+                                        hex.push_str("   ");
+                                        ascii.push(' ');
+                                    }
                                 }
                             }
+                            (
+                                format!("{offset:08X}  {hex} |{ascii}|"),
+                                ui.visuals().strong_text_color(),
+                            )
                         }
-                        (
-                            format!("{offset:08X}  {hex} |{ascii}|"),
-                            ui.visuals().strong_text_color(),
+                    };
+                    let mut job = LayoutJob::default();
+                    job.append(
+                        &text,
+                        0.0,
+                        egui::TextFormat {
+                            // The console font, whose own row height is what
+                            // `row_height` reserves per row — rows must stay exactly
+                            // that tall for the pin-to-bottom math below (and
+                            // `show_rows`' own virtualization) to line up with what
+                            // is actually painted.
+                            font_id: font.clone(),
+                            color,
+                            ..Default::default()
+                        },
+                    );
+                    // `LayoutJob`'s galley can be fractionally taller than the
+                    // font's advertised row height. Letting that allocate directly
+                    // in `show_rows` makes the painted rows drift from the fixed
+                    // pitch the virtualizer (and the bottom-pin offset) uses. Keep
+                    // the allocation in an exact-height slot, as the normal
+                    // console does for every row.
+                    let (mut row_ui, _slot) =
+                        row_slot(ui, row_height, egui::Sense::hover(), row_id);
+                    let resp =
+                        wrapped_text(&mut row_ui, job, &m, u32::MAX, row_height, row_id, None);
+                    resp.context_menu(|ui| {
+                        console_menu(
+                            ui,
+                            menu,
+                            Some(MenuTarget::active(None)),
+                            ts_format,
+                            has_mark,
+                            false,
                         )
-                    }
-                };
-                let mut job = LayoutJob::default();
-                job.append(
-                    &text,
-                    0.0,
-                    egui::TextFormat {
-                        // The console font, whose own row height is what
-                        // `row_height` reserves per row — rows must stay exactly
-                        // that tall for the pin-to-bottom math below (and
-                        // `show_rows`' own virtualization) to line up with what
-                        // is actually painted.
-                        font_id: font.clone(),
-                        color,
-                        ..Default::default()
-                    },
-                );
-                // `LayoutJob`'s galley can be fractionally taller than the
-                // font's advertised row height. Letting that allocate directly
-                // in `show_rows` makes the painted rows drift from the fixed
-                // pitch the virtualizer (and the bottom-pin offset) uses. Keep
-                // the allocation in an exact-height slot, as the normal
-                // console does for every row.
-                let (mut row_ui, _slot) = row_slot(ui, row_height, egui::Sense::hover(), row_id);
-                let resp = wrapped_text(&mut row_ui, job, &m, u32::MAX, row_height, row_id, None);
-                resp.context_menu(|ui| {
-                    console_menu(
-                        ui,
-                        menu,
-                        Some(MenuTarget::active(None)),
-                        ts_format,
-                        has_mark,
-                        false,
-                    )
-                });
-            }
-        });
+                    });
+                }
+            },
+        );
         rearm_follow_at_bottom(
             &mut self.connections[active].follow,
             user_scrolled,
@@ -1691,13 +1914,21 @@ impl App {
         if let Some((action, text)) = menu.selection {
             match action {
                 SelectionAction::Search => {
-                    let query = regex::escape(&text);
                     if self.merged_selected {
+                        let query = if self.merged_search_regex {
+                            regex::escape(&text)
+                        } else {
+                            text.clone()
+                        };
                         self.merged_search_query = query;
                         self.merged_search_dirty = true;
                         self.merged_search_pos = None;
                     } else if let Some(conn) = self.connections.get_mut(active) {
-                        conn.search_query = query;
+                        conn.search_query = if conn.search_regex {
+                            regex::escape(&text)
+                        } else {
+                            text
+                        };
                         conn.search_dirty = true;
                         conn.search_pos = None;
                     }
@@ -1751,6 +1982,9 @@ impl App {
             // in any other would look like the command did nothing at all.
             self.config.settings.timestamp_format = TimestampFormat::Mark;
             self.write_config();
+        }
+        if menu.open_macros {
+            self.show_macros_win = true;
         }
         if menu.open_filters {
             self.show_filters_win = !self.show_filters_win;
@@ -1877,6 +2111,31 @@ impl App {
     }
 }
 
+/// Include a few clipped rows above the interactive viewport for the header's
+/// backdrop, keeping the scroll area height and offsets exactly unchanged.
+fn show_rows_with_header(
+    area: egui::ScrollArea,
+    ui: &mut egui::Ui,
+    row_height: f32,
+    rows: usize,
+    header_height: f32,
+    draw: impl FnOnce(&mut egui::Ui, std::ops::Range<usize>),
+) -> egui::scroll_area::ScrollAreaOutput<()> {
+    area.show_viewport(ui, |ui, viewport| {
+        ui.set_height(rows as f32 * row_height);
+        let first =
+            (((viewport.min.y - header_height).max(0.0) / row_height).floor() as usize).min(rows);
+        let end = ((viewport.max.y / row_height).ceil() as usize + 1).min(rows);
+        let mut rect = ui.max_rect();
+        rect.min.y += first as f32 * row_height;
+        rect.max.y = rect.min.y + end.saturating_sub(first) as f32 * row_height;
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+            ui.skip_ahead_auto_ids(first);
+            draw(ui, first..end)
+        });
+    })
+}
+
 /// Stream one connection's displayed rows to `writer`, without materializing
 /// either the selected indices or the formatted export as a whole.
 fn write_active_export(
@@ -1987,13 +2246,14 @@ fn console_menu(
     has_mark: bool,
     merged_view: bool,
 ) {
+    super::chrome::menu_style(ui);
     let selection = ui
         .ctx()
         .data(|data| data.get_temp::<SelectionMenu>(selection_menu_id()))
         .unwrap_or_default();
     if selection.hit {
         ui.add_enabled_ui(!selection.text.is_empty(), |ui| {
-            if ui.button("Copy").clicked() {
+            if super::chrome::menu_item(ui, "Copy", "Ctrl+Shift+C").clicked() {
                 ui.ctx().copy_text(selection.text.clone());
                 ui.close_menu();
             }
@@ -2004,7 +2264,19 @@ fn console_menu(
                 ("Add highlight rule...", SelectionAction::Highlight),
             ] {
                 let enabled = !matches!(action, SelectionAction::Macro) || !menu.macro_editor_open;
-                if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                let shortcut = if matches!(action, SelectionAction::Search) {
+                    "Ctrl+Shift+F"
+                } else {
+                    ""
+                };
+                if ui
+                    .add_enabled(
+                        enabled,
+                        egui::Button::new(label)
+                            .shortcut_text(egui::RichText::new(shortcut).size(12.0).weak()),
+                    )
+                    .clicked()
+                {
                     menu.selection = Some((action, selection.text.clone()));
                     ui.close_menu();
                 }
@@ -2025,6 +2297,7 @@ fn console_menu(
     // and export also have explicit merged-view implementations.
     let own_console = !merged_view && target.is_some() && row_label.is_none();
     ui.menu_button("Timestamps", |ui| {
+        super::chrome::menu_style(ui);
         for f in [
             TimestampFormat::Absolute,
             TimestampFormat::Time,
@@ -2046,13 +2319,15 @@ fn console_menu(
             menu.toggle_hex = true;
             ui.close_menu();
         }
-        if ui.button("Toggle plot").clicked() {
+        if super::chrome::menu_item(ui, "Toggle plot", "Ctrl+Shift+P").clicked() {
             menu.toggle_plot = true;
             ui.close_menu();
         }
     }
     ui.separator();
-    if (own_console || merged_view) && ui.button("Search…").clicked() {
+    if (own_console || merged_view)
+        && super::chrome::menu_item(ui, "Search…", "Ctrl+Shift+F").clicked()
+    {
         menu.toggle_search = true;
         ui.close_menu();
     }
@@ -2060,8 +2335,14 @@ fn console_menu(
         menu.open_filters = true;
         ui.close_menu();
     }
-    if (own_console || merged_view) && ui.button("Save view…").clicked() {
+    if (own_console || merged_view)
+        && super::chrome::menu_item(ui, "Save view…", "Ctrl+Shift+S").clicked()
+    {
         menu.export = Some(false);
+        ui.close_menu();
+    }
+    if super::chrome::menu_item(ui, "Macros…", "Ctrl+Shift+M").clicked() {
+        menu.open_macros = true;
         ui.close_menu();
     }
     if ui.button("Highlight rules…").clicked() {
@@ -2090,6 +2371,7 @@ fn console_menu(
             ui.add_space(2.0);
         }
         ui.menu_button("Control lines", |ui| {
+            super::chrome::menu_style(ui);
             if ui
                 .button("Toggle DTR")
                 .on_hover_text("Resets many boards")
@@ -2147,7 +2429,8 @@ fn console_menu(
 
 fn export_menu(ui: &mut egui::Ui, menu: &mut MenuAction) {
     ui.menu_button("Export view", |ui| {
-        if ui.button("Text (.txt)").clicked() {
+        super::chrome::menu_style(ui);
+        if super::chrome::menu_item(ui, "Text (.txt)", "Ctrl+Shift+S").clicked() {
             menu.export = Some(false);
             ui.close_menu();
         }
@@ -2969,6 +3252,112 @@ fn fmt_delta(micros: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn long_search_text_keeps_controls_in_place() {
+        for merged in [false, true] {
+            for width in [224.0, 400.0, 714.0] {
+                let (mut app, _tx) = crate::app::tests::test_app("long-search");
+                let id = serialcore::store::PortId(1);
+                app.connections.push(app.make_connection(
+                    id,
+                    "probe".into(),
+                    Default::default(),
+                    Default::default(),
+                    crate::app::tests::inert_handle(id),
+                ));
+                if merged {
+                    app.create_merged_tab(vec![id]);
+                }
+                app.show_search = true;
+                let ctx = egui::Context::default();
+                let mut baseline = None;
+                for query in ["short".to_owned(), "d".repeat(500), "short".to_owned()] {
+                    app.connections[0].search_query = query.clone();
+                    app.merged_search_query = query;
+                    let mut bounds = egui::Rect::NOTHING;
+                    let output = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 400.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                app.show_header_search(ui);
+                                bounds = ui.min_rect();
+                            });
+                        },
+                    );
+                    let toggle = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) if text.galley.text() == "Aa" => Some(text.pos),
+                            _ => None,
+                        })
+                        .expect("case-sensitive toggle should be rendered");
+                    let layout = (bounds, toggle);
+                    if let Some(baseline) = baseline {
+                        assert_eq!(layout, baseline, "merged={merged}, width={width}");
+                    } else {
+                        baseline = Some(layout);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn header_search_fits_minimum_split_pane_width() {
+        for merged in [false, true] {
+            let (mut app, _tx) = crate::app::tests::test_app("narrow-search");
+            let id = serialcore::store::PortId(1);
+            app.connections.push(app.make_connection(
+                id,
+                "probe".into(),
+                Default::default(),
+                Default::default(),
+                crate::app::tests::inert_handle(id),
+            ));
+            if merged {
+                app.create_merged_tab(vec![id]);
+            }
+            app.show_search = true;
+            let ctx = egui::Context::default();
+            for invalid in [false, true] {
+                app.connections[0].search_regex = invalid;
+                app.connections[0].search_query = "[".into();
+                app.merged_search_regex = invalid;
+                app.merged_search_query = "[".into();
+                // A 240-point pane leaves 224 points inside the toolbar;
+                // nested UI margins can reduce the search row further.
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(224.0, 400.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let available = ui.available_rect_before_wrap();
+                            app.show_header_search(ui);
+                            assert!(
+                                ui.min_rect().right() <= available.right(),
+                                "search overflow: {:?} beyond {:?}, merged={merged}, invalid={invalid}",
+                                ui.min_rect(),
+                                available
+                            );
+                        });
+                    },
+                );
+            }
+        }
+    }
+
     use super::*;
     use crate::app::tests::{inert_handle, test_app};
     use serialcore::config::{PortConfig, PortIdentity};
@@ -3016,7 +3405,10 @@ mod tests {
                         events,
                         ..Default::default()
                     },
-                    |ctx| app.show_console(ctx, false),
+                    |ctx| {
+                        app.show_toolbar(ctx);
+                        app.show_console(ctx, false);
+                    },
                 )
             };
             let _ = draw(&mut app, vec![]);
@@ -3288,7 +3680,7 @@ mod tests {
                 } else {
                     &app.connections[0].search_query
                 },
-                &regex::escape(text)
+                &text.to_owned()
             );
             app.show_search = false;
             app.search_focus_request = false;
@@ -3361,6 +3753,7 @@ mod tests {
                     },
                     |ctx| {
                         ctx.copy_text("clipboard sentinel".into());
+                        app.show_toolbar(ctx);
                         app.show_console(ctx, false);
                     },
                 )
@@ -3400,8 +3793,8 @@ mod tests {
             } else {
                 &app.connections[0].search_query
             };
-            assert_eq!(query, &regex::escape(text));
-            let regex = compile_search(query, true).unwrap();
+            assert_eq!(query, &text.to_owned());
+            let regex = compile_search(query, true, false).unwrap();
             assert!(regex.is_match(text));
             assert!(!regex.is_match("value0anything"));
             let focused = ctx.memory(|m| m.focused()).unwrap();
@@ -3412,7 +3805,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 range.sorted()[0].index..range.sorted()[1].index,
-                0..regex::escape(text).chars().count()
+                0..text.chars().count()
             );
             let mut selection = egui::text_selection::LabelSelectionState::load(&ctx);
             selection.clear_selection();
@@ -3428,11 +3821,7 @@ mod tests {
             } else {
                 &app.connections[0].search_query
             };
-            assert_eq!(
-                query,
-                &regex::escape(text),
-                "no selection preserves the query"
-            );
+            assert_eq!(query, &text.to_owned(), "no selection preserves the query");
             // A click creates a zero-width label selection: no text to seed.
             let point = ctx.read_response(row.with("text")).unwrap().rect.center();
             let _ = draw(
@@ -3450,7 +3839,7 @@ mod tests {
             };
             assert_eq!(
                 query,
-                &regex::escape(text),
+                &text.to_owned(),
                 "empty selection must not seed clipboard contents"
             );
             // Input arriving in the same frame as the seed must replace it too.
@@ -3530,7 +3919,7 @@ mod tests {
                     },
                     |ctx| {
                         app.show_header(ctx);
-                        app.show_footer(ctx);
+                        app.show_toolbar(ctx);
                         egui::CentralPanel::default().show(ctx, |ui| {
                             let salt = if merged {
                                 let tab = app
