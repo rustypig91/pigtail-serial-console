@@ -302,6 +302,7 @@ impl App {
 
         let header_rect = super::workspace::show_panel(
             egui::TopBottomPanel::top(self.pane_widget_id("header"))
+                .default_height(super::chrome::HEADER_HEIGHT + 6.0)
                 .show_separator_line(false)
                 .frame(
                     egui::Frame::none()
@@ -870,14 +871,16 @@ impl App {
         let mut select_view = None;
         let mut toggle_plot = false;
         let toolbar_rect = super::workspace::show_panel(
-            egui::TopBottomPanel::top(self.pane_widget_id("console_toolbar")).frame(
-                egui::Frame::none()
-                    .fill(super::chrome::header_fill(
-                        ctx.style().visuals.dark_mode,
-                        true,
-                    ))
-                    .inner_margin(egui::Margin::symmetric(8.0, 5.0)),
-            ),
+            egui::TopBottomPanel::top(self.pane_widget_id("console_toolbar"))
+                .default_height(32.0 + 10.0)
+                .frame(
+                    egui::Frame::none()
+                        .fill(super::chrome::header_fill(
+                            ctx.style().visuals.dark_mode,
+                            true,
+                        ))
+                        .inner_margin(egui::Margin::symmetric(8.0, 5.0)),
+                ),
             ctx,
             parent,
             |ui| {
@@ -1674,6 +1677,20 @@ mod tests {
                         _ => None,
                     })
                     .expect("active tab background");
+                for shape in &output.shapes {
+                    if let egui::Shape::Rect(rect) = &shape.shape {
+                        if rect.rect == tab
+                            || (rect.rounding.nw == 7.0 && rect.rect.height() == 32.0)
+                        {
+                            assert!(
+                                shape.clip_rect.contains_rect(rect.rect),
+                                "header control clipped: {:?} by {:?}",
+                                rect.rect,
+                                shape.clip_rect
+                            );
+                        }
+                    }
+                }
                 assert_eq!(tab.height(), crate::panes::chrome::HEADER_HEIGHT);
                 assert_eq!(tab.bottom(), header.bottom(), "tab must reach the toolbar");
                 assert_eq!(header.height(), crate::panes::chrome::HEADER_HEIGHT + 6.0);
