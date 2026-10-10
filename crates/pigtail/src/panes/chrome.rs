@@ -349,6 +349,7 @@ impl App {
 pub(super) enum ActionIcon {
     Search,
     Clear,
+    Plot,
 }
 
 pub(super) enum SearchControl {
@@ -473,20 +474,38 @@ pub(super) fn action_button(
     tooltip: &str,
 ) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(36.0, 32.0), Sense::click());
+    paint_action_frame(ui, &response, selected);
+    if matches!(icon, ActionIcon::Clear) {
+        let pulse_id = response.id.with("clear_pulse");
+        let now = ui.input(|input| input.time);
+        // clicked() reads context input; do not call it while holding data_mut's lock.
+        let clicked = response.clicked();
+        let started = ui.ctx().data_mut(|data| {
+            if clicked {
+                data.insert_temp(pulse_id, now);
+            }
+            data.get_temp::<f64>(pulse_id)
+        });
+        if let Some(started) = started {
+            let progress = ((now - started) / 0.6).clamp(0.0, 1.0) as f32;
+            if progress < 1.0 {
+                let strength = (1.0 - progress).powi(2);
+                ui.painter().rect(
+                    rect,
+                    5.0,
+                    ui.visuals().selection.bg_fill.gamma_multiply(strength),
+                    Stroke::new(
+                        1.0_f32,
+                        ui.visuals().selection.stroke.color.gamma_multiply(strength),
+                    ),
+                );
+                ui.ctx().request_repaint();
+            } else {
+                ui.ctx().data_mut(|data| data.remove::<f64>(pulse_id));
+            }
+        }
+    }
     let visuals = ui.style().interact_selectable(&response, selected);
-    let fill = if selected {
-        ui.visuals().selection.bg_fill
-    } else if response.hovered() {
-        surface(ui, true)
-    } else {
-        Color32::TRANSPARENT
-    };
-    let border = if selected {
-        ui.visuals().selection.stroke
-    } else {
-        Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color)
-    };
-    ui.painter().rect(rect, 5.0, fill, border);
     let c = rect.center();
     let stroke = Stroke::new(1.4_f32, visuals.fg_stroke.color);
     match icon {
@@ -515,11 +534,36 @@ pub(super) fn action_button(
                     .line_segment([c + Vec2::new(x, -1.0), c + Vec2::new(x, 3.0)], stroke);
             }
         }
+        ActionIcon::Plot => paint_view_content(
+            ui,
+            rect.translate(Vec2::new(3.0, 0.0)),
+            ViewIcon::Plot,
+            "",
+            visuals.fg_stroke.color,
+        ),
     }
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), selected, tooltip)
     });
     response.on_hover_text(tooltip)
+}
+
+/// The same outline, hit area and active treatment for every toolbar action.
+pub(super) fn paint_action_frame(ui: &Ui, response: &Response, selected: bool) {
+    let rect = response.rect;
+    let fill = if selected {
+        ui.visuals().selection.bg_fill
+    } else if response.hovered() {
+        surface(ui, true)
+    } else {
+        Color32::TRANSPARENT
+    };
+    let border = if selected {
+        ui.visuals().selection.stroke
+    } else {
+        Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color)
+    };
+    ui.painter().rect(rect, 5.0, fill, border);
 }
 
 pub(super) fn paint_export(ui: &Ui, rect: Rect) {
@@ -594,43 +638,114 @@ pub(super) enum ViewIcon {
     Plot,
 }
 
-pub(super) fn view_button(ui: &mut Ui, icon: ViewIcon, label: &str, selected: bool) -> Response {
-    let label_width = ui
-        .painter()
-        .layout_no_wrap(
-            label.into(),
-            egui::FontId::proportional(13.0),
-            ui.visuals().text_color(),
-        )
-        .size()
-        .x;
-    let (rect, response) = ui.allocate_exact_size(
-        Vec2::new((label_width + 38.0).max(64.0), 32.0),
-        Sense::click(),
+fn view_width(ui: &Ui, label: &str) -> f32 {
+    let galley = ui.painter().layout_no_wrap(
+        label.into(),
+        egui::FontId::proportional(13.0),
+        ui.visuals().text_color(),
     );
-    let blue = Color32::from_rgb(64, 165, 255);
-    let fill = if selected {
-        if ui.visuals().dark_mode {
-            Color32::from_rgb(27, 55, 83)
-        } else {
-            Color32::from_rgb(216, 235, 255)
+    (galley.size().x + 38.0).max(64.0)
+}
+
+/// One shared track makes the mutually exclusive console modes explicit.
+/// Animate local edges so moving/resizing a pane does not move the highlight.
+pub(super) fn view_selector(
+    ui: &mut Ui,
+    id: egui::Id,
+    selected: usize,
+    merged: bool,
+) -> Option<usize> {
+    let modes = [
+        (ViewIcon::Log, "Log", "Chronological log · Ctrl+Shift+Q"),
+        (ViewIcon::Hex, "Hex", "Raw bytes · Ctrl+Shift+W"),
+        (
+            ViewIcon::Terminal,
+            "ANSI/VT",
+            "Terminal screen · Ctrl+Shift+E",
+        ),
+    ];
+    let count = if merged { 1 } else { modes.len() };
+    let widths: Vec<_> = modes[..count]
+        .iter()
+        .map(|(_, label, _)| view_width(ui, label))
+        .collect();
+    let (track, _) = ui.allocate_exact_size(
+        Vec2::new(widths.iter().sum::<f32>() + 6.0, 32.0),
+        Sense::hover(),
+    );
+    ui.painter().rect(
+        track,
+        7.0,
+        surface(ui, false),
+        Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
+    );
+    let mut left = track.left() + 3.0;
+    let mut responses = Vec::new();
+    let mut clicked = None;
+    for (index, width) in widths.iter().enumerate() {
+        let rect = Rect::from_min_size(Pos2::new(left, track.top() + 3.0), Vec2::new(*width, 26.0));
+        let response = ui.interact(rect, id.with(index), Sense::click());
+        if response.clicked() {
+            clicked = Some(index);
         }
-    } else if response.hovered() {
-        surface(ui, true)
-    } else {
-        Color32::TRANSPARENT
-    };
-    let stroke = if selected {
-        Stroke::new(1.0_f32, blue)
-    } else {
-        Stroke::NONE
-    };
-    ui.painter().rect(rect, 5.0, fill, stroke);
-    let color = if selected {
-        blue
-    } else {
-        ui.visuals().text_color()
-    };
+        responses.push(response);
+        left += width;
+    }
+    let active = clicked.unwrap_or(selected).min(count - 1);
+    // Hover belongs behind the selection, including while it slides between modes.
+    for (index, response) in responses.iter().enumerate() {
+        if response.hovered() && index != active {
+            ui.painter()
+                .rect_filled(response.rect, 5.0, surface(ui, true));
+        }
+    }
+    let target = responses[active].rect;
+    let left = ui.ctx().animate_value_with_time(
+        id.with("highlight_left"),
+        target.left() - track.left(),
+        0.18,
+    );
+    let right = ui.ctx().animate_value_with_time(
+        id.with("highlight_right"),
+        target.right() - track.left(),
+        0.18,
+    );
+    let highlight = Rect::from_min_max(
+        Pos2::new(track.left() + left, target.top()),
+        Pos2::new(track.left() + right, target.bottom()),
+    );
+    ui.painter().rect(
+        highlight,
+        5.0,
+        ui.visuals().selection.bg_fill,
+        ui.visuals().selection.stroke,
+    );
+    for (index, (response, (icon, label, tooltip))) in responses.into_iter().zip(modes).enumerate()
+    {
+        let color = if index == active {
+            ui.visuals().selection.stroke.color
+        } else {
+            ui.visuals().text_color()
+        };
+        paint_view_content(ui, response.rect, icon, label, color);
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::SelectableLabel,
+                ui.is_enabled(),
+                index == active,
+                label,
+            )
+        });
+        response.on_hover_text(if merged {
+            "Merged chronological log"
+        } else {
+            tooltip
+        });
+    }
+    clicked
+}
+
+fn paint_view_content(ui: &Ui, rect: Rect, icon: ViewIcon, label: &str, color: Color32) {
     let pen = Stroke::new(1.2_f32, color);
     let c = Pos2::new(rect.left() + 15.0, rect.center().y);
     match icon {
@@ -699,15 +814,6 @@ pub(super) fn view_button(ui: &mut Ui, icon: ViewIcon, label: &str, selected: bo
         galley,
         color,
     );
-    response.widget_info(|| {
-        egui::WidgetInfo::selected(
-            egui::WidgetType::SelectableLabel,
-            ui.is_enabled(),
-            selected,
-            label,
-        )
-    });
-    response
 }
 
 pub(super) fn paint_overflow(ui: &Ui, rect: Rect) {
@@ -782,6 +888,129 @@ pub(super) fn modal_header(ui: &mut Ui, title: &str, open: &mut bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_button_click_pulses_then_fades_and_can_restart() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(app_visuals(true));
+        let render = |time, events| {
+            let mut response = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        response =
+                            Some(action_button(ui, ActionIcon::Clear, false, "Clear console"));
+                    });
+                },
+            );
+            let pulse_color = ctx.style().visuals.selection.bg_fill;
+            let pulse_alpha = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect)
+                        if rect.fill != Color32::TRANSPARENT
+                            && rect.stroke.color
+                                != ctx.style().visuals.widgets.noninteractive.bg_stroke.color
+                            && rect.rect == response.as_ref().unwrap().rect =>
+                    {
+                        Some(rect.fill.a())
+                    }
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0);
+            (response.unwrap(), pulse_alpha, pulse_color.a())
+        };
+        let (response, alpha, _) = render(0.0, vec![]);
+        assert_eq!(alpha, 0);
+        let pos = response.rect.center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        render(0.01, vec![egui::Event::PointerMoved(pos), button(true)]);
+        let (response, alpha, full_alpha) = render(0.02, vec![button(false)]);
+        assert!(response.clicked());
+        assert_eq!(alpha, full_alpha);
+        let (_, fading, _) = render(0.32, vec![]);
+        assert!(fading > 0 && fading < alpha);
+        render(0.33, vec![button(true)]);
+        let (_, restarted, _) = render(0.34, vec![button(false)]);
+        assert_eq!(restarted, full_alpha);
+        let (response, alpha, _) = render(1.0, vec![]);
+        assert_eq!(alpha, 0);
+        assert!(ctx
+            .data(|data| data.get_temp::<f64>(response.id.with("clear_pulse")))
+            .is_none());
+    }
+
+    #[test]
+    fn console_mode_selection_slides_and_accepts_clicks() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(app_visuals(true));
+        let id = egui::Id::new("test_view_selector");
+        let render = |time, selected, events| {
+            let mut clicked = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(500.0, 200.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        clicked = view_selector(ui, id, selected, false);
+                    });
+                },
+            );
+            let highlight = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect)
+                        if rect.fill == ctx.style().visuals.selection.bg_fill =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            (output, highlight, clicked)
+        };
+        let (_, start, _) = render(0.0, 0, vec![]);
+        render(0.01, 2, vec![]);
+        let (_, middle, _) = render(0.10, 2, vec![]);
+        let (output, end, _) = render(0.30, 2, vec![]);
+        assert!(start.left() < middle.left() && middle.left() < end.left());
+        let hex = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Hex" => {
+                    Some(text.pos + text.galley.size() / 2.0)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let button = |pressed| egui::Event::PointerButton {
+            pos: hex,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        render(0.31, 2, vec![egui::Event::PointerMoved(hex), button(true)]);
+        let (_, _, clicked) = render(0.32, 2, vec![button(false)]);
+        assert_eq!(clicked, Some(1));
+    }
 
     #[test]
     fn header_double_press_toggles_maximize_even_without_native_drag_release() {

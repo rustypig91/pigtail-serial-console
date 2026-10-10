@@ -540,23 +540,37 @@ impl App {
     fn show_console_actions(&mut self, ui: &mut egui::Ui) {
         self.show_app_menu(ui);
         let export = ui
-            .menu_button("     ", |ui| {
-                super::chrome::menu_style(ui);
-                for (label, csv) in [("Export text…", false), ("Export CSV…", true)] {
-                    if super::chrome::menu_item(ui, label, if csv { "" } else { "Ctrl+Shift+S" })
-                        .clicked()
-                    {
-                        if self.merged_selected {
-                            self.export_merged_view(csv);
-                        } else if let Some(active) = self.active_index() {
-                            self.export_active_view(active, csv);
+            .scope(|ui| {
+                egui::menu::menu_custom_button(
+                    ui,
+                    egui::Button::new(" ")
+                        .frame(false)
+                        .min_size(egui::vec2(36.0, 32.0)),
+                    |ui| {
+                        super::chrome::menu_style(ui);
+                        for (label, csv) in [("Export text…", false), ("Export CSV…", true)] {
+                            if super::chrome::menu_item(
+                                ui,
+                                label,
+                                if csv { "" } else { "Ctrl+Shift+S" },
+                            )
+                            .clicked()
+                            {
+                                if self.merged_selected {
+                                    self.export_merged_view(csv);
+                                } else if let Some(active) = self.active_index() {
+                                    self.export_active_view(active, csv);
+                                }
+                                ui.close_menu();
+                            }
                         }
-                        ui.close_menu();
-                    }
-                }
+                    },
+                )
             })
+            .inner
             .response
             .on_hover_text("Export current view");
+        super::chrome::paint_action_frame(ui, &export, false);
         super::chrome::paint_export(ui, export.rect);
         if super::chrome::action_button(
             ui,
@@ -824,58 +838,38 @@ impl App {
                         |ui| {
                             self.show_console_actions(ui);
                             if self.merged_selected {
-                                super::chrome::view_button(
+                                super::chrome::view_selector(
                                     ui,
-                                    super::chrome::ViewIcon::Log,
-                                    "Log",
+                                    self.pane_widget_id("view_selector"),
+                                    0,
                                     true,
-                                )
-                                .on_hover_text("Merged chronological log");
+                                );
                             } else if let Some(active) = self.active_index() {
                                 let conn = &self.connections[active];
-                                if super::chrome::view_button(
+                                if super::chrome::action_button(
                                     ui,
-                                    super::chrome::ViewIcon::Plot,
-                                    "Plot",
+                                    super::chrome::ActionIcon::Plot,
                                     conn.show_plot,
+                                    "Toggle plot · Ctrl+Shift+P",
                                 )
-                                .on_hover_text("Toggle plot · Ctrl+Shift+P")
                                 .clicked()
                                 {
                                     toggle_plot = true;
                                 }
-                                if super::chrome::view_button(
+                                let selected = if conn.screen_view {
+                                    2
+                                } else if conn.hex_view {
+                                    1
+                                } else {
+                                    0
+                                };
+                                if let Some(mode) = super::chrome::view_selector(
                                     ui,
-                                    super::chrome::ViewIcon::Terminal,
-                                    "ANSI/VT",
-                                    conn.screen_view,
-                                )
-                                .on_hover_text("Terminal screen · Ctrl+Shift+E")
-                                .clicked()
-                                {
-                                    select_view = Some((true, false));
-                                }
-                                if super::chrome::view_button(
-                                    ui,
-                                    super::chrome::ViewIcon::Hex,
-                                    "Hex",
-                                    conn.hex_view && !conn.screen_view,
-                                )
-                                .on_hover_text("Raw bytes · Ctrl+Shift+W")
-                                .clicked()
-                                {
-                                    select_view = Some((false, true));
-                                }
-                                if super::chrome::view_button(
-                                    ui,
-                                    super::chrome::ViewIcon::Log,
-                                    "Log",
-                                    !conn.hex_view && !conn.screen_view,
-                                )
-                                .on_hover_text("Chronological log · Ctrl+Shift+Q")
-                                .clicked()
-                                {
-                                    select_view = Some((false, false));
+                                    self.pane_widget_id("view_selector").with(conn.id),
+                                    selected,
+                                    false,
+                                ) {
+                                    select_view = Some((mode == 2, mode == 1));
                                 }
                             }
                             if self.show_search && ui.available_size_before_wrap().x >= 280.0 {
