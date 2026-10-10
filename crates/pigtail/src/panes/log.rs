@@ -944,7 +944,7 @@ impl App {
         // The toolbar can move search between rows as the window resizes.
         // Keep its identity tied to the pane rather than the layout's parent UI.
         let search_id = self.pane_widget_id("search_query");
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let show_count = ui.available_width() >= 360.0;
             let reserved = if show_count { 234.0 } else { 204.0 };
             let conn = &mut self.connections[active];
@@ -1089,7 +1089,7 @@ impl App {
         let mut close = false;
         let mut focus = std::mem::take(&mut self.search_focus_request);
         let search_id = self.pane_widget_id("search_query");
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let show_count = ui.available_width() >= 360.0;
             let reserved = if show_count { 234.0 } else { 204.0 };
             if select_query {
@@ -3227,6 +3227,55 @@ fn fmt_delta(micros: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn header_search_fits_minimum_split_pane_width() {
+        for merged in [false, true] {
+            let (mut app, _tx) = crate::app::tests::test_app("narrow-search");
+            let id = serialcore::store::PortId(1);
+            app.connections.push(app.make_connection(
+                id,
+                "probe".into(),
+                Default::default(),
+                Default::default(),
+                crate::app::tests::inert_handle(id),
+            ));
+            if merged {
+                app.create_merged_tab(vec![id]);
+            }
+            app.show_search = true;
+            let ctx = egui::Context::default();
+            for invalid in [false, true] {
+                app.connections[0].search_regex = invalid;
+                app.connections[0].search_query = "[".into();
+                app.merged_search_regex = invalid;
+                app.merged_search_query = "[".into();
+                // A 240-point pane leaves 224 points inside the toolbar;
+                // nested UI margins can reduce the search row further.
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(224.0, 400.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let available = ui.available_rect_before_wrap();
+                            app.show_header_search(ui);
+                            assert!(
+                                ui.min_rect().right() <= available.right(),
+                                "search overflow: {:?} beyond {:?}, merged={merged}, invalid={invalid}",
+                                ui.min_rect(),
+                                available
+                            );
+                        });
+                    },
+                );
+            }
+        }
+    }
+
     use super::*;
     use crate::app::tests::{inert_handle, test_app};
     use serialcore::config::{PortConfig, PortIdentity};
