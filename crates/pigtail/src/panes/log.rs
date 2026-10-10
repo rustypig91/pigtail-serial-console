@@ -37,6 +37,39 @@ fn surrender_search_focus_on_close(
     }
 }
 
+fn search_query_field(
+    ui: &mut egui::Ui,
+    query: &mut String,
+    id: egui::Id,
+    regex: bool,
+    width: f32,
+) -> egui::Response {
+    let margin = egui::vec2(8.0, 6.0);
+    let width = width.min((ui.available_width() - 2.0 * margin.x).max(24.0));
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let height = (ui.fonts(|fonts| fonts.row_height(&font)) + 2.0 * margin.y)
+        .max(ui.spacing().interact_size.y);
+    let (_, rect) = ui.allocate_space(egui::vec2(width + 2.0 * margin.x, height));
+    // egui 0.30 allocates the full galley width even for clipped single-line
+    // edits. Keep that extra allocation in a child so it cannot move controls.
+    let mut field_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    field_ui.add(
+        egui::TextEdit::singleline(query)
+            .id(id)
+            .hint_text(if regex {
+                "Search regex…"
+            } else {
+                "Search text…"
+            })
+            .margin(margin)
+            .desired_width(width),
+    )
+}
+
 /// One run of bytes as the hex view lays it out: the 16-byte rows it still has
 /// resident, and the boundary that closes it.
 struct HexSegment {
@@ -951,16 +984,12 @@ impl App {
             if select_query {
                 select_search_query(ui.ctx(), search_id, &conn.search_query);
             }
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut conn.search_query)
-                    .id(search_id)
-                    .hint_text(if conn.search_regex {
-                        "Search regex…"
-                    } else {
-                        "Search text…"
-                    })
-                    .margin(egui::vec2(8.0, 6.0))
-                    .desired_width((ui.available_width() - reserved).clamp(40.0, 320.0)),
+            let resp = search_query_field(
+                ui,
+                &mut conn.search_query,
+                search_id,
+                conn.search_regex,
+                (ui.available_width() - reserved).clamp(40.0, 320.0),
             );
             if resp.changed() {
                 conn.search_dirty = true;
@@ -1095,16 +1124,12 @@ impl App {
             if select_query {
                 select_search_query(ui.ctx(), search_id, &self.merged_search_query);
             }
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.merged_search_query)
-                    .id(search_id)
-                    .hint_text(if self.merged_search_regex {
-                        "Search regex…"
-                    } else {
-                        "Search text…"
-                    })
-                    .margin(egui::vec2(8.0, 6.0))
-                    .desired_width((ui.available_width() - reserved).clamp(40.0, 320.0)),
+            let resp = search_query_field(
+                ui,
+                &mut self.merged_search_query,
+                search_id,
+                self.merged_search_regex,
+                (ui.available_width() - reserved).clamp(40.0, 320.0),
             );
             if resp.changed() {
                 self.merged_search_dirty = true;
@@ -3227,6 +3252,63 @@ fn fmt_delta(micros: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn long_search_text_keeps_controls_in_place() {
+        for merged in [false, true] {
+            for width in [224.0, 400.0, 714.0] {
+                let (mut app, _tx) = crate::app::tests::test_app("long-search");
+                let id = serialcore::store::PortId(1);
+                app.connections.push(app.make_connection(
+                    id,
+                    "probe".into(),
+                    Default::default(),
+                    Default::default(),
+                    crate::app::tests::inert_handle(id),
+                ));
+                if merged {
+                    app.create_merged_tab(vec![id]);
+                }
+                app.show_search = true;
+                let ctx = egui::Context::default();
+                let mut baseline = None;
+                for query in ["short".to_owned(), "d".repeat(500), "short".to_owned()] {
+                    app.connections[0].search_query = query.clone();
+                    app.merged_search_query = query;
+                    let mut bounds = egui::Rect::NOTHING;
+                    let output = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 400.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                app.show_header_search(ui);
+                                bounds = ui.min_rect();
+                            });
+                        },
+                    );
+                    let toggle = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) if text.galley.text() == "Aa" => Some(text.pos),
+                            _ => None,
+                        })
+                        .expect("case-sensitive toggle should be rendered");
+                    let layout = (bounds, toggle);
+                    if let Some(baseline) = baseline {
+                        assert_eq!(layout, baseline, "merged={merged}, width={width}");
+                    } else {
+                        baseline = Some(layout);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn header_search_fits_minimum_split_pane_width() {
         for merged in [false, true] {
