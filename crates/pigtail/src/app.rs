@@ -3765,6 +3765,8 @@ impl eframe::App for App {
         // Keep the guard focused until every widget has been drawn, so none of
         // the later floating windows can claim this Tab either.
         self.release_console_tab_after_layout(ctx, console_tab_claimed);
+        // Window edges take priority over content and floating-window cursors.
+        self.show_window_resize(ctx);
 
         // Sends every command whose deadline has arrived and schedules only
         // the next deadline, keeping an otherwise idle console asleep between

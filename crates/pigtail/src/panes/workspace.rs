@@ -511,10 +511,11 @@ impl App {
                 )
                 .show(ctx, |ui| {
                     ui.style_mut().interaction.selectable_labels = false;
+                    super::chrome::header_style(ui);
                     ui.horizontal(|ui| {
                         ui.weak("Rusty's Pigtail");
                         ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width(), 36.0),
+                            egui::vec2(ui.available_width(), super::chrome::HEADER_HEIGHT),
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
                                 super::chrome::window_controls(ui);
@@ -639,7 +640,6 @@ impl App {
             self.apply_layout_action(action);
         }
         self.persist_workspace();
-        self.show_window_resize(ctx);
     }
 }
 
@@ -1379,6 +1379,84 @@ mod tests {
             assert_eq!(app.ordered_tabs()[0], tab);
             assert_eq!(app.connections.len(), 3);
             assert_eq!(app.merged_tabs.len(), usize::from(merged));
+        }
+    }
+
+    #[test]
+    fn all_tabs_dropdown_only_appears_when_tabs_do_not_fit() {
+        let (mut app, _tx) = test_app("overflow-dropdown");
+        for id in 1..=3 {
+            add_connection(&mut app, id);
+        }
+        let ctx = egui::Context::default();
+        for (width, expected) in [(1200.0, false), (360.0, true), (1200.0, false)] {
+            let size = egui::vec2(width, 600.0);
+            frame(&mut app, &ctx, size, vec![]);
+            let output = frame(&mut app, &ctx, size, vec![]);
+            let dropdown_visible = output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "▾")
+            });
+            assert_eq!(dropdown_visible, expected);
+        }
+    }
+
+    #[test]
+    fn selecting_an_overflowed_tab_reveals_it_without_truncating_its_name() {
+        let (mut app, _tx) = test_app("overflow-selection");
+        for id in 1..=8 {
+            add_connection(&mut app, id);
+        }
+        let name = "A device with a name longer than twenty four characters";
+        app.connections[7].name = Some(name.into());
+        let ctx = egui::Context::default();
+        let size = egui::vec2(520.0, 600.0);
+        frame(&mut app, &ctx, size, vec![]);
+        frame(&mut app, &ctx, size, vec![]);
+        app.active = 7;
+        frame(&mut app, &ctx, size, vec![]);
+        let output = frame(&mut app, &ctx, size, vec![]);
+        let metrics = ctx
+            .data(|data| {
+                data.get_temp::<(f32, f32, f32)>(app.pane_widget_id("tabs_scroll_metrics"))
+            })
+            .unwrap();
+        assert!(metrics.0 > 0.0);
+        assert!(
+            text_rect(&output, name).intersects(egui::Rect::from_min_size(egui::Pos2::ZERO, size))
+        );
+        assert_eq!(app.selected_tab_id(), Some(TabId::Connection(PortId(8))));
+    }
+
+    #[test]
+    fn resizing_or_renaming_tabs_keeps_the_active_tab_visible() {
+        let (mut app, _tx) = test_app("overflow-layout-change");
+        for id in 1..=8 {
+            add_connection(&mut app, id);
+        }
+        app.active = 7;
+        let ctx = egui::Context::default();
+        let wide = egui::vec2(1600.0, 600.0);
+        frame(&mut app, &ctx, wide, vec![]);
+        frame(&mut app, &ctx, wide, vec![]);
+        let narrow = egui::vec2(520.0, 600.0);
+        for rename in [false, true] {
+            if rename {
+                app.connections[0].name = Some("A much longer name for the first device".into());
+            }
+            frame(&mut app, &ctx, narrow, vec![]);
+            let output = frame(&mut app, &ctx, narrow, vec![]);
+            let (offset, visible, _) = ctx
+                .data(|data| {
+                    data.get_temp::<(f32, f32, f32)>(app.pane_widget_id("tabs_scroll_metrics"))
+                })
+                .unwrap();
+            assert!(offset > 0.0, "rename={rename}");
+            let label = text_rect(&output, "device-8");
+            // The whole selected label must fit inside the tab viewport.
+            assert!(
+                label.left() >= 10.0 && label.right() <= 10.0 + visible,
+                "rename={rename}, label={label:?}"
+            );
         }
     }
 

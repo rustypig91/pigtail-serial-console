@@ -301,41 +301,84 @@ impl App {
             || self.file_transfer_dialog.is_some();
 
         let header_rect = super::workspace::show_panel(
-            egui::TopBottomPanel::top(self.pane_widget_id("header")).frame(
-                egui::Frame::none()
-                    .fill(super::chrome::header_fill(
-                        ctx.style().visuals.dark_mode,
-                        false,
-                    ))
-                    .inner_margin(egui::Margin {
-                        left: 10.0,
-                        right: 8.0,
-                        top: 6.0,
-                        bottom: 0.0,
-                    }),
-            ),
+            egui::TopBottomPanel::top(self.pane_widget_id("header"))
+                .show_separator_line(false)
+                .frame(
+                    egui::Frame::none()
+                        .fill(super::chrome::header_fill(
+                            ctx.style().visuals.dark_mode,
+                            false,
+                        ))
+                        .inner_margin(egui::Margin {
+                            left: 10.0,
+                            right: 8.0,
+                            top: 6.0,
+                            bottom: 0.0,
+                        }),
+                ),
             ctx,
             parent,
             |ui| {
                 // Status and navigation labels must not join console text selection.
                 ui.style_mut().interaction.selectable_labels = false;
-                ui.spacing_mut().interact_size.y = 30.0;
+                super::chrome::header_style(ui);
                 let header = ui.horizontal(|ui| {
                     // Only the tab strip and "+" are disabled: global actions
                     // below act on neither the dialog nor the set of tabs, so
                     // there is nothing for them to corrupt.
                     ui.add_enabled_ui(!modal_open, |ui| {
-                        let reserve = if self.workspace.split.is_some() {
-                            32.0
+                        let labels: Vec<_> = tabs.iter().map(|id| match id {
+                            TabId::Connection(id) => self.connections.iter().find(|c| c.id == *id).unwrap().display_label().to_owned(),
+                            TabId::Merged(id) => self.merged_tabs.iter().find(|t| t.id == *id).unwrap().name.clone(),
+                        }).collect();
+                        let selected_tab = if self.merged_selected {
+                            self.loaded_merged_tab.map(|i| TabId::Merged(self.merged_tabs[i].id))
                         } else {
-                            145.0
+                            self.connections.get(self.active).map(|c| TabId::Connection(c.id))
                         };
-                        egui::ScrollArea::horizontal()
+                        let base_reserve = if self.workspace.split.is_some() { 32.0 } else { 145.0 };
+                        let widths: Vec<f32> = labels.iter().map(|label| {
+                            ui.painter().layout_no_wrap(label.clone(), egui::FontId::proportional(13.0), ui.visuals().text_color()).size().x + 64.0
+                        }).collect();
+                        let total_width = widths.iter().sum::<f32>()
+                            + ui.spacing().item_spacing.x * tabs.len().saturating_sub(1) as f32;
+                        let overflow = total_width > (ui.available_width() - base_reserve).max(1.0);
+                        let reserve = base_reserve + if overflow { 33.0 } else { 0.0 };
+                        let visible_width = (ui.available_width() - reserve).max(1.0);
+                        let selected_bounds = tabs.iter().position(|id| Some(*id) == selected_tab).map(|index| {
+                            let left = widths[..index].iter().sum::<f32>() + ui.spacing().item_spacing.x * index as f32;
+                            (left, left + widths[index])
+                        });
+                        // Reveal again when resizing, renaming, or reordering changes
+                        // the selected tab's position. Stable layouts still allow
+                        // the user to scroll away from the selection.
+                        let layout_id = self.pane_widget_id("tabs_last_layout");
+                        let layout = (selected_tab, selected_bounds, visible_width);
+                        let previous = ctx.data(|data| data.get_temp::<(Option<TabId>, Option<(f32, f32)>, f32)>(layout_id));
+                        let reveal_selected = previous != Some(layout);
+                        ctx.data_mut(|data| data.insert_temp(layout_id, layout));
+                        let scroll_id = self.pane_widget_id("tabs_scroll");
+                        let metrics_id = self.pane_widget_id("tabs_scroll_metrics");
+                        let (offset, _, _) = ctx.data(|data| data.get_temp::<(f32, f32, f32)>(metrics_id)).unwrap_or_default();
+                        let mut requested_offset = None;
+                        let mut area = egui::ScrollArea::horizontal()
                             .drag_to_scroll(false)
-                            .id_salt(self.pane_widget_id("tabs_scroll"))
-                            .max_width((ui.available_width() - reserve).max(40.0))
-                            .auto_shrink([true, true])
-                            .show(ui, |ui| {
+                            .id_salt(scroll_id)
+                            .max_width(visible_width)
+                            .auto_shrink([true, true]);
+                        if reveal_selected {
+                            if let Some((left, right)) = selected_bounds {
+                                if left < offset || right - left > visible_width {
+                                    requested_offset = Some(left);
+                                } else if right > offset + visible_width {
+                                    requested_offset = Some(right - visible_width);
+                                }
+                            }
+                        }
+                        if let Some(offset) = requested_offset {
+                            area = area.horizontal_scroll_offset(offset);
+                        }
+                        let scroll = area.show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     for (position, tab_id) in tabs.iter().copied().enumerate() {
                                         match tab_id {
@@ -361,7 +404,7 @@ impl App {
                                                 // `on_hover_text` only fires on an *enabled* widget,
                                                 // so a disabled tab needs its own tooltip to keep the
                                                 // detected device name and port available.
-                                                let (resp, close) = super::chrome::device_tab(ui, &short_label(display_label), selected, state_color(conn.state));
+                                                let (resp, close) = super::chrome::device_tab(ui, display_label, selected, state_color(conn.state));
                                                 let resp = resp.on_hover_text(&tooltip).on_disabled_hover_text(format!("{tooltip}\n(finish or cancel the open dialog first)"));
                                                 if close { to_close = Some(i); }
                                                 if !modal_open {
@@ -402,7 +445,7 @@ impl App {
                                                     .position(|t| t.id == id)
                                                     .unwrap();
                                                 let tab = &self.merged_tabs[i];
-                                                let (resp, close) = super::chrome::device_tab(ui, &short_label(&tab.name), self.merged_selected && self.loaded_merged_tab == Some(i), egui::Color32::from_rgb(120, 145, 180));
+                                                let (resp, close) = super::chrome::device_tab(ui, &tab.name, self.merged_selected && self.loaded_merged_tab == Some(i), egui::Color32::from_rgb(120, 145, 180));
                                                 let resp = resp.on_hover_text(&tab.name);
                                                 if close { close_merged = Some(i); }
                                                 if !modal_open {
@@ -433,6 +476,30 @@ impl App {
                                     }
                                 });
                             });
+                        ctx.data_mut(|data| data.insert_temp(metrics_id, (scroll.state.offset.x, scroll.inner_rect.width(), (scroll.content_size.x - scroll.inner_rect.width()).max(0.0))));
+                        if overflow {
+                        ui.menu_button("▾", |ui| {
+                            super::chrome::menu_style(ui);
+                            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                                for (tab_id, label) in tabs.iter().zip(&labels) {
+                                    let text = match tab_id {
+                                        TabId::Connection(id) => {
+                                            let conn = self.connections.iter().find(|c| c.id == *id).unwrap();
+                                            format!("{label} — {}", conn.state)
+                                        }
+                                        TabId::Merged(_) => format!("{label} — merged view"),
+                                    };
+                                    if ui.selectable_label(selected_tab == Some(*tab_id), text).clicked() {
+                                        match tab_id {
+                                            TabId::Connection(id) => set_active = self.connections.iter().position(|c| c.id == *id),
+                                            TabId::Merged(id) => select_merged = self.merged_tabs.iter().position(|t| t.id == *id),
+                                        }
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                        }).response.on_hover_text("All tabs");
+                        }
                         ui.menu_button(egui::RichText::new("+").size(20.0), |ui| {
                             super::chrome::menu_style(ui);
                             if ui.button("New connection").clicked() {
@@ -448,7 +515,7 @@ impl App {
 
                     if self.workspace.split.is_none() {
                         ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width(), 36.0),
+                            egui::vec2(ui.available_width(), super::chrome::HEADER_HEIGHT),
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
                                 super::chrome::window_controls(ui);
@@ -807,20 +874,6 @@ impl App {
                         ctx.style().visuals.dark_mode,
                         true,
                     ))
-                    .stroke(egui::Stroke::new(
-                        1.0_f32,
-                        if ctx.style().visuals.dark_mode {
-                            egui::Color32::from_rgb(39, 49, 61)
-                        } else {
-                            egui::Color32::from_rgb(211, 220, 232)
-                        },
-                    ))
-                    .rounding(egui::Rounding {
-                        nw: 6.0,
-                        ne: 6.0,
-                        sw: 0.0,
-                        se: 0.0,
-                    })
                     .inner_margin(egui::Margin::symmetric(8.0, 5.0)),
             ),
             ctx,
@@ -926,11 +979,7 @@ impl App {
         super::workspace::show_panel(
             egui::TopBottomPanel::bottom(self.pane_widget_id("status_footer")).frame(
                 egui::Frame::none()
-                    .fill(if dark {
-                        egui::Color32::from_rgb(18, 24, 31)
-                    } else {
-                        egui::Color32::from_rgb(239, 243, 248)
-                    })
+                    .fill(super::chrome::header_fill(dark, true))
                     .stroke(egui::Stroke::new(
                         1.0_f32,
                         if dark {
@@ -1578,6 +1627,54 @@ mod tests {
     use serialcore::config::TransmitMacro;
     use serialcore::store::PortId;
 
+    #[test]
+    fn active_tab_meets_toolbar_at_the_configured_header_height() {
+        for dark in [false, true] {
+            let (mut app, _tx) = test_app("compact-header");
+            app.create_merged_tab(vec![]);
+            let ctx = egui::Context::default();
+            ctx.set_visuals(crate::panes::chrome::app_visuals(dark));
+            for width in [700.0, 1100.0] {
+                let mut header = egui::Rect::NOTHING;
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 400.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        app.show_header(ctx);
+                        header = crate::panes::chrome::HeaderBackdrop::current(
+                            ctx,
+                            app.pane_widget_id("header_backdrop"),
+                        )
+                        .unwrap()
+                        .rect;
+                        app.show_toolbar(ctx);
+                    },
+                );
+                let tab = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Rect(rect)
+                            if rect.rounding.nw == 8.0
+                                && rect.fill == crate::panes::chrome::header_fill(dark, true) =>
+                        {
+                            Some(rect.rect)
+                        }
+                        _ => None,
+                    })
+                    .expect("active tab background");
+                assert_eq!(tab.height(), crate::panes::chrome::HEADER_HEIGHT);
+                assert_eq!(tab.bottom(), header.bottom(), "tab must reach the toolbar");
+                assert_eq!(header.height(), crate::panes::chrome::HEADER_HEIGHT + 6.0);
+            }
+        }
+    }
+
     fn tab_switch(key: Key) -> Event {
         Event::Key {
             key,
@@ -1955,6 +2052,7 @@ mod tests {
                 |ctx| app.show_header(ctx),
             )
         };
+        frame(vec![]);
         let output = frame(vec![]);
         let tab_center = |name: &str| {
             output
@@ -1970,7 +2068,7 @@ mod tests {
                 .unwrap()
         };
         let start = tab_center(if merged { "Merged 1" } else { "Tab 1" });
-        let end = tab_center(if merged { "Tab 1" } else { "Tab 3" }) + egui::vec2(25.0, 0.0);
+        let end = tab_center(if merged { "Tab 1" } else { "Tab 3" }) + egui::vec2(10.0, 0.0);
         let button = |pos, pressed| Event::PointerButton {
             pos,
             button: drag_button,
