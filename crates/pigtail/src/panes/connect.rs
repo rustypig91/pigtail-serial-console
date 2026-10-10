@@ -336,10 +336,6 @@ impl App {
                         } else {
                             self.connections.get(self.active).map(|c| TabId::Connection(c.id))
                         };
-                        let selection_id = self.pane_widget_id("tabs_last_selection");
-                        let previous = ctx.data(|data| data.get_temp::<Option<TabId>>(selection_id));
-                        let reveal_selected = previous != Some(selected_tab);
-                        ctx.data_mut(|data| data.insert_temp(selection_id, selected_tab));
                         let base_reserve = if self.workspace.split.is_some() { 32.0 } else { 145.0 };
                         let widths: Vec<f32> = labels.iter().map(|label| {
                             ui.painter().layout_no_wrap(label.clone(), egui::FontId::proportional(13.0), ui.visuals().text_color()).size().x + 64.0
@@ -348,6 +344,19 @@ impl App {
                             + ui.spacing().item_spacing.x * tabs.len().saturating_sub(1) as f32;
                         let overflow = total_width > (ui.available_width() - base_reserve).max(1.0);
                         let reserve = base_reserve + if overflow { 33.0 } else { 0.0 };
+                        let visible_width = (ui.available_width() - reserve).max(1.0);
+                        let selected_bounds = tabs.iter().position(|id| Some(*id) == selected_tab).map(|index| {
+                            let left = widths[..index].iter().sum::<f32>() + ui.spacing().item_spacing.x * index as f32;
+                            (left, left + widths[index])
+                        });
+                        // Reveal again when resizing, renaming, or reordering changes
+                        // the selected tab's position. Stable layouts still allow
+                        // the user to scroll away from the selection.
+                        let layout_id = self.pane_widget_id("tabs_last_layout");
+                        let layout = (selected_tab, selected_bounds, visible_width);
+                        let previous = ctx.data(|data| data.get_temp::<(Option<TabId>, Option<(f32, f32)>, f32)>(layout_id));
+                        let reveal_selected = previous != Some(layout);
+                        ctx.data_mut(|data| data.insert_temp(layout_id, layout));
                         let scroll_id = self.pane_widget_id("tabs_scroll");
                         let metrics_id = self.pane_widget_id("tabs_scroll_metrics");
                         let (offset, _, _) = ctx.data(|data| data.get_temp::<(f32, f32, f32)>(metrics_id)).unwrap_or_default();
@@ -355,14 +364,11 @@ impl App {
                         let mut area = egui::ScrollArea::horizontal()
                             .drag_to_scroll(false)
                             .id_salt(scroll_id)
-                            .max_width((ui.available_width() - reserve).max(1.0))
+                            .max_width(visible_width)
                             .auto_shrink([true, true]);
                         if reveal_selected {
-                            if let Some(index) = tabs.iter().position(|id| Some(*id) == selected_tab) {
-                                let left = widths[..index].iter().sum::<f32>() + ui.spacing().item_spacing.x * index as f32;
-                                let right = left + widths[index];
-                                let visible_width = (ui.available_width() - reserve).max(1.0);
-                                if left < offset || widths[index] > visible_width {
+                            if let Some((left, right)) = selected_bounds {
+                                if left < offset || right - left > visible_width {
                                     requested_offset = Some(left);
                                 } else if right > offset + visible_width {
                                     requested_offset = Some(right - visible_width);

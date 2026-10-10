@@ -1428,6 +1428,39 @@ mod tests {
     }
 
     #[test]
+    fn resizing_or_renaming_tabs_keeps_the_active_tab_visible() {
+        let (mut app, _tx) = test_app("overflow-layout-change");
+        for id in 1..=8 {
+            add_connection(&mut app, id);
+        }
+        app.active = 7;
+        let ctx = egui::Context::default();
+        let wide = egui::vec2(1600.0, 600.0);
+        frame(&mut app, &ctx, wide, vec![]);
+        frame(&mut app, &ctx, wide, vec![]);
+        let narrow = egui::vec2(520.0, 600.0);
+        for rename in [false, true] {
+            if rename {
+                app.connections[0].name = Some("A much longer name for the first device".into());
+            }
+            frame(&mut app, &ctx, narrow, vec![]);
+            let output = frame(&mut app, &ctx, narrow, vec![]);
+            let (offset, visible, _) = ctx
+                .data(|data| {
+                    data.get_temp::<(f32, f32, f32)>(app.pane_widget_id("tabs_scroll_metrics"))
+                })
+                .unwrap();
+            assert!(offset > 0.0, "rename={rename}");
+            let label = text_rect(&output, "device-8");
+            // The whole selected label must fit inside the tab viewport.
+            assert!(
+                label.left() >= 10.0 && label.right() <= 10.0 + visible,
+                "rename={rename}, label={label:?}"
+            );
+        }
+    }
+
+    #[test]
     fn overflowing_tab_strip_still_allows_reordering_by_drag() {
         let (mut app, _tx) = test_app("overflow-tab-drag");
         for id in 1..=8 {
