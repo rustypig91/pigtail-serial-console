@@ -73,7 +73,7 @@ application.
   ANSI/VT sits beside Hex; highlights are in the overflow menu. A thin footer shows
   connection status, line counts, port settings, and view diagnostics, with a
   clickable pin icon for autoscroll. The header tint blends subtly
-  with scrolling terminal history underneath it.
+  with scrolling terminal history and its timestamps underneath it.
 - Optional **ANSI/VT** screen for interactive shells and device menus: cursor
   positioning, erase and redraw operations, scrolling regions, styled/colored
   text, and alternate screen buffers. Select **Log**, **Hex**, or **ANSI/VT** in

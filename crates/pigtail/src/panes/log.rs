@@ -2738,6 +2738,16 @@ fn row_slot(
     (child, response)
 }
 
+// Labels normally skip painting outside the viewport. Retained rows above it
+// still need their markers in the header backdrop, just like their text.
+fn paint_row_label(ui: &mut egui::Ui, text: egui::RichText) {
+    let (pos, galley, response) = egui::Label::new(text).layout_in_ui(ui);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), galley.text())
+    });
+    ui.painter().galley(pos, galley, ui.visuals().text_color());
+}
+
 fn render_row(ui: &mut egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> egui::Response {
     let m = rctx.m;
     let height = rctx.rows as f32 * m.row_height;
@@ -2745,7 +2755,8 @@ fn render_row(ui: &mut egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> egui:
         let color = egui::Color32::from_rgb(0xe5, 0xc0, 0x40);
         let (mut cui, response) = row_slot(ui, height, egui::Sense::click(), rctx.row_id);
         cui.add(egui::Separator::default().horizontal());
-        cui.label(
+        paint_row_label(
+            &mut cui,
             egui::RichText::new(format!("── {} ──", line.text))
                 .font(m.font.clone())
                 .color(color),
@@ -2762,14 +2773,21 @@ fn render_row(ui: &mut egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> egui:
     let (mut cui, _slot) = row_slot(ui, height, egui::Sense::hover(), rctx.row_id);
     cui.spacing_mut().item_spacing.x = ROW_GAP;
     if let Some((tag, color)) = &rctx.port_tag {
-        cui.label(egui::RichText::new(tag).font(m.font.clone()).color(*color));
+        paint_row_label(
+            &mut cui,
+            egui::RichText::new(tag).font(m.font.clone()).color(*color),
+        );
     }
     let gutter = format_timestamp(line.meta.ts, rctx.ts_format, rctx.prev_micros, rctx.mark);
     if !gutter.is_empty() {
-        cui.label(egui::RichText::new(gutter).font(m.font.clone()).weak());
+        paint_row_label(
+            &mut cui,
+            egui::RichText::new(gutter).font(m.font.clone()).weak(),
+        );
     }
     if line.meta.flags.contains(LineFlags::TX_ECHO) {
-        cui.label(
+        paint_row_label(
+            &mut cui,
             egui::RichText::new(">")
                 .font(m.font.clone())
                 .color(egui::Color32::from_rgb(0x66, 0xaa, 0xff)),

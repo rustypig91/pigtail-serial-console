@@ -1625,7 +1625,7 @@ mod tests {
         for mode in ["log", "hex", "vt", "merged"] {
             let (mut app, _tx) = test_app("header-backdrop");
             add_connection(&mut app, 1);
-            app.config.settings.timestamp_format = serialcore::config::TimestampFormat::None;
+            app.config.settings.timestamp_format = serialcore::config::TimestampFormat::Time;
             app.connections[0]
                 .raw_sessions
                 .push(crate::app::RawSession {
@@ -1672,6 +1672,13 @@ mod tests {
                     .any(|shape| matches!(shape, egui::Shape::Text(_))),
                 "missing history under {mode} header"
             );
+            if matches!(mode, "log" | "merged") {
+                assert!(
+                    text.iter().any(|shape| matches!(shape, egui::Shape::Text(text)
+                        if text.galley.text().contains(':') && !text.galley.text().contains("terminal output"))),
+                    "missing timestamps under {mode} header"
+                );
+            }
             let controls = output.shapes.iter().position(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "Log")).unwrap();
             assert!(
                 index < controls,
