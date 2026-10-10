@@ -115,6 +115,30 @@ exercise unfinished escapes, so it does not detect these cases.
 
 ## Validation
 
+### PR #131 byte-preservation review
+
+The reader now completes its retained backlog before reporting disconnect,
+reconnect or closure. Previously a nonblocking final drain could silently leave
+batches behind at EOF or deliver them after a reconnect boundary; the smaller
+channel made this reachable within a single newline-heavy read. Final delivery
+may block after reading stops; the existing shutdown path drains while joining.
+The screen OSC guard also stays in Escape for the C0, DEL and high bytes VTE
+ignores there, preventing those bytes from bypassing its allocation ceiling.
+
+Regression tests compare exact raw bytes, framed text, timestamps and flags
+across 1 KiB split boundaries for Classic, LF-only and VT100, including CR/LF,
+backspace, valid and invalid UTF-8, colours, cursor edits and overlength lines.
+UI tests compare styled history and the original VT screen while yielding
+between raw chunks and lines. EOF tests fill the channel before consumption.
+An overload test verifies that delivered bytes plus reported gap bytes account
+for every input byte, and that the raw capture contains the entire input.
+
+This is not a lossless live-view guarantee. The 8 MiB backlog still sheds output
+under sustained overload, and the smaller channel reaches that policy sooner.
+The new history budget can evict lines sooner, and controls exceeding the new
+parser ceilings are discarded from interpreted output. Raw capture precedes
+these limits and is byte-preserving when logging succeeds.
+
 `cargo test --workspace --offline` and
 `cargo clippy --workspace --all-targets --offline` pass. New regression tests
 cover stalled-reader heap budgets, batch splitting with exact raw-byte/line

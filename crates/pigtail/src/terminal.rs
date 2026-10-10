@@ -46,6 +46,9 @@ impl Terminal {
                     State::Ground if byte == 0x1b => State::Escape,
                     State::Escape if byte == b']' => State::Osc(0),
                     State::Escape if byte == 0x1b => State::Escape,
+                    State::Escape if matches!(byte, 0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f..=0xff) => {
+                        State::Escape
+                    }
                     State::Osc(_) if byte == 0x1b => State::Escape,
                     State::Osc(_) if matches!(byte, 0x07 | 0x18 | 0x1a) => State::Ground,
                     State::Osc(count) if count >= MAX_OSC_BYTES => {
@@ -102,7 +105,7 @@ mod tests {
 
     #[test]
     fn normal_controls_match_the_original_parser_for_split_reads() {
-        let bytes = b"hello\r\n\x1b[31mred\x1b[0m\x1b]0;title\x07\x1b]2;other\x1b\\end";
+        let bytes = b"hello\r\n\x1b[31mred\x1b[0m\x1b]0;title\x07\x1b]2;other\x1b\\end\x1b\x00]0;nul\x07\x1b\x7f]2;del\x07\x1b\x18]plain\x1b Pignored\x1b\\\x1b[?1049halt\x1b[?1049l";
         let mut expected = vt100::Parser::new(24, 80, 0);
         expected.process(bytes);
         for split in 0..=bytes.len() {
@@ -110,9 +113,24 @@ mod tests {
             terminal.process(&bytes[..split]);
             terminal.process(&bytes[split..]);
             assert_eq!(
-                terminal.screen().contents_formatted(),
-                expected.screen().contents_formatted()
+                terminal.screen().state_formatted(),
+                expected.screen().state_formatted()
             );
+        }
+    }
+
+    #[test]
+    fn osc_after_ignored_escape_bytes_stays_bounded() {
+        // VTE remains in Escape when executing C0 controls or ignoring DEL
+        // and high bytes. The OSC guard must do the same, even across reads.
+        for ignored in [0x00, 0x0a, 0x7f, 0xff] {
+            let mut terminal = Terminal::new(24, 80, 0);
+            terminal.process(&[0x1b, ignored]);
+            terminal.process(b"]0;");
+            terminal.process(&vec![b'x'; MAX_OSC_BYTES * 2]);
+            assert!(matches!(terminal.state, State::DiscardOsc));
+            terminal.process(b"\x07after");
+            assert!(terminal.screen().contents().contains("after"));
         }
     }
 }

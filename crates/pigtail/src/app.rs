@@ -5977,6 +5977,72 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn yielding_preserves_raw_screen_and_styled_lines_in_every_terminal_mode() {
+        use serialcore::config::TerminalMode;
+        let sample = b"old\rnew\r\nutf8:\xc3\xa5\xe2\x82\xac\xf0\x9f\x90\x96\ninvalid:\xff\xfe\nabc\x08d\n\x1b[31mred\x1b[0m\nabcdef\x1b[3DXY\x1b[K\n\x1b]0;title\x1b\\ok\n";
+        let raw = sample.repeat(200);
+        for mode in [
+            TerminalMode::Classic,
+            TerminalMode::LfOnly,
+            TerminalMode::Vt100,
+        ] {
+            let (mut app, _enum_tx) = test_app("receive-mode-preservation");
+            let tx = conn_with_injected_events(&mut app, PortId(0));
+            let mut framer = serialcore::framer::Framer::with_mode(mode);
+            let mut lines = Vec::new();
+            framer.push(&raw, app.clock.now(), &mut lines);
+            framer.flush_final(&mut lines);
+            let mut expected = LineStore::new(10_000);
+            for line in &lines {
+                let styled = serialcore::ansi::parse_line(&line.text, line.cursor);
+                expected.append(IncomingLine {
+                    text: styled.text,
+                    ts: line.ts,
+                    port: PortId(0),
+                    flags: line.flags,
+                    spans: styled.spans,
+                    cursor: styled.cursor.map(|c| c as u32),
+                });
+            }
+            tx.send(ReaderEvent::Batch(reader::Batch {
+                lines,
+                raw: raw.clone(),
+            }))
+            .unwrap();
+            tx.send(ReaderEvent::State(ConnState::Closed)).unwrap();
+            let conn = &mut app.connections[0];
+            let mut drains = 0;
+            while conn.drain_events(10_000, Duration::ZERO) {
+                drains += 1;
+                assert!(drains < 10_000, "pending bytes must make progress");
+            }
+            assert!(drains > 2);
+            assert_eq!(conn.raw_ring.iter().copied().collect::<Vec<_>>(), raw);
+            assert_eq!(conn.store.len(), expected.len());
+            for abs in expected.first_abs_index()..expected.next_abs_index() {
+                let actual = conn.store.get(abs).unwrap();
+                let expected = expected.get(abs).unwrap();
+                assert_eq!(actual.text, expected.text, "{mode:?}, line {abs}");
+                assert_eq!(actual.meta.flags, expected.meta.flags);
+                assert_eq!(actual.meta.spans, expected.meta.spans);
+                assert_eq!(actual.meta.cursor, expected.meta.cursor);
+                assert_eq!(actual.meta.ts, expected.meta.ts);
+            }
+            let mut original_screen = vt100::Parser::new(24, 80, conn.vt_scrollback_rows);
+            original_screen.process(&raw);
+            assert_eq!(
+                conn.terminal.screen().contents_formatted(),
+                original_screen.screen().contents_formatted()
+            );
+            assert_eq!(
+                conn.terminal.screen().cursor_position(),
+                original_screen.screen().cursor_position()
+            );
+            assert_eq!(conn.state, ConnState::Closed);
+        }
+    }
+
+    #[test]
     fn clearing_console_discards_the_remainder_of_a_partly_consumed_batch() {
         let (mut app, _enum_tx) = test_app("receive-clear-pending");
         let tx = conn_with_injected_events(&mut app, PortId(0));
