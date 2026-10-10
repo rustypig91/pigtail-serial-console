@@ -1018,7 +1018,11 @@ impl App {
                         (self.merged_follow, self.merged_new_since_scroll)
                     } else if let Some(active) = self.active_index() {
                         let conn = &self.connections[active];
-                        ui.colored_label(state_color(conn.state), conn.state.to_string());
+                        let status =
+                            ui.colored_label(state_color(conn.state), conn.state.to_string());
+                        if let Some(err) = &conn.last_error {
+                            status.on_hover_text(&err.msg);
+                        }
                         ui.weak(format!("{} lines", conn.store.next_abs_index()));
                         if width > 450.0 {
                             ui.weak(conn.port_config.summary());
