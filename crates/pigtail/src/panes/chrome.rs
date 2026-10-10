@@ -2,13 +2,28 @@
 use crate::app::App;
 use egui::{Color32, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2};
 
-/// The header blends with terminal text painted beneath it.
+pub(super) const HEADER_HEIGHT: f32 = 27.0;
+
+pub(super) fn header_style(ui: &mut Ui) {
+    ui.spacing_mut().interact_size.y = HEADER_HEIGHT;
+    // The largest header glyph is the 20-point "+". Its padding must not
+    // force the row taller than the tabs.
+    ui.spacing_mut().button_padding.y = ui
+        .spacing()
+        .button_padding
+        .y
+        .min(((HEADER_HEIGHT - 20.0) / 2.0).max(0.0));
+}
+
+/// The tab strip blends with terminal text beneath it; the toolbar and active
+/// tab share an opaque surface so they join without a seam. The footer uses
+/// the same surface color.
 pub(super) fn header_fill(dark: bool, toolbar: bool) -> Color32 {
     match (dark, toolbar) {
         (true, false) => Color32::from_rgba_unmultiplied(15, 20, 27, 225),
-        (true, true) => Color32::from_rgba_unmultiplied(22, 28, 35, 238),
+        (true, true) => Color32::from_rgb(32, 41, 52),
         (false, false) => Color32::from_rgba_unmultiplied(235, 239, 245, 225),
-        (false, true) => Color32::from_rgba_unmultiplied(248, 250, 253, 238),
+        (false, true) => Color32::from_rgb(248, 250, 253),
     }
 }
 
@@ -58,16 +73,19 @@ pub(super) fn device_tab(
     selected: bool,
     status: Color32,
 ) -> (Response, bool) {
+    let label_color = if selected {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
     let font = egui::FontId::proportional(13.0);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label.into(), font, ui.visuals().text_color());
-    let width = (galley.size().x + 64.0).max(148.0);
+    let galley = ui.painter().layout_no_wrap(label.into(), font, label_color);
+    let width = galley.size().x + 64.0;
     let id = ui.next_auto_id();
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 36.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, HEADER_HEIGHT), Sense::hover());
     let close_rect = Rect::from_center_size(
         Pos2::new(rect.right() - 17.0, rect.center().y),
-        Vec2::splat(24.0),
+        Vec2::new(24.0, HEADER_HEIGHT.min(24.0)),
     );
     let body = Rect::from_min_max(rect.min, Pos2::new(close_rect.left(), rect.bottom()));
     let response = ui.interact(body, id.with("tab"), Sense::click_and_drag());
@@ -87,13 +105,18 @@ pub(super) fn device_tab(
             format!("Close {label}"),
         )
     });
-    let fill = surface(ui, selected || response.hovered());
-    let border = if selected {
-        Color32::from_rgb(57, 151, 244)
+    let fill = if selected {
+        header_fill(ui.visuals().dark_mode, true)
+    } else if !ui.visuals().dark_mode {
+        if response.hovered() {
+            Color32::from_rgb(229, 235, 243)
+        } else {
+            Color32::from_rgb(216, 224, 234)
+        }
     } else {
-        ui.visuals().widgets.noninteractive.bg_stroke.color
+        surface(ui, response.hovered())
     };
-    ui.painter().rect(
+    ui.painter().rect_filled(
         rect,
         egui::Rounding {
             nw: 8.0,
@@ -102,14 +125,13 @@ pub(super) fn device_tab(
             se: 0.0,
         },
         fill,
-        Stroke::new(1.0_f32, border),
     );
     ui.painter()
         .circle_filled(Pos2::new(rect.left() + 17.0, rect.center().y), 4.5, status);
     ui.painter().galley(
         Pos2::new(rect.left() + 31.0, rect.center().y - galley.size().y / 2.0),
         galley,
-        ui.visuals().text_color(),
+        label_color,
     );
     let center = close_rect.center();
     let color = if close.hovered() {
@@ -146,7 +168,7 @@ pub(super) fn window_controls(ui: &mut Ui) -> [Response; 3] {
     std::array::from_fn(|index| {
         let (tooltip, command) = &controls[index];
         let response = ui
-            .add_sized([36.0, 30.0], egui::Button::new(" ").frame(false))
+            .add_sized([36.0, HEADER_HEIGHT], egui::Button::new(" ").frame(false))
             .on_hover_text(*tooltip);
         response.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), *tooltip)
@@ -198,7 +220,7 @@ pub(super) fn window_controls(ui: &mut Ui) -> [Response; 3] {
 
 pub(super) fn drag_window(ui: &mut Ui) {
     let (_, response) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width().max(0.0), 36.0),
+        Vec2::new(ui.available_width().max(0.0), HEADER_HEIGHT),
         Sense::click_and_drag(),
     );
     let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
@@ -256,8 +278,8 @@ impl App {
             return;
         }
         let rect = ctx.screen_rect();
-        let edge = 4.0;
-        let corner = 12.0;
+        let edge = 8.0;
+        let corner = 20.0;
         use egui::ResizeDirection::*;
         let targets = [
             (
@@ -325,23 +347,43 @@ impl App {
                 egui::CursorIcon::ResizeHorizontal,
             ),
         ];
-        let ui = egui::Ui::new(
-            ctx.clone(),
-            egui::Id::new("window_resize"),
-            egui::UiBuilder::new()
-                .layer_id(egui::LayerId::new(
-                    egui::Order::Foreground,
-                    egui::Id::new("window_edges"),
-                ))
-                .max_rect(rect),
-        );
-        for (index, (target, direction, cursor)) in targets.into_iter().enumerate() {
-            let response = ui
-                .interact(target, ui.id().with(index), Sense::drag())
-                .on_hover_cursor(cursor);
-            if response.drag_started_by(egui::PointerButton::Primary) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
-            }
+        let hover_cursor = ctx
+            .input(|input| input.pointer.hover_pos())
+            .and_then(|pos| {
+                targets
+                    .iter()
+                    .find(|(target, _, _)| target.contains(pos))
+                    .map(|(_, _, cursor)| *cursor)
+            });
+        for (index, (target, direction, _)) in targets.into_iter().enumerate() {
+            // An Area registers the layer for hit testing. A standalone Ui
+            // on a foreground layer can lose hover and presses to the panels.
+            let id = egui::Id::new("window_resize").with(index);
+            ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, id));
+            egui::Area::new(id)
+                .order(egui::Order::Foreground)
+                .fixed_pos(target.min)
+                .movable(false)
+                .constrain(false)
+                .default_size(target.size())
+                .show(ctx, |ui| {
+                    let (_, response) =
+                        ui.allocate_exact_size(target.size(), Sense::click_and_drag());
+                    // Start native resizing on the press, while the window
+                    // manager still has the initiating mouse event.
+                    if response.is_pointer_button_down_on()
+                        && ui.input(|input| {
+                            input.pointer.button_pressed(egui::PointerButton::Primary)
+                        })
+                    {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+                    }
+                });
+        }
+        // Hover must also work on the first frame after the pointer enters
+        // the window or its bounds change, before widget hit tests settle.
+        if let Some(cursor) = hover_cursor {
+            ctx.set_cursor_icon(cursor);
         }
     }
 }
@@ -1056,6 +1098,163 @@ mod tests {
                     .iter()
                     .any(|command| matches!(command, egui::ViewportCommand::Maximized(_))));
             }
+        }
+    }
+
+    #[test]
+    fn window_edges_show_resize_cursors_and_start_on_primary_press() {
+        use egui::{
+            CursorIcon::{ResizeHorizontal, ResizeNeSw, ResizeNwSe, ResizeVertical},
+            ResizeDirection::*,
+        };
+        for (pos, direction, cursor) in [
+            (Pos2::new(6.0, 6.0), NorthWest, ResizeNwSe),
+            (Pos2::new(694.0, 6.0), NorthEast, ResizeNeSw),
+            (Pos2::new(6.0, 394.0), SouthWest, ResizeNeSw),
+            (Pos2::new(694.0, 394.0), SouthEast, ResizeNwSe),
+            (Pos2::new(350.0, 6.0), North, ResizeVertical),
+            (Pos2::new(350.0, 394.0), South, ResizeVertical),
+            (Pos2::new(6.0, 200.0), West, ResizeHorizontal),
+            (Pos2::new(694.0, 200.0), East, ResizeHorizontal),
+        ] {
+            let (mut app, _tx) = crate::app::tests::test_app("window-resize");
+            let ctx = egui::Context::default();
+            let mut render = |events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 400.0))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        app.show_workspace(ctx, false);
+                        app.show_window_resize(ctx);
+                    },
+                )
+            };
+            render(vec![]);
+            render(vec![]);
+            let output = render(vec![egui::Event::PointerMoved(pos)]);
+            assert_eq!(output.platform_output.cursor_icon, cursor, "{direction:?}");
+            let button = |button, pressed| egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let output = render(vec![button(egui::PointerButton::Secondary, true)]);
+            assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|cmd| matches!(cmd, egui::ViewportCommand::BeginResize(_))));
+            render(vec![button(egui::PointerButton::Secondary, false)]);
+            let output = render(vec![button(egui::PointerButton::Primary, true)]);
+            assert!(
+                output.viewport_output[&egui::ViewportId::ROOT]
+                    .commands
+                    .contains(&egui::ViewportCommand::BeginResize(direction)),
+                "{direction:?}"
+            );
+            let output = render(vec![egui::Event::PointerMoved(pos + Vec2::splat(1.0))]);
+            assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|cmd| matches!(cmd, egui::ViewportCommand::BeginResize(_))));
+        }
+    }
+
+    #[test]
+    fn corner_cursors_follow_window_size_changes() {
+        let (mut app, _tx) = crate::app::tests::test_app("corner-resize-hover");
+        let ctx = egui::Context::default();
+        ctx.set_visuals(app_visuals(true));
+        let mut render = |size, pos: Option<Pos2>| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                    events: pos.map_or_else(
+                        || vec![egui::Event::PointerGone],
+                        |pos| vec![egui::Event::PointerMoved(pos)],
+                    ),
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.show_workspace(ctx, false);
+                    // Simulate a content widget choosing its cursor first.
+                    ctx.set_cursor_icon(egui::CursorIcon::Text);
+                    app.show_window_resize(ctx);
+                },
+            )
+        };
+        for size in [
+            Vec2::new(1100.0, 720.0),
+            Vec2::new(700.0, 400.0),
+            Vec2::new(900.0, 500.0),
+        ] {
+            for offset in [0.5, 2.0, 6.0, 12.0, 19.0] {
+                for (pos, cursor) in [
+                    (Pos2::new(offset, offset), egui::CursorIcon::ResizeNwSe),
+                    (
+                        Pos2::new(size.x - offset, offset),
+                        egui::CursorIcon::ResizeNeSw,
+                    ),
+                    (
+                        Pos2::new(offset, size.y - offset),
+                        egui::CursorIcon::ResizeNeSw,
+                    ),
+                    (
+                        Pos2::new(size.x - offset, size.y - offset),
+                        egui::CursorIcon::ResizeNwSe,
+                    ),
+                ] {
+                    let output = render(size, None);
+                    assert_eq!(output.platform_output.cursor_icon, egui::CursorIcon::Text);
+                    let output = render(size, Some(pos));
+                    assert_eq!(
+                        output.platform_output.cursor_icon, cursor,
+                        "size={size:?}, pos={pos:?}"
+                    );
+                }
+            }
+            let output = render(size, Some(Pos2::new(size.x / 2.0, size.y / 2.0)));
+            assert_eq!(output.platform_output.cursor_icon, egui::CursorIcon::Text);
+        }
+    }
+
+    #[test]
+    fn maximized_and_fullscreen_windows_have_no_resize_targets() {
+        for (maximized, fullscreen) in [(true, false), (false, true)] {
+            let (app, _tx) = crate::app::tests::test_app("window-resize-disabled");
+            let ctx = egui::Context::default();
+            let render = |events| {
+                let mut input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 400.0))),
+                    events,
+                    ..Default::default()
+                };
+                let viewport = input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
+                viewport.maximized = Some(maximized);
+                viewport.fullscreen = Some(fullscreen);
+                ctx.run(input, |ctx| app.show_window_resize(ctx))
+            };
+            render(vec![]);
+            let output = render(vec![
+                egui::Event::PointerMoved(Pos2::new(6.0, 200.0)),
+                egui::Event::PointerButton {
+                    pos: Pos2::new(6.0, 200.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            assert_eq!(
+                output.platform_output.cursor_icon,
+                egui::CursorIcon::Default
+            );
+            assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|cmd| matches!(cmd, egui::ViewportCommand::BeginResize(_))));
         }
     }
 
