@@ -641,6 +641,72 @@ mod tests {
     use crate::app::tests::test_app;
 
     #[test]
+    fn escape_closes_modal_over_focused_search_without_closing_search() {
+        for merged in [false, true] {
+            for modal_key in [egui::Key::F1, egui::Key::F2] {
+                let (mut app, _enum_tx) = test_app("search-modal-escape");
+                let id = serialcore::store::PortId(1);
+                app.connections.push(app.make_connection(
+                    id,
+                    "Device 1".into(),
+                    Default::default(),
+                    Default::default(),
+                    crate::app::tests::inert_handle(id),
+                ));
+                if merged {
+                    app.create_merged_tab(vec![id]);
+                    app.merged_search_query = "needle".into();
+                } else {
+                    app.connections[0].search_query = "needle".into();
+                }
+                app.show_search = true;
+                app.search_focus_request = true;
+                let ctx = egui::Context::default();
+                let frame = |app: &mut crate::app::App, events| {
+                    ctx.run(
+                        egui::RawInput {
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            app.consume_app_shortcuts(ctx);
+                            app.close_window_on_escape(ctx);
+                            app.show_workspace(ctx, false);
+                            app.show_settings_window(ctx);
+                            app.show_about_window(ctx);
+                        },
+                    )
+                };
+                frame(&mut app, vec![]);
+                frame(&mut app, vec![]);
+                assert_eq!(
+                    ctx.memory(|memory| memory.focused()),
+                    Some(app.pane_widget_id("search_query"))
+                );
+                let key = |key| egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                frame(&mut app, vec![key(modal_key)]);
+                assert!(app.show_about || app.show_settings);
+                frame(&mut app, vec![key(egui::Key::Escape)]);
+                assert!(!app.show_settings && !app.show_about);
+                assert!(app.show_search);
+                let query = if merged {
+                    &app.merged_search_query
+                } else {
+                    &app.connections[0].search_query
+                };
+                assert_eq!(query, "needle");
+                assert!(!ctx.input(|input| input.key_pressed(egui::Key::Escape)));
+            }
+        }
+    }
+
+    #[test]
     fn escape_cancels_close_modal_without_changing_connection_or_preferences() {
         let (mut app, _enum_tx) = test_app("close-modal-escape");
         let id = serialcore::store::PortId(1);

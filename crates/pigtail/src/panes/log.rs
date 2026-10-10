@@ -934,7 +934,9 @@ impl App {
     }
 
     fn show_search_bar(&mut self, ui: &mut egui::Ui, active: usize, select_query: bool) {
-        let input_enabled = self.pane_input_enabled();
+        // A modal can remove text-field focus this frame. Its Escape/Enter
+        // must not be consumed by the search field's lost-focus handler.
+        let input_enabled = self.pane_input_enabled() && !self.keyboard_overlay_open(ui.ctx());
         let mut next = false;
         let mut prev = false;
         let mut close = false;
@@ -1079,7 +1081,9 @@ impl App {
     }
 
     fn show_merged_search_bar(&mut self, ui: &mut egui::Ui, select_query: bool) {
-        let input_enabled = self.pane_input_enabled();
+        // A modal can remove text-field focus this frame. Its Escape/Enter
+        // must not be consumed by the search field's lost-focus handler.
+        let input_enabled = self.pane_input_enabled() && !self.keyboard_overlay_open(ui.ctx());
         let mut next = false;
         let mut prev = false;
         let mut close = false;
