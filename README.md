@@ -262,6 +262,9 @@ Use **Ctrl+Shift+Up / Down** to scroll one line up or down.
 Use **Ctrl+Shift+Tab** to cycle forwards through tabs in the current pane.
 Use **F6** to switch focus between split panes.
 Use **F1** for About, **F2** for Settings, and **Ctrl+Shift+S** to save the current view as text.
+
+In **Settings → Appearance**, choose Dark or Light and a separate Blue, Green, or
+Red base color. Each theme remembers its own base color across restarts.
 Plain Page Up / Page Down and arrow keys retain their normal terminal behavior.
 
 Use **Ctrl+Shift+Space** to pin the console to the bottom. On connection tabs,

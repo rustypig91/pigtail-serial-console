@@ -2,7 +2,9 @@
 //! can borrow whatever App state they need without cross-module plumbing.
 
 mod chrome;
+#[cfg(test)]
 pub(crate) use chrome::app_visuals;
+pub(crate) use chrome::settings_visuals;
 mod connect;
 mod log;
 pub use log::wrap_len;

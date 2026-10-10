@@ -504,10 +504,7 @@ impl App {
                 .default_height(super::chrome::HEADER_HEIGHT + 6.0)
                 .frame(
                     egui::Frame::none()
-                        .fill(super::chrome::header_fill(
-                            ctx.style().visuals.dark_mode,
-                            false,
-                        ))
+                        .fill(super::chrome::header_fill(&ctx.style().visuals, false))
                         .inner_margin(egui::Margin::symmetric(8.0, 3.0)),
                 )
                 .show(ctx, |ui| {

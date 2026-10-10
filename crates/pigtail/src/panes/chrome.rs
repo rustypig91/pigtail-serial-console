@@ -16,18 +16,19 @@ pub(super) fn header_style(ui: &mut Ui) {
 }
 
 /// Opaque surfaces for the tab strip and footer.
-pub(super) fn header_fill(dark: bool, toolbar: bool) -> Color32 {
-    match (dark, toolbar) {
+pub(super) fn header_fill(visuals: &egui::Visuals, toolbar: bool) -> Color32 {
+    let color = match (visuals.dark_mode, toolbar) {
         (true, false) => Color32::from_rgb(15, 20, 27),
         (true, true) => Color32::from_rgb(32, 41, 52),
         (false, false) => Color32::from_rgb(235, 239, 245),
         (false, true) => Color32::from_rgb(248, 250, 253),
-    }
+    };
+    palette_color(color, visual_base_color(visuals))
 }
 
 /// The lower header lets console text show through behind the toolbar/search.
-pub(super) fn toolbar_fill(dark: bool, opacity: u8) -> Color32 {
-    let surface = header_fill(dark, true);
+pub(super) fn toolbar_fill(visuals: &egui::Visuals, opacity: u8) -> Color32 {
+    let surface = header_fill(visuals, true);
     Color32::from_rgba_unmultiplied(surface.r(), surface.g(), surface.b(), opacity)
 }
 
@@ -61,11 +62,10 @@ impl HeaderBackdrop {
 }
 
 pub(super) fn surface(ui: &Ui, raised: bool) -> Color32 {
-    match (ui.visuals().dark_mode, raised) {
-        (true, false) => Color32::from_rgb(15, 20, 27),
-        (true, true) => Color32::from_rgb(25, 33, 43),
-        (false, false) => Color32::from_rgb(235, 239, 245),
-        (false, true) => Color32::from_rgb(248, 250, 253),
+    if raised {
+        ui.visuals().window_fill
+    } else {
+        header_fill(ui.visuals(), false)
     }
 }
 
@@ -111,12 +111,18 @@ pub(super) fn device_tab(
         )
     });
     let fill = if selected {
-        toolbar_fill(ui.visuals().dark_mode, opacity)
+        toolbar_fill(ui.visuals(), opacity)
     } else if !ui.visuals().dark_mode {
         if response.hovered() {
-            Color32::from_rgb(229, 235, 243)
+            palette_color(
+                Color32::from_rgb(229, 235, 243),
+                visual_base_color(ui.visuals()),
+            )
         } else {
-            Color32::from_rgb(216, 224, 234)
+            palette_color(
+                Color32::from_rgb(216, 224, 234),
+                visual_base_color(ui.visuals()),
+            )
         }
     } else {
         surface(ui, response.hovered())
@@ -647,7 +653,73 @@ pub(super) fn paint_export(ui: &Ui, rect: Rect) {
     ));
 }
 
+#[cfg(test)]
 pub(crate) fn app_visuals(dark: bool) -> egui::Visuals {
+    palette_visuals(dark, serialcore::config::BaseColor::Blue)
+}
+
+#[cfg(test)]
+#[test]
+fn settings_palettes_follow_theme_without_changing_saved_colors() {
+    use serialcore::config::{BaseColor, Settings};
+    for dark in [false, true] {
+        let palettes = [BaseColor::Blue, BaseColor::Green, BaseColor::Red].map(|base| {
+            let settings = Settings {
+                theme: if dark { "dark" } else { "light" }.into(),
+                dark_base_color: if dark { base } else { BaseColor::Red },
+                light_base_color: if dark { BaseColor::Green } else { base },
+                ..Default::default()
+            };
+            let visuals = settings_visuals(&settings);
+            assert_eq!(visuals.dark_mode, dark);
+            assert_eq!(visual_base_color(&visuals), base);
+            assert_eq!(
+                header_fill(&visuals, false),
+                palette_color(header_fill(&app_visuals(dark), false), base)
+            );
+            visuals.panel_fill
+        });
+        assert_ne!(palettes[0], palettes[1]);
+        assert_ne!(palettes[1], palettes[2]);
+        assert_ne!(palettes[0], palettes[2]);
+    }
+}
+
+fn palette_color(color: Color32, base: serialcore::config::BaseColor) -> Color32 {
+    use serialcore::config::BaseColor;
+    let [r, g, b, a] = color.to_array();
+    match base {
+        BaseColor::Blue => color,
+        BaseColor::Green => Color32::from_rgba_premultiplied(r, b, g, a),
+        BaseColor::Red => Color32::from_rgba_premultiplied(b, g, r, a),
+    }
+}
+
+fn visual_base_color(visuals: &egui::Visuals) -> serialcore::config::BaseColor {
+    use serialcore::config::BaseColor;
+    let color = visuals.selection.stroke.color;
+    if color.r() > color.b() && color.r() > color.g() {
+        BaseColor::Red
+    } else if color.g() > color.b() {
+        BaseColor::Green
+    } else {
+        BaseColor::Blue
+    }
+}
+
+pub(crate) fn settings_visuals(settings: &serialcore::config::Settings) -> egui::Visuals {
+    let dark = settings.theme != "light";
+    palette_visuals(
+        dark,
+        if dark {
+            settings.dark_base_color
+        } else {
+            settings.light_base_color
+        },
+    )
+}
+
+pub(crate) fn palette_visuals(dark: bool, base: serialcore::config::BaseColor) -> egui::Visuals {
     let mut visuals = if dark {
         egui::Visuals::dark()
     } else {
@@ -682,11 +754,34 @@ pub(crate) fn app_visuals(dark: bool) -> egui::Visuals {
         visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(35, 48, 64);
         visuals.widgets.active.bg_fill = Color32::from_rgb(37, 65, 92);
     }
+    if !dark {
+        visuals.panel_fill = Color32::from_rgb(235, 239, 245);
+        visuals.window_fill = Color32::from_rgb(248, 250, 253);
+        visuals.extreme_bg_color = Color32::from_rgb(250, 252, 255);
+        visuals.faint_bg_color = Color32::from_rgb(229, 235, 243);
+        visuals.widgets.inactive.bg_fill = Color32::from_rgb(216, 224, 234);
+        visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(235, 239, 245);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(213, 233, 255);
+        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(229, 235, 243);
+        visuals.widgets.active.bg_fill = Color32::from_rgb(195, 220, 247);
+    }
+    visuals.panel_fill = palette_color(visuals.panel_fill, base);
+    visuals.window_fill = palette_color(visuals.window_fill, base);
+    visuals.window_stroke.color = palette_color(visuals.window_stroke.color, base);
+    visuals.extreme_bg_color = palette_color(visuals.extreme_bg_color, base);
+    visuals.faint_bg_color = palette_color(visuals.faint_bg_color, base);
+    visuals.selection.bg_fill = palette_color(visuals.selection.bg_fill, base);
+    visuals.selection.stroke.color = palette_color(visuals.selection.stroke.color, base);
+    visuals.hyperlink_color = palette_color(visuals.hyperlink_color, base);
     for widgets in [
+        &mut visuals.widgets.noninteractive,
         &mut visuals.widgets.inactive,
         &mut visuals.widgets.hovered,
         &mut visuals.widgets.active,
     ] {
+        widgets.bg_fill = palette_color(widgets.bg_fill, base);
+        widgets.weak_bg_fill = palette_color(widgets.weak_bg_fill, base);
+        widgets.bg_stroke.color = palette_color(widgets.bg_stroke.color, base);
         widgets.rounding = egui::Rounding::same(5.0);
     }
     visuals
