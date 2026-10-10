@@ -550,7 +550,7 @@ impl App {
             },
         );
 
-        let fill = super::chrome::header_fill(ctx.style().visuals.dark_mode, false);
+        let fill = super::chrome::header_fill(&ctx.style().visuals, false);
         let mut background = Vec::new();
         let mut corners = Vec::new();
         if active_tab_rect.is_positive() {
@@ -936,7 +936,7 @@ impl App {
                 .frame(
                     egui::Frame::none()
                         .fill(super::chrome::toolbar_fill(
-                            ctx.style().visuals.dark_mode,
+                            &ctx.style().visuals,
                             self.config.settings.header_opacity,
                         ))
                         .inner_margin(egui::Margin::symmetric(8.0, 5.0)),
@@ -1044,7 +1044,7 @@ impl App {
         super::workspace::show_panel(
             egui::TopBottomPanel::bottom(self.pane_widget_id("status_footer")).frame(
                 egui::Frame::none()
-                    .fill(super::chrome::header_fill(dark, true))
+                    .fill(super::chrome::header_fill(&ctx.style().visuals, true))
                     .stroke(egui::Stroke::new(
                         1.0_f32,
                         if dark {
@@ -1732,7 +1732,7 @@ mod tests {
                             if rect.rounding.nw == 8.0
                                 && rect.fill
                                     == crate::panes::chrome::toolbar_fill(
-                                        dark,
+                                        &ctx.style().visuals,
                                         app.config.settings.header_opacity,
                                     ) =>
                         {

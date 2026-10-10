@@ -406,6 +406,10 @@ pub struct Settings {
     pub session_retention_days: u32,
     #[serde(default = "default_theme", skip_serializing_if = "is_default_theme")]
     pub theme: String,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub dark_base_color: BaseColor,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub light_base_color: BaseColor,
     /// Ask GitHub for a newer release at startup. This is pigtail's only
     /// outbound network request; off means it makes none.
     #[serde(
@@ -417,6 +421,16 @@ pub struct Settings {
     /// something newer than this is published.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped_version: Option<String>,
+}
+
+/// Base palette, independent of the light/dark theme.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BaseColor {
+    #[default]
+    Blue,
+    Green,
+    Red,
 }
 
 // Saved settings contain only overrides; missing fields use the current defaults.
@@ -469,6 +483,8 @@ impl Default for Settings {
             timestamp_format: TimestampFormat::default(),
             session_retention_days: default_retention(),
             theme: default_theme(),
+            dark_base_color: BaseColor::default(),
+            light_base_color: BaseColor::default(),
             check_updates: default_check_updates(),
             skipped_version: None,
         }
@@ -976,6 +992,24 @@ enabled = true
         let loaded: Settings = toml::from_str(&legacy).unwrap();
         assert_eq!(loaded, defaults);
         assert!(toml::to_string(&loaded).unwrap().is_empty());
+    }
+
+    #[test]
+    fn base_colors_default_and_round_trip_independently() {
+        let defaults: Settings = toml::from_str("").unwrap();
+        assert_eq!(defaults.dark_base_color, BaseColor::Blue);
+        assert_eq!(defaults.light_base_color, BaseColor::Blue);
+        for dark in [BaseColor::Blue, BaseColor::Green, BaseColor::Red] {
+            for light in [BaseColor::Blue, BaseColor::Green, BaseColor::Red] {
+                let settings = Settings {
+                    dark_base_color: dark,
+                    light_base_color: light,
+                    ..Default::default()
+                };
+                let saved = toml::to_string(&settings).unwrap();
+                assert_eq!(toml::from_str::<Settings>(&saved).unwrap(), settings);
+            }
+        }
     }
 
     #[test]

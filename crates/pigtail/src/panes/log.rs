@@ -2817,6 +2817,116 @@ fn text_ui<R>(
     add_text(&mut child)
 }
 
+// egui exposes selection as extra rectangle vertices, but has no selected-text
+// color override. Apply console colors after its end-of-pass cleanup so missing
+// endpoints never leave recolored text behind after selection is cleared.
+#[derive(Clone)]
+struct SelectionPaint {
+    layer: egui::LayerId,
+    shape: egui::layers::ShapeIdx,
+    original: std::sync::Arc<egui::Galley>,
+    dark: bool,
+}
+
+fn recolor_selection(painted: &mut egui::Galley, original: &egui::Galley, dark: bool) {
+    let (background, foreground) = if dark {
+        (
+            egui::Color32::from_rgb(35, 94, 166),
+            egui::Color32::from_rgb(250, 252, 255),
+        )
+    } else {
+        (
+            egui::Color32::from_rgb(145, 195, 250),
+            egui::Color32::from_rgb(10, 25, 45),
+        )
+    };
+    for (row, original_row) in painted.rows.iter_mut().zip(&original.rows) {
+        let start = original_row.visuals.mesh.vertices.len();
+        let vertices = &mut row.visuals.mesh.vertices;
+        if vertices.len() != start + 4 || vertices[start].color == egui::Color32::TRANSPARENT {
+            continue;
+        }
+        let bounds = egui::Rect::from_min_max(vertices[start].pos, vertices[start + 3].pos);
+        for vertex in &mut vertices[start..] {
+            vertex.color = background;
+        }
+        // Each visible glyph is a quad. Test its center to avoid recoloring an
+        // adjacent glyph whose antialiasing extends across the selection edge.
+        let (glyphs, _) = vertices[row.visuals.glyph_vertex_range.clone()].as_chunks_mut::<4>();
+        for quad in glyphs {
+            let center = quad[0].pos.lerp(quad[3].pos, 0.5);
+            if bounds.x_range().contains(center.x) {
+                for vertex in quad {
+                    vertex.color = foreground;
+                }
+            }
+        }
+    }
+}
+
+fn queue_selection_colors(ui: &egui::Ui, original: &std::sync::Arc<egui::Galley>) {
+    let pending = ui.ctx().graphics(|layers| {
+        let list = layers.get(ui.layer_id())?;
+        let index = list.all_entries().len().checked_sub(1)?;
+        let egui::Shape::Text(shape) = &list.all_entries().last()?.shape else {
+            return None;
+        };
+        shape
+            .galley
+            .rows
+            .iter()
+            .zip(&original.rows)
+            .any(|(row, original)| {
+                row.visuals.mesh.vertices.len() == original.visuals.mesh.vertices.len() + 4
+            })
+            .then(|| SelectionPaint {
+                layer: ui.layer_id(),
+                shape: egui::layers::ShapeIdx(index),
+                original: original.clone(),
+                dark: ui.visuals().dark_mode,
+            })
+    });
+    let Some(pending) = pending else {
+        return;
+    };
+    let ctx = ui.ctx();
+    let id = egui::Id::new(("console_selection_colors", ctx.viewport_id()));
+    let installed = egui::Id::new("console_selection_colors_installed");
+    let install = ctx.data_mut(|data| {
+        data.get_temp_mut_or_default::<Vec<SelectionPaint>>(id)
+            .push(pending);
+        let install = !data.get_temp::<bool>(installed).unwrap_or(false);
+        data.insert_temp(installed, true);
+        install
+    });
+    if install {
+        ctx.on_end_pass(
+            "console_selection_colors",
+            std::sync::Arc::new(|ctx| {
+                let id = egui::Id::new(("console_selection_colors", ctx.viewport_id()));
+                let pending = ctx.data_mut(|data| {
+                    std::mem::take(data.get_temp_mut_or_default::<Vec<SelectionPaint>>(id))
+                });
+                ctx.graphics_mut(|layers| {
+                    for pending in pending {
+                        if let Some(list) = layers.get_mut(pending.layer) {
+                            list.mutate_shape(pending.shape, |shape| {
+                                if let egui::Shape::Text(shape) = &mut shape.shape {
+                                    recolor_selection(
+                                        std::sync::Arc::make_mut(&mut shape.galley),
+                                        &pending.original,
+                                        pending.dark,
+                                    );
+                                }
+                            });
+                        }
+                    }
+                });
+            }),
+        );
+    }
+}
+
 /// Render `job` as a selectable galley filling the rest of the row's slot, so a
 /// text selection can start anywhere on the line — over glyphs or the empty
 /// margin past them. Uses egui's cross-widget label selection, so dragging
@@ -2894,6 +3004,7 @@ fn wrapped_text(
             fallback,
             egui::Stroke::NONE,
         );
+        queue_selection_colors(ui, &galley);
     } else {
         ui.painter()
             .galley(rect.left_top(), galley.clone(), fallback);
@@ -3523,8 +3634,104 @@ mod tests {
     }
 
     #[test]
+    fn selection_colors_override_search_and_ansi_only_inside_selected_range() {
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(super::super::app_visuals(dark));
+            let _ = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let ansi = egui::Color32::RED;
+                    let search = egui::Color32::YELLOW;
+                    let mut job = LayoutJob::default();
+                    job.append(
+                        "abcdefgh",
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::monospace(14.0),
+                            color: ansi,
+                            background: search,
+                            ..Default::default()
+                        },
+                    );
+                    job.wrap.max_width = 35.0;
+                    job.wrap.break_anywhere = true;
+                    let original = ui.fonts(|fonts| fonts.layout_job(job));
+                    assert!(original.rows.len() > 1);
+                    let mut painted = original.clone();
+                    let range = egui::text_selection::CursorRange::two(
+                        original.from_ccursor(egui::text::CCursor::new(1)),
+                        original.from_ccursor(egui::text::CCursor::new(6)),
+                    );
+                    egui::text_selection::visuals::paint_text_selection(
+                        &mut painted,
+                        ui.visuals(),
+                        &range,
+                        None,
+                    );
+                    let mut cleared = (*painted).clone();
+                    for (row, old) in cleared.rows.iter_mut().zip(&original.rows) {
+                        for vertex in
+                            &mut row.visuals.mesh.vertices[old.visuals.mesh.vertices.len()..]
+                        {
+                            vertex.color = egui::Color32::TRANSPARENT;
+                        }
+                    }
+                    let before_cleanup = cleared.clone();
+                    recolor_selection(&mut cleared, &original, dark);
+                    assert_eq!(
+                        cleared, before_cleanup,
+                        "invalid selections must stay unchanged"
+                    );
+                    recolor_selection(std::sync::Arc::make_mut(&mut painted), &original, dark);
+                    let foreground = if dark {
+                        egui::Color32::from_rgb(250, 252, 255)
+                    } else {
+                        egui::Color32::from_rgb(10, 25, 45)
+                    };
+                    let background = if dark {
+                        egui::Color32::from_rgb(35, 94, 166)
+                    } else {
+                        egui::Color32::from_rgb(145, 195, 250)
+                    };
+                    let mut index = 0;
+                    for (row, old) in painted.rows.iter().zip(&original.rows) {
+                        let vertices = &row.visuals.mesh.vertices;
+                        for quad in vertices[row.visuals.glyph_vertex_range.clone()]
+                            .as_chunks::<4>()
+                            .0
+                        {
+                            let expected = if (1..6).contains(&index) {
+                                foreground
+                            } else {
+                                ansi
+                            };
+                            assert!(
+                                quad.iter().all(|vertex| vertex.color == expected),
+                                "glyph {index}"
+                            );
+                            index += 1;
+                        }
+                        assert_eq!(
+                            &vertices[..old.visuals.glyph_vertex_range.start],
+                            &old.visuals.mesh.vertices[..old.visuals.glyph_vertex_range.start]
+                        );
+                        assert!(vertices[old.visuals.mesh.vertices.len()..]
+                            .iter()
+                            .all(|v| v.color == background));
+                    }
+                    assert_eq!(index, 8);
+                    assert_eq!(
+                        original.job, painted.job,
+                        "selection must not alter source formatting"
+                    );
+                });
+            });
+        }
+    }
+
+    #[test]
     fn selected_text_context_menu_captures_text_and_targets_only_selection() {
-        for merged in [false, true] {
+        for (merged, dark) in [(false, false), (false, true), (true, false), (true, true)] {
             let (mut app, _enum_tx) = test_app("selection-menu");
             let port = PortId(0);
             let mut conn = app.make_connection(
@@ -3555,6 +3762,7 @@ mod tests {
             app.merged_follow = false;
             app.config.settings.timestamp_format = TimestampFormat::None;
             let ctx = egui::Context::default();
+            ctx.set_visuals(super::super::app_visuals(dark));
             let draw = |app: &mut App, events| {
                 ctx.run(
                     egui::RawInput {
@@ -3588,7 +3796,26 @@ mod tests {
                 vec![egui::Event::PointerMoved(start), button(start, true)],
             );
             let _ = draw(&mut app, vec![egui::Event::PointerMoved(end)]);
-            let _ = draw(&mut app, vec![button(end, false)]);
+            let selected = draw(&mut app, vec![button(end, false)]);
+            let foreground = if dark {
+                egui::Color32::from_rgb(250, 252, 255)
+            } else {
+                egui::Color32::from_rgb(10, 25, 45)
+            };
+            assert!(
+                selected.shapes.iter().any(|shape| {
+                    let egui::Shape::Text(shape) = &shape.shape else {
+                        return false;
+                    };
+                    shape.galley.job.text == text
+                        && shape.galley.rows.iter().all(|row| {
+                            row.visuals.mesh.vertices[row.visuals.glyph_vertex_range.clone()]
+                                .iter()
+                                .all(|vertex| vertex.color == foreground)
+                        })
+                }),
+                "selected console glyphs must use contrasting text in both themes"
+            );
             let point = start + egui::vec2(12.0, 0.0);
             let secondary = |pos, pressed| egui::Event::PointerButton {
                 pos,

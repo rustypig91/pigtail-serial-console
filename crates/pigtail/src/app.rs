@@ -1843,8 +1843,8 @@ impl App {
             .style_mut(|style| style.spacing.menu_margin = egui::Margin::same(8.0));
 
         // Theme from settings.
-        let dark = config.settings.theme != "light";
-        cc.egui_ctx.set_visuals(crate::panes::app_visuals(dark));
+        cc.egui_ctx
+            .set_visuals(crate::panes::settings_visuals(&config.settings));
 
         // The wake every background thread gets: an idle UI schedules no frames
         // of its own, so a repaint request is the only thing that brings it back.
