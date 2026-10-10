@@ -152,9 +152,13 @@ pub(super) fn window_controls(ui: &mut Ui) -> [Response; 3] {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), *tooltip)
         });
         let c = response.rect.center();
-        if index == 0 && response.hovered() {
-            ui.painter()
-                .rect_filled(response.rect, 4.0, Color32::from_rgb(182, 48, 62));
+        if response.hovered() || response.is_pointer_button_down_on() {
+            let fill = if index == 0 {
+                Color32::from_rgb(182, 48, 62)
+            } else {
+                ui.visuals().widgets.hovered.bg_fill
+            };
+            ui.painter().rect_filled(response.rect, 4.0, fill);
         }
         let stroke = Stroke::new(1.2_f32, ui.visuals().text_color());
         match index {
@@ -194,20 +198,51 @@ pub(super) fn window_controls(ui: &mut Ui) -> [Response; 3] {
 
 pub(super) fn drag_window(ui: &mut Ui) {
     let (_, response) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width().max(0.0), 30.0),
+        Vec2::new(ui.available_width().max(0.0), 36.0),
         Sense::click_and_drag(),
     );
     let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
-    if response.double_clicked() {
-        ui.ctx()
-            .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+    let press_id = response.id.with("last_window_press");
+    let options = ui.ctx().options(|options| options.input_options.clone());
+    let (time, pos) = ui.input(|input| (input.time, input.pointer.interact_pos()));
+    // Native dragging can consume the release event. Detect the second press
+    // ourselves, before starting another native drag, so double-click works
+    // even when egui never sees a complete first click.
+    if let Some(pos) = pos {
+        ui.ctx().data_mut(|data| {
+            if data
+                .get_temp::<(f64, Pos2)>(press_id)
+                .is_some_and(|(last_time, last_pos)| {
+                    time - last_time > options.max_double_click_delay
+                        || pos.distance(last_pos) > options.max_click_dist
+                })
+            {
+                data.remove::<(f64, Pos2)>(press_id);
+            }
+        });
     }
     // Native window dragging must start on the press, before egui's
     // click-and-drag motion threshold (and never again while moving).
     if response.is_pointer_button_down_on()
         && ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary))
     {
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        let double_press = ui.ctx().data_mut(|data| {
+            let previous = data.get_temp::<(f64, Pos2)>(press_id);
+            data.remove::<(f64, Pos2)>(press_id);
+            if previous.is_some() {
+                true
+            } else {
+                if let Some(pos) = pos {
+                    data.insert_temp(press_id, (time, pos));
+                }
+                false
+            }
+        });
+        ui.ctx().send_viewport_cmd(if double_press {
+            egui::ViewportCommand::Maximized(!maximized)
+        } else {
+            egui::ViewportCommand::StartDrag
+        });
     }
     response.on_hover_text("Drag to move · Double-click to maximize");
 }
@@ -747,6 +782,53 @@ pub(super) fn modal_header(ui: &mut Ui, title: &str, open: &mut bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_double_press_toggles_maximize_even_without_native_drag_release() {
+        for maximized in [false, true] {
+            for release in [false, true] {
+                let (mut app, _tx) = crate::app::tests::test_app("header-double-click");
+                let ctx = egui::Context::default();
+                let mut render = |time, events| {
+                    let mut input = egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 400.0))),
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    };
+                    input
+                        .viewports
+                        .get_mut(&egui::ViewportId::ROOT)
+                        .unwrap()
+                        .maximized = Some(maximized);
+                    ctx.run(input, |ctx| {
+                        app.show_header(ctx);
+                    })
+                };
+                render(0.0, vec![]);
+                let pos = egui::pos2(350.0, 20.0);
+                let button = |pressed| egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                render(0.1, vec![egui::Event::PointerMoved(pos), button(true)]);
+                if release {
+                    render(0.15, vec![button(false)]);
+                }
+                let output = render(0.2, vec![button(true)]);
+                let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+                assert!(commands.contains(&egui::ViewportCommand::Maximized(!maximized)));
+                assert!(!commands.contains(&egui::ViewportCommand::StartDrag));
+                let output = render(0.25, vec![button(false)]);
+                assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command, egui::ViewportCommand::Maximized(_))));
+            }
+        }
+    }
 
     #[test]
     fn window_drag_starts_on_primary_press_without_waiting_for_motion() {
