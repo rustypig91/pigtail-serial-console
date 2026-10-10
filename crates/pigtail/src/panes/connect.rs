@@ -273,6 +273,8 @@ impl App {
             .unwrap_or_else(|| ctx.layer_painter(egui::LayerId::background()));
         let mut backdrop = super::chrome::HeaderBackdrop::reserve(painter.clone());
         let background_slot = painter.add(egui::Shape::Noop);
+        let corners_slot = painter.add(egui::Shape::Noop);
+        let mut active_tab_shape_rect = egui::Rect::NOTHING;
         let mut active_tab_rect = egui::Rect::NOTHING;
         let mut to_close: Option<usize> = None;
         let mut set_active: Option<usize> = None;
@@ -402,8 +404,8 @@ impl App {
                                                 // `on_hover_text` only fires on an *enabled* widget,
                                                 // so a disabled tab needs its own tooltip to keep the
                                                 // detected device name and port available.
-                                                let (resp, close, rect) = super::chrome::device_tab(ui, display_label, selected, state_color(conn.state), self.config.settings.header_opacity);
-                                                if selected { active_tab_rect = rect; }
+                                                let (resp, close, (shape_rect, rect)) = super::chrome::device_tab(ui, display_label, selected, state_color(conn.state), self.config.settings.header_opacity);
+                                                if selected { active_tab_rect = rect; active_tab_shape_rect = shape_rect; }
                                                 let resp = resp.on_hover_text(&tooltip).on_disabled_hover_text(format!("{tooltip}\n(finish or cancel the open dialog first)"));
                                                 if close { to_close = Some(i); }
                                                 if !modal_open {
@@ -445,8 +447,8 @@ impl App {
                                                     .unwrap();
                                                 let tab = &self.merged_tabs[i];
                                                 let selected = self.merged_selected && self.loaded_merged_tab == Some(i);
-                                                let (resp, close, rect) = super::chrome::device_tab(ui, &tab.name, selected, egui::Color32::from_rgb(120, 145, 180), self.config.settings.header_opacity);
-                                                if selected { active_tab_rect = rect; }
+                                                let (resp, close, (shape_rect, rect)) = super::chrome::device_tab(ui, &tab.name, selected, egui::Color32::from_rgb(120, 145, 180), self.config.settings.header_opacity);
+                                                if selected { active_tab_rect = rect; active_tab_shape_rect = shape_rect; }
                                                 let resp = resp.on_hover_text(&tab.name);
                                                 if close { close_merged = Some(i); }
                                                 if !modal_open {
@@ -550,6 +552,7 @@ impl App {
 
         let fill = super::chrome::header_fill(ctx.style().visuals.dark_mode, false);
         let mut background = Vec::new();
+        let mut corners = Vec::new();
         if active_tab_rect.is_positive() {
             let tab = active_tab_rect.intersect(header_rect);
             for rect in [
@@ -574,16 +577,17 @@ impl App {
                     background.push(egui::Shape::rect_filled(rect, 0.0, fill));
                 }
             }
-            // Keep the space outside the active tab's rounded corners opaque.
+            // Preserve the original rounded corners when the tab is clipped by
+            // scrolling. The visible rectangle may cut through its flat middle.
             for (corner, center, start) in [
                 (
-                    tab.left_top(),
-                    tab.left_top() + egui::vec2(8.0, 8.0),
+                    active_tab_shape_rect.left_top(),
+                    active_tab_shape_rect.left_top() + egui::vec2(8.0, 8.0),
                     std::f32::consts::PI,
                 ),
                 (
-                    tab.right_top(),
-                    tab.right_top() + egui::vec2(-8.0, 8.0),
+                    active_tab_shape_rect.right_top(),
+                    active_tab_shape_rect.right_top() + egui::vec2(-8.0, 8.0),
                     -std::f32::consts::FRAC_PI_2,
                 ),
             ] {
@@ -592,7 +596,7 @@ impl App {
                     center + egui::vec2(angle.cos(), angle.sin()) * 8.0
                 };
                 for step in 0..16 {
-                    background.push(egui::Shape::convex_polygon(
+                    corners.push(egui::Shape::convex_polygon(
                         vec![corner, point(step), point(step + 1)],
                         fill,
                         egui::Stroke::NONE,
@@ -603,6 +607,9 @@ impl App {
             background.push(egui::Shape::rect_filled(header_rect, 0.0, fill));
         }
         painter.set(background_slot, egui::Shape::Vec(background));
+        painter
+            .with_clip_rect(active_tab_rect.intersect(header_rect))
+            .set(corners_slot, egui::Shape::Vec(corners));
         backdrop.rect = header_rect;
         ctx.data_mut(|data| data.insert_temp(self.pane_widget_id("header_backdrop"), backdrop));
 
@@ -1753,6 +1760,57 @@ mod tests {
                 assert_eq!(header.height(), crate::panes::chrome::HEADER_HEIGHT + 6.0);
             }
         }
+    }
+
+    #[test]
+    fn clipped_active_tab_keeps_its_original_corners() {
+        let (mut app, _tx) = test_app("clipped-tab-corners");
+        app.create_merged_tab(vec![]);
+        app.merged_tabs[0].name = "Wide tab ".repeat(100);
+        let ctx = egui::Context::default();
+        let mut render = || {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(700.0, 400.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| app.show_header(ctx),
+            )
+        };
+        render();
+        let output = render();
+        let tab = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect) if rect.rounding.nw == 8.0 => Some(rect.rect),
+                _ => None,
+            })
+            .unwrap();
+        assert!(tab.width() > 700.0);
+        fn check_corners(shape: &egui::Shape, tab: egui::Rect) -> usize {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().map(|s| check_corners(s, tab)).sum(),
+                egui::Shape::Path(path) if path.points.len() == 3 => {
+                    assert!(
+                        path.points[0] == tab.left_top() || path.points[0] == tab.right_top(),
+                        "rounded corner moved to a scroll clipping edge: {:?}",
+                        path.points[0]
+                    );
+                    1
+                }
+                _ => 0,
+            }
+        }
+        let corners: usize = output
+            .shapes
+            .iter()
+            .map(|shape| check_corners(&shape.shape, tab))
+            .sum();
+        assert_eq!(corners, 32);
     }
 
     fn tab_switch(key: Key) -> Event {

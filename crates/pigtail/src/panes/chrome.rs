@@ -77,7 +77,7 @@ pub(super) fn device_tab(
     selected: bool,
     status: Color32,
     opacity: u8,
-) -> (Response, bool, Rect) {
+) -> (Response, bool, (Rect, Rect)) {
     let label_color = if selected {
         ui.visuals().text_color()
     } else {
@@ -156,7 +156,7 @@ pub(super) fn device_tab(
     (
         response,
         close.on_hover_text("Close tab").clicked(),
-        rect.intersect(ui.clip_rect()),
+        (rect, rect.intersect(ui.clip_rect())),
     )
 }
 
