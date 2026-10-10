@@ -28,6 +28,8 @@ use memchr::{memchr, memchr2, memchr3};
 /// Hard cap on a single line's byte length (spec §7.2). A device stuck emitting
 /// bytes with no newline must not grow the tail without bound.
 pub const MAX_LINE_LEN: usize = 64 * 1024;
+/// Incomplete terminal control strings must not bypass the line-length cap.
+const MAX_ESCAPE_LEN: usize = 4096;
 
 /// A line produced by the framer, ready to become an [`crate::store::IncomingLine`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,6 +87,9 @@ pub struct Framer {
     /// downstream, not the framer's; it must not consume bytes it doesn't
     /// itself need to interpret.
     esc_raw: Vec<u8>,
+    /// Discard an oversized control string through its terminator, so its
+    /// contents cannot become cursor commands or visible text midway through.
+    escape_overflow: bool,
     /// We already emitted the current tail as PROVISIONAL, so the next emission
     /// for this line is a CONTINUATION that replaces it.
     emitted_provisional: bool,
@@ -117,6 +122,7 @@ impl Framer {
             pending_cr: false,
             esc: EscState::None,
             esc_raw: Vec::new(),
+            escape_overflow: false,
             emitted_provisional: false,
             last_ts: None,
         }
@@ -202,6 +208,7 @@ impl Framer {
                             // Only reached in VT100 mode: start an escape sequence.
                             self.esc = EscState::Esc;
                             self.esc_raw.clear();
+                            self.escape_overflow = false;
                             self.esc_raw.push(0x1b);
                             i = self.consume_escape(chunk, pos + 1, ts, out);
                         }
@@ -238,7 +245,16 @@ impl Framer {
         while i < chunk.len() {
             let b = chunk[i];
             i += 1;
-            self.esc_raw.push(b);
+            if self.esc_raw.len() == MAX_ESCAPE_LEN {
+                self.esc_raw.clear();
+                if let EscState::Csi { params } = &mut self.esc {
+                    params.clear();
+                }
+                self.escape_overflow = true;
+            }
+            if !self.escape_overflow {
+                self.esc_raw.push(b);
+            }
             match &mut self.esc {
                 EscState::None => return i - 1,
                 EscState::Esc => match b {
@@ -248,13 +264,15 @@ impl Framer {
                 },
                 EscState::Csi { params } => {
                     if (0x30..=0x3F).contains(&b) {
-                        params.push(b); // parameter byte (digits, ';', ...)
+                        if !self.escape_overflow {
+                            params.push(b); // parameter byte (digits, ';', ...)
+                        }
                     } else if (0x20..=0x2F).contains(&b) {
                         // intermediate byte; none of our recognized commands use one
                     } else if (0x40..=0x7E).contains(&b) {
                         let params = std::mem::take(params);
                         self.esc = EscState::None;
-                        if self.apply_csi(b, &params) {
+                        if !self.escape_overflow && self.apply_csi(b, &params) {
                             self.esc_raw.clear(); // handled: don't leak it as text
                         }
                     } else {
@@ -276,6 +294,7 @@ impl Framer {
                 }
             }
             if self.esc == EscState::None {
+                self.escape_overflow = false;
                 if !self.esc_raw.is_empty() {
                     let raw = std::mem::take(&mut self.esc_raw);
                     self.append_to_tail(&raw, ts, out);
@@ -846,6 +865,35 @@ fn sanitize_utf8_tracking(bytes: &[u8], track: Option<usize>) -> (String, bool, 
 
 #[cfg(test)]
 mod tests {
+    /// Report parser allocations for malformed streams independently of UI
+    /// history, channels, and capture. This is a diagnostic, not a timing gate.
+    #[test]
+    #[ignore = "manual receive-load diagnostic"]
+    fn unterminated_escape_allocation_diagnostic() {
+        for prefix in [b"\x1b]".as_slice(), b"\x1b["] {
+            let mut framer = super::Framer::with_mode(crate::config::TerminalMode::Vt100);
+            let mut lines = Vec::new();
+            let clock = crate::clock::SessionClock::new();
+            framer.push(prefix, clock.now(), &mut lines);
+            let chunk = vec![b'1'; 65536];
+            for reads in 1..=256 {
+                framer.push(&chunk, clock.now(), &mut lines);
+                if reads == 16 || reads == 256 {
+                    let params = match &framer.esc {
+                        super::EscState::Csi { params } => params.capacity(),
+                        _ => 0,
+                    };
+                    eprintln!(
+                        "prefix {prefix:?}, received {} MiB: escape allocation {} bytes; tail {} bytes; {} emitted lines",
+                        reads / 16,
+                        framer.esc_raw.capacity() + params,
+                        framer.tail.len(),
+                        lines.len(),
+                    );
+                }
+            }
+        }
+    }
     use super::*;
     use crate::clock::SessionClock;
 
@@ -858,6 +906,30 @@ mod tests {
 
     fn texts(lines: &[FramedLine]) -> Vec<String> {
         lines.iter().map(|l| l.text.clone()).collect()
+    }
+
+    #[test]
+    fn oversized_controls_stay_bounded_and_recover_at_the_terminator() {
+        for (prefix, end) in [(b"\x1b]".as_slice(), b'\x07'), (b"\x1b[".as_slice(), b'm')] {
+            let mut framer = Framer::with_mode(TerminalMode::Vt100);
+            let mut lines = Vec::new();
+            framer.push(prefix, ts(0), &mut lines);
+            for _ in 0..32 {
+                framer.push(&vec![b'1'; MAX_ESCAPE_LEN], ts(1), &mut lines);
+            }
+            assert!(framer.escape_overflow);
+            assert!(framer.esc_raw.capacity() <= MAX_ESCAPE_LEN);
+            if let EscState::Csi { params } = &framer.esc {
+                assert!(params.capacity() <= MAX_ESCAPE_LEN);
+                assert!(params.is_empty());
+            }
+            assert!(lines.is_empty());
+            assert_eq!(framer.tail_len(), 0);
+            framer.push(&[end], ts(2), &mut lines);
+            framer.push(b"ok\n\x1b[31mred\n", ts(3), &mut lines);
+            assert_eq!(texts(&lines), vec!["ok", "\x1b[31mred"]);
+            assert!(!framer.escape_overflow);
+        }
     }
 
     /// Feed the whole input as a single chunk.

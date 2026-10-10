@@ -993,8 +993,9 @@ impl App {
                                 || conn.raw_evicted_any
                                 || conn.series_evicted_any)
                         {
-                            ui.weak("History limited")
-                                .on_hover_text("Older history evicted; full capture on disk");
+                            ui.weak("History limited").on_hover_text(
+                                "Live history or plotted series limited; full capture on disk",
+                            );
                         }
                         (conn.follow, conn.new_since_scroll)
                     } else {

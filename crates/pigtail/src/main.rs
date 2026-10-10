@@ -7,6 +7,7 @@
 mod app;
 mod panes;
 mod paths;
+mod terminal;
 mod wrap;
 
 use anyhow::Context;

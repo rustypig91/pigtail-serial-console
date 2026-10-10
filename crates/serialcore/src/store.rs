@@ -114,6 +114,17 @@ pub struct LineRef<'a> {
 const MAX_ARENA_BYTES: usize = 1 << 31; // 2 GiB
 #[cfg(test)]
 const MAX_ARENA_BYTES: usize = 4096;
+/// Text, metadata and heap-backed colour spans share this retention budget.
+/// Vector spare capacity is additional (normally less than another budget).
+const MAX_RESIDENT_BYTES: usize = 128 * 1024 * 1024;
+
+fn span_bytes(spans: &smallvec::SmallVec<[ColorSpan; 2]>) -> usize {
+    if spans.spilled() {
+        spans.capacity() * std::mem::size_of::<ColorSpan>()
+    } else {
+        0
+    }
+}
 
 /// Line arena with front eviction.
 ///
@@ -128,6 +139,8 @@ pub struct LineStore {
     /// Lines evicted from the front, for index translation.
     line_base: u64,
     max_lines: usize,
+    max_resident_bytes: usize,
+    span_heap_bytes: usize,
     /// Set once eviction has occurred, for the UI banner.
     evicted_any: bool,
     /// Set once a line you sent has been stored. Sticky, because those lines
@@ -145,6 +158,8 @@ impl LineStore {
             arena_base: 0,
             line_base: 0,
             max_lines: max_lines.max(1),
+            max_resident_bytes: MAX_RESIDENT_BYTES,
+            span_heap_bytes: 0,
             evicted_any: false,
             tx_echo_any: false,
         }
@@ -199,6 +214,8 @@ impl LineStore {
                     let mut flags = line.flags;
                     flags.remove(LineFlags::CONTINUATION);
                     last.flags = flags;
+                    self.span_heap_bytes -= span_bytes(&last.spans);
+                    self.span_heap_bytes += span_bytes(&line.spans);
                     last.spans = line.spans;
                     last.cursor = line.cursor;
                     let abs = self.line_base + (self.lines.len() as u64 - 1);
@@ -214,6 +231,7 @@ impl LineStore {
 
         let start = self.arena.len() as u32;
         self.arena.extend_from_slice(line.text.as_bytes());
+        self.span_heap_bytes += span_bytes(&line.spans);
         let mut flags = line.flags;
         flags.remove(LineFlags::CONTINUATION);
         self.lines.push(LineMeta {
@@ -283,6 +301,7 @@ impl LineStore {
         self.arena.clear();
         self.line_base += self.lines.len() as u64;
         self.lines.clear();
+        self.span_heap_bytes = 0;
         // No line is left to wear a ">", so the column it needed goes back to
         // the text.
         self.tx_echo_any = false;
@@ -338,7 +357,25 @@ impl LineStore {
             0
         };
 
-        let evict_count = by_lines.max(by_bytes);
+        let resident = self.arena.len()
+            + self.lines.len() * std::mem::size_of::<LineMeta>()
+            + self.span_heap_bytes;
+        let by_resident = if resident > self.max_resident_bytes {
+            let target = resident - self.max_resident_bytes / 2;
+            let mut freed = 0;
+            self.lines
+                .iter()
+                .position(|meta| {
+                    freed += meta.len as usize
+                        + std::mem::size_of::<LineMeta>()
+                        + span_bytes(&meta.spans);
+                    freed >= target
+                })
+                .map_or(self.lines.len(), |i| i + 1)
+        } else {
+            0
+        };
+        let evict_count = by_lines.max(by_bytes).max(by_resident);
         if evict_count > 0 {
             self.evict(evict_count);
         }
@@ -364,6 +401,10 @@ impl LineStore {
         self.arena_base += byte_cutoff as u64;
 
         // Drop metadata and shift offsets.
+        self.span_heap_bytes -= self.lines[..count]
+            .iter()
+            .map(|m| span_bytes(&m.spans))
+            .sum::<usize>();
         self.lines.drain(..count);
         for m in &mut self.lines {
             m.start -= byte_cutoff as u32;
@@ -374,7 +415,9 @@ impl LineStore {
 
     /// Approximate resident memory footprint in bytes.
     pub fn approx_bytes(&self) -> usize {
-        self.arena.capacity() + self.lines.capacity() * std::mem::size_of::<LineMeta>()
+        self.arena.capacity()
+            + self.lines.capacity() * std::mem::size_of::<LineMeta>()
+            + self.span_heap_bytes
     }
 }
 
@@ -405,6 +448,44 @@ mod tests {
         assert_eq!(s.get(0).unwrap().text, "hello");
         assert_eq!(s.get(1).unwrap().text, "world");
         assert!(s.get(2).is_none());
+    }
+
+    #[test]
+    fn resident_budget_bounds_metadata_even_for_empty_lines() {
+        let clock = SessionClock::new();
+        let mut store = LineStore::new(1_000_000);
+        store.max_resident_bytes = 2048;
+        for _ in 0..100 {
+            store.append(incoming("", &clock));
+            assert!(store.lines.len() * std::mem::size_of::<LineMeta>() <= 2048);
+        }
+        assert!(store.evicted_any());
+        assert!(store.get(99).is_some());
+    }
+
+    #[test]
+    fn colour_span_allocations_are_accounted_on_replace_evict_and_clear() {
+        let clock = SessionClock::new();
+        let mut store = LineStore::new(1000);
+        let mut line = incoming("colour", &clock);
+        line.flags = LineFlags::PROVISIONAL;
+        line.spans = (0..16)
+            .map(|_| ColorSpan {
+                start: 0,
+                len: 1,
+                rgb: ColorSpan::NO_COLOR,
+                bg: ColorSpan::NO_COLOR,
+                bold: false,
+            })
+            .collect();
+        store.append(line);
+        assert!(store.span_heap_bytes > 0);
+        let mut replacement = incoming("plain", &clock);
+        replacement.flags = LineFlags::CONTINUATION;
+        store.append(replacement);
+        assert_eq!(store.span_heap_bytes, 0);
+        store.clear();
+        assert_eq!(store.span_heap_bytes, 0);
     }
 
     #[test]

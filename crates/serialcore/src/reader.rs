@@ -29,6 +29,10 @@ use std::time::{Duration, Instant};
 const READ_BUF: usize = 64 * 1024;
 const BATCH_INTERVAL: Duration = Duration::from_millis(16);
 const BATCH_MAX_LINES: usize = 4000;
+const FRAME_CHUNK_BYTES: usize = 1024;
+const BATCH_TARGET_BYTES: usize = 256 * 1024;
+const BATCH_MAX_BYTES: usize = 512 * 1024;
+const BATCH_MAX_RAW: usize = 64 * 1024;
 /// Heap budget for batches that could not be handed to the UI yet.
 ///
 /// The channel itself is bounded, but without a second bound here a stalled UI
@@ -41,12 +45,12 @@ const MAX_BACKLOG_BYTES: usize = 8 * 1024 * 1024;
 // with no trailing newline) appears promptly instead of feeling laggy.
 const PROVISIONAL_AFTER: Duration = Duration::from_millis(20);
 #[cfg(not(test))]
-const CHANNEL_CAPACITY: usize = 1024;
+// Each channel slot is capped at BATCH_MAX_BYTES, so live-view batches in the
+// channel occupy at most 8 MiB, in addition to the 8 MiB local backlog.
+const CHANNEL_CAPACITY: usize = 16;
 /// Small under test so a full channel — the state the blocking sends have to
-/// survive — is reachable in a few milliseconds rather than the sixteen
-/// seconds of output it takes at the real size. Nothing here depends on the
-/// number itself; integration tests link the lib built without `cfg(test)`
-/// and so still run at the real capacity.
+/// survive — is reachable in a few milliseconds. Nothing here depends on the
+/// number itself; integration tests use the production capacity.
 #[cfg(test)]
 const CHANNEL_CAPACITY: usize = 4;
 
@@ -696,8 +700,14 @@ fn run(
                             event_tx.send(ReaderEvent::session_error(format!("log write: {e}")));
                         }
                     }
-                    pending.raw.extend_from_slice(&buf[..n]);
-                    framer.push(&buf[..n], ts, &mut pending.lines);
+                    frame_read(
+                        &buf[..n],
+                        ts,
+                        &mut framer,
+                        &mut pending,
+                        &mut backlog,
+                        &event_tx,
+                    );
                 }
                 Err(SourceError::Disconnected(msg)) => {
                     event_tx.send(ReaderEvent::connection_error(msg));
@@ -1151,6 +1161,31 @@ fn flush_batch(
     enqueue_batch(std::mem::take(pending), backlog, event_tx, order_at);
 }
 
+/// Keep one read full of short lines from becoming one enormous batch. The
+/// timestamp and raw capture remain those of the original read.
+fn frame_read(
+    bytes: &[u8],
+    ts: Timestamp,
+    framer: &mut Framer,
+    pending: &mut Batch,
+    backlog: &mut Backlog,
+    event_tx: &EventTx,
+) {
+    for chunk in bytes.chunks(FRAME_CHUNK_BYTES) {
+        // One byte can finish one line, plus one already-open line may be
+        // force-truncated. Reserve room before parsing, not after a full read.
+        if pending.lines.len() + chunk.len() + 1 > BATCH_MAX_LINES {
+            flush_batch(pending, backlog, event_tx, framer, ts);
+        }
+        pending.raw.extend_from_slice(chunk);
+        framer.push(chunk, ts, &mut pending.lines);
+        if pending.raw.len() >= BATCH_MAX_RAW || Backlog::batch_bytes(pending) >= BATCH_TARGET_BYTES
+        {
+            flush_batch(pending, backlog, event_tx, framer, ts);
+        }
+    }
+}
+
 /// Give queued batches every currently available channel slot before enforcing
 /// the local memory budget. This matters at the boundary: if the UI just made
 /// room, dropping an old batch before retrying the channel would manufacture a
@@ -1167,7 +1202,14 @@ fn enqueue_batch_with_limit(
     limit: usize,
 ) {
     drain_backlog(backlog, event_tx);
+    let oversized = Backlog::batch_bytes(&batch) > BATCH_MAX_BYTES;
     backlog.push_unbounded(batch, order_at);
+    if oversized {
+        // Defensive ceiling, including vector capacities. Never admit a batch
+        // that could break the channel's aggregate heap bound. Dropping the
+        // preceding backlog too keeps the reported gap in stream order.
+        backlog.enforce_limit(0);
+    }
     drain_backlog(backlog, event_tx);
     backlog.enforce_limit(limit);
     drain_backlog(backlog, event_tx);
@@ -1317,6 +1359,98 @@ mod tests {
             tx,
             wake: Wake::default(),
         }
+    }
+
+    #[test]
+    fn newline_flood_is_split_without_changing_raw_bytes_or_lines() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let events = EventTx {
+            tx,
+            wake: Wake::none(),
+        };
+        let mut pending = Batch::default();
+        let mut backlog = Backlog::default();
+        let mut framer = Framer::new();
+        let ts = SessionClock::new().now();
+        let bytes = vec![b'\n'; READ_BUF];
+        frame_read(&bytes, ts, &mut framer, &mut pending, &mut backlog, &events);
+        flush_batch(&mut pending, &mut backlog, &events, &framer, ts);
+        let mut raw = Vec::new();
+        let mut count = 0;
+        for event in rx.try_iter() {
+            let ReaderEvent::Batch(batch) = event else {
+                panic!("unexpected gap")
+            };
+            assert!(batch.lines.len() <= BATCH_MAX_LINES);
+            assert!(batch.raw.len() <= BATCH_MAX_RAW);
+            assert!(Backlog::batch_bytes(&batch) <= BATCH_MAX_BYTES);
+            assert!(batch
+                .lines
+                .iter()
+                .all(|line| line.text.is_empty() && line.ts == ts));
+            count += batch.lines.len();
+            raw.extend(batch.raw);
+        }
+        assert_eq!(raw, bytes);
+        assert_eq!(count, READ_BUF);
+    }
+
+    #[test]
+    fn oversized_batch_cannot_enter_channel_and_reports_a_gap() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let events = EventTx {
+            tx,
+            wake: Wake::none(),
+        };
+        let mut backlog = Backlog::default();
+        let ts = SessionClock::new().now();
+        enqueue_batch(
+            Batch {
+                lines: Vec::new(),
+                raw: vec![0; BATCH_MAX_BYTES + 1],
+            },
+            &mut backlog,
+            &events,
+            ts,
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(ReaderEvent::OutputDropped { raw_bytes, at, .. }) if raw_bytes == (BATCH_MAX_BYTES + 1) as u64 && at == ts)
+        );
+        assert!(rx.is_empty());
+        assert!(backlog.batches.is_empty());
+    }
+
+    #[test]
+    fn stalled_ui_keeps_channel_and_backlog_within_heap_budgets() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let events = EventTx {
+            tx,
+            wake: Wake::none(),
+        };
+        let mut pending = Batch::default();
+        let mut backlog = Backlog::default();
+        let mut framer = Framer::new();
+        let ts = SessionClock::new().now();
+        let bytes = vec![b'\n'; READ_BUF];
+        for _ in 0..64 {
+            frame_read(&bytes, ts, &mut framer, &mut pending, &mut backlog, &events);
+            assert!(backlog.allocated_bytes <= MAX_BACKLOG_BYTES);
+        }
+        flush_batch(&mut pending, &mut backlog, &events, &framer, ts);
+        assert!(backlog.dropped.raw_bytes > 0);
+        let mut channel_bytes = 0;
+        for event in rx.try_iter() {
+            if let ReaderEvent::Batch(batch) = event {
+                assert!(Backlog::batch_bytes(&batch) <= BATCH_MAX_BYTES);
+                channel_bytes += Backlog::batch_bytes(&batch);
+            }
+        }
+        assert!(channel_bytes <= 8 * 1024 * 1024);
+        drain_backlog(&mut backlog, &events);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ReaderEvent::OutputDropped { .. })
+        ));
     }
 
     #[test]
