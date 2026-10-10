@@ -29,6 +29,10 @@ use std::time::{Duration, Instant};
 const READ_BUF: usize = 64 * 1024;
 const BATCH_INTERVAL: Duration = Duration::from_millis(16);
 const BATCH_MAX_LINES: usize = 4000;
+const FRAME_CHUNK_BYTES: usize = 1024;
+const BATCH_TARGET_BYTES: usize = 256 * 1024;
+const BATCH_MAX_BYTES: usize = 512 * 1024;
+const BATCH_MAX_RAW: usize = 64 * 1024;
 /// Heap budget for batches that could not be handed to the UI yet.
 ///
 /// The channel itself is bounded, but without a second bound here a stalled UI
@@ -41,12 +45,12 @@ const MAX_BACKLOG_BYTES: usize = 8 * 1024 * 1024;
 // with no trailing newline) appears promptly instead of feeling laggy.
 const PROVISIONAL_AFTER: Duration = Duration::from_millis(20);
 #[cfg(not(test))]
-const CHANNEL_CAPACITY: usize = 1024;
+// Each channel slot is capped at BATCH_MAX_BYTES, so live-view batches in the
+// channel occupy at most 8 MiB, in addition to the 8 MiB local backlog.
+const CHANNEL_CAPACITY: usize = 16;
 /// Small under test so a full channel — the state the blocking sends have to
-/// survive — is reachable in a few milliseconds rather than the sixteen
-/// seconds of output it takes at the real size. Nothing here depends on the
-/// number itself; integration tests link the lib built without `cfg(test)`
-/// and so still run at the real capacity.
+/// survive — is reachable in a few milliseconds. Nothing here depends on the
+/// number itself; integration tests use the production capacity.
 #[cfg(test)]
 const CHANNEL_CAPACITY: usize = 4;
 
@@ -638,6 +642,7 @@ fn run(
         let mut last_send = Instant::now();
         let mut last_byte = Instant::now();
         let mut provisional_flushed = false;
+        let connection_error;
         let mut transfer: Option<ActiveTransfer> = None;
         let mut transmit = PacedTransmit::default();
 
@@ -661,7 +666,16 @@ fn run(
                     // Flush and exit.
                     framer.flush_final(&mut pending.lines);
                     flush_batch(&mut pending, &mut backlog, &event_tx, &framer, clock.now());
-                    drain_backlog(&mut backlog, &event_tx);
+                    finish_backlog(
+                        &cmd_rx,
+                        ClearTargets {
+                            writer: &mut writer,
+                            framer: &mut framer,
+                            pending: &mut pending,
+                            backlog: &mut backlog,
+                        },
+                        &event_tx,
+                    );
                     if let Some(w) = &mut writer {
                         let _ = w.flush();
                     }
@@ -696,16 +710,22 @@ fn run(
                             event_tx.send(ReaderEvent::session_error(format!("log write: {e}")));
                         }
                     }
-                    pending.raw.extend_from_slice(&buf[..n]);
-                    framer.push(&buf[..n], ts, &mut pending.lines);
+                    frame_read(
+                        &buf[..n],
+                        ts,
+                        &mut framer,
+                        &mut pending,
+                        &mut backlog,
+                        &event_tx,
+                    );
                 }
                 Err(SourceError::Disconnected(msg)) => {
-                    event_tx.send(ReaderEvent::connection_error(msg));
+                    connection_error = msg;
                     break;
                 }
                 Err(e) => {
                     // Treat any read error as a loss; reconnect will retry.
-                    event_tx.send(ReaderEvent::connection_error(e.to_string()));
+                    connection_error = e.to_string();
                     break;
                 }
             }
@@ -736,10 +756,24 @@ fn run(
         // still presenting itself as the live one.
         framer.flush_final(&mut pending.lines);
         flush_batch(&mut pending, &mut backlog, &event_tx, &framer, clock.now());
-        drain_backlog(&mut backlog, &event_tx);
+        let shutdown = finish_backlog(
+            &cmd_rx,
+            ClearTargets {
+                writer: &mut writer,
+                framer: &mut framer,
+                pending: &mut pending,
+                backlog: &mut backlog,
+            },
+            &event_tx,
+        );
         if let Some(w) = &mut writer {
             let _ = w.flush();
         }
+        if shutdown {
+            event_tx.send(ReaderEvent::State(ConnState::Closed));
+            break 'outer;
+        }
+        event_tx.send(ReaderEvent::connection_error(connection_error));
 
         if !reconnect {
             event_tx.send(ReaderEvent::State(ConnState::Closed));
@@ -1151,6 +1185,31 @@ fn flush_batch(
     enqueue_batch(std::mem::take(pending), backlog, event_tx, order_at);
 }
 
+/// Keep one read full of short lines from becoming one enormous batch. The
+/// timestamp and raw capture remain those of the original read.
+fn frame_read(
+    bytes: &[u8],
+    ts: Timestamp,
+    framer: &mut Framer,
+    pending: &mut Batch,
+    backlog: &mut Backlog,
+    event_tx: &EventTx,
+) {
+    for chunk in bytes.chunks(FRAME_CHUNK_BYTES) {
+        // One byte can finish one line, plus one already-open line may be
+        // force-truncated. Reserve room before parsing, not after a full read.
+        if pending.lines.len() + chunk.len() + 1 > BATCH_MAX_LINES {
+            flush_batch(pending, backlog, event_tx, framer, ts);
+        }
+        pending.raw.extend_from_slice(chunk);
+        framer.push(chunk, ts, &mut pending.lines);
+        if pending.raw.len() >= BATCH_MAX_RAW || Backlog::batch_bytes(pending) >= BATCH_TARGET_BYTES
+        {
+            flush_batch(pending, backlog, event_tx, framer, ts);
+        }
+    }
+}
+
 /// Give queued batches every currently available channel slot before enforcing
 /// the local memory budget. This matters at the boundary: if the UI just made
 /// room, dropping an old batch before retrying the channel would manufacture a
@@ -1167,7 +1226,14 @@ fn enqueue_batch_with_limit(
     limit: usize,
 ) {
     drain_backlog(backlog, event_tx);
+    let oversized = Backlog::batch_bytes(&batch) > BATCH_MAX_BYTES;
     backlog.push_unbounded(batch, order_at);
+    if oversized {
+        // Defensive ceiling, including vector capacities. Never admit a batch
+        // that could break the channel's aggregate heap bound. Dropping the
+        // preceding backlog too keeps the reported gap in stream order.
+        backlog.enforce_limit(0);
+    }
     drain_backlog(backlog, event_tx);
     backlog.enforce_limit(limit);
     drain_backlog(backlog, event_tx);
@@ -1223,6 +1289,73 @@ fn drain_backlog(backlog: &mut Backlog, event_tx: &EventTx) {
     }
 }
 
+/// Once reading has stopped, deliver every retained batch before announcing
+/// the stream boundary. A nonblocking drain can leave unsent data behind at
+/// EOF or put old data after reconnect events. Blocking here cannot delay
+/// active reads. Continue accepting commands while waiting for channel space:
+/// a clear must still discard these bytes and truncate their capture at EOF.
+/// Returns whether shutdown was requested before delivery completed.
+fn finish_backlog(
+    cmd_rx: &Receiver<ReaderCommand>,
+    targets: ClearTargets<'_>,
+    event_tx: &EventTx,
+) -> bool {
+    let ClearTargets {
+        writer,
+        framer,
+        pending,
+        backlog,
+    } = targets;
+    loop {
+        let event = if let Some(at) = backlog.dropped.at {
+            let event = ReaderEvent::OutputDropped {
+                raw_bytes: backlog.dropped.raw_bytes,
+                line_updates: backlog.dropped.line_updates,
+                at,
+            };
+            backlog.dropped = DroppedOutput::default();
+            event
+        } else if let Some(queued) = backlog.pop_front() {
+            ReaderEvent::Batch(queued.batch)
+        } else {
+            return false;
+        };
+        loop {
+            // Prefer commands already waiting over sending another old batch.
+            crossbeam_channel::select_biased! {
+                recv(cmd_rx) -> command => {
+                    let Ok(command) = command else { return true; };
+                    let cleared = matches!(command, ReaderCommand::ClearLog);
+                    if handle_disconnected_command(
+                        command,
+                        ClearTargets {
+                            writer: &mut *writer,
+                            framer: &mut *framer,
+                            pending: &mut *pending,
+                            backlog: &mut *backlog,
+                        },
+                        event_tx,
+                    ) {
+                        return true;
+                    }
+                    if cleared {
+                        // The event removed above also belongs to the clear.
+                        break;
+                    }
+                }
+                send(event_tx.tx, event) -> result => {
+                    if result.is_err() {
+                        backlog.clear();
+                        return true;
+                    }
+                    event_tx.wake.signal();
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Sleep for `dur`, returning `true` if a Shutdown arrived meanwhile.
 fn wait_or_shutdown(
     cmd_rx: &Receiver<ReaderCommand>,
@@ -1231,41 +1364,51 @@ fn wait_or_shutdown(
     event_tx: &EventTx,
 ) -> bool {
     match cmd_rx.recv_timeout(dur) {
-        Ok(ReaderCommand::Shutdown) => true,
+        Ok(command) => handle_disconnected_command(command, targets, event_tx),
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => false,
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => true,
+    }
+}
+
+fn handle_disconnected_command(
+    command: ReaderCommand,
+    targets: ClearTargets<'_>,
+    event_tx: &EventTx,
+) -> bool {
+    match command {
+        ReaderCommand::Shutdown => true,
         // Handled even while disconnected: the capture is still on disk, and a
         // console cleared during an outage must not have its history reappear
         // as preloaded output on the next launch.
-        Ok(ReaderCommand::ClearLog) => {
+        ReaderCommand::ClearLog => {
             clear_log(targets, event_tx);
             false
         }
         // Nothing to write to while disconnected, and staying here until
         // reconnect would just delay input the user typed against a stale
         // idea of the link. Report it instead of silently eating it.
-        Ok(ReaderCommand::Transmit(_, _, _)) => {
+        ReaderCommand::Transmit(_, _, _) => {
             report_dropped_command(event_tx, "transmit");
             false
         }
-        Ok(ReaderCommand::StartTransfer(_, _)) => {
+        ReaderCommand::StartTransfer(_, _) => {
             report_dropped_command(event_tx, "file transfer");
             event_tx.send(ReaderEvent::TransferEnded);
             false
         }
-        Ok(ReaderCommand::CancelTransfer) => false,
-        Ok(ReaderCommand::SetDtr(_)) => {
+        ReaderCommand::CancelTransfer => false,
+        ReaderCommand::SetDtr(_) => {
             report_dropped_command(event_tx, "dtr");
             false
         }
-        Ok(ReaderCommand::SetRts(_)) => {
+        ReaderCommand::SetRts(_) => {
             report_dropped_command(event_tx, "rts");
             false
         }
-        Ok(ReaderCommand::SendBreak) => {
+        ReaderCommand::SendBreak => {
             report_dropped_command(event_tx, "break");
             false
         }
-        Err(crossbeam_channel::RecvTimeoutError::Timeout) => false,
-        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => true,
     }
 }
 
@@ -1317,6 +1460,145 @@ mod tests {
             tx,
             wake: Wake::default(),
         }
+    }
+
+    #[test]
+    fn newline_flood_is_split_without_changing_raw_bytes_or_lines() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let events = EventTx {
+            tx,
+            wake: Wake::none(),
+        };
+        let mut pending = Batch::default();
+        let mut backlog = Backlog::default();
+        let mut framer = Framer::new();
+        let ts = SessionClock::new().now();
+        let bytes = vec![b'\n'; READ_BUF];
+        frame_read(&bytes, ts, &mut framer, &mut pending, &mut backlog, &events);
+        flush_batch(&mut pending, &mut backlog, &events, &framer, ts);
+        let mut raw = Vec::new();
+        let mut count = 0;
+        for event in rx.try_iter() {
+            let ReaderEvent::Batch(batch) = event else {
+                panic!("unexpected gap")
+            };
+            assert!(batch.lines.len() <= BATCH_MAX_LINES);
+            assert!(batch.raw.len() <= BATCH_MAX_RAW);
+            assert!(Backlog::batch_bytes(&batch) <= BATCH_MAX_BYTES);
+            assert!(batch
+                .lines
+                .iter()
+                .all(|line| line.text.is_empty() && line.ts == ts));
+            count += batch.lines.len();
+            raw.extend(batch.raw);
+        }
+        assert_eq!(raw, bytes);
+        assert_eq!(count, READ_BUF);
+    }
+
+    #[test]
+    fn split_reads_preserve_framing_for_every_terminal_mode() {
+        let sample = b"old\rnew\r\nutf8:\xc3\xa5\xe2\x82\xac\xf0\x9f\x90\x96\ninvalid:\xff\xfe\nabc\x08d\n\x1b[31mred\x1b[0m\nabcdef\x1b[3DXY\x1b[K\n\x1b]0;title\x1b\\ok\n";
+        for mode in [
+            crate::config::TerminalMode::Classic,
+            crate::config::TerminalMode::LfOnly,
+            crate::config::TerminalMode::Vt100,
+        ] {
+            // Put every part of the sample across a 1 KiB parser boundary.
+            for offset in 0..sample.len() {
+                let mut bytes = vec![b'x'; FRAME_CHUNK_BYTES - offset];
+                bytes.extend_from_slice(sample);
+                bytes.extend_from_slice(&vec![b'z'; crate::framer::MAX_LINE_LEN + 3]);
+                bytes.extend_from_slice(b"\r\ntail");
+                let ts = SessionClock::new().now();
+                let mut expected_framer = Framer::with_mode(mode);
+                let mut expected = Vec::new();
+                expected_framer.push(&bytes, ts, &mut expected);
+                expected_framer.flush_final(&mut expected);
+
+                let (tx, rx) = crossbeam_channel::unbounded();
+                let events = EventTx {
+                    tx,
+                    wake: Wake::none(),
+                };
+                let mut pending = Batch::default();
+                let mut backlog = Backlog::default();
+                let mut framer = Framer::with_mode(mode);
+                frame_read(&bytes, ts, &mut framer, &mut pending, &mut backlog, &events);
+                framer.flush_final(&mut pending.lines);
+                flush_batch(&mut pending, &mut backlog, &events, &framer, ts);
+                let mut raw = Vec::new();
+                let mut lines = Vec::new();
+                for event in rx.try_iter() {
+                    let ReaderEvent::Batch(batch) = event else {
+                        panic!("unexpected gap")
+                    };
+                    assert!(Backlog::batch_bytes(&batch) <= BATCH_MAX_BYTES);
+                    raw.extend(batch.raw);
+                    lines.extend(batch.lines);
+                }
+                assert_eq!(raw, bytes, "{mode:?}, offset {offset}");
+                assert_eq!(lines, expected, "{mode:?}, offset {offset}");
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_batch_cannot_enter_channel_and_reports_a_gap() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let events = EventTx {
+            tx,
+            wake: Wake::none(),
+        };
+        let mut backlog = Backlog::default();
+        let ts = SessionClock::new().now();
+        enqueue_batch(
+            Batch {
+                lines: Vec::new(),
+                raw: vec![0; BATCH_MAX_BYTES + 1],
+            },
+            &mut backlog,
+            &events,
+            ts,
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(ReaderEvent::OutputDropped { raw_bytes, at, .. }) if raw_bytes == (BATCH_MAX_BYTES + 1) as u64 && at == ts)
+        );
+        assert!(rx.is_empty());
+        assert!(backlog.batches.is_empty());
+    }
+
+    #[test]
+    fn stalled_ui_keeps_channel_and_backlog_within_heap_budgets() {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let events = EventTx {
+            tx,
+            wake: Wake::none(),
+        };
+        let mut pending = Batch::default();
+        let mut backlog = Backlog::default();
+        let mut framer = Framer::new();
+        let ts = SessionClock::new().now();
+        let bytes = vec![b'\n'; READ_BUF];
+        for _ in 0..64 {
+            frame_read(&bytes, ts, &mut framer, &mut pending, &mut backlog, &events);
+            assert!(backlog.allocated_bytes <= MAX_BACKLOG_BYTES);
+        }
+        flush_batch(&mut pending, &mut backlog, &events, &framer, ts);
+        assert!(backlog.dropped.raw_bytes > 0);
+        let mut channel_bytes = 0;
+        for event in rx.try_iter() {
+            if let ReaderEvent::Batch(batch) = event {
+                assert!(Backlog::batch_bytes(&batch) <= BATCH_MAX_BYTES);
+                channel_bytes += Backlog::batch_bytes(&batch);
+            }
+        }
+        assert!(channel_bytes <= 8 * 1024 * 1024);
+        drain_backlog(&mut backlog, &events);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ReaderEvent::OutputDropped { .. })
+        ));
     }
 
     #[test]
@@ -1641,6 +1923,183 @@ mod tests {
             port_label: "test".into(),
             cleared: false,
         }
+    }
+
+    struct NotifyingSource {
+        source: ScriptedSource,
+        eof: Sender<()>,
+    }
+    impl ByteSource for NotifyingSource {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, SourceError> {
+            let result = self.source.read(buf);
+            if result.is_err() {
+                self.eof.send(()).unwrap();
+            }
+            result
+        }
+        fn description(&self) -> String {
+            "notifying scripted source".into()
+        }
+    }
+
+    #[test]
+    fn eof_delivers_all_buffered_bytes_before_closed() {
+        for mode in [
+            crate::config::TerminalMode::Classic,
+            crate::config::TerminalMode::LfOnly,
+            crate::config::TerminalMode::Vt100,
+        ] {
+            let bytes = vec![b'\n'; READ_BUF];
+            let (eof, eof_rx) = crossbeam_channel::bounded(1);
+            let src = NotifyingSource {
+                source: ScriptedSource::new(vec![(bytes.clone(), Duration::ZERO)]).eof_when_done(),
+                eof,
+            };
+            let config = ReaderConfig {
+                port_id: PortId(0),
+                clock: SessionClock::new(),
+                session_dir: None,
+                meta: test_meta(),
+                terminal: mode,
+                wake: Wake::none(),
+            };
+            let handle = spawn(config, SourceSpec::OneShot(Box::new(src))).unwrap();
+            // Keep the channel full until the entire read is framed. This is
+            // well below the backlog limit and must not lose any output.
+            eof_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut raw = Vec::new();
+            let mut lines = 0;
+            let mut ended = false;
+            loop {
+                match handle.events.recv_timeout(Duration::from_secs(5)).unwrap() {
+                    ReaderEvent::Batch(batch) => {
+                        assert!(!ended, "output must precede the disconnect error");
+                        raw.extend(batch.raw);
+                        lines += batch.lines.len();
+                    }
+                    ReaderEvent::OutputDropped { .. } => panic!("unexpected gap"),
+                    ReaderEvent::Error { .. } => ended = true,
+                    ReaderEvent::State(ConnState::Closed) => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(raw.len(), bytes.len(), "lost raw bytes in {mode:?}");
+            assert_eq!(raw, bytes);
+            assert_eq!(lines, READ_BUF);
+            handle.shutdown();
+        }
+    }
+
+    #[test]
+    fn clearing_while_eof_is_draining_discards_backlog_and_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let (eof, eof_rx) = crossbeam_channel::bounded(1);
+        let src = NotifyingSource {
+            source: ScriptedSource::new(vec![(vec![b'\n'; READ_BUF], Duration::ZERO)])
+                .eof_when_done(),
+            eof,
+        };
+        let config = ReaderConfig {
+            port_id: PortId(0),
+            clock: SessionClock::new(),
+            session_dir: Some(dir.path().to_path_buf()),
+            meta: test_meta(),
+            terminal: crate::config::TerminalMode::Classic,
+            wake: Wake::none(),
+        };
+        let handle = spawn(config, SourceSpec::OneShot(Box::new(src))).unwrap();
+        eof_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        handle.clear_log();
+        // Mimic clearing the UI's snapshot of already queued output.
+        for _ in 0..handle.events.len() {
+            handle.events.try_recv().unwrap();
+        }
+        let mut remaining_raw = 0;
+        loop {
+            match handle.events.recv_timeout(Duration::from_secs(5)).unwrap() {
+                ReaderEvent::Batch(batch) => remaining_raw += batch.raw.len(),
+                ReaderEvent::State(ConnState::Closed) => break,
+                _ => {}
+            }
+        }
+        handle.shutdown();
+        let capture = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "bin"))
+            .unwrap();
+        assert!(
+            crate::session::read_tail_records(&capture, READ_BUF)
+                .unwrap()
+                .is_empty(),
+            "clear must truncate the capture even while EOF is draining"
+        );
+        assert!(crate::session::read_meta(&capture).unwrap().cleared);
+        assert!(
+            remaining_raw <= BATCH_MAX_RAW,
+            "cleared backlog must not reappear"
+        );
+    }
+
+    #[test]
+    fn overload_accounts_for_live_view_gaps_and_preserves_the_entire_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = vec![b'\n'; READ_BUF * 8];
+        let (eof, eof_rx) = crossbeam_channel::bounded(1);
+        let src = NotifyingSource {
+            source: ScriptedSource::new(vec![(bytes.clone(), Duration::ZERO)]).eof_when_done(),
+            eof,
+        };
+        let config = ReaderConfig {
+            port_id: PortId(0),
+            clock: SessionClock::new(),
+            session_dir: Some(dir.path().to_path_buf()),
+            meta: test_meta(),
+            terminal: crate::config::TerminalMode::Vt100,
+            wake: Wake::none(),
+        };
+        let handle = spawn(config, SourceSpec::OneShot(Box::new(src))).unwrap();
+        eof_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut delivered = 0;
+        let mut dropped = 0;
+        let mut delivered_lines = 0;
+        let mut dropped_lines = 0;
+        loop {
+            match handle.events.recv_timeout(Duration::from_secs(5)).unwrap() {
+                ReaderEvent::Batch(batch) => {
+                    delivered += batch.raw.len();
+                    delivered_lines += batch.lines.len();
+                }
+                ReaderEvent::OutputDropped {
+                    raw_bytes,
+                    line_updates,
+                    ..
+                } => {
+                    dropped += raw_bytes as usize;
+                    dropped_lines += line_updates as usize;
+                }
+                ReaderEvent::State(ConnState::Closed) => break,
+                _ => {}
+            }
+        }
+        assert!(
+            dropped > 0,
+            "fixture must exceed the live-view backlog budget"
+        );
+        assert_eq!(delivered + dropped, bytes.len());
+        assert_eq!(delivered_lines + dropped_lines, bytes.len());
+        handle.shutdown();
+        let capture = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "bin"))
+            .unwrap();
+        let captured: Vec<u8> = crate::session::read_tail_records(&capture, bytes.len())
+            .unwrap()
+            .into_iter()
+            .flat_map(|(_, raw)| raw)
+            .collect();
+        assert_eq!(captured, bytes);
     }
 
     fn collect_lines(handle: &ReaderHandle, timeout: Duration) -> (Vec<String>, Vec<ConnState>) {

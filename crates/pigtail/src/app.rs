@@ -31,6 +31,16 @@ use std::time::{Duration, Instant};
 mod demo;
 
 const CONFIG_WRITE_DELAY: Duration = Duration::from_secs(1);
+const RECEIVE_FRAME_BUDGET: Duration = Duration::from_millis(8);
+const RECEIVE_MAX_LINES_PER_PORT: usize = 4000;
+const RECEIVE_MAX_EVENTS_PER_PORT: usize = 64;
+const RECEIVE_RAW_CHUNK_BYTES: usize = 4096;
+const MAX_EXTRACTED_SERIES: usize = 64;
+const MAX_TOTAL_SERIES_POINTS: usize = 1_000_000;
+
+fn series_point_capacity(requested: usize, count: usize) -> usize {
+    requested.min(MAX_TOTAL_SERIES_POINTS / count.max(1)).max(2)
+}
 
 /// Retention limits derived from the single user-facing memory setting.
 ///
@@ -490,6 +500,9 @@ pub struct Connection {
     raw_capacity: usize,
     /// Current console-line cap, used to detect a settings-driven decrease.
     history_max_lines: usize,
+    /// A batch can span frames; consume its lines before later reader events.
+    pending_lines: std::vec::IntoIter<serialcore::framer::FramedLine>,
+    pending_raw: std::vec::IntoIter<u8>,
     /// A decrease trimmed resident history; release the old backing allocations
     /// once the interactive edit finishes rather than reallocating every drag frame.
     history_allocation_shrink_pending: bool,
@@ -520,7 +533,7 @@ pub struct Connection {
     pub hex_view: bool,
     pub screen_view: bool,
     pub screen_search: crate::panes::ScreenSearch,
-    pub terminal: vt100::Parser,
+    pub terminal: crate::terminal::Terminal,
     pub vt_scrollback_rows: usize,
     // Filtering (spec §7.8).
     pub filter_rules: Vec<FilterRule>,
@@ -627,8 +640,9 @@ impl Connection {
         );
         let shrank = limits.series_points < self.series_capacity;
         self.series_capacity = limits.series_points;
+        let point_capacity = series_point_capacity(self.series_capacity, self.series.len());
         for entry in &mut self.series {
-            self.series_evicted_any |= entry.series.set_capacity(self.series_capacity);
+            self.series_evicted_any |= entry.series.set_capacity(point_capacity);
         }
         if shrank {
             // A lower cap invalidates backfill above it, but an intermediate
@@ -662,157 +676,211 @@ impl Connection {
         history_shrank
     }
 
-    fn drain_events(&mut self, max_lines: usize) -> bool {
+    fn drain_events(&mut self, max_lines: usize, budget: Duration) -> bool {
         self.apply_history_limits(history_limits(max_lines));
+        let started = Instant::now();
         let mut changed = false;
-        // Non-blocking drain of all pending reader events (spec §5).
-        while let Ok(ev) = self.handle.events.try_recv() {
+        let mut lines = 0;
+        let mut events = 0;
+        let mut pairs: Vec<(String, f64)> = Vec::new();
+        // Finish each batch in order, yielding between lines as well as events.
+        // At least one unit progresses even with a very small per-port share.
+        loop {
+            if changed
+                && (started.elapsed() >= budget
+                    || lines >= RECEIVE_MAX_LINES_PER_PORT
+                    || events >= RECEIVE_MAX_EVENTS_PER_PORT)
+            {
+                break;
+            }
+            if self.pending_raw.len() > 0 {
+                let mut raw = std::mem::replace(&mut self.pending_raw, Vec::new().into_iter());
+                let count = raw.len().min(RECEIVE_RAW_CHUNK_BYTES);
+                self.push_raw_bytes(&raw.as_slice()[..count]);
+                raw.nth(count - 1);
+                self.pending_raw = raw;
+                changed = true;
+                continue;
+            }
+            self.pending_raw = Vec::new().into_iter();
+            if let Some(line) = self.pending_lines.next() {
+                changed = true;
+                lines += 1;
+                // Parse SGR colours and strip other escapes (spec §2, §7.9).
+                let styled = serialcore::ansi::parse_line(&line.text, line.cursor);
+                let is_data = feeds_plot(line.flags);
+                let text = styled.text;
+                pairs.clear();
+                if is_data {
+                    for rule in &self.extract_compiled {
+                        rule.extract(&text, &mut pairs);
+                    }
+                }
+                // Where a genuinely new line would land. A
+                // `CONTINUATION` instead replaces the open provisional
+                // line in place and hands back *its* index, which is
+                // below this — see below.
+                let next = self.store.next_abs_index();
+                let abs = self.store.append(IncomingLine {
+                    text,
+                    ts: line.ts,
+                    port: self.id,
+                    flags: line.flags,
+                    spans: styled.spans,
+                    cursor: styled.cursor.map(|c| c as u32),
+                });
+                // Counted per *line*, not per event: a line the device
+                // is still writing is re-sent every ~20ms as it grows,
+                // and counting those would have the footer's "N new"
+                // climb by ~50/s while the console gained nothing at
+                // all (issue #46). Keyed off the index rather than the
+                // flag, so a continuation with no provisional
+                // predecessor — which `append` correctly treats as a
+                // new line — still counts as one.
+                if !self.follow && abs >= next {
+                    self.new_since_scroll += 1;
+                }
+                // Run extraction and push points (spec §7.13).
+                if !pairs.is_empty() {
+                    let t = line.ts.micros as f64 / 1_000_000.0;
+                    for (name, value) in pairs.drain(..) {
+                        self.push_series_point(&name, t, value, abs);
+                    }
+                }
+                continue;
+            }
+            // Release the exhausted batch's backing vector before going idle.
+            self.pending_lines = Vec::new().into_iter();
+            let Ok(ev) = self.handle.events.try_recv() else {
+                break;
+            };
+            events += 1;
             changed = true;
-            match ev {
-                ReaderEvent::State(s) => {
-                    // Leaving Connected ends whatever line was still open. The
-                    // reader finalizes it for us when it had bytes in hand; this
-                    // catches the line it had already rewound (a bare `\r`), for
-                    // which it has nothing left to send and whose caret would
-                    // otherwise stay lit across the outage and beyond it.
-                    if s != ConnState::Connected {
-                        self.store.finalize_last_provisional();
-                        self.mark_raw_discontinuity();
-                    } else if matches!(
+            self.apply_reader_event(ev);
+        }
+        changed
+    }
+
+    /// Forget output owned by the UI at a clear or reader replacement boundary.
+    fn discard_pending_output(&mut self) {
+        self.pending_lines = Vec::new().into_iter();
+        self.pending_raw = Vec::new().into_iter();
+        // Take only the events already queued, so an active reader cannot keep
+        // this loop running. State/errors/transfers must still reach the UI.
+        for _ in 0..self.handle.events.len() {
+            let Ok(event) = self.handle.events.try_recv() else {
+                break;
+            };
+            if !matches!(
+                event,
+                ReaderEvent::Batch(_) | ReaderEvent::OutputDropped { .. }
+            ) {
+                self.apply_reader_event(event);
+            }
+        }
+    }
+
+    fn apply_reader_event(&mut self, ev: ReaderEvent) {
+        match ev {
+            ReaderEvent::State(s) => {
+                // Leaving Connected ends whatever line was still open. The
+                // reader finalizes it for us when it had bytes in hand; this
+                // catches the line it had already rewound (a bare `\r`), for
+                // which it has nothing left to send and whose caret would
+                // otherwise stay lit across the outage and beyond it.
+                if s != ConnState::Connected {
+                    self.store.finalize_last_provisional();
+                    self.mark_raw_discontinuity();
+                } else if matches!(
+                    self.last_error,
+                    Some(TabError {
+                        scope: ErrorScope::Connection,
+                        ..
+                    })
+                ) {
+                    // A successful (re)connect means whatever was wrong
+                    // with the *link* no longer applies; don't leave a
+                    // stale error showing once the port is open again.
+                    // Session-scoped errors (a capture file that couldn't
+                    // be opened, say) are untouched by reconnecting, so
+                    // they survive it.
+                    self.last_error = None;
+                }
+                self.set_state(s);
+            }
+            ReaderEvent::Error { scope, msg } => {
+                tracing::warn!(port = self.id.0, "{msg}");
+                // A dropped-command notice (session-scoped) while the link
+                // itself is down would otherwise clobber the connection
+                // error explaining *why* — and unlike a connection error,
+                // nothing later clears it, so it would keep hiding the
+                // real cause for the rest of the outage. The link being
+                // down already implies commands can't get through, so
+                // just keep showing that.
+                let hides_connection_error = scope == ErrorScope::Session
+                    && matches!(
                         self.last_error,
                         Some(TabError {
                             scope: ErrorScope::Connection,
                             ..
                         })
-                    ) {
-                        // A successful (re)connect means whatever was wrong
-                        // with the *link* no longer applies; don't leave a
-                        // stale error showing once the port is open again.
-                        // Session-scoped errors (a capture file that couldn't
-                        // be opened, say) are untouched by reconnecting, so
-                        // they survive it.
-                        self.last_error = None;
-                    }
-                    self.set_state(s);
-                }
-                ReaderEvent::Error { scope, msg } => {
-                    tracing::warn!(port = self.id.0, "{msg}");
-                    // A dropped-command notice (session-scoped) while the link
-                    // itself is down would otherwise clobber the connection
-                    // error explaining *why* — and unlike a connection error,
-                    // nothing later clears it, so it would keep hiding the
-                    // real cause for the rest of the outage. The link being
-                    // down already implies commands can't get through, so
-                    // just keep showing that.
-                    let hides_connection_error = scope == ErrorScope::Session
-                        && matches!(
-                            self.last_error,
-                            Some(TabError {
-                                scope: ErrorScope::Connection,
-                                ..
-                            })
-                        );
-                    if !hides_connection_error {
-                        self.last_error = Some(TabError { scope, msg });
-                    }
-                }
-                ReaderEvent::TransferProgress { sent, total } => {
-                    if let Some(progress) = &mut self.transfer_progress {
-                        progress.sent = sent;
-                        progress.total = total;
-                    }
-                }
-                ReaderEvent::TransferEnded => self.transfer_progress = None,
-                ReaderEvent::OutputDropped {
-                    raw_bytes,
-                    line_updates,
-                    at,
-                } => {
-                    self.mark_raw_discontinuity();
-                    let label = format!(
-                        "output dropped · {raw_bytes} bytes, {line_updates} line updates · display was busy"
                     );
-
-                    // A missing completion may have belonged to the open line
-                    // already on screen. Close it before the boundary so a
-                    // retained continuation cannot rewrite text from before
-                    // the gap.
-                    self.store.finalize_last_provisional();
-
-                    // Close the current hex run with the same visible gap
-                    // marker. The next batch opens a fresh run whose offsets
-                    // restart at zero rather than pretending the retained raw
-                    // bytes are contiguous with bytes we discarded.
-                    if let Some(session) = self.raw_sessions.last_mut() {
-                        if session.label.is_none() {
-                            session.label = Some(label.clone());
-                        }
-                    }
-
-                    let next = self.store.next_abs_index();
-                    let abs = self.store.append(IncomingLine {
-                        text: label,
-                        ts: at,
-                        port: self.id,
-                        flags: LineFlags::RECONNECT_MARKER,
-                        spans: Default::default(),
-                        cursor: None,
-                    });
-                    if !self.follow && abs >= next {
-                        self.new_since_scroll += 1;
-                    }
-                }
-                ReaderEvent::Batch(batch) => {
-                    self.open_live_raw_session();
-                    self.push_raw_bytes(&batch.raw);
-                    let mut pairs: Vec<(String, f64)> = Vec::new();
-                    for line in batch.lines {
-                        // Parse SGR colours and strip other escapes (spec §2, §7.9).
-                        let styled = serialcore::ansi::parse_line(&line.text, line.cursor);
-                        let is_data = feeds_plot(line.flags);
-                        let text = styled.text;
-                        // Where a genuinely new line would land. A
-                        // `CONTINUATION` instead replaces the open provisional
-                        // line in place and hands back *its* index, which is
-                        // below this — see below.
-                        let next = self.store.next_abs_index();
-                        let abs = self.store.append(IncomingLine {
-                            text: text.clone(),
-                            ts: line.ts,
-                            port: self.id,
-                            flags: line.flags,
-                            spans: styled.spans,
-                            cursor: styled.cursor.map(|c| c as u32),
-                        });
-                        // Counted per *line*, not per event: a line the device
-                        // is still writing is re-sent every ~20ms as it grows,
-                        // and counting those would have the footer's "N new"
-                        // climb by ~50/s while the console gained nothing at
-                        // all (issue #46). Keyed off the index rather than the
-                        // flag, so a continuation with no provisional
-                        // predecessor — which `append` correctly treats as a
-                        // new line — still counts as one.
-                        if !self.follow && abs >= next {
-                            self.new_since_scroll += 1;
-                        }
-                        // Run extraction and push points (spec §7.13).
-                        if is_data && !self.extract_compiled.is_empty() {
-                            pairs.clear();
-                            for rule in &self.extract_compiled {
-                                rule.extract(&text, &mut pairs);
-                            }
-                            if !pairs.is_empty() {
-                                let t = line.ts.micros as f64 / 1_000_000.0;
-                                for (name, value) in pairs.drain(..) {
-                                    self.push_series_point(&name, t, value, abs);
-                                }
-                            }
-                        }
-                    }
+                if !hides_connection_error {
+                    self.last_error = Some(TabError { scope, msg });
                 }
             }
+            ReaderEvent::TransferProgress { sent, total } => {
+                if let Some(progress) = &mut self.transfer_progress {
+                    progress.sent = sent;
+                    progress.total = total;
+                }
+            }
+            ReaderEvent::TransferEnded => self.transfer_progress = None,
+            ReaderEvent::OutputDropped {
+                raw_bytes,
+                line_updates,
+                at,
+            } => {
+                self.mark_raw_discontinuity();
+                let label = format!(
+                    "output dropped · {raw_bytes} bytes, {line_updates} line updates · display was busy"
+                );
+
+                // A missing completion may have belonged to the open line
+                // already on screen. Close it before the boundary so a
+                // retained continuation cannot rewrite text from before
+                // the gap.
+                self.store.finalize_last_provisional();
+
+                // Close the current hex run with the same visible gap
+                // marker. The next batch opens a fresh run whose offsets
+                // restart at zero rather than pretending the retained raw
+                // bytes are contiguous with bytes we discarded.
+                if let Some(session) = self.raw_sessions.last_mut() {
+                    if session.label.is_none() {
+                        session.label = Some(label.clone());
+                    }
+                }
+
+                let next = self.store.next_abs_index();
+                let abs = self.store.append(IncomingLine {
+                    text: label,
+                    ts: at,
+                    port: self.id,
+                    flags: LineFlags::RECONNECT_MARKER,
+                    spans: Default::default(),
+                    cursor: None,
+                });
+                if !self.follow && abs >= next {
+                    self.new_since_scroll += 1;
+                }
+            }
+            ReaderEvent::Batch(batch) => {
+                self.open_live_raw_session();
+                self.pending_raw = batch.raw.into_iter();
+                self.pending_lines = batch.lines.into_iter();
+            }
         }
-        changed
     }
 
     /// Absolute index of the next byte to enter the raw ring.
@@ -844,7 +912,7 @@ impl Connection {
 
     pub(crate) fn reset_terminal(&mut self) {
         let (rows, cols) = self.terminal.screen().size();
-        self.terminal = vt100::Parser::new(rows, cols, self.vt_scrollback_rows);
+        self.terminal = crate::terminal::Terminal::new(rows, cols, self.vt_scrollback_rows);
         self.screen_search.dirty = true;
     }
 
@@ -1039,8 +1107,9 @@ impl Connection {
     /// throwing away samples whose source lines have already been evicted.
     fn grow_series_history(&mut self) {
         let first_resident = self.store.first_abs_index();
+        let capacity = series_point_capacity(self.series_capacity, self.series.len());
         for entry in &mut self.series {
-            entry.series.set_capacity(self.series_capacity);
+            self.series_evicted_any |= entry.series.set_capacity(capacity);
             // The suffix is replayed below. The prefix cannot be reconstructed
             // from the line store, so it must survive the rebuild in place.
             entry.series.retain_before_line(first_resident);
@@ -1066,14 +1135,17 @@ impl Connection {
     }
 
     fn push_series_point(&mut self, name: &str, t: f64, value: f64, line: u64) {
-        let idx = series_slot(
+        let (idx, trimmed) = series_slot(
             &mut self.series,
             &mut self.series_index,
             None,
             name,
             self.series_capacity,
         );
-        self.series_evicted_any |= self.series[idx].series.push(t, value, line);
+        self.series_evicted_any |= trimmed;
+        if let Some(idx) = idx {
+            self.series_evicted_any |= self.series[idx].series.push(t, value, line);
+        }
     }
 }
 
@@ -1093,9 +1165,20 @@ fn series_slot(
     remembered: Option<&HashMap<String, SeriesStyle>>,
     name: &str,
     capacity: usize,
-) -> usize {
+) -> (Option<usize>, bool) {
     if let Some(&i) = index.get(name) {
-        return i;
+        return (Some(i), false);
+    }
+    if series.len() >= MAX_EXTRACTED_SERIES {
+        return (None, true);
+    }
+    let capacity = series_point_capacity(capacity, series.len() + 1);
+    let mut trimmed = false;
+    for entry in series.iter_mut() {
+        if entry.series.set_capacity(capacity) {
+            entry.series.shrink_to_fit();
+            trimmed = true;
+        }
     }
     let style = remembered
         .and_then(|m| m.get(name).copied())
@@ -1111,7 +1194,7 @@ fn series_slot(
         own_axis: style.own_axis,
     });
     index.insert(name.to_string(), series.len() - 1);
-    series.len() - 1
+    (Some(series.len() - 1), trimmed)
 }
 
 /// Whether a line's text is something the extraction rules should read.
@@ -1171,8 +1254,11 @@ fn extract_all(
         }
         let t = line.meta.ts.micros as f64 / 1_000_000.0;
         for (name, value) in pairs.drain(..) {
-            let idx = series_slot(series, index, Some(remembered), &name, capacity);
-            evicted |= series[idx].series.push(t, value, abs);
+            let (idx, trimmed) = series_slot(series, index, Some(remembered), &name, capacity);
+            evicted |= trimmed;
+            if let Some(idx) = idx {
+                evicted |= series[idx].series.push(t, value, abs);
+            }
         }
     }
     evicted
@@ -2032,6 +2118,8 @@ impl App {
         // again. The wait is no new cost: this join already happened, just
         // after the spawn rather than before it.
         self.connections[index].handle.shutdown_in_place();
+        self.connections[index].discard_pending_output();
+        self.connections[index].mark_raw_discontinuity();
         // `shutdown_in_place` drains and discards the old reader's final
         // events, including `TransferEnded`, so retire its UI state here.
         self.connections[index].transfer_progress = None;
@@ -2425,6 +2513,8 @@ impl App {
             raw_ring: VecDeque::new(),
             raw_capacity: limits.raw_bytes,
             history_max_lines: limits.max_lines,
+            pending_lines: Vec::new().into_iter(),
+            pending_raw: Vec::new().into_iter(),
             history_allocation_shrink_pending: false,
             raw_evicted_any: false,
             raw_base: 0,
@@ -2436,7 +2526,7 @@ impl App {
             hex_view: false,
             screen_view: false,
             screen_search: Default::default(),
-            terminal: vt100::Parser::new(
+            terminal: crate::terminal::Terminal::new(
                 24,
                 80,
                 self.config
@@ -3433,9 +3523,9 @@ impl App {
     /// every port (that is what the window is showing) and a single tab clears
     /// itself.
     ///
-    /// Bytes already in flight (read but not yet drained from the reader
-    /// channel) still land afterwards. That's a line or two at most, and they
-    /// are output that arrived after the click.
+    /// Discard output already owned by the UI and ask the reader to discard
+    /// its backlog. Bytes concurrently handed to the channel can still arrive
+    /// before the reader processes the clear command.
     pub fn clear_console(&mut self, port: Option<PortId>) {
         let targets: Vec<usize> = match port {
             Some(id) => self
@@ -3463,6 +3553,7 @@ impl App {
             if conn.state != ConnState::Closed {
                 conn.handle.clear_log();
             }
+            conn.discard_pending_output();
             conn.store.clear();
             conn.reset_terminal();
             // The offsets restart at zero with the next byte: nothing is left
@@ -3624,11 +3715,12 @@ impl eframe::App for App {
 
         let max_lines = self.config.settings.max_lines;
         let mut any_data = false;
+        let receive_budget = RECEIVE_FRAME_BUDGET / self.connections.len().max(1) as u32;
         for conn in &mut self.connections {
             // Before the drain: a rule edited last frame re-reads the console's
             // history here, and the lines arriving below then extend it once.
             conn.maintain_extract();
-            if conn.drain_events(max_lines) {
+            if conn.drain_events(max_lines, receive_budget) {
                 any_data = true;
             }
         }
@@ -5580,7 +5672,7 @@ pub(crate) mod tests {
             msg: "transmit: dropped, not connected".into(),
         })
         .unwrap();
-        app.connections[0].drain_events(1000);
+        app.connections[0].drain_events(1000, Duration::from_secs(1));
 
         let err = app.connections[0]
             .last_error
@@ -5600,7 +5692,7 @@ pub(crate) mod tests {
             msg: "transmit: dropped, not connected".into(),
         })
         .unwrap();
-        app.connections[0].drain_events(1000);
+        app.connections[0].drain_events(1000, Duration::from_secs(1));
         assert_eq!(
             app.connections[0].last_error.as_ref().unwrap().msg,
             "transmit: dropped, not connected"
@@ -5623,7 +5715,7 @@ pub(crate) mod tests {
             }))
             .unwrap();
         }
-        app.connections[0].drain_events(1000);
+        app.connections[0].drain_events(1000, Duration::from_secs(1));
         let conn = &mut app.connections[0];
         assert!(!conn.screen_view && !conn.hex_view);
         assert_eq!(conn.terminal.screen().cell(0, 0).unwrap().contents(), "n");
@@ -5727,7 +5819,7 @@ pub(crate) mod tests {
         }))
         .unwrap();
 
-        app.connections[0].drain_events(1000);
+        app.connections[0].drain_events(1000, Duration::from_secs(1));
         let conn = &app.connections[0];
         assert_eq!(conn.store.len(), 3);
         assert_eq!(conn.store.get(0).unwrap().text, "before");
@@ -5804,7 +5896,7 @@ pub(crate) mod tests {
         framer.push(b"ready>", clock.now(), &mut lines);
         lines.push(framer.flush_provisional().unwrap());
         send(&tx, lines);
-        app.connections[0].drain_events(1000);
+        app.connections[0].drain_events(1000, Duration::from_secs(1));
         assert_eq!(
             app.connections[0].new_since_scroll, 2,
             "the settled line and the open one are two lines"
@@ -5817,7 +5909,7 @@ pub(crate) mod tests {
             framer.push(&[*byte], clock.now(), &mut lines);
             lines.push(framer.flush_provisional().unwrap());
             send(&tx, lines);
-            app.connections[0].drain_events(1000);
+            app.connections[0].drain_events(1000, Duration::from_secs(1));
         }
 
         let conn = &app.connections[0];
@@ -5859,7 +5951,7 @@ pub(crate) mod tests {
             raw: Vec::new(),
         }))
         .unwrap();
-        app.connections[0].drain_events(1000);
+        app.connections[0].drain_events(1000, Duration::from_secs(1));
         assert_eq!(app.connections[0].new_since_scroll, 3);
     }
 
@@ -5880,6 +5972,306 @@ pub(crate) mod tests {
         conn.handle.events = rx;
         app.connections.push(conn);
         tx
+    }
+
+    #[test]
+    fn receive_yields_inside_a_batch_and_preserves_event_order() {
+        let (mut app, _enum_tx) = test_app("receive-budget");
+        let tx = conn_with_injected_events(&mut app, PortId(0));
+        let mut framer = serialcore::framer::Framer::new();
+        let mut lines = Vec::new();
+        framer.push(&b"x\n".repeat(8001), app.clock.now(), &mut lines);
+        tx.send(ReaderEvent::Batch(reader::Batch {
+            lines,
+            raw: b"x\n".repeat(8001),
+        }))
+        .unwrap();
+        tx.send(ReaderEvent::State(ConnState::Closed)).unwrap();
+        let conn = &mut app.connections[0];
+        conn.drain_events(10_000, Duration::from_secs(1));
+        assert_eq!(conn.store.len(), RECEIVE_MAX_LINES_PER_PORT);
+        assert_eq!(conn.state, ConnState::Connecting);
+        assert_eq!(conn.pending_lines.len(), 4001);
+        conn.drain_events(10_000, Duration::from_secs(1));
+        assert_eq!(conn.store.len(), 8000);
+        assert_eq!(conn.state, ConnState::Connecting);
+        conn.drain_events(10_000, Duration::from_secs(1));
+        assert_eq!(conn.store.len(), 8001);
+        assert_eq!(conn.state, ConnState::Closed);
+        assert_eq!(conn.raw_ring.len(), 16002, "raw bytes processed only once");
+    }
+
+    #[test]
+    fn yielding_preserves_raw_screen_and_styled_lines_in_every_terminal_mode() {
+        use serialcore::config::TerminalMode;
+        let sample = b"old\rnew\r\nutf8:\xc3\xa5\xe2\x82\xac\xf0\x9f\x90\x96\ninvalid:\xff\xfe\nabc\x08d\n\x1b[31mred\x1b[0m\nabcdef\x1b[3DXY\x1b[K\n\x1b]0;title\x1b\\ok\n";
+        let raw = sample.repeat(200);
+        for mode in [
+            TerminalMode::Classic,
+            TerminalMode::LfOnly,
+            TerminalMode::Vt100,
+        ] {
+            let (mut app, _enum_tx) = test_app("receive-mode-preservation");
+            let tx = conn_with_injected_events(&mut app, PortId(0));
+            let mut framer = serialcore::framer::Framer::with_mode(mode);
+            let mut lines = Vec::new();
+            framer.push(&raw, app.clock.now(), &mut lines);
+            framer.flush_final(&mut lines);
+            let mut expected = LineStore::new(10_000);
+            for line in &lines {
+                let styled = serialcore::ansi::parse_line(&line.text, line.cursor);
+                expected.append(IncomingLine {
+                    text: styled.text,
+                    ts: line.ts,
+                    port: PortId(0),
+                    flags: line.flags,
+                    spans: styled.spans,
+                    cursor: styled.cursor.map(|c| c as u32),
+                });
+            }
+            tx.send(ReaderEvent::Batch(reader::Batch {
+                lines,
+                raw: raw.clone(),
+            }))
+            .unwrap();
+            tx.send(ReaderEvent::State(ConnState::Closed)).unwrap();
+            let conn = &mut app.connections[0];
+            let mut drains = 0;
+            while conn.drain_events(10_000, Duration::ZERO) {
+                drains += 1;
+                assert!(drains < 10_000, "pending bytes must make progress");
+            }
+            assert!(drains > 2);
+            assert_eq!(conn.raw_ring.iter().copied().collect::<Vec<_>>(), raw);
+            assert_eq!(conn.store.len(), expected.len());
+            for abs in expected.first_abs_index()..expected.next_abs_index() {
+                let actual = conn.store.get(abs).unwrap();
+                let expected = expected.get(abs).unwrap();
+                assert_eq!(actual.text, expected.text, "{mode:?}, line {abs}");
+                assert_eq!(actual.meta.flags, expected.meta.flags);
+                assert_eq!(actual.meta.spans, expected.meta.spans);
+                assert_eq!(actual.meta.cursor, expected.meta.cursor);
+                assert_eq!(actual.meta.ts, expected.meta.ts);
+            }
+            let mut original_screen = vt100::Parser::new(24, 80, conn.vt_scrollback_rows);
+            original_screen.process(&raw);
+            assert_eq!(
+                conn.terminal.screen().contents_formatted(),
+                original_screen.screen().contents_formatted()
+            );
+            assert_eq!(
+                conn.terminal.screen().cursor_position(),
+                original_screen.screen().cursor_position()
+            );
+            assert_eq!(conn.state, ConnState::Closed);
+        }
+    }
+
+    #[test]
+    fn clearing_console_discards_the_remainder_of_a_partly_consumed_batch() {
+        let (mut app, _enum_tx) = test_app("receive-clear-pending");
+        let tx = conn_with_injected_events(&mut app, PortId(0));
+        let mut framer = serialcore::framer::Framer::new();
+        let mut lines = Vec::new();
+        framer.push(&b"x\n".repeat(8001), app.clock.now(), &mut lines);
+        tx.send(ReaderEvent::Batch(reader::Batch {
+            lines,
+            raw: Vec::new(),
+        }))
+        .unwrap();
+        app.connections[0].drain_events(10_000, Duration::from_secs(1));
+        assert!(!app.connections[0].pending_lines.as_slice().is_empty());
+        app.clear_console(Some(PortId(0)));
+        app.connections[0].drain_events(10_000, Duration::from_secs(1));
+        assert!(app.connections[0].store.is_empty());
+    }
+
+    #[test]
+    fn clearing_console_discards_queued_output_but_preserves_control_events() {
+        let (mut app, _enum_tx) = test_app("receive-clear-queued");
+        let tx = conn_with_injected_events(&mut app, PortId(0));
+        let mut framer = serialcore::framer::Framer::new();
+        for _ in 0..3 {
+            let mut lines = Vec::new();
+            framer.push(b"old\n", app.clock.now(), &mut lines);
+            tx.send(ReaderEvent::Batch(reader::Batch {
+                lines,
+                raw: b"old\n".to_vec(),
+            }))
+            .unwrap();
+        }
+        tx.send(ReaderEvent::OutputDropped {
+            raw_bytes: 10,
+            line_updates: 1,
+            at: app.clock.now(),
+        })
+        .unwrap();
+        tx.send(ReaderEvent::Error {
+            scope: ErrorScope::Session,
+            msg: "keep this error".into(),
+        })
+        .unwrap();
+        tx.send(ReaderEvent::State(ConnState::Closed)).unwrap();
+        app.connections[0].drain_events(1000, Duration::ZERO);
+        app.clear_console(Some(PortId(0)));
+        let conn = &mut app.connections[0];
+        conn.drain_events(1000, Duration::from_secs(1));
+        assert!(conn.store.is_empty());
+        assert!(conn.raw_ring.is_empty());
+        assert_eq!(conn.state, ConnState::Closed);
+        assert_eq!(conn.last_error.as_ref().unwrap().msg, "keep this error");
+    }
+
+    #[test]
+    fn reconnect_discards_the_old_readers_partial_batch() {
+        let (mut app, _enum_tx) = test_app("receive-reconnect-pending");
+        let tx = conn_with_injected_events(&mut app, PortId(0));
+        let raw = b"old\n".repeat(2000);
+        let mut framer = serialcore::framer::Framer::new();
+        let mut lines = Vec::new();
+        framer.push(&raw, app.clock.now(), &mut lines);
+        tx.send(ReaderEvent::Batch(reader::Batch { lines, raw }))
+            .unwrap();
+        app.connections[0].drain_events(1000, Duration::ZERO);
+        app.connections[0].drain_events(1000, Duration::ZERO);
+        assert!(app.connections[0].pending_raw.len() > 0);
+        app.reconnect_with_config(
+            PortId(0),
+            Some("/nonexistent/pigtail-review-port".into()),
+            PortConfig::default(),
+        );
+        let conn = &mut app.connections[0];
+        assert_eq!(conn.pending_raw.len(), 0);
+        assert_eq!(conn.pending_lines.len(), 0);
+        assert_eq!(conn.raw_contiguous_start, conn.raw_next());
+        assert!(conn
+            .store
+            .get(conn.store.next_abs_index() - 1)
+            .unwrap()
+            .meta
+            .flags
+            .contains(LineFlags::RECONNECT_MARKER));
+    }
+
+    #[test]
+    fn growing_plot_history_keeps_the_shared_point_limit() {
+        let (mut app, _enum_tx) = test_app("receive-grow-series-budget");
+        let _tx = conn_with_injected_events(&mut app, PortId(0));
+        let conn = &mut app.connections[0];
+        for i in 0..MAX_EXTRACTED_SERIES {
+            conn.push_series_point(&format!("key{i}"), 0.0, 1.0, 0);
+        }
+        conn.series_capacity = usize::MAX;
+        conn.grow_series_history();
+        // Backfill must leave the same limit in place for subsequent samples.
+        let capacity = MAX_TOTAL_SERIES_POINTS / MAX_EXTRACTED_SERIES;
+        for i in 0..=capacity {
+            conn.push_series_point("key0", i as f64, 1.0, i as u64);
+        }
+        assert_eq!(conn.series[0].series.len(), capacity);
+    }
+
+    #[test]
+    fn small_receive_budget_makes_progress_for_each_port() {
+        let (mut app, _enum_tx) = test_app("receive-fairness");
+        for id in [PortId(0), PortId(1)] {
+            let tx = conn_with_injected_events(&mut app, id);
+            let mut framer = serialcore::framer::Framer::new();
+            let mut lines = Vec::new();
+            framer.push(b"first\nsecond\n", app.clock.now(), &mut lines);
+            tx.send(ReaderEvent::Batch(reader::Batch {
+                lines,
+                raw: Vec::new(),
+            }))
+            .unwrap();
+        }
+        for conn in &mut app.connections {
+            conn.drain_events(1000, Duration::ZERO); // take batch
+            conn.drain_events(1000, Duration::ZERO); // take one line
+            assert_eq!(conn.store.len(), 1);
+            assert_eq!(conn.store.get(0).unwrap().text, "first");
+        }
+    }
+
+    #[test]
+    fn extraction_bounds_series_names_and_shares_the_point_budget() {
+        let (mut app, _enum_tx) = test_app("receive-series-budget");
+        let _tx = conn_with_injected_events(&mut app, PortId(0));
+        let conn = &mut app.connections[0];
+        conn.series_capacity = usize::MAX;
+        for i in 0..MAX_EXTRACTED_SERIES + 10 {
+            conn.push_series_point(&format!("key{i}"), i as f64, 1.0, i as u64);
+        }
+        assert_eq!(conn.series.len(), MAX_EXTRACTED_SERIES);
+        assert_eq!(conn.series_index.len(), MAX_EXTRACTED_SERIES);
+        assert!(conn.series_evicted_any);
+        assert!(
+            series_point_capacity(usize::MAX, conn.series.len()) * conn.series.len()
+                <= MAX_TOTAL_SERIES_POINTS
+        );
+        conn.push_series_point("key0", 100.0, 2.0, 100);
+        assert_eq!(
+            conn.series[0].series.len(),
+            2,
+            "existing keys still receive samples"
+        );
+    }
+
+    /// Manual diagnostic: exercise the real UI ingest path without hardware.
+    /// No timing assertion: report latency and allocations on the test host.
+    #[test]
+    #[ignore = "manual receive-load diagnostic"]
+    fn receive_load_diagnostic() {
+        for (name, pattern) in [
+            ("ordinary", format!("{}\r\n", "x".repeat(38))),
+            ("newlines", "\n".to_string()),
+        ] {
+            let (mut app, _enum_tx) = test_app(&format!("receive-load-{name}"));
+            let tx = conn_with_injected_events(&mut app, PortId(0));
+            let raw = pattern.repeat(65536 / pattern.len()).into_bytes();
+            let mut framer = serialcore::framer::Framer::with_mode(PortConfig::default().terminal);
+            let mut queued_bytes = 0usize;
+            let mut updates = 0usize;
+            // A modest backlog (32 reads, ~2 MiB raw) keeps this probe safe to
+            // run on small machines. Injection deliberately bypasses the new
+            // reader limits, retaining the original workload for comparison.
+            for _ in 0..32 {
+                let mut lines = Vec::new();
+                framer.push(&raw, app.clock.now(), &mut lines);
+                updates += lines.len();
+                queued_bytes += raw.capacity()
+                    + lines.capacity() * std::mem::size_of::<serialcore::framer::FramedLine>()
+                    + lines.iter().map(|line| line.text.capacity()).sum::<usize>();
+                tx.send(ReaderEvent::Batch(reader::Batch {
+                    raw: raw.clone(),
+                    lines,
+                }))
+                .unwrap();
+            }
+            let start = Instant::now();
+            app.connections[0].drain_events(1_000_000, RECEIVE_FRAME_BUDGET);
+            let elapsed = start.elapsed();
+            let conn = &mut app.connections[0];
+            eprintln!(
+                "{name}: {updates} updates; queued {:.1} MiB; one UI drain {elapsed:?}; remaining events {}; line store {:.1} MiB",
+                queued_bytes as f64 / 1048576.0,
+                conn.handle.events.len(),
+                conn.store.approx_bytes() as f64 / 1048576.0,
+            );
+            let mut frames = 1;
+            let mut worst = elapsed;
+            while conn.pending_lines.len() > 0
+                || conn.pending_raw.len() > 0
+                || !conn.handle.events.is_empty()
+            {
+                let start = Instant::now();
+                conn.drain_events(1_000_000, RECEIVE_FRAME_BUDGET);
+                worst = worst.max(start.elapsed());
+                frames += 1;
+            }
+            assert_eq!(conn.store.next_abs_index(), updates as u64);
+            eprintln!("{name}: completed in {frames} drains; longest drain {worst:?}");
+        }
     }
 
     /// Issue #38: a line the device is still writing reaches the UI twice —
@@ -5943,7 +6335,7 @@ pub(crate) mod tests {
 
         let conn = &mut app.connections[0];
         conn.maintain_extract();
-        conn.drain_events(1000);
+        conn.drain_events(1000, Duration::from_secs(1));
 
         assert_eq!(conn.store.len(), 1, "the two events are one line");
         let temp = conn
@@ -5992,7 +6384,7 @@ pub(crate) mod tests {
             raw: b"error: sen".to_vec(),
         }))
         .unwrap();
-        app.connections[0].drain_events(1000);
+        app.connections[0].drain_events(1000, Duration::from_secs(1));
         app.maintain_search();
         assert!(
             app.connections[0].search_matches.is_empty(),
@@ -6008,7 +6400,7 @@ pub(crate) mod tests {
             raw: b"sor timeout\n".to_vec(),
         }))
         .unwrap();
-        app.connections[0].drain_events(1000);
+        app.connections[0].drain_events(1000, Duration::from_secs(1));
         app.maintain_search();
 
         let conn = &app.connections[0];
@@ -6045,7 +6437,7 @@ pub(crate) mod tests {
             raw: b"abort".to_vec(),
         }))
         .unwrap();
-        app.connections[0].drain_events(1000);
+        app.connections[0].drain_events(1000, Duration::from_secs(1));
         app.maintain_search();
         assert_eq!(app.connections[0].search_matches, vec![0]);
 
@@ -6058,7 +6450,7 @@ pub(crate) mod tests {
             raw: b"\rdone\n".to_vec(),
         }))
         .unwrap();
-        app.connections[0].drain_events(1000);
+        app.connections[0].drain_events(1000, Duration::from_secs(1));
         app.maintain_search();
 
         let conn = &app.connections[0];
