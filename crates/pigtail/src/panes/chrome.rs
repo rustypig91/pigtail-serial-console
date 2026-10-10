@@ -347,15 +347,15 @@ impl App {
                 egui::CursorIcon::ResizeHorizontal,
             ),
         ];
-        let hover_cursor = ctx
+        let hovered_target = ctx
             .input(|input| input.pointer.hover_pos())
             .and_then(|pos| {
                 targets
                     .iter()
                     .find(|(target, _, _)| target.contains(pos))
-                    .map(|(_, _, cursor)| *cursor)
+                    .map(|(_, direction, cursor)| (*direction, *cursor))
             });
-        for (index, (target, direction, _)) in targets.into_iter().enumerate() {
+        for (index, (target, _, _)) in targets.into_iter().enumerate() {
             // An Area registers the layer for hit testing. A standalone Ui
             // on a foreground layer can lose hover and presses to the panels.
             let id = egui::Id::new("window_resize").with(index);
@@ -367,23 +367,19 @@ impl App {
                 .constrain(false)
                 .default_size(target.size())
                 .show(ctx, |ui| {
-                    let (_, response) =
-                        ui.allocate_exact_size(target.size(), Sense::click_and_drag());
-                    // Start native resizing on the press, while the window
-                    // manager still has the initiating mouse event.
-                    if response.is_pointer_button_down_on()
-                        && ui.input(|input| {
-                            input.pointer.button_pressed(egui::PointerButton::Primary)
-                        })
-                    {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
-                    }
+                    ui.allocate_exact_size(target.size(), Sense::click_and_drag());
                 });
         }
         // Hover must also work on the first frame after the pointer enters
         // the window or its bounds change, before widget hit tests settle.
-        if let Some(cursor) = hover_cursor {
+        if let Some((direction, cursor)) = hovered_target {
             ctx.set_cursor_icon(cursor);
+            // Widget hit tests use the previous frame's rectangles. Use the
+            // current bounds for the initiating press too, so resizing works
+            // immediately after a window size change or on its first frame.
+            if ctx.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary)) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+            }
         }
     }
 }
@@ -1099,6 +1095,42 @@ mod tests {
                     .any(|command| matches!(command, egui::ViewportCommand::Maximized(_))));
             }
         }
+    }
+
+    #[test]
+    fn resize_press_uses_current_window_bounds() {
+        let (app, _tx) = crate::app::tests::test_app("resize-current-bounds");
+        let ctx = egui::Context::default();
+        let render = |size, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.show_window_resize(ctx),
+            )
+        };
+        render(Vec2::new(700.0, 400.0), vec![]);
+        render(Vec2::new(700.0, 400.0), vec![]);
+        let pos = Pos2::new(894.0, 494.0);
+        let output = render(
+            Vec2::new(900.0, 500.0),
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::BeginResize(
+                egui::ResizeDirection::SouthEast
+            )));
     }
 
     #[test]
