@@ -336,7 +336,9 @@ impl App {
                         } else {
                             self.connections.get(self.active).map(|c| TabId::Connection(c.id))
                         };
-                        let base_reserve = if self.workspace.split.is_some() { 32.0 } else { 145.0 };
+                        // Keep a small window drag area even when tabs fill the
+                        // strip. Split workspaces have a separate title bar.
+                        let base_reserve = if self.workspace.split.is_some() { 32.0 } else { 145.0 + super::chrome::HEADER_HEIGHT };
                         let widths: Vec<f32> = labels.iter().map(|label| {
                             ui.painter().layout_no_wrap(label.clone(), egui::FontId::proportional(13.0), ui.visuals().text_color()).size().x + 64.0
                         }).collect();
