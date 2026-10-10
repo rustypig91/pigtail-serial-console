@@ -756,108 +756,131 @@ impl Connection {
             };
             events += 1;
             changed = true;
-            match ev {
-                ReaderEvent::State(s) => {
-                    // Leaving Connected ends whatever line was still open. The
-                    // reader finalizes it for us when it had bytes in hand; this
-                    // catches the line it had already rewound (a bare `\r`), for
-                    // which it has nothing left to send and whose caret would
-                    // otherwise stay lit across the outage and beyond it.
-                    if s != ConnState::Connected {
-                        self.store.finalize_last_provisional();
-                        self.mark_raw_discontinuity();
-                    } else if matches!(
+            self.apply_reader_event(ev);
+        }
+        changed
+    }
+
+    /// Forget output owned by the UI at a clear or reader replacement boundary.
+    fn discard_pending_output(&mut self) {
+        self.pending_lines = Vec::new().into_iter();
+        self.pending_raw = Vec::new().into_iter();
+        // Take only the events already queued, so an active reader cannot keep
+        // this loop running. State/errors/transfers must still reach the UI.
+        for _ in 0..self.handle.events.len() {
+            let Ok(event) = self.handle.events.try_recv() else {
+                break;
+            };
+            if !matches!(
+                event,
+                ReaderEvent::Batch(_) | ReaderEvent::OutputDropped { .. }
+            ) {
+                self.apply_reader_event(event);
+            }
+        }
+    }
+
+    fn apply_reader_event(&mut self, ev: ReaderEvent) {
+        match ev {
+            ReaderEvent::State(s) => {
+                // Leaving Connected ends whatever line was still open. The
+                // reader finalizes it for us when it had bytes in hand; this
+                // catches the line it had already rewound (a bare `\r`), for
+                // which it has nothing left to send and whose caret would
+                // otherwise stay lit across the outage and beyond it.
+                if s != ConnState::Connected {
+                    self.store.finalize_last_provisional();
+                    self.mark_raw_discontinuity();
+                } else if matches!(
+                    self.last_error,
+                    Some(TabError {
+                        scope: ErrorScope::Connection,
+                        ..
+                    })
+                ) {
+                    // A successful (re)connect means whatever was wrong
+                    // with the *link* no longer applies; don't leave a
+                    // stale error showing once the port is open again.
+                    // Session-scoped errors (a capture file that couldn't
+                    // be opened, say) are untouched by reconnecting, so
+                    // they survive it.
+                    self.last_error = None;
+                }
+                self.set_state(s);
+            }
+            ReaderEvent::Error { scope, msg } => {
+                tracing::warn!(port = self.id.0, "{msg}");
+                // A dropped-command notice (session-scoped) while the link
+                // itself is down would otherwise clobber the connection
+                // error explaining *why* — and unlike a connection error,
+                // nothing later clears it, so it would keep hiding the
+                // real cause for the rest of the outage. The link being
+                // down already implies commands can't get through, so
+                // just keep showing that.
+                let hides_connection_error = scope == ErrorScope::Session
+                    && matches!(
                         self.last_error,
                         Some(TabError {
                             scope: ErrorScope::Connection,
                             ..
                         })
-                    ) {
-                        // A successful (re)connect means whatever was wrong
-                        // with the *link* no longer applies; don't leave a
-                        // stale error showing once the port is open again.
-                        // Session-scoped errors (a capture file that couldn't
-                        // be opened, say) are untouched by reconnecting, so
-                        // they survive it.
-                        self.last_error = None;
-                    }
-                    self.set_state(s);
-                }
-                ReaderEvent::Error { scope, msg } => {
-                    tracing::warn!(port = self.id.0, "{msg}");
-                    // A dropped-command notice (session-scoped) while the link
-                    // itself is down would otherwise clobber the connection
-                    // error explaining *why* — and unlike a connection error,
-                    // nothing later clears it, so it would keep hiding the
-                    // real cause for the rest of the outage. The link being
-                    // down already implies commands can't get through, so
-                    // just keep showing that.
-                    let hides_connection_error = scope == ErrorScope::Session
-                        && matches!(
-                            self.last_error,
-                            Some(TabError {
-                                scope: ErrorScope::Connection,
-                                ..
-                            })
-                        );
-                    if !hides_connection_error {
-                        self.last_error = Some(TabError { scope, msg });
-                    }
-                }
-                ReaderEvent::TransferProgress { sent, total } => {
-                    if let Some(progress) = &mut self.transfer_progress {
-                        progress.sent = sent;
-                        progress.total = total;
-                    }
-                }
-                ReaderEvent::TransferEnded => self.transfer_progress = None,
-                ReaderEvent::OutputDropped {
-                    raw_bytes,
-                    line_updates,
-                    at,
-                } => {
-                    self.mark_raw_discontinuity();
-                    let label = format!(
-                        "output dropped · {raw_bytes} bytes, {line_updates} line updates · display was busy"
                     );
-
-                    // A missing completion may have belonged to the open line
-                    // already on screen. Close it before the boundary so a
-                    // retained continuation cannot rewrite text from before
-                    // the gap.
-                    self.store.finalize_last_provisional();
-
-                    // Close the current hex run with the same visible gap
-                    // marker. The next batch opens a fresh run whose offsets
-                    // restart at zero rather than pretending the retained raw
-                    // bytes are contiguous with bytes we discarded.
-                    if let Some(session) = self.raw_sessions.last_mut() {
-                        if session.label.is_none() {
-                            session.label = Some(label.clone());
-                        }
-                    }
-
-                    let next = self.store.next_abs_index();
-                    let abs = self.store.append(IncomingLine {
-                        text: label,
-                        ts: at,
-                        port: self.id,
-                        flags: LineFlags::RECONNECT_MARKER,
-                        spans: Default::default(),
-                        cursor: None,
-                    });
-                    if !self.follow && abs >= next {
-                        self.new_since_scroll += 1;
-                    }
-                }
-                ReaderEvent::Batch(batch) => {
-                    self.open_live_raw_session();
-                    self.pending_raw = batch.raw.into_iter();
-                    self.pending_lines = batch.lines.into_iter();
+                if !hides_connection_error {
+                    self.last_error = Some(TabError { scope, msg });
                 }
             }
+            ReaderEvent::TransferProgress { sent, total } => {
+                if let Some(progress) = &mut self.transfer_progress {
+                    progress.sent = sent;
+                    progress.total = total;
+                }
+            }
+            ReaderEvent::TransferEnded => self.transfer_progress = None,
+            ReaderEvent::OutputDropped {
+                raw_bytes,
+                line_updates,
+                at,
+            } => {
+                self.mark_raw_discontinuity();
+                let label = format!(
+                    "output dropped · {raw_bytes} bytes, {line_updates} line updates · display was busy"
+                );
+
+                // A missing completion may have belonged to the open line
+                // already on screen. Close it before the boundary so a
+                // retained continuation cannot rewrite text from before
+                // the gap.
+                self.store.finalize_last_provisional();
+
+                // Close the current hex run with the same visible gap
+                // marker. The next batch opens a fresh run whose offsets
+                // restart at zero rather than pretending the retained raw
+                // bytes are contiguous with bytes we discarded.
+                if let Some(session) = self.raw_sessions.last_mut() {
+                    if session.label.is_none() {
+                        session.label = Some(label.clone());
+                    }
+                }
+
+                let next = self.store.next_abs_index();
+                let abs = self.store.append(IncomingLine {
+                    text: label,
+                    ts: at,
+                    port: self.id,
+                    flags: LineFlags::RECONNECT_MARKER,
+                    spans: Default::default(),
+                    cursor: None,
+                });
+                if !self.follow && abs >= next {
+                    self.new_since_scroll += 1;
+                }
+            }
+            ReaderEvent::Batch(batch) => {
+                self.open_live_raw_session();
+                self.pending_raw = batch.raw.into_iter();
+                self.pending_lines = batch.lines.into_iter();
+            }
         }
-        changed
     }
 
     /// Absolute index of the next byte to enter the raw ring.
@@ -1084,8 +1107,9 @@ impl Connection {
     /// throwing away samples whose source lines have already been evicted.
     fn grow_series_history(&mut self) {
         let first_resident = self.store.first_abs_index();
+        let capacity = series_point_capacity(self.series_capacity, self.series.len());
         for entry in &mut self.series {
-            entry.series.set_capacity(self.series_capacity);
+            self.series_evicted_any |= entry.series.set_capacity(capacity);
             // The suffix is replayed below. The prefix cannot be reconstructed
             // from the line store, so it must survive the rebuild in place.
             entry.series.retain_before_line(first_resident);
@@ -2094,6 +2118,8 @@ impl App {
         // again. The wait is no new cost: this join already happened, just
         // after the spawn rather than before it.
         self.connections[index].handle.shutdown_in_place();
+        self.connections[index].discard_pending_output();
+        self.connections[index].mark_raw_discontinuity();
         // `shutdown_in_place` drains and discards the old reader's final
         // events, including `TransferEnded`, so retire its UI state here.
         self.connections[index].transfer_progress = None;
@@ -3527,8 +3553,7 @@ impl App {
             if conn.state != ConnState::Closed {
                 conn.handle.clear_log();
             }
-            conn.pending_lines = Vec::new().into_iter();
-            conn.pending_raw = Vec::new().into_iter();
+            conn.discard_pending_output();
             conn.store.clear();
             conn.reset_terminal();
             // The offsets restart at zero with the next byte: nothing is left
@@ -6059,6 +6084,91 @@ pub(crate) mod tests {
         app.clear_console(Some(PortId(0)));
         app.connections[0].drain_events(10_000, Duration::from_secs(1));
         assert!(app.connections[0].store.is_empty());
+    }
+
+    #[test]
+    fn clearing_console_discards_queued_output_but_preserves_control_events() {
+        let (mut app, _enum_tx) = test_app("receive-clear-queued");
+        let tx = conn_with_injected_events(&mut app, PortId(0));
+        let mut framer = serialcore::framer::Framer::new();
+        for _ in 0..3 {
+            let mut lines = Vec::new();
+            framer.push(b"old\n", app.clock.now(), &mut lines);
+            tx.send(ReaderEvent::Batch(reader::Batch {
+                lines,
+                raw: b"old\n".to_vec(),
+            }))
+            .unwrap();
+        }
+        tx.send(ReaderEvent::OutputDropped {
+            raw_bytes: 10,
+            line_updates: 1,
+            at: app.clock.now(),
+        })
+        .unwrap();
+        tx.send(ReaderEvent::Error {
+            scope: ErrorScope::Session,
+            msg: "keep this error".into(),
+        })
+        .unwrap();
+        tx.send(ReaderEvent::State(ConnState::Closed)).unwrap();
+        app.connections[0].drain_events(1000, Duration::ZERO);
+        app.clear_console(Some(PortId(0)));
+        let conn = &mut app.connections[0];
+        conn.drain_events(1000, Duration::from_secs(1));
+        assert!(conn.store.is_empty());
+        assert!(conn.raw_ring.is_empty());
+        assert_eq!(conn.state, ConnState::Closed);
+        assert_eq!(conn.last_error.as_ref().unwrap().msg, "keep this error");
+    }
+
+    #[test]
+    fn reconnect_discards_the_old_readers_partial_batch() {
+        let (mut app, _enum_tx) = test_app("receive-reconnect-pending");
+        let tx = conn_with_injected_events(&mut app, PortId(0));
+        let raw = b"old\n".repeat(2000);
+        let mut framer = serialcore::framer::Framer::new();
+        let mut lines = Vec::new();
+        framer.push(&raw, app.clock.now(), &mut lines);
+        tx.send(ReaderEvent::Batch(reader::Batch { lines, raw }))
+            .unwrap();
+        app.connections[0].drain_events(1000, Duration::ZERO);
+        app.connections[0].drain_events(1000, Duration::ZERO);
+        assert!(app.connections[0].pending_raw.len() > 0);
+        app.reconnect_with_config(
+            PortId(0),
+            Some("/nonexistent/pigtail-review-port".into()),
+            PortConfig::default(),
+        );
+        let conn = &mut app.connections[0];
+        assert_eq!(conn.pending_raw.len(), 0);
+        assert_eq!(conn.pending_lines.len(), 0);
+        assert_eq!(conn.raw_contiguous_start, conn.raw_next());
+        assert!(conn
+            .store
+            .get(conn.store.next_abs_index() - 1)
+            .unwrap()
+            .meta
+            .flags
+            .contains(LineFlags::RECONNECT_MARKER));
+    }
+
+    #[test]
+    fn growing_plot_history_keeps_the_shared_point_limit() {
+        let (mut app, _enum_tx) = test_app("receive-grow-series-budget");
+        let _tx = conn_with_injected_events(&mut app, PortId(0));
+        let conn = &mut app.connections[0];
+        for i in 0..MAX_EXTRACTED_SERIES {
+            conn.push_series_point(&format!("key{i}"), 0.0, 1.0, 0);
+        }
+        conn.series_capacity = usize::MAX;
+        conn.grow_series_history();
+        // Backfill must leave the same limit in place for subsequent samples.
+        let capacity = MAX_TOTAL_SERIES_POINTS / MAX_EXTRACTED_SERIES;
+        for i in 0..=capacity {
+            conn.push_series_point("key0", i as f64, 1.0, i as u64);
+        }
+        assert_eq!(conn.series[0].series.len(), capacity);
     }
 
     #[test]

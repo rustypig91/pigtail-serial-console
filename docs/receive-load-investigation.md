@@ -153,3 +153,17 @@ CPU saturation, GPU rendering or capture-disk contention. Replaying the user's
 actual input while sampling process CPU/RSS, swap and disk activity would
 distinguish those causes. Raw logging is buffered and avoids per-record fsync;
 it has not been implicated by these tests.
+
+### Additional PR review fixes
+
+Clear now discards both the UI's partially consumed batch and output already
+queued in the reader channel, while preserving queued connection, error and
+transfer events. Applying new port options also discards the old reader's
+partial batch and resets the raw parser boundary before replacing the reader;
+old bytes and line updates cannot appear after the settings-change marker.
+Plot-history growth/backfill keeps the shared one-million-point limit instead
+of temporarily restoring the uncapped per-series setting.
+
+Three regression tests reproduced these failures before the fixes and pass
+with them. The full workspace suite passes with 422 tests and two ignored
+manual diagnostics; workspace Clippy and changed-file formatting also pass.
