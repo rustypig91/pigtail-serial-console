@@ -1245,7 +1245,8 @@ impl App {
                 .frame(super::chrome::dialog_frame(ctx))
                 .show(ctx, |ui| {
                     super::chrome::dialog_style(ui);
-                    ui.label("Port");
+                    let port_help = "Serial device to connect to. Ports already open in another tab are unavailable.";
+                    ui.label("Port").on_hover_text(port_help);
                     egui::ComboBox::from_id_salt("dlg_port")
                         .width(260.0)
                         .selected_text(
@@ -1272,7 +1273,9 @@ impl App {
                                     );
                                 });
                             }
-                        });
+                        })
+                        .response
+                        .on_hover_text(port_help);
                     if available.is_empty() {
                         ui.weak("No serial ports detected.");
                     } else if available.iter().enumerate().all(|(index, _)| {
@@ -1285,7 +1288,7 @@ impl App {
                     connect_controls(ui, &mut dialog.config);
 
                     ui.separator();
-                    ui.label("Presets");
+                    ui.label("Presets").on_hover_text("Save or reuse a named set of port options.");
                     ui.horizontal(|ui| {
                         egui::ComboBox::from_id_salt("dlg_preset")
                             .selected_text("Load…")
@@ -1296,13 +1299,18 @@ impl App {
                                         load_preset = Some(i);
                                     }
                                 }
-                            });
+                            })
+                            .response
+                            .on_hover_text("Load saved port options into this dialog.");
                         ui.add(
                             egui::TextEdit::singleline(&mut dialog.preset_name)
                                 .hint_text("preset name")
                                 .desired_width(120.0),
-                        );
-                        if ui.button("Save preset").clicked() {
+                        )
+                        .on_hover_text("Name for this set of port options.");
+                        if ui.button("Save preset")
+                            .on_hover_text("Save these options under this name, replacing any existing preset with the same name.")
+                            .clicked() {
                             persist = true;
                         }
                     });
@@ -1432,7 +1440,8 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
         .num_columns(2)
         .spacing([8.0, 4.0])
         .show(ui, |ui| {
-            ui.label("Baud");
+            let help = "Serial speed in bits per second. Must match the device.";
+            ui.label("Baud").on_hover_text(help);
             ui.horizontal(|ui| {
                 egui::ComboBox::from_id_salt("baud")
                     .selected_text(cfg.baud.to_string())
@@ -1441,18 +1450,21 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
                         for &b in COMMON_BAUDS {
                             ui.selectable_value(&mut cfg.baud, b, b.to_string());
                         }
-                    });
+                    })
+                    .response
+                    .on_hover_text(help);
                 ui.label("or");
                 ui.add(
                     egui::DragValue::new(&mut cfg.baud)
                         .speed(0.0)
                         .range(50..=6_000_000),
                 )
-                .on_hover_text("Click to type any baud rate");
+                .on_hover_text(format!("{help} Click to type a custom rate."));
             });
             ui.end_row();
 
-            ui.label("Data bits");
+            let help = "Data bits per character, usually 8. Must match the device.";
+            ui.label("Data bits").on_hover_text(help);
             egui::ComboBox::from_id_salt("databits")
                 .selected_text(format!("{}", u8::from(cfg.data_bits)))
                 .show_ui(ui, |ui| {
@@ -1465,10 +1477,13 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
                     ] {
                         ui.selectable_value(&mut cfg.data_bits, b, format!("{}", u8::from(b)));
                     }
-                });
+                })
+                .response
+                .on_hover_text(help);
             ui.end_row();
 
-            ui.label("Parity");
+            let help = "Optional error-checking bit. Must match the device.";
+            ui.label("Parity").on_hover_text(help);
             egui::ComboBox::from_id_salt("parity")
                 .selected_text(parity_label(cfg.parity))
                 .show_ui(ui, |ui| {
@@ -1476,10 +1491,13 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
                     for p in [Parity::None, Parity::Odd, Parity::Even] {
                         ui.selectable_value(&mut cfg.parity, p, parity_label(p));
                     }
-                });
+                })
+                .response
+                .on_hover_text(help);
             ui.end_row();
 
-            ui.label("Stop bits");
+            let help = "Bits marking the end of each character. Must match the device.";
+            ui.label("Stop bits").on_hover_text(help);
             egui::ComboBox::from_id_salt("stopbits")
                 .selected_text(format!("{}", u8::from(cfg.stop_bits)))
                 .show_ui(ui, |ui| {
@@ -1487,10 +1505,13 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
                     for s in [StopBits::One, StopBits::Two] {
                         ui.selectable_value(&mut cfg.stop_bits, s, format!("{}", u8::from(s)));
                     }
-                });
+                })
+                .response
+                .on_hover_text(help);
             ui.end_row();
 
-            ui.label("Flow control");
+            let help = "Pause transmission with XON/XOFF or RTS/CTS to avoid overruns. Must match the device.";
+            ui.label("Flow control").on_hover_text(help);
             egui::ComboBox::from_id_salt("flow")
                 .selected_text(flow_label(cfg.flow_control))
                 .show_ui(ui, |ui| {
@@ -1502,10 +1523,13 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
                     ] {
                         ui.selectable_value(&mut cfg.flow_control, f, flow_label(f));
                     }
-                });
+                })
+                .response
+                .on_hover_text(help);
             ui.end_row();
 
-            ui.label("Terminal");
+            let help = "How received \\r and \\n affect log lines. Independent of the Log/Hex/ANSI view.";
+            ui.label("Terminal").on_hover_text(help);
             egui::ComboBox::from_id_salt("terminal")
                 .selected_text(cfg.terminal.label())
                 .show_ui(ui, |ui| {
@@ -1522,23 +1546,23 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
                                 TerminalMode::Classic => "\\n, \\r\\n, or \\r each break a line",
                             });
                     }
-                });
+                })
+                .response
+                .on_hover_text(help);
             ui.end_row();
 
-            ui.label("Send delay");
+            let help = "Pause between outgoing bytes for typing, paste, macros, and files. 0 disables pacing.";
+            ui.label("Send delay").on_hover_text(help);
             ui.add(
                 egui::DragValue::new(&mut cfg.send_delay_ms)
                     .range(0..=60_000)
                     .suffix(" ms"),
             )
-            .on_hover_text(
-                "Minimum delay between outgoing bytes on this connection for typing, paste, \
-                 macros, and file transfers. 0 sends without a delay. UTF-8 characters \
-                 may contain multiple bytes.",
-            );
+            .on_hover_text(help);
             ui.end_row();
 
-            ui.label("Send ending");
+            let help = "Line ending sent when you press Enter, also appended to macro commands.";
+            ui.label("Send ending").on_hover_text(help);
             egui::ComboBox::from_id_salt("line_ending")
                 .selected_text(cfg.line_ending.label())
                 .show_ui(ui, |ui| {
@@ -1551,22 +1575,32 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
                     ] {
                         ui.selectable_value(&mut cfg.line_ending, e, e.label());
                     }
-                });
+                })
+                .response
+                .on_hover_text(help);
             ui.end_row();
         });
 
     ui.checkbox(
         &mut cfg.dtr_on_open,
         "Assert DTR on open (resets many boards)",
+    )
+    .on_hover_text("Set Data Terminal Ready when connecting. May reset the device.");
+    ui.checkbox(&mut cfg.rts_on_open, "Assert RTS on open")
+        .on_hover_text(
+        "Set Request to Send when connecting. Hardware flow control may manage it automatically.",
     );
-    ui.checkbox(&mut cfg.rts_on_open, "Assert RTS on open");
     ui.checkbox(
         &mut cfg.local_echo,
         "Local echo (show sent input in the log)",
-    );
+    )
+    .on_hover_text("Show outgoing input locally. Leave off if the device echoes it back.");
     ui.checkbox(
         &mut cfg.local_history,
         "Local history (Up/Down recall sent input, never sent)",
+    )
+    .on_hover_text(
+        "Use Up/Down to recall sent input in Log/Hex. ANSI/VT sends these keys to the device.",
     );
 }
 

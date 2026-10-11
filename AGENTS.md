@@ -131,7 +131,9 @@ application.
   valid neighboring options. Unknown keys are omitted on save. Invalid TOML syntax
   still fails configuration loading. Discarding a malformed option or settings
   section, or the obsolete global send delay, emits a warning in `app.log` identifying
-  the section and option where applicable.
+  the section and option where applicable. Port-option labels and controls have
+  concise tooltips explaining serial parameters, receive framing, transmit pacing
+  and endings, modem signals, local echo/history, and presets.
 - DTR/RTS toggles and break signal
 - Export the current (filtered) view to `.txt` or `.csv`
 - Startup notice when a newer release is published, with "skip this version" and
