@@ -333,6 +333,8 @@ Every push to `main` and every pull request builds both platforms, runs workspac
 with all features, and uploads packages and the Linux screenshot to the workflow
 run. Pull requests do not require build labels. Feature-branch pushes build through
 the pull-request event, avoiding duplicate push and pull-request builds.
+New PR commits cancel older runs for that PR. Each `main` push, version-tag build,
+and manual run has its own concurrency group and is not cancelled by newer runs.
 Rerunning a failed platform replaces its workflow artifacts while retaining
 successful platforms' artifacts from earlier attempts of the same run.
 
