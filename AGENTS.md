@@ -162,6 +162,9 @@ Use **F1** for About, **F2** for Settings, and **Ctrl+Shift+S** to save the curr
 In **Settings → Appearance**, choose Dark or Light and a separate Blue, Green, or
 Red base color. Each theme remembers its own base color across restarts.
 Plain Page Up / Page Down and arrow keys retain their normal terminal behavior.
+Ctrl+wheel over the console changes the font size by one point per frame.
+Nonzero wheel deltas apply at gesture start, move, and end; zero-delta
+gesture boundaries do not change the size.
 
 Use **Ctrl+Shift+Space** to pin the console to the bottom. On connection tabs,
 **Ctrl+Shift+Q / W / E** selects the **Log / Hex / ANSI** view.

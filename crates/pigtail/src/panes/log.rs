@@ -2716,10 +2716,7 @@ fn ctrl_wheel_steps(ctx: &egui::Context) -> i32 {
             .iter()
             .filter_map(|e| match e {
                 egui::Event::MouseWheel {
-                    phase: egui::TouchPhase::Move,
-                    delta,
-                    modifiers,
-                    ..
+                    delta, modifiers, ..
                 } if modifiers.command => Some(delta.y),
                 _ => None,
             })
@@ -3433,6 +3430,43 @@ pub(super) fn copied_text(output: &egui::PlatformOutput) -> String {
 #[cfg(test)]
 mod tests {
     use crate::test_ui::ContextTestExt as _;
+    #[test]
+    fn font_zoom_uses_nonzero_wheel_deltas_at_gesture_boundaries() {
+        let ctx = egui::Context::default();
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        for phase in [
+            egui::TouchPhase::Start,
+            egui::TouchPhase::Move,
+            egui::TouchPhase::End,
+        ] {
+            for (delta, modifiers, expected) in [
+                (1.0, ctrl, 1),
+                (-1.0, ctrl, -1),
+                (0.0, ctrl, 0),
+                (1.0, egui::Modifiers::NONE, 0),
+            ] {
+                let _ = ctx.run_test_ui(
+                    egui::RawInput {
+                        events: vec![egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, delta),
+                            phase,
+                            modifiers,
+                        }],
+                        ..Default::default()
+                    },
+                    |ui| {
+                        assert_eq!(super::ctrl_wheel_steps(ui.ctx()), expected, "{phase:?}");
+                    },
+                );
+            }
+        }
+    }
+
     #[test]
     fn long_search_text_keeps_controls_in_place() {
         for merged in [false, true] {
