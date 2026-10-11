@@ -1,6 +1,5 @@
 //! Platform config/data paths via `directories`.
 
-#[cfg(not(feature = "demo"))]
 use anyhow::Context;
 use std::path::PathBuf;
 
@@ -13,6 +12,26 @@ pub struct AppPaths {
     /// has no console attached (`windows_subsystem = "windows"`), so without a
     /// file a crash leaves nothing at all behind to look at.
     pub crash_log: PathBuf,
+}
+
+impl AppPaths {
+    pub fn open_config_dir(&self) -> anyhow::Result<()> {
+        let directory = self
+            .config_file
+            .parent()
+            .context("configuration file has no parent directory")?;
+        std::fs::create_dir_all(directory).context("creating configuration directory")?;
+        open::that_detached(directory).context("opening configuration directory")
+    }
+
+    pub fn open_logs_dir(&self) -> anyhow::Result<()> {
+        let directory = self
+            .crash_log
+            .parent()
+            .context("crash log has no parent directory")?;
+        std::fs::create_dir_all(directory).context("creating logs directory")?;
+        open::that_detached(directory).context("opening logs directory")
+    }
 }
 
 #[cfg(not(feature = "demo"))]

@@ -21,6 +21,7 @@ directories = "6.0.0"
 eframe = { version = "0.30.0", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "wayland", "x11"] }
 egui = "0.30"
 egui_plot = "0.30.0"
+open = "5.4.4"
 regex = "1.13.1"
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }

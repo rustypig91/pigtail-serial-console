@@ -1,9 +1,13 @@
 # Agent guide
 
-This guide applies to the whole repository. Keep [README.md](README.md) focused
-on users: the product, installation, basic usage, and a quick source build.
-Keep detailed implementation, behavior, validation, packaging, and release
-information here. Update both documents when a change affects their guidance.
+This guide applies to the whole repository. Keep [README.md](README.md) short:
+a concise explanation of the product, installation, basic usage, and a quick
+source build. Do not add small feature details, menu-item instructions,
+troubleshooting paths, editor-specific commands, or other development details
+to the README. Keep detailed implementation, behavior, validation, packaging,
+and release information here. Update the README only when its concise overview
+or essential installation and usage guidance needs to change; document smaller
+changes here instead.
 
 ## Architecture and code map
 
@@ -124,6 +128,15 @@ application.
 
 ### Keyboard shortcuts and appearance
 
+The app menu's **Open configuration folder** opens the parent directory of the
+active `pigtail.toml` path in the system file manager, creating the directory if
+needed. Launcher failures are logged and shown in the existing error dialog.
+**Open logs folder** opens the parent directory of the active `crash.log` path,
+also containing `app.log`, `app.previous.log`, and the sessions subdirectory.
+It uses the same directory creation and launcher error handling.
+Demo builds open their isolated temporary directories; ordinary demo diagnostics
+are still written to stderr.
+
 Use **Ctrl+Shift+Page Up / Page Down** to scroll the console one page up or down.
 Use **Ctrl+Shift+Up / Down** to scroll one line up or down.
 Use **Ctrl+Shift+Tab** to cycle forwards through tabs in the current pane.
@@ -235,6 +248,11 @@ cargo build --release
 ```
 
 Run in development with `cargo run -p pigtail`.
+
+VS Code tasks are in `.vscode/tasks.json`. **Tasks: Run Task → Run Pigtail
+(Release)** executes `cargo run --release -p pigtail --locked` from the workspace
+root, using the normal configuration and sessions. The default build task
+remains **Run Pigtail** (debug).
 
 ### Demo build
 

@@ -763,6 +763,34 @@ impl App {
                     self.show_settings = true;
                     ui.close_menu();
                 }
+                if ui
+                    .button("Open configuration folder")
+                    .on_hover_text("Open the folder containing pigtail.toml in your file manager")
+                    .clicked()
+                {
+                    if let Err(error) = self.paths.open_config_dir() {
+                        self.record_connect_error(
+                            "Could not open configuration folder",
+                            format!("{error:#}"),
+                        );
+                    }
+                    ui.close_menu();
+                }
+                if ui
+                    .button("Open logs folder")
+                    .on_hover_text(
+                        "Open the folder containing app.log and crash.log in your file manager",
+                    )
+                    .clicked()
+                {
+                    if let Err(error) = self.paths.open_logs_dir() {
+                        self.record_connect_error(
+                            "Could not open logs folder",
+                            format!("{error:#}"),
+                        );
+                    }
+                    ui.close_menu();
+                }
                 let updating = self.update_rx.is_some() || self.install_rx.is_some();
                 let update_unavailable = if self.demo_mode {
                     "Updates are disabled in demo builds"
