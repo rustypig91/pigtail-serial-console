@@ -64,7 +64,10 @@ application.
 - Multiple ports as persistent, user-named tabs, plus optional merged views that label
   and interleave selected connections by timestamp.
   Choose **New merged view** from the **+** menu and select the
-  connections to include. You can open several merged views and close each
+  connections to include. The merged view footer has a left-aligned **Send to**
+  selector after its status text for choosing which included connection receives
+  typing, pasted text, and macros.
+  You can open several merged views and close each
   with a middle-click or its tab's right-click menu. Merged views can start
   empty; right-click their tab and choose **Options** to change
   its name and included connections at any time. Drag merged tabs alongside

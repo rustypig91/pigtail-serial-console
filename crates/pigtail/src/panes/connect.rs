@@ -1100,6 +1100,40 @@ impl App {
                                 self.merged_search_matches.len()
                             ));
                         }
+                        let selected_label = self
+                            .merged_tx_port
+                            .and_then(|id| self.connections.iter().find(|conn| conn.id == id))
+                            .map(|conn| short_label(conn.display_label()))
+                            .unwrap_or_else(|| "Select device".into());
+                        let mut selected = self.merged_tx_port;
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            ui.weak("Send to:");
+                            egui::ComboBox::from_id_salt(self.pane_widget_id("merged_tx_device"))
+                                .selected_text(selected_label)
+                                .show_ui(ui, |ui| {
+                                    super::chrome::popup_style(ui);
+                                    for conn in self
+                                        .connections
+                                        .iter()
+                                        .filter(|conn| self.merged_contains(conn.id))
+                                    {
+                                        if ui
+                                            .add_enabled(
+                                                conn.state != ConnState::Closed,
+                                                egui::Button::selectable(
+                                                    selected == Some(conn.id),
+                                                    short_label(conn.display_label()),
+                                                ),
+                                            )
+                                            .clicked()
+                                        {
+                                            selected = Some(conn.id);
+                                        }
+                                    }
+                                });
+                        });
+                        self.merged_tx_port = selected;
                         (self.merged_follow, self.merged_new_since_scroll)
                     } else if let Some(active) = self.active_index() {
                         let conn = &self.connections[active];
@@ -1187,39 +1221,6 @@ impl App {
                     }
                 }
             }
-        }
-        if self.merged_selected {
-            has_options = true;
-            let selected_label = self
-                .merged_tx_port
-                .and_then(|id| self.connections.iter().find(|conn| conn.id == id))
-                .map(|conn| short_label(conn.display_label()))
-                .unwrap_or_else(|| "Select device".into());
-            let mut selected = self.merged_tx_port;
-            egui::ComboBox::from_id_salt(self.pane_widget_id("merged_tx_device"))
-                .selected_text(format!("Send to: {selected_label}"))
-                .show_ui(ui, |ui| {
-                    super::chrome::popup_style(ui);
-                    for conn in self
-                        .connections
-                        .iter()
-                        .filter(|conn| self.merged_contains(conn.id))
-                    {
-                        if ui
-                            .add_enabled(
-                                conn.state != ConnState::Closed,
-                                egui::Button::selectable(
-                                    selected == Some(conn.id),
-                                    short_label(conn.display_label()),
-                                ),
-                            )
-                            .clicked()
-                        {
-                            selected = Some(conn.id);
-                        }
-                    }
-                });
-            self.merged_tx_port = selected;
         }
         if self.config.highlight.iter().any(|rule| rule.enabled) {
             has_options = true;
