@@ -12,6 +12,7 @@ impl App {
         let mut history_limit_changed = false;
         let mut history_limit_dragged = false;
         let mut vt_limit_editing = false;
+        let mut folder_to_open = None;
         if open {
             let response = super::chrome::app_modal(ctx, "Settings").show(ctx, |ui| {
                 ui.set_width(420.0);
@@ -190,10 +191,31 @@ impl App {
                         ui.end_row();
                         });
                         ui.add_space(10.0);
-                        ui.collapsing("Storage locations", |ui| {
-                            ui.weak(format!("Config: {}", self.paths.config_file.display()));
-                            ui.weak(format!("Sessions: {}", self.paths.sessions.display()));
-                        });
+                        egui::Frame::NONE
+                            .fill(ui.visuals().faint_bg_color)
+                            .stroke(ui.visuals().window_stroke)
+                            .corner_radius(8.0)
+                            .inner_margin(12.0)
+                            .show(ui, |ui| {
+                                ui.set_min_width((ui.available_width() - 1.0).max(0.0));
+                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                                ui.strong("Folders");
+                                ui.weak("Click a path to open it in your file manager.");
+                                for (label, file, logs) in [
+                                    ("Configuration", &self.paths.config_file, false),
+                                    ("Logs and session captures", &self.paths.crash_log, true),
+                                ] {
+                                    if let Some(directory) = file.parent() {
+                                        ui.add_space(8.0);
+                                        ui.label(label);
+                                        let path = directory.display().to_string();
+                                        if ui.link(&path).on_hover_text(format!("Open {path}")).clicked() {
+                                            // Defer until after the immutable paths borrow ends.
+                                            folder_to_open = Some(logs);
+                                        }
+                                    }
+                                }
+                            });
                         ui.add_space(8.0);
                         ui.weak(concat!(
                             "Rusty's Pigtail · v",
@@ -218,6 +240,9 @@ impl App {
             }
         }
 
+        if let Some(logs) = folder_to_open {
+            self.open_folder(logs);
+        }
         self.show_settings = open;
         if !vt_limit_editing || !open {
             for conn in &mut self.connections {

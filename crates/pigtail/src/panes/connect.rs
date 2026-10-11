@@ -758,24 +758,6 @@ impl App {
                     self.show_settings = true;
                     ui.close();
                 }
-                if ui
-                    .button("Open configuration folder")
-                    .on_hover_text("Open the folder containing pigtail.toml in your file manager")
-                    .clicked()
-                {
-                    self.open_folder(false);
-                    ui.close();
-                }
-                if ui
-                    .button("Open logs folder")
-                    .on_hover_text(
-                        "Open the folder containing app.log and crash.log in your file manager",
-                    )
-                    .clicked()
-                {
-                    self.open_folder(true);
-                    ui.close();
-                }
                 let updating = self.update_rx.is_some() || self.install_rx.is_some();
                 let update_unavailable = if self.demo_mode {
                     "Updates are disabled in demo builds"
