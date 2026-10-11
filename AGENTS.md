@@ -223,6 +223,9 @@ remaining hardware validation. CI runs workspace tests with all features so
 demo-only API migrations are checked too. Headless test frames supply finite
 window bounds. Repeated application animation/selection-scroll redraw requests
 are paced independently of vsync, while reader wakes remain immediate.
+Receive-backlog frames use the same pacing. Timer requests compensate for egui's
+predicted frame time so configuration writes and macro deadlines do not busy-loop
+just before they are due.
 
 Dependencies were checked against the registry and updated to current stable versions
 on 2026-10-11. The GUI uses eframe/egui 0.36.2, egui_plot 0.37.0 and wgpu 30.0.1.

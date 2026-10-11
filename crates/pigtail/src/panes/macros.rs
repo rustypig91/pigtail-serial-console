@@ -756,7 +756,10 @@ impl App {
             .map(|run| run.next_at)
             .min()
         {
-            ctx.request_repaint_after(next_at.saturating_duration_since(Instant::now()));
+            crate::graphics::request_repaint_after(
+                ctx,
+                next_at.saturating_duration_since(Instant::now()),
+            );
         }
         // A receive wait has no timer or animation of its own, but its footer
         // indicator must still appear once the run reaches its threshold on an
@@ -766,7 +769,10 @@ impl App {
                 .then(|| run.started_at.checked_add(MACRO_INDICATOR_DELAY))
                 .flatten()
         }) {
-            ctx.request_repaint_after(indicator_at.saturating_duration_since(Instant::now()));
+            crate::graphics::request_repaint_after(
+                ctx,
+                indicator_at.saturating_duration_since(Instant::now()),
+            );
         }
     }
 

@@ -9,11 +9,21 @@ use eframe::wgpu::CurrentSurfaceTexture;
 /// Pace our animations without relying on the surface's presentation mode.
 /// Input and reader wakes can still request an earlier frame.
 pub fn request_animation_frame(context: &egui::Context) {
+    request_repaint_after(context, Duration::from_millis(16));
+}
+
+/// Request a real delay, including for deadlines checked against `Instant`.
+/// Avoid rendering repeatedly just before a deadline when vsync is disabled.
+pub fn request_repaint_after(context: &egui::Context, delay: Duration) {
+    if delay.is_zero() {
+        context.request_repaint();
+        return;
+    }
     // egui subtracts predicted_dt from delayed repaint requests. Compensate
-    // so a 16 ms animation interval does not become an immediate busy loop.
+    // so short delays do not become an immediate busy loop.
     let predicted = context.input(|input| input.predicted_dt);
     context.request_repaint_after(
-        Duration::from_millis(16) + Duration::try_from_secs_f32(predicted).unwrap_or_default(),
+        delay.saturating_add(Duration::try_from_secs_f32(predicted).unwrap_or_default()),
     );
 }
 
@@ -61,6 +71,27 @@ mod tests {
     use super::*;
     use crate::test_ui::ContextTestExt as _;
     use std::sync::Mutex;
+
+    #[test]
+    fn short_deadline_repaints_wait_and_due_deadlines_remain_immediate() {
+        let context = egui::Context::default();
+        for delay in [
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            Duration::ZERO,
+        ] {
+            for _ in 0..3 {
+                let _ = context.run_test_ui(Default::default(), |_| {});
+            }
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let captured = requests.clone();
+            context.set_request_repaint_callback(move |request| {
+                captured.lock().unwrap().push(request.delay);
+            });
+            request_repaint_after(&context, delay);
+            assert_eq!(*requests.lock().unwrap(), [delay]);
+        }
+    }
 
     #[test]
     fn animation_repaints_are_delayed_but_do_not_postpone_input() {

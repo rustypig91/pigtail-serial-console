@@ -2669,10 +2669,10 @@ impl App {
         let elapsed = dirty_since.elapsed();
         if elapsed >= CONFIG_WRITE_DELAY {
             if !self.flush_config() {
-                ctx.request_repaint_after(CONFIG_WRITE_DELAY);
+                crate::graphics::request_repaint_after(ctx, CONFIG_WRITE_DELAY);
             }
         } else {
-            ctx.request_repaint_after(CONFIG_WRITE_DELAY - elapsed);
+            crate::graphics::request_repaint_after(ctx, CONFIG_WRITE_DELAY - elapsed);
         }
     }
 
@@ -3843,7 +3843,7 @@ impl eframe::App for App {
         // schedule the next one — that keeps a backlog draining, and keeps
         // follow-tail smooth through a burst.
         if any_data {
-            ctx.request_repaint_after(Duration::from_millis(16));
+            crate::graphics::request_animation_frame(ctx);
         }
     }
 
@@ -4586,6 +4586,33 @@ pub(crate) mod tests {
         app.start_update_check(true);
         assert!(app.install_rx.as_ref().unwrap().same_channel(&original));
         assert!(app.update_rx.is_none());
+    }
+
+    #[test]
+    fn pending_config_write_does_not_repaint_early_when_prediction_exceeds_deadline() {
+        let (mut app, _tx) = test_app("config-repaint-deadline");
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            let _ = ctx.run_test_ui(
+                egui::RawInput {
+                    predicted_dt: 2.0,
+                    ..Default::default()
+                },
+                |_| {},
+            );
+        }
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        ctx.set_request_repaint_callback(move |request| {
+            captured.lock().unwrap().push(request.delay);
+        });
+        app.write_config();
+        app.maintain_config(&ctx);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0] > Duration::ZERO);
+        assert!(requests[0] <= CONFIG_WRITE_DELAY);
+        assert!(app.config_dirty_since.is_some());
     }
 
     #[test]
