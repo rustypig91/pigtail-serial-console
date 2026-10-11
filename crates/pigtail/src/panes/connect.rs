@@ -763,12 +763,7 @@ impl App {
                     .on_hover_text("Open the folder containing pigtail.toml in your file manager")
                     .clicked()
                 {
-                    if let Err(error) = self.paths.open_config_dir() {
-                        self.record_connect_error(
-                            "Could not open configuration folder",
-                            format!("{error:#}"),
-                        );
-                    }
+                    self.open_folder(false);
                     ui.close();
                 }
                 if ui
@@ -778,12 +773,7 @@ impl App {
                     )
                     .clicked()
                 {
-                    if let Err(error) = self.paths.open_logs_dir() {
-                        self.record_connect_error(
-                            "Could not open logs folder",
-                            format!("{error:#}"),
-                        );
-                    }
+                    self.open_folder(true);
                     ui.close();
                 }
                 let updating = self.update_rx.is_some() || self.install_rx.is_some();

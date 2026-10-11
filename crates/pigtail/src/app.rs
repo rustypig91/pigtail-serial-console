@@ -1746,6 +1746,7 @@ pub struct App {
     /// race), and neither should silently erase the other before either is
     /// shown.
     pub connect_errors: VecDeque<ConnectError>,
+    folder_open_results: Vec<Receiver<ConnectError>>,
 }
 
 impl App {
@@ -1834,6 +1835,7 @@ impl App {
             font_toast: None,
             macro_runs: Vec::new(),
             connect_errors: VecDeque::new(),
+            folder_open_results: Vec::new(),
         }
     }
 
@@ -2050,6 +2052,51 @@ impl App {
             return;
         }
         self.connect_errors.push_back(err);
+    }
+
+    /// Wait for launcher exit off the UI thread so failures remain observable.
+    pub(crate) fn open_folder(&mut self, logs: bool) {
+        let paths = self.paths.clone();
+        let wake = self.wake.clone();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let title = if logs {
+            "Could not open logs folder"
+        } else {
+            "Could not open configuration folder"
+        };
+        match std::thread::Builder::new()
+            .name("open-folder".into())
+            .spawn(move || {
+                let result = if logs {
+                    paths.open_logs_dir()
+                } else {
+                    paths.open_config_dir()
+                };
+                if let Err(error) = result {
+                    let _ = tx.send(ConnectError {
+                        title,
+                        message: format!("{error:#}"),
+                    });
+                }
+                // Disconnect before waking, including on a successful launch.
+                drop(tx);
+                wake.signal();
+            }) {
+            Ok(_) => self.folder_open_results.push(rx),
+            Err(error) => self.record_connect_error(title, error.to_string()),
+        }
+    }
+
+    fn poll_folder_open_results(&mut self) {
+        let mut pending = Vec::new();
+        for rx in std::mem::take(&mut self.folder_open_results) {
+            match rx.try_recv() {
+                Ok(error) => self.record_connect_error(error.title, error.message),
+                Err(crossbeam_channel::TryRecvError::Empty) => pending.push(rx),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {}
+            }
+        }
+        self.folder_open_results = pending;
     }
 
     /// Whether a modal dialog anchored at CENTER_CENTER (see `show_connect_error`)
@@ -3693,6 +3740,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
         self.poll_enumerator();
+        self.poll_folder_open_results();
         self.poll_update_check();
         self.poll_update_install(ctx);
         if self.install_rx.is_some()
@@ -4404,6 +4452,32 @@ pub(crate) mod tests {
             rx,
         );
         (app, tx)
+    }
+
+    #[test]
+    fn folder_launcher_results_report_errors_and_preserve_pending_requests() {
+        let (mut app, _tx) = test_app("folder-launcher-results");
+        let (pending_tx, pending_rx) = crossbeam_channel::bounded(1);
+        let (failed_tx, failed_rx) = crossbeam_channel::bounded(1);
+        let (success_tx, success_rx) = crossbeam_channel::bounded(1);
+        failed_tx
+            .send(ConnectError {
+                title: "Could not open logs folder",
+                message: "launcher exited with status 7".into(),
+            })
+            .unwrap();
+        drop(success_tx);
+        app.folder_open_results = vec![pending_rx, failed_rx, success_rx];
+        app.poll_folder_open_results();
+        assert_eq!(app.folder_open_results.len(), 1);
+        assert_eq!(
+            app.connect_errors.front().unwrap().message,
+            "launcher exited with status 7"
+        );
+        drop(pending_tx);
+        app.poll_folder_open_results();
+        assert!(app.folder_open_results.is_empty());
+        assert_eq!(app.connect_errors.len(), 1);
     }
 
     fn update_test_app(name: &str) -> (App, crossbeam_channel::Sender<update::InstallEvent>) {

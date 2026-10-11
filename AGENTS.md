@@ -138,6 +138,8 @@ needed. Launcher failures are logged and shown in the existing error dialog.
 **Open logs folder** opens the parent directory of the active `crash.log` path,
 also containing `app.log`, `app.previous.log`, and the sessions subdirectory.
 It uses the same directory creation and launcher error handling.
+Folder launchers run on background workers; their exit failures wake the UI and
+appear in the existing error dialog without blocking console input.
 Demo builds open their isolated temporary directories; ordinary demo diagnostics
 are still written to stderr.
 

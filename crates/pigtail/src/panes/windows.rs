@@ -118,6 +118,7 @@ impl App {
             ("Port options", self.config_dialog.is_some()),
             ("New connection", self.config_dialog.is_some()),
             ("Rename tab", self.rename_dialog.is_some()),
+            ("new_merged_view", self.merged_dialog.is_some()),
             ("Send file", self.file_transfer_dialog.is_some()),
             (
                 "file_transfer_progress",
@@ -198,6 +199,9 @@ impl App {
             closed = true;
         } else if self.rename_dialog.is_some() && is_window("Rename tab") {
             self.rename_dialog = None;
+            closed = true;
+        } else if self.merged_dialog.is_some() && is_window("new_merged_view") {
+            self.merged_dialog = None;
             closed = true;
         } else if self.file_transfer_dialog.is_some() && is_window("Send file") {
             self.file_transfer_dialog = None;
@@ -686,6 +690,40 @@ fn show_filter_controls(
 mod tests {
     use crate::app::tests::test_app;
     use crate::test_ui::ContextTestExt as _;
+
+    #[test]
+    fn escape_closes_merged_options_above_a_tool_window() {
+        let (mut app, _tx) = test_app("escape-merged-options");
+        app.show_filters_win = true;
+        app.merged_dialog = Some(crate::app::MergedDialog {
+            editing: None,
+            name: "Merged".into(),
+            ports: Vec::new(),
+        });
+        let ctx = egui::Context::default();
+        let _ = ctx.run_test_ui(Default::default(), |ui| {
+            app.show_tool_windows(ui.ctx());
+            app.show_merged_dialog(ui.ctx());
+        });
+        let _ = ctx.run_test_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                app.close_window_on_escape(ui.ctx());
+                assert!(app.merged_dialog.is_none());
+                assert!(app.show_filters_win);
+                assert!(!ui.input(|input| input.key_pressed(egui::Key::Escape)));
+            },
+        );
+    }
 
     #[test]
     fn escape_closes_modal_over_focused_search_without_closing_search() {
