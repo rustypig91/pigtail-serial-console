@@ -4455,6 +4455,55 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn discarded_configuration_values_emit_application_log_warnings() {
+        #[derive(Clone)]
+        struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for LogBuffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = LogBuffer(Default::default());
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            Config::from_toml(
+                r#"
+                [settings]
+                send_delay_ms = 20
+                console_font_size = "invalid"
+                theme = "invalid"
+                check_updates = false
+                [[preset]]
+                name = "slow"
+                baud = 9600
+                send_delay_ms = -1
+            "#,
+            )
+            .unwrap();
+            Config::from_toml("settings = 7").unwrap();
+        });
+        let log = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("WARN"), "{log}");
+        assert!(log.contains("obsolete configuration option"), "{log}");
+        assert!(log.contains("option=\"send_delay_ms\""), "{log}");
+        assert!(log.contains("option=\"console_font_size\""), "{log}");
+        assert!(log.contains("option=\"theme\""), "{log}");
+        assert!(log.contains("section=\"preset[0]\""), "{log}");
+        assert!(log.contains("malformed configuration section"), "{log}");
+        assert!(!log.contains("option=\"check_updates\""), "{log}");
+        assert!(!log.contains("option=\"baud\""), "{log}");
+    }
+
+    #[test]
     fn folder_launcher_results_report_errors_and_preserve_pending_requests() {
         let (mut app, _tx) = test_app("folder-launcher-results");
         let (pending_tx, pending_rx) = crossbeam_channel::bounded(1);

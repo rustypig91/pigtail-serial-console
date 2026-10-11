@@ -129,7 +129,9 @@ application.
   on load and removed on the next save; it is not migrated. Malformed global
   settings and port-option values fall back individually to defaults, preserving
   valid neighboring options. Unknown keys are omitted on save. Invalid TOML syntax
-  still fails configuration loading.
+  still fails configuration loading. Discarding a malformed option or settings
+  section, or the obsolete global send delay, emits a warning in `app.log` identifying
+  the section and option where applicable.
 - DTR/RTS toggles and break signal
 - Export the current (filtered) view to `.txt` or `.csv`
 - Startup notice when a newer release is published, with "skip this version" and

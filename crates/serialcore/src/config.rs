@@ -711,22 +711,38 @@ impl Config {
         let mut value: toml::Value = toml::from_str(s)?;
         if let Some(settings) = value.get_mut("settings") {
             if settings.is_table() {
-                discard_invalid_options::<Settings>(settings, |settings| {
+                if settings
+                    .as_table_mut()
+                    .expect("settings table")
+                    .remove("send_delay_ms")
+                    .is_some()
+                {
+                    tracing::warn!(section = "settings", option = "send_delay_ms", "ignoring obsolete configuration option; it will be omitted on the next save");
+                }
+                discard_invalid_options::<Settings>(settings, "settings", |settings| {
                     matches!(settings.theme.as_str(), "dark" | "light")
                         && (MIN_CONSOLE_FONT_SIZE..=MAX_CONSOLE_FONT_SIZE)
                             .contains(&settings.console_font_size)
                         && settings.vt_scrollback_rows <= MAX_VT_SCROLLBACK_ROWS
                 });
             } else if let Some(table) = value.as_table_mut() {
+                tracing::warn!(
+                    section = "settings",
+                    "ignoring malformed configuration section; using default settings"
+                );
                 table.remove("settings");
             }
         }
         for key in ["last_open", "preset"] {
             if let Some(entries) = value.get_mut(key).and_then(toml::Value::as_array_mut) {
-                for entry in entries {
-                    discard_invalid_options::<PortConfig>(entry, |port| {
-                        port.send_delay_ms <= 60_000 && (50..=6_000_000).contains(&port.baud)
-                    });
+                for (index, entry) in entries.iter_mut().enumerate() {
+                    discard_invalid_options::<PortConfig>(
+                        entry,
+                        &format!("{key}[{index}]"),
+                        |port| {
+                            port.send_delay_ms <= 60_000 && (50..=6_000_000).contains(&port.baud)
+                        },
+                    );
                 }
             }
         }
@@ -741,7 +757,7 @@ impl Config {
 
 /// Validate each option separately so one bad value cannot discard valid peers.
 /// Deserialize against the defaults to reuse the field types and enum validation.
-fn discard_invalid_options<T>(value: &mut toml::Value, valid: impl Fn(&T) -> bool)
+fn discard_invalid_options<T>(value: &mut toml::Value, section: &str, valid: impl Fn(&T) -> bool)
 where
     T: serde::de::DeserializeOwned + Serialize + Default,
 {
@@ -754,7 +770,17 @@ where
                 .as_table_mut()
                 .expect("defaults table")
                 .insert(key.to_owned(), value.clone());
-            candidate.try_into::<T>().is_ok_and(|option| valid(&option))
+            match candidate.try_into::<T>() {
+                Ok(option) if valid(&option) => true,
+                _ => {
+                    tracing::warn!(
+                        section,
+                        option = key,
+                        "ignoring malformed configuration option; using its default value"
+                    );
+                    false
+                }
+            }
         });
     }
 }
