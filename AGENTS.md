@@ -133,7 +133,9 @@ application.
   section, or the obsolete global send delay, emits a warning in `app.log` identifying
   the section and option where applicable. Port-option labels and controls have
   concise tooltips explaining serial parameters, receive framing, transmit pacing
-  and endings, modem signals, local echo/history, and presets.
+  and endings, modem signals, local echo/history, and presets. Port options and
+  New connection scroll within small windows while their Apply/Connect and Cancel
+  buttons remain outside the scrolling area.
 - DTR/RTS toggles and break signal
 - Export the current (filtered) view to `.txt` or `.csv`
 - Startup notice when a newer release is published, with "skip this version" and

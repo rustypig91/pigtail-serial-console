@@ -1245,75 +1245,87 @@ impl App {
                 .frame(super::chrome::dialog_frame(ctx))
                 .show(ctx, |ui| {
                     super::chrome::dialog_style(ui);
-                    let port_help = "Serial device to connect to. Ports already open in another tab are unavailable.";
-                    ui.label("Port").on_hover_text(port_help);
-                    egui::ComboBox::from_id_salt("dlg_port")
-                        .width(260.0)
-                        .selected_text(
-                            dialog
-                                .selected_path
-                                .clone()
-                                .unwrap_or_else(|| "select a port…".into()),
-                        )
-                        .show_ui(ui, |ui| {
-                            super::chrome::popup_style(ui);
-                            for (index, p) in available.iter().enumerate() {
-                                let added = available_port_is_added(
-                                    index,
-                                    available,
-                                    connections,
-                                    editing_port,
-                                );
-                                let text = port_choice_text(&p.path, &p.identity.label(), added);
-                                ui.add_enabled_ui(!added, |ui| {
-                                    ui.selectable_value(
-                                        &mut dialog.selected_path,
-                                        Some(p.path.clone()),
-                                        text,
-                                    );
-                                });
-                            }
-                        })
-                        .response
-                        .on_hover_text(port_help);
-                    if available.is_empty() {
-                        ui.weak("No serial ports detected.");
-                    } else if available.iter().enumerate().all(|(index, _)| {
-                        available_port_is_added(index, available, connections, editing_port)
-                    }) {
-                        ui.weak("All detected ports have already been added.");
-                    }
-
-                    ui.separator();
-                    connect_controls(ui, &mut dialog.config);
-
-                    ui.separator();
-                    ui.label("Presets").on_hover_text("Save or reuse a named set of port options.");
-                    ui.horizontal(|ui| {
-                        egui::ComboBox::from_id_salt("dlg_preset")
-                            .selected_text("Load…")
-                            .show_ui(ui, |ui| {
-                                super::chrome::popup_style(ui);
-                                for (i, preset) in config.presets.iter().enumerate() {
-                                    if ui.selectable_label(false, &preset.name).clicked() {
-                                        load_preset = Some(i);
+                    // Reserve room for the title, frame margins, and action row.
+                    // Scroll both axes so even narrow windows retain every option.
+                    ui.set_width((ctx.content_rect().width() - 64.0).clamp(0.0, 380.0));
+                    egui::ScrollArea::both()
+                        .id_salt("port_options_scroll")
+                        .animated(false)
+                        .auto_shrink([false, true])
+                        .max_height((ctx.content_rect().height() - 160.0).max(0.0))
+                        .min_scrolled_height(0.0)
+                        .show(ui, |ui| {
+                            let port_help = "Serial device to connect to. Ports already open in another tab are unavailable.";
+                            ui.label("Port").on_hover_text(port_help);
+                            egui::ComboBox::from_id_salt("dlg_port")
+                                .width(260.0)
+                                .selected_text(
+                                    dialog
+                                        .selected_path
+                                        .clone()
+                                        .unwrap_or_else(|| "select a port…".into()),
+                                )
+                                .show_ui(ui, |ui| {
+                                    super::chrome::popup_style(ui);
+                                    for (index, p) in available.iter().enumerate() {
+                                        let added = available_port_is_added(
+                                            index,
+                                            available,
+                                            connections,
+                                            editing_port,
+                                        );
+                                        let text = port_choice_text(&p.path, &p.identity.label(), added);
+                                        ui.add_enabled_ui(!added, |ui| {
+                                            ui.selectable_value(
+                                                &mut dialog.selected_path,
+                                                Some(p.path.clone()),
+                                                text,
+                                            );
+                                        });
                                     }
+                                })
+                                .response
+                                .on_hover_text(port_help);
+                            if available.is_empty() {
+                                ui.weak("No serial ports detected.");
+                            } else if available.iter().enumerate().all(|(index, _)| {
+                                available_port_is_added(index, available, connections, editing_port)
+                            }) {
+                                ui.weak("All detected ports have already been added.");
+                            }
+
+                            ui.separator();
+                            connect_controls(ui, &mut dialog.config);
+
+                            ui.separator();
+                            ui.label("Presets").on_hover_text("Save or reuse a named set of port options.");
+                            ui.horizontal(|ui| {
+                                egui::ComboBox::from_id_salt("dlg_preset")
+                                    .selected_text("Load…")
+                                    .show_ui(ui, |ui| {
+                                        super::chrome::popup_style(ui);
+                                        for (i, preset) in config.presets.iter().enumerate() {
+                                            if ui.selectable_label(false, &preset.name).clicked() {
+                                                load_preset = Some(i);
+                                            }
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text("Load saved port options into this dialog.");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut dialog.preset_name)
+                                        .hint_text("preset name")
+                                        .desired_width(120.0),
+                                )
+                                .on_hover_text("Name for this set of port options.");
+                                if ui.button("Save preset")
+                                    .on_hover_text("Save these options under this name, replacing any existing preset with the same name.")
+                                    .clicked() {
+                                    persist = true;
                                 }
-                            })
-                            .response
-                            .on_hover_text("Load saved port options into this dialog.");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut dialog.preset_name)
-                                .hint_text("preset name")
-                                .desired_width(120.0),
-                        )
-                        .on_hover_text("Name for this set of port options.");
-                        if ui.button("Save preset")
-                            .on_hover_text("Save these options under this name, replacing any existing preset with the same name.")
-                            .clicked() {
-                            persist = true;
-                        }
-                    });
+                            });
+
+                        });
 
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -1736,6 +1748,103 @@ mod tests {
     use egui::{Event, Key};
     use serialcore::config::TransmitMacro;
     use serialcore::store::PortId;
+
+    #[test]
+    fn small_port_dialogs_keep_actions_visible_and_options_scrollable() {
+        for editing in [false, true] {
+            let (mut app, _tx) = test_app("small-port-dialog");
+            if editing {
+                let id = PortId(0);
+                app.connections.push(app.make_connection(
+                    id,
+                    "probe".into(),
+                    Default::default(),
+                    Default::default(),
+                    inert_handle(id),
+                ));
+                app.open_port_options(0);
+            } else {
+                app.open_config_dialog();
+            }
+            let ctx = egui::Context::default();
+            let text_rect = |output: &egui::FullOutput, label: &str| {
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| {
+                        if let egui::Shape::Text(text) = &shape.shape {
+                            let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                            (text.galley.text() == label && shape.clip_rect.contains_rect(rect))
+                                .then_some(rect)
+                        } else {
+                            None
+                        }
+                    })
+                    .filter(|rect| rect.is_positive())
+            };
+            // Reuse the context to verify resizing an already-open dialog.
+            for size in [
+                egui::vec2(1100.0, 410.0),
+                egui::vec2(480.0, 280.0),
+                egui::vec2(320.0, 240.0),
+            ] {
+                let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                let draw = |app: &mut crate::app::App, events| {
+                    ctx.run_test_ui(
+                        egui::RawInput {
+                            screen_rect: Some(bounds),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| app.show_config_dialog(ui.ctx()),
+                    )
+                };
+                // Window placement uses the previous frame's measured size.
+                let _ = draw(&mut app, vec![]);
+                let output = draw(&mut app, vec![]);
+                for label in [
+                    if editing {
+                        "Port options"
+                    } else {
+                        "New connection"
+                    },
+                    if editing {
+                        "Apply & reconnect"
+                    } else {
+                        "Connect"
+                    },
+                    "Cancel",
+                ] {
+                    let rect = text_rect(&output, label)
+                        .unwrap_or_else(|| panic!("{label} missing at {size:?}"));
+                    assert!(
+                        bounds.contains_rect(rect),
+                        "{label} outside {size:?}: {rect:?}"
+                    );
+                }
+                let _ = draw(
+                    &mut app,
+                    vec![
+                        Event::PointerMoved(bounds.center()),
+                        Event::MouseWheel {
+                            phase: egui::TouchPhase::Move,
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(-2000.0, -2000.0),
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+                let output = draw(&mut app, vec![]);
+                // The final preset control is reachable by scrolling, while
+                // the footer stays visible throughout.
+                assert!(
+                    text_rect(&output, "Save preset").is_some(),
+                    "presets unreachable at {size:?}"
+                );
+                assert!(text_rect(&output, "Cancel").is_some());
+            }
+        }
+    }
 
     #[test]
     fn active_tab_meets_toolbar_at_the_configured_header_height() {
