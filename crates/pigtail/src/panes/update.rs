@@ -127,6 +127,7 @@ pub(crate) fn show_ack_window(ctx: &egui::Context, title: &str, message: &str) -
 #[cfg(test)]
 mod tests {
     use crate::app::{tests::test_app, UpdateDialog};
+    use crate::test_ui::ContextTestExt as _;
 
     #[test]
     fn escape_dismisses_update_notice_but_keeps_installation_progress_open() {
@@ -148,8 +149,8 @@ mod tests {
                 app.install_rx = Some(rx);
             }
             let ctx = egui::Context::default();
-            let _ = ctx.run(egui::RawInput::default(), |ctx| app.show_update_dialog(ctx));
-            let _ = ctx.run(
+            let _ = ctx.run_test_ui(egui::RawInput::default(), |ctx| app.show_update_dialog(ctx));
+            let _ = ctx.run_test_ui(
                 egui::RawInput {
                     events: vec![egui::Event::Key {
                         key: egui::Key::Escape,
@@ -160,7 +161,8 @@ mod tests {
                     }],
                     ..Default::default()
                 },
-                |ctx| {
+                |ui| {
+                    let ctx = &ui.ctx().clone();
                     app.close_window_on_escape(ctx);
                     app.show_update_dialog(ctx);
                 },

@@ -204,6 +204,7 @@ impl WrapIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_ui::ContextTestExt as _;
 
     #[test]
     fn rows_for_counts_whole_and_partial_rows() {
@@ -336,12 +337,13 @@ mod tests {
             for size in [6.0f32, 12.0, 17.0, 40.0] {
                 let ctx = egui::Context::default();
                 ctx.set_pixels_per_point(ppp);
-                let _ = ctx.run(Default::default(), |ctx| {
+                let _ = ctx.run_test_ui(Default::default(), |ui| {
+                    let ctx = &ui.ctx().clone();
                     let font = egui::FontId::monospace(size);
                     // Mirrors `panes::log::Metrics`: the advance a row is laid
                     // out with, and a wrap width holding exactly `cols` of them.
-                    let advance = ctx.fonts(|f| f.glyph_width(&font, '0'));
-                    let char_w = ((advance * ppp).round() / ppp).max(1.0);
+                    let advance = ctx.fonts_mut(|f| f.glyph_width(&font, '0'));
+                    let char_w = advance;
                     for cols in [8usize, 40, 80, 133] {
                         for len in [0usize, 1, 7, 39, 79, 80, 81, 160, 161, 999] {
                             let mut job = egui::text::LayoutJob::single_section(
@@ -353,7 +355,7 @@ mod tests {
                             );
                             job.wrap.max_width = cols as f32 * char_w + char_w * 0.25;
                             job.wrap.break_anywhere = true;
-                            let galley = ctx.fonts(|f| f.layout_job(job));
+                            let galley = ctx.fonts_mut(|f| f.layout_job(job));
                             assert_eq!(
                                 galley.rows.len(),
                                 rows_for(len as u32, cols) as usize,

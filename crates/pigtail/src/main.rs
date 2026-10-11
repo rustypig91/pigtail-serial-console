@@ -5,9 +5,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod graphics;
 mod panes;
 mod paths;
 mod terminal;
+#[cfg(test)]
+mod test_ui;
 mod wrap;
 
 use anyhow::Context;
@@ -15,13 +18,6 @@ use anyhow::Context;
 static RESTART_PATH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     // Keep demo builds completely separate from the user's config and captures.
     #[cfg(feature = "demo")]
     let demo_dir = tempfile::tempdir().context("creating demo directory")?;
@@ -33,7 +29,9 @@ fn main() -> anyhow::Result<()> {
     };
     #[cfg(not(feature = "demo"))]
     let dirs = paths::AppPaths::resolve().context("resolving app directories")?;
+    install_logging(&dirs.crash_log.with_file_name("app.log"));
     install_panic_hook(dirs.crash_log.clone());
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting Pigtail");
 
     // Best-effort retention cleanup at startup (spec §7.5).
     let cfg = if cfg!(feature = "demo") {
@@ -68,17 +66,29 @@ fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!("loading window icon: {e}"),
     }
 
+    let graphics_context = std::sync::Arc::new(std::sync::OnceLock::new());
     let native_options = eframe::NativeOptions {
         viewport,
+        renderer: eframe::Renderer::Wgpu,
+        wgpu_options: graphics::configuration(graphics_context.clone()),
         ..Default::default()
     };
 
     eframe::run_native(
         "pigtail",
         native_options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, dirs, cfg)))),
+        Box::new(move |cc| {
+            let _ = graphics_context.set(cc.egui_ctx.clone());
+            if let Some(render_state) = &cc.wgpu_render_state {
+                tracing::info!(adapter = ?render_state.adapter.get_info(), "graphics adapter selected");
+            }
+            Ok(Box::new(app::App::new(cc, dirs, cfg)))
+        }),
     )
-    .map_err(|e| anyhow::anyhow!("eframe error: {e}"))?;
+    .map_err(|e| {
+        tracing::error!("eframe error: {e}");
+        anyhow::anyhow!("eframe error: {e}")
+    })?;
     // run_native has dropped App and its serial connections before restarting.
     if let Some(path) = RESTART_PATH.lock().expect("restart path lock").take() {
         let mut command = std::process::Command::new(&path);
@@ -90,6 +100,7 @@ fn main() -> anyhow::Result<()> {
             command.env_remove(key);
         }
         if let Err(error) = command.spawn() {
+            tracing::error!(%error, "could not restart after update");
             rfd::MessageDialog::new()
                 .set_title("Update installed")
                 .set_description(format!(
@@ -102,13 +113,45 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Keep diagnostics from the latest two normal launches alongside the panic log.
+/// Demo builds log to stderr and never leave diagnostics in regular app data.
+fn install_logging(path: &std::path::Path) {
+    use tracing_subscriber::fmt::writer::BoxMakeWriter;
+
+    let file = if cfg!(feature = "demo") {
+        None
+    } else {
+        if path.is_file() {
+            if let Err(error) = std::fs::rename(path, path.with_file_name("app.previous.log")) {
+                eprintln!("could not preserve {}: {error}", path.display());
+            }
+        }
+        path.parent()
+            .map(std::fs::create_dir_all)
+            .transpose()
+            .and_then(|_| std::fs::File::create(path))
+            .map_err(|error| eprintln!("could not create {}: {error}", path.display()))
+            .ok()
+    };
+    let writer = match file {
+        Some(file) => BoxMakeWriter::new(std::sync::Mutex::new(file)),
+        None => BoxMakeWriter::new(std::io::stderr),
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_ansi(false)
+        .with_writer(writer)
+        .init();
+}
+
 /// Append every panic to a file, then let the default hook run.
 ///
-/// A release build is a `windows` subsystem binary with no console attached
-/// and no log file, so a panic on the UI thread takes the window down leaving
-/// the user with nothing to report but "it crashed". This is the whole record
-/// of what happened, and it survives the process — which is why it is written
-/// straight through rather than buffered.
+/// Windows release builds have no console attached. Record the panic and its
+/// backtrace separately from ordinary tracing, even if logging could not start.
+/// Write straight through rather than buffering so the record survives exit.
 fn install_panic_hook(path: std::path::PathBuf) {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

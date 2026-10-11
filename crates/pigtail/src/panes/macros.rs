@@ -38,8 +38,8 @@ impl App {
     /// Reserve an assigned Ctrl+Shift+digit chord before raw console input.
     pub(crate) fn consume_macro_shortcut(&mut self, ctx: &egui::Context) {
         if self.floating_window_open()
-            || ctx.is_context_menu_open()
-            || ctx.memory(|memory| memory.any_popup_open() || memory.focused().is_some())
+            || egui::Popup::is_any_open(ctx)
+            || ctx.memory(|memory| memory.focused().is_some())
             || self.macro_target_port().is_none()
         {
             return;
@@ -756,7 +756,10 @@ impl App {
             .map(|run| run.next_at)
             .min()
         {
-            ctx.request_repaint_after(next_at.saturating_duration_since(Instant::now()));
+            crate::graphics::request_repaint_after(
+                ctx,
+                next_at.saturating_duration_since(Instant::now()),
+            );
         }
         // A receive wait has no timer or animation of its own, but its footer
         // indicator must still appear once the run reaches its threshold on an
@@ -766,7 +769,10 @@ impl App {
                 .then(|| run.started_at.checked_add(MACRO_INDICATOR_DELAY))
                 .flatten()
         }) {
-            ctx.request_repaint_after(indicator_at.saturating_duration_since(Instant::now()));
+            crate::graphics::request_repaint_after(
+                ctx,
+                indicator_at.saturating_duration_since(Instant::now()),
+            );
         }
     }
 
@@ -796,7 +802,7 @@ impl App {
         let mut bytes = command.as_bytes().to_vec();
         bytes.extend_from_slice(conn.port_config.line_ending.bytes());
         if !bytes.is_empty() {
-            let delay = Duration::from_millis(self.config.settings.send_delay_ms);
+            let delay = Duration::from_millis(conn.port_config.send_delay_ms);
             if delay.is_zero() && !conn.handle.has_used_pacing() {
                 conn.handle.transmit(bytes);
             } else {
@@ -891,10 +897,7 @@ fn show_macro_steps(ui: &mut egui::Ui, editor: &mut MacroEditor) {
                         MacroStep::WaitFor { .. } => "Wait for",
                     };
                     if ui
-                        .add_sized(
-                            [72.0, row_height],
-                            egui::SelectableLabel::new(selected, kind),
-                        )
+                        .add_sized([72.0, row_height], egui::Button::selectable(selected, kind))
                         .clicked()
                     {
                         editor.step_selection = Some(step_index);
@@ -1190,6 +1193,7 @@ fn transfer_macro_shortcut(macros: &mut [TransmitMacro], target: usize, digit: u
 mod tests {
     use super::*;
     use crate::app::tests::{inert_handle, test_app};
+    use crate::test_ui::ContextTestExt as _;
     use serialcore::config::{LineEnding, PortConfig};
 
     fn app_with_macro(delay_ms: u64) -> App {
@@ -1236,11 +1240,36 @@ mod tests {
     }
 
     #[test]
+    fn macro_pacing_uses_the_target_connections_delay() {
+        let mut app = app_with_macro(0);
+        app.connections[0].port_config.send_delay_ms = 20;
+        let id = PortId(1);
+        let mut conn = app.make_connection(
+            id,
+            "other".into(),
+            Default::default(),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        conn.set_state(ConnState::Connected);
+        app.connections.push(conn);
+        // The selected connection is paced; targeting another one must use its
+        // own zero delay, including sends addressed through a merged view.
+        let mut pending = None;
+        assert!(app.send_macro_command(id, "fast", &mut pending));
+        assert!(pending.is_none());
+        assert!(!app.connections[1].handle.has_used_pacing());
+        assert!(app.send_macro_command(PortId(0), "slow", &mut pending));
+        assert!(pending.is_some());
+        assert!(app.connections[0].handle.has_used_pacing());
+    }
+
+    #[test]
     fn unpaced_macro_waits_for_queued_paced_output_before_starting_its_delay() {
         for file_transfer in [false, true] {
             let mut app = app_with_macro(100);
             // Output queued with the previous setting can still pace a macro
-            // after the user disables the global delay.
+            // after the user disables the connection's send delay.
             if file_transfer {
                 app.connections[0].handle.start_transfer_paced(
                     serialcore::transfer::PreparedTransfer {
@@ -1285,7 +1314,7 @@ mod tests {
     #[test]
     fn paced_command_finishes_before_starting_its_delay() {
         let mut app = app_with_macro(100);
-        app.config.settings.send_delay_ms = 20;
+        app.connections[0].port_config.send_delay_ms = 20;
         let ctx = egui::Context::default();
         let started = Instant::now();
         assert!(app.start_macro(0, started));
@@ -1314,7 +1343,7 @@ mod tests {
     fn paced_macro_wait_retains_early_responses_and_ignores_old_output() {
         for (early_response, delay_ms) in [(false, 0), (true, 0), (false, 100), (true, 100)] {
             let mut app = app_with_macro(100);
-            app.config.settings.send_delay_ms = 20;
+            app.connections[0].port_config.send_delay_ms = 20;
             app.config.macros[0].steps = vec![
                 MacroStep::Command {
                     text: "reboot".into(),
@@ -1363,7 +1392,7 @@ mod tests {
     #[test]
     fn disabling_pacing_does_not_reuse_the_previous_commands_receive_start() {
         let mut app = app_with_macro(0);
-        app.config.settings.send_delay_ms = 20;
+        app.connections[0].port_config.send_delay_ms = 20;
         app.config.macros[0].steps = vec![
             MacroStep::Command {
                 text: "first".into(),
@@ -1392,7 +1421,7 @@ mod tests {
         // The first command's reply arrives while it is still sending. The
         // next command uses the newly disabled pacing setting.
         app.connections[0].push_raw_bytes(b"READY");
-        app.config.settings.send_delay_ms = 0;
+        app.connections[0].port_config.send_delay_ms = 0;
         tx.send(started).unwrap();
         app.maintain_macro_runs_at(started, &ctx);
         assert_eq!(echoed(&app), ["first", "second"]);
@@ -1427,7 +1456,7 @@ mod tests {
     #[test]
     fn paced_macro_does_not_repeat_or_advance_after_a_failed_send() {
         let mut app = app_with_macro(0);
-        app.config.settings.send_delay_ms = 20;
+        app.connections[0].port_config.send_delay_ms = 20;
         app.config.macros[0].repeat_indefinitely = true;
         app.config.macros[0].steps = vec![MacroStep::Command {
             text: "first".into(),
@@ -1801,7 +1830,7 @@ mod tests {
             let mut app = app_with_macro(100);
             app.config.macros[0].shortcut = Some(0);
             let ctx = egui::Context::default();
-            let _ = ctx.run(
+            let _ = ctx.run_test_ui(
                 egui::RawInput {
                     events: vec![egui::Event::Key {
                         key,
@@ -1817,7 +1846,8 @@ mod tests {
                     }],
                     ..Default::default()
                 },
-                |ctx| {
+                |ui| {
+                    let ctx = &ui.ctx().clone();
                     app.consume_macro_shortcut(ctx);
                     assert!(ctx.input(|input| input.events.is_empty()));
                 },
@@ -1846,7 +1876,7 @@ mod tests {
 
         assert_eq!(app.macro_runs.len(), 1);
         assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
     }
 
     #[test]
@@ -1873,7 +1903,7 @@ mod tests {
 
         assert_eq!(app.macro_runs.len(), 1);
         assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
     }
 
     #[test]
@@ -1911,7 +1941,7 @@ mod tests {
             [Some(0), Some(1)]
         );
         assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
     }
 
     #[test]
@@ -1932,7 +1962,7 @@ mod tests {
         app.consume_macro_shortcut(&ctx);
         assert_eq!(app.macro_runs.len(), 1);
         app.stop_macro(0);
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
 
         // egui determines repeat state from the key-down state retained
         // across passes, regardless of the repeat value supplied in RawInput.
@@ -1945,7 +1975,7 @@ mod tests {
 
         assert!(app.macro_runs.is_empty());
         assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
     }
 
     #[test]

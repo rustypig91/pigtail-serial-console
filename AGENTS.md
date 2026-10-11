@@ -1,9 +1,13 @@
 # Agent guide
 
-This guide applies to the whole repository. Keep [README.md](README.md) focused
-on users: the product, installation, basic usage, and a quick source build.
-Keep detailed implementation, behavior, validation, packaging, and release
-information here. Update both documents when a change affects their guidance.
+This guide applies to the whole repository. Keep [README.md](README.md) short:
+a concise explanation of the product, installation, basic usage, and a quick
+source build. Do not add small feature details, menu-item instructions,
+troubleshooting paths, editor-specific commands, or other development details
+to the README. Keep detailed implementation, behavior, validation, packaging,
+and release information here. Update the README only when its concise overview
+or essential installation and usage guidance needs to change; document smaller
+changes here instead.
 
 ## Architecture and code map
 
@@ -38,6 +42,7 @@ For Rust changes, choose checks appropriate to the affected code:
 ```sh
 cargo fmt --all -- --check
 cargo test --workspace --locked
+cargo test --workspace --all-features --locked
 cargo clippy --workspace --all-targets --locked
 cargo check -p pigtail --features demo --locked
 ```
@@ -59,7 +64,10 @@ application.
 - Multiple ports as persistent, user-named tabs, plus optional merged views that label
   and interleave selected connections by timestamp.
   Choose **New merged view** from the **+** menu and select the
-  connections to include. You can open several merged views and close each
+  connections to include. The merged view footer has a left-aligned **Send to**
+  selector after its status text for choosing which included connection receives
+  typing, pasted text, and macros.
+  You can open several merged views and close each
   with a middle-click or its tab's right-click menu. Merged views can start
   empty; right-click their tab and choose **Options** to change
   its name and included connections at any time. Drag merged tabs alongside
@@ -115,14 +123,35 @@ application.
 - Drop files onto a console, or use **Send file…**, to send raw bytes, paced text lines, or hex-decoded data
 - Named transmit macros with reorderable command, delay, and regex wait steps,
   finite or indefinite looping, and assignable Ctrl+Shift+0 through Ctrl+Shift+9 shortcuts
-- Global send delay in Settings (milliseconds between outgoing bytes, default 0),
-  applied to typing, paste, macros, and file transfers
+- Per-connection **Send delay** in Port options (milliseconds between outgoing bytes,
+  default 0), applied to typing, paste, macros, and file transfers. The delay is saved
+  with each connection and port preset. The obsolete global delay setting is ignored
+  on load and removed on the next save; it is not migrated. Malformed global
+  settings and port-option values fall back individually to defaults, preserving
+  valid neighboring options. Unknown keys are omitted on save. Invalid TOML syntax
+  still fails configuration loading. Discarding a malformed option or settings
+  section, or the obsolete global send delay, emits a warning in `app.log` identifying
+  the section and option where applicable. Port-option labels and controls have
+  concise tooltips explaining serial parameters, receive framing, transmit pacing
+  and endings, modem signals, local echo/history, and presets. Port options and
+  New connection scroll within small windows while their Apply/Connect and Cancel
+  buttons remain outside the scrolling area.
 - DTR/RTS toggles and break signal
 - Export the current (filtered) view to `.txt` or `.csv`
 - Startup notice when a newer release is published, with "skip this version" and
   one-click download and update. Startup checks can be switched off in Settings.
 
 ### Keyboard shortcuts and appearance
+
+In **Settings → Folders**, click the configuration directory path to open the
+parent directory of the active `pigtail.toml` in the system file manager.
+Click the **Logs and session captures** directory path to open the parent of
+`crash.log`, also containing `app.log`, `app.previous.log`, and the sessions
+subdirectory. Missing directories are created before opening.
+Folder launchers run on background workers; their exit failures wake the UI,
+are logged, and appear in the existing error dialog without blocking console input.
+Demo builds open their isolated temporary directories; ordinary demo diagnostics
+are still written to stderr.
 
 Use **Ctrl+Shift+Page Up / Page Down** to scroll the console one page up or down.
 Use **Ctrl+Shift+Up / Down** to scroll one line up or down.
@@ -133,6 +162,9 @@ Use **F1** for About, **F2** for Settings, and **Ctrl+Shift+S** to save the curr
 In **Settings → Appearance**, choose Dark or Light and a separate Blue, Green, or
 Red base color. Each theme remembers its own base color across restarts.
 Plain Page Up / Page Down and arrow keys retain their normal terminal behavior.
+Ctrl+wheel over the console changes the font size by one point per frame.
+Nonzero wheel deltas apply at gesture start, move, and end; zero-delta
+gesture boundaries do not change the size.
 
 Use **Ctrl+Shift+Space** to pin the console to the bottom. On connection tabs,
 **Ctrl+Shift+Q / W / E** selects the **Log / Hex / ANSI** view.
@@ -149,7 +181,7 @@ Every release publishes installers alongside the plain binaries on the
 | Windows | `pigtail-v<version>-x86_64-setup.exe` | The one most people want. Install wizard with an optional desktop shortcut; recommends installing for the current user in AppData, with an all-users option. |
 | Windows | `pigtail-v<version>-x86_64-pc-windows-msvc.msi` | Same application, for scripted or managed deployment (`msiexec /i ... /qn`, Group Policy). Adds a Start Menu entry and an Add/Remove Programs entry. |
 | Debian/Ubuntu | `pigtail_<version>-1_amd64.deb` | `sudo apt install ./pigtail_<version>-1_amd64.deb` — pulls in its own dependencies and registers a desktop entry. |
-| Any Linux | `pigtail-v<version>-x86_64.AppImage` | `chmod +x` and run; no installation, bundles its libraries. Needs the host's GPU drivers for OpenGL. |
+| Any Linux | `pigtail-v<version>-x86_64.AppImage` | `chmod +x` and run; no installation, bundles its libraries. Needs the host's graphics loader and GPU driver (Vulkan recommended). |
 | Portable | `.zip` / `.tar.gz` | Just the binary, no installation. |
 
 The setup wizard offers the installation scope even when started as administrator
@@ -183,6 +215,70 @@ digest; older releases without these assets cannot be installed automatically.
 
 ## Building, demos, packaging, and CI
 
+### Rendering and diagnostics
+
+The [wgpu migration review](docs/wgpu-migration-review.md) records comparative
+CPU timings, native software and Intel Vulkan checks, memory overhead, and
+remaining hardware validation. CI runs workspace tests with all features so
+demo-only API migrations are checked too. Headless test frames supply finite
+window bounds. Repeated application animation/selection-scroll redraw requests
+are paced independently of vsync, while reader wakes remain immediate.
+Receive-backlog frames use the same pacing. Timer requests compensate for egui's
+predicted frame time so configuration writes and macro deadlines do not busy-loop
+just before they are due.
+
+Dependencies were checked against the registry and updated to current stable versions
+on 2026-10-11. The GUI uses eframe/egui 0.36.2, egui_plot 0.37.0 and wgpu 30.0.1.
+This includes the upstream fix for DX12 diagnostic hooks being initialized when
+DX12 is disabled, which caused AMD Vulkan presentation to flood Windows logs.
+Automatic backend selection and environment overrides remain available.
+The migration uses parent-UI panels, output hooks for clipboard selection capture,
+and fractional font advances for console wrapping. Headless UI tests explicitly
+discard texture uploads because they have no GPU consumer.
+The Windows migration passed workspace tests, Clippy, formatting and the demo
+feature check. A captured demo frame confirmed the saved dark theme, console and
+plot layout; an automatic-backend run no longer emitted the repeated AMD DXGI
+resource-state diagnostics. This machine still logs a missing Rockstar Social
+Club Vulkan layer manifest registered by another application. Linux runtime and
+Windows sleep/resume validation remain necessary on the affected hardware.
+
+The application uses eframe's wgpu renderer with standard wgpu backend and adapter
+selection, including its `WGPU_BACKEND` and `WGPU_POWER_PREF` environment overrides.
+The direct wgpu dependency enables its standard backend features (eframe disables
+wgpu's defaults). No platform-specific backend is forced. This replaces the
+glow/glutin renderer involved in the AMD `atio6axx.dll` crash on Windows resume.
+Linux uses `AutoNoVsync` presentation: wgpu chooses Immediate, then Mailbox,
+then FIFO according to surface support. This avoids the repeated frame-acquisition
+timeouts observed with default FIFO presentation on Intel Iris Xe/Mesa 26.0.8
+under Wayland. Mailbox was confirmed to restore both mouse and keyboard input.
+Immediate presentation can tear on displays that support it. Other platforms
+retain the default presentation mode. This does not change backend selection.
+The affected machine must still validate the fix with repeated sleep/wake cycles,
+including idle and active serial connections, minimized windows, and monitor changes.
+
+Lost rendering surfaces are recreated; outdated/suboptimal surfaces are reconfigured.
+eframe requests the recovery frame for lost/outdated surfaces and renders suboptimal
+frames before reconfiguring. The status callback also requests a delayed repaint;
+in particular, timeouts retry after at most 100 ms even when the terminal is idle.
+This handles recoverable presentation errors, not full GPU device loss or native
+driver crashes. Occluded windows skip frames quietly. Surface validation failures are logged without scheduling retries.
+
+Normal builds write tracing diagnostics (including returned eframe errors) to
+`app.log` alongside `crash.log`. The latest launch replaces `app.log`, preserving
+the previous launch as `app.previous.log`. On Windows these files are under
+`%APPDATA%\pigtail\pigtail\data`. On Linux they are under
+`${XDG_DATA_HOME:-~/.local/share}/pigtail`. The panic log continues to append panic
+backtraces; native driver crashes can bypass it. Demo builds log to stderr and
+retain their isolated temporary directories.
+
+Linux needs a working graphics driver; Vulkan is recommended, with its loader
+(`libvulkan1` on Debian/Ubuntu). Mesa's `mesa-vulkan-drivers` supports Intel/AMD GPUs
+and lavapipe software rendering; NVIDIA uses its vendor driver. DEB packages depend on `libvulkan1`;
+AppImages use the host's loader, driver and ICD files. Screenshot capture forces
+lavapipe under Xvfb so it works without a physical GPU.
+
+### Source build
+
 Requires stable Rust.
 
 On Linux, install the development headers for udev (serial port access) and GTK 3 (file dialogs) first:
@@ -198,6 +294,11 @@ cargo build --release
 ```
 
 Run in development with `cargo run -p pigtail`.
+
+VS Code tasks are in `.vscode/tasks.json`. **Tasks: Run Task → Run Pigtail
+(Release)** executes `cargo run --release -p pigtail --locked` from the workspace
+root, using the normal configuration and sessions. The default build task
+remains **Run Pigtail** (debug).
 
 ### Demo build
 
@@ -236,7 +337,7 @@ Rerunning a failed platform replaces its workflow artifacts while retaining
 successful platforms' artifacts from earlier attempts of the same run.
 
 To capture it locally on Linux, install `xvfb`, `xauth`, `xdotool`, `imagemagick`,
-and Mesa's software rendering libraries, then run:
+`libvulkan1`, and `mesa-vulkan-drivers`, then run:
 
 ```sh
 cargo build -p pigtail --release --features demo
@@ -285,7 +386,8 @@ On Debian/Ubuntu, install the prerequisites first:
 ```sh
 sudo apt-get install build-essential pkg-config libudev-dev python3 curl \
     ca-certificates file binutils dpkg-dev patchelf \
-    libx11-6 libxcursor1 libxi6 libxrandr2 libxkbcommon0 libxkbcommon-x11-0
+    libx11-6 libxcursor1 libxi6 libxrandr2 libxkbcommon0 libxkbcommon-x11-0 \
+    libvulkan1 mesa-vulkan-drivers
 ```
 
 The Linux script installs `cargo-deb` if missing. AppImage packaging downloads

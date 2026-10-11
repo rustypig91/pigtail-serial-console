@@ -110,8 +110,8 @@ impl App {
             || self.config_dialog.is_some()
             || self.rename_dialog.is_some()
             || self.file_transfer_dialog.is_some()
-            || ctx.is_context_menu_open()
-            || ctx.memory(|memory| memory.any_popup_open() || memory.focused().is_some())
+            || egui::Popup::is_any_open(ctx)
+            || ctx.memory(|memory| memory.focused().is_some())
         {
             return;
         }
@@ -262,15 +262,12 @@ impl App {
 
     /// The top header: one tab per connection or merged view, `+`, and global
     /// actions collected under an ellipsis menu.
-    pub(crate) fn show_header(&mut self, ctx: &egui::Context) {
-        self.show_header_in(ctx, None);
+    pub(crate) fn show_header(&mut self, ui: &mut egui::Ui) {
+        self.show_header_in(&ui.ctx().clone(), ui);
     }
 
-    pub(crate) fn show_header_in(&mut self, ctx: &egui::Context, parent: Option<&mut egui::Ui>) {
-        let painter = parent
-            .as_ref()
-            .map(|ui| ui.painter().clone())
-            .unwrap_or_else(|| ctx.layer_painter(egui::LayerId::background()));
+    pub(crate) fn show_header_in(&mut self, ctx: &egui::Context, parent: &mut egui::Ui) {
+        let painter = parent.painter().clone();
         let mut backdrop = super::chrome::HeaderBackdrop::reserve(painter.clone());
         let background_slot = painter.add(egui::Shape::Noop);
         let corners_slot = painter.add(egui::Shape::Noop);
@@ -305,16 +302,15 @@ impl App {
             || self.file_transfer_dialog.is_some();
 
         let header_rect = super::workspace::show_panel(
-            egui::TopBottomPanel::top(self.pane_widget_id("header"))
-                .default_height(super::chrome::HEADER_HEIGHT + 6.0)
+            egui::Panel::top(self.pane_widget_id("header"))
+                .default_size(super::chrome::HEADER_HEIGHT + 6.0)
                 .show_separator_line(false)
-                .frame(egui::Frame::none().inner_margin(egui::Margin {
-                    left: 10.0,
-                    right: 8.0,
-                    top: 6.0,
-                    bottom: 0.0,
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin {
+                    left: 10,
+                    right: 8,
+                    top: 6,
+                    bottom: 0,
                 })),
-            ctx,
             parent,
             |ui| {
                 // Status and navigation labels must not join console text selection.
@@ -362,7 +358,7 @@ impl App {
                         let (offset, _, _) = ctx.data(|data| data.get_temp::<(f32, f32, f32)>(metrics_id)).unwrap_or_default();
                         let mut requested_offset = None;
                         let mut area = egui::ScrollArea::horizontal()
-                            .drag_to_scroll(false)
+                            .scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Never, ..Default::default() })
                             .id_salt(scroll_id)
                             .max_width(visible_width)
                             .auto_shrink([true, true]);
@@ -426,15 +422,15 @@ impl App {
                                                     self.show_tab_layout_menu(ui, tab_id);
                                                     if ui.button("Rename…").clicked() {
                                                         rename_tab = Some(i);
-                                                        ui.close_menu();
+                                                        ui.close();
                                                     }
                                                     if ui.button("Port options…").clicked() {
                                                         port_options = Some(i);
-                                                        ui.close_menu();
+                                                        ui.close();
                                                     }
                                                     if ui.button("Close tab").clicked() {
                                                         to_close = Some(i);
-                                                        ui.close_menu();
+                                                        ui.close();
                                                     }
                                                 });
                                             }
@@ -467,11 +463,11 @@ impl App {
                                                     self.show_tab_layout_menu(ui, tab_id);
                                                     if ui.button("Options").clicked() {
                                                         edit_merged = Some(i);
-                                                        ui.close_menu();
+                                                        ui.close();
                                                     }
                                                     if ui.button("Close tab").clicked() {
                                                         close_merged = Some(i);
-                                                        ui.close_menu();
+                                                        ui.close();
                                                     }
                                                 });
                                             }
@@ -497,7 +493,7 @@ impl App {
                                             TabId::Connection(id) => set_active = self.connections.iter().position(|c| c.id == *id),
                                             TabId::Merged(id) => select_merged = self.merged_tabs.iter().position(|t| t.id == *id),
                                         }
-                                        ui.close_menu();
+                                        ui.close();
                                     }
                                 }
                             });
@@ -507,11 +503,11 @@ impl App {
                             super::chrome::menu_style(ui);
                             if ui.button("New connection").clicked() {
                                 new_tab = true;
-                                ui.close_menu();
+                                ui.close();
                             }
                             if ui.button("New merged view").clicked() {
                                 new_merged = true;
-                                ui.close_menu();
+                                ui.close();
                             }
                         });
                     });
@@ -550,7 +546,7 @@ impl App {
             },
         );
 
-        let fill = super::chrome::header_fill(&ctx.style().visuals, false);
+        let fill = super::chrome::header_fill(&ctx.global_style().visuals, false);
         let mut background = Vec::new();
         let mut corners = Vec::new();
         if active_tab_rect.is_positive() {
@@ -671,34 +667,33 @@ impl App {
         self.show_app_menu(ui);
         let export = ui
             .scope(|ui| {
-                egui::menu::menu_custom_button(
-                    ui,
+                egui::containers::menu::MenuButton::from_button(
                     egui::Button::new(" ")
                         .frame(false)
                         .min_size(egui::vec2(36.0, 32.0)),
-                    |ui| {
-                        super::chrome::menu_style(ui);
-                        for (label, csv) in [("Export text…", false), ("Export CSV…", true)] {
-                            if super::chrome::menu_item(
-                                ui,
-                                label,
-                                if csv { "" } else { "Ctrl+Shift+S" },
-                            )
-                            .clicked()
-                            {
-                                if self.merged_selected {
-                                    self.export_merged_view(csv);
-                                } else if let Some(active) = self.active_index() {
-                                    self.export_active_view(active, csv);
-                                }
-                                ui.close_menu();
-                            }
-                        }
-                    },
                 )
+                .ui(ui, |ui| {
+                    super::chrome::menu_style(ui);
+                    for (label, csv) in [("Export text…", false), ("Export CSV…", true)] {
+                        if super::chrome::menu_item(
+                            ui,
+                            label,
+                            if csv { "" } else { "Ctrl+Shift+S" },
+                        )
+                        .clicked()
+                        {
+                            if self.merged_selected {
+                                self.export_merged_view(csv);
+                            } else if let Some(active) = self.active_index() {
+                                self.export_active_view(active, csv);
+                            }
+                            ui.close();
+                        }
+                    }
+                })
             })
             .inner
-            .response
+            .0
             .on_hover_text("Export current view");
         super::chrome::paint_action_frame(ui, &export, false);
         super::chrome::paint_export(ui, export.rect);
@@ -745,7 +740,7 @@ impl App {
                     .clicked()
                 {
                     self.choose_file_transfer();
-                    ui.close_menu();
+                    ui.close();
                 }
                 ui.separator();
                 if super::chrome::menu_item(ui, "Macros", "Ctrl+Shift+M")
@@ -753,15 +748,15 @@ impl App {
                     .clicked()
                 {
                     self.show_macros_win = true;
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui.button("Show keyboard shortcuts").clicked() {
                     self.show_keyboard_shortcuts = true;
-                    ui.close_menu();
+                    ui.close();
                 }
                 if super::chrome::menu_item(ui, "Settings", "F2").clicked() {
                     self.show_settings = true;
-                    ui.close_menu();
+                    ui.close();
                 }
                 let updating = self.update_rx.is_some() || self.install_rx.is_some();
                 let update_unavailable = if self.demo_mode {
@@ -778,7 +773,7 @@ impl App {
                     .clicked()
                 {
                     self.start_update_check(true);
-                    ui.close_menu();
+                    ui.close();
                 }
                 ui.separator();
                 if ui
@@ -789,11 +784,11 @@ impl App {
                     ui.ctx().open_url(egui::OpenUrl::new_tab(
                         "https://buymeacoffee.com/rustypig91g",
                     ));
-                    ui.close_menu();
+                    ui.close();
                 }
                 if super::chrome::menu_item(ui, "About", "F1").clicked() {
                     self.show_about = true;
-                    ui.close_menu();
+                    ui.close();
                 }
             })
             .response
@@ -815,7 +810,7 @@ impl App {
             let scrollbar = &mut ui.spacing_mut().scroll;
             scrollbar.floating_allocated_width = scrollbar.bar_width + 8.0;
             super::chrome::modal_header(ui, "Keyboard shortcuts", &mut open);
-            let height = (ctx.screen_rect().height() - 160.0).clamp(180.0, 600.0);
+            let height = (ctx.content_rect().height() - 160.0).clamp(180.0, 600.0);
             egui::ScrollArea::vertical()
                 .max_height(height)
                 .min_scrolled_height(height)
@@ -920,28 +915,27 @@ impl App {
 
     /// The reference toolbar leaves the left side empty and groups the primary
     /// view switches and icon actions on the right.
-    pub(crate) fn show_toolbar(&mut self, ctx: &egui::Context) {
-        self.show_toolbar_in(ctx, None);
+    pub(crate) fn show_toolbar(&mut self, ui: &mut egui::Ui) {
+        self.show_toolbar_in(&ui.ctx().clone(), ui);
     }
 
-    pub(crate) fn show_toolbar_in(&mut self, ctx: &egui::Context, parent: Option<&mut egui::Ui>) {
+    pub(crate) fn show_toolbar_in(&mut self, ctx: &egui::Context, parent: &mut egui::Ui) {
         let long_running_macros =
             self.long_running_macro_indicators(Instant::now(), self.macro_target_port());
         let mut stop_macro_run = None;
         let mut select_view = None;
         let mut toggle_plot = false;
         let toolbar_rect = super::workspace::show_panel(
-            egui::TopBottomPanel::top(self.pane_widget_id("console_toolbar"))
-                .default_height(32.0 + 10.0)
+            egui::Panel::top(self.pane_widget_id("console_toolbar"))
+                .default_size(32.0 + 10.0)
                 .frame(
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(super::chrome::toolbar_fill(
-                            &ctx.style().visuals,
+                            &ctx.global_style().visuals,
                             self.config.settings.header_opacity,
                         ))
-                        .inner_margin(egui::Margin::symmetric(8.0, 5.0)),
+                        .inner_margin(egui::Margin::symmetric(8, 5)),
                 ),
-            ctx,
             parent,
             |ui| {
                 ui.style_mut().interaction.selectable_labels = false;
@@ -1030,21 +1024,20 @@ impl App {
     }
 
     /// A slim status strip with a compact pin-to-bottom toggle.
-    pub(crate) fn show_status_footer(&mut self, ctx: &egui::Context) {
-        self.show_status_footer_in(ctx, None);
+    pub(crate) fn show_status_footer(&mut self, ui: &mut egui::Ui) {
+        self.show_status_footer_in(&ui.ctx().clone(), ui);
     }
 
-    pub(crate) fn show_status_footer_in(
-        &mut self,
-        ctx: &egui::Context,
-        parent: Option<&mut egui::Ui>,
-    ) {
-        let dark = ctx.style().visuals.dark_mode;
+    pub(crate) fn show_status_footer_in(&mut self, ctx: &egui::Context, parent: &mut egui::Ui) {
+        let dark = ctx.global_style().visuals.dark_mode;
         let mut toggle_pin = false;
         super::workspace::show_panel(
-            egui::TopBottomPanel::bottom(self.pane_widget_id("status_footer")).frame(
-                egui::Frame::none()
-                    .fill(super::chrome::header_fill(&ctx.style().visuals, true))
+            egui::Panel::bottom(self.pane_widget_id("status_footer")).frame(
+                egui::Frame::NONE
+                    .fill(super::chrome::header_fill(
+                        &ctx.global_style().visuals,
+                        true,
+                    ))
                     .stroke(egui::Stroke::new(
                         1.0_f32,
                         if dark {
@@ -1053,9 +1046,8 @@ impl App {
                             egui::Color32::from_rgb(211, 220, 232)
                         },
                     ))
-                    .inner_margin(egui::Margin::symmetric(10.0, 3.0)),
+                    .inner_margin(egui::Margin::symmetric(10, 3)),
             ),
-            ctx,
             parent,
             |ui| {
                 ui.style_mut().interaction.selectable_labels = false;
@@ -1080,6 +1072,40 @@ impl App {
                                 self.merged_search_matches.len()
                             ));
                         }
+                        let selected_label = self
+                            .merged_tx_port
+                            .and_then(|id| self.connections.iter().find(|conn| conn.id == id))
+                            .map(|conn| short_label(conn.display_label()))
+                            .unwrap_or_else(|| "Select device".into());
+                        let mut selected = self.merged_tx_port;
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            ui.weak("Send to:");
+                            egui::ComboBox::from_id_salt(self.pane_widget_id("merged_tx_device"))
+                                .selected_text(selected_label)
+                                .show_ui(ui, |ui| {
+                                    super::chrome::popup_style(ui);
+                                    for conn in self
+                                        .connections
+                                        .iter()
+                                        .filter(|conn| self.merged_contains(conn.id))
+                                    {
+                                        if ui
+                                            .add_enabled(
+                                                conn.state != ConnState::Closed,
+                                                egui::Button::selectable(
+                                                    selected == Some(conn.id),
+                                                    short_label(conn.display_label()),
+                                                ),
+                                            )
+                                            .clicked()
+                                        {
+                                            selected = Some(conn.id);
+                                        }
+                                    }
+                                });
+                        });
+                        self.merged_tx_port = selected;
                         (self.merged_follow, self.merged_new_since_scroll)
                     } else if let Some(active) = self.active_index() {
                         let conn = &self.connections[active];
@@ -1163,43 +1189,10 @@ impl App {
                         .clicked()
                     {
                         self.show_error_win = Some(self.connections[active].id);
-                        ui.close_menu();
+                        ui.close();
                     }
                 }
             }
-        }
-        if self.merged_selected {
-            has_options = true;
-            let selected_label = self
-                .merged_tx_port
-                .and_then(|id| self.connections.iter().find(|conn| conn.id == id))
-                .map(|conn| short_label(conn.display_label()))
-                .unwrap_or_else(|| "Select device".into());
-            let mut selected = self.merged_tx_port;
-            egui::ComboBox::from_id_salt(self.pane_widget_id("merged_tx_device"))
-                .selected_text(format!("Send to: {selected_label}"))
-                .show_ui(ui, |ui| {
-                    super::chrome::popup_style(ui);
-                    for conn in self
-                        .connections
-                        .iter()
-                        .filter(|conn| self.merged_contains(conn.id))
-                    {
-                        if ui
-                            .add_enabled(
-                                conn.state != ConnState::Closed,
-                                egui::SelectableLabel::new(
-                                    selected == Some(conn.id),
-                                    short_label(conn.display_label()),
-                                ),
-                            )
-                            .clicked()
-                        {
-                            selected = Some(conn.id);
-                        }
-                    }
-                });
-            self.merged_tx_port = selected;
         }
         if self.config.highlight.iter().any(|rule| rule.enabled) {
             has_options = true;
@@ -1252,67 +1245,87 @@ impl App {
                 .frame(super::chrome::dialog_frame(ctx))
                 .show(ctx, |ui| {
                     super::chrome::dialog_style(ui);
-                    ui.label("Port");
-                    egui::ComboBox::from_id_salt("dlg_port")
-                        .width(260.0)
-                        .selected_text(
-                            dialog
-                                .selected_path
-                                .clone()
-                                .unwrap_or_else(|| "select a port…".into()),
-                        )
-                        .show_ui(ui, |ui| {
-                            super::chrome::popup_style(ui);
-                            for (index, p) in available.iter().enumerate() {
-                                let added = available_port_is_added(
-                                    index,
-                                    available,
-                                    connections,
-                                    editing_port,
-                                );
-                                let text = port_choice_text(&p.path, &p.identity.label(), added);
-                                ui.add_enabled_ui(!added, |ui| {
-                                    ui.selectable_value(
-                                        &mut dialog.selected_path,
-                                        Some(p.path.clone()),
-                                        text,
-                                    );
-                                });
-                            }
-                        });
-                    if available.is_empty() {
-                        ui.weak("No serial ports detected.");
-                    } else if available.iter().enumerate().all(|(index, _)| {
-                        available_port_is_added(index, available, connections, editing_port)
-                    }) {
-                        ui.weak("All detected ports have already been added.");
-                    }
-
-                    ui.separator();
-                    connect_controls(ui, &mut dialog.config);
-
-                    ui.separator();
-                    ui.label("Presets");
-                    ui.horizontal(|ui| {
-                        egui::ComboBox::from_id_salt("dlg_preset")
-                            .selected_text("Load…")
-                            .show_ui(ui, |ui| {
-                                super::chrome::popup_style(ui);
-                                for (i, preset) in config.presets.iter().enumerate() {
-                                    if ui.selectable_label(false, &preset.name).clicked() {
-                                        load_preset = Some(i);
+                    // Reserve room for the title, frame margins, and action row.
+                    // Scroll both axes so even narrow windows retain every option.
+                    ui.set_width((ctx.content_rect().width() - 64.0).clamp(0.0, 380.0));
+                    egui::ScrollArea::both()
+                        .id_salt("port_options_scroll")
+                        .animated(false)
+                        .auto_shrink([false, true])
+                        .max_height((ctx.content_rect().height() - 160.0).max(0.0))
+                        .min_scrolled_height(0.0)
+                        .show(ui, |ui| {
+                            let port_help = "Serial device to connect to. Ports already open in another tab are unavailable.";
+                            ui.label("Port").on_hover_text(port_help);
+                            egui::ComboBox::from_id_salt("dlg_port")
+                                .width(260.0)
+                                .selected_text(
+                                    dialog
+                                        .selected_path
+                                        .clone()
+                                        .unwrap_or_else(|| "select a port…".into()),
+                                )
+                                .show_ui(ui, |ui| {
+                                    super::chrome::popup_style(ui);
+                                    for (index, p) in available.iter().enumerate() {
+                                        let added = available_port_is_added(
+                                            index,
+                                            available,
+                                            connections,
+                                            editing_port,
+                                        );
+                                        let text = port_choice_text(&p.path, &p.identity.label(), added);
+                                        ui.add_enabled_ui(!added, |ui| {
+                                            ui.selectable_value(
+                                                &mut dialog.selected_path,
+                                                Some(p.path.clone()),
+                                                text,
+                                            );
+                                        });
                                     }
+                                })
+                                .response
+                                .on_hover_text(port_help);
+                            if available.is_empty() {
+                                ui.weak("No serial ports detected.");
+                            } else if available.iter().enumerate().all(|(index, _)| {
+                                available_port_is_added(index, available, connections, editing_port)
+                            }) {
+                                ui.weak("All detected ports have already been added.");
+                            }
+
+                            ui.separator();
+                            connect_controls(ui, &mut dialog.config);
+
+                            ui.separator();
+                            ui.label("Presets").on_hover_text("Save or reuse a named set of port options.");
+                            ui.horizontal(|ui| {
+                                egui::ComboBox::from_id_salt("dlg_preset")
+                                    .selected_text("Load…")
+                                    .show_ui(ui, |ui| {
+                                        super::chrome::popup_style(ui);
+                                        for (i, preset) in config.presets.iter().enumerate() {
+                                            if ui.selectable_label(false, &preset.name).clicked() {
+                                                load_preset = Some(i);
+                                            }
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text("Load saved port options into this dialog.");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut dialog.preset_name)
+                                        .hint_text("preset name")
+                                        .desired_width(120.0),
+                                )
+                                .on_hover_text("Name for this set of port options.");
+                                if ui.button("Save preset")
+                                    .on_hover_text("Save these options under this name, replacing any existing preset with the same name.")
+                                    .clicked() {
+                                    persist = true;
                                 }
                             });
-                        ui.add(
-                            egui::TextEdit::singleline(&mut dialog.preset_name)
-                                .hint_text("preset name")
-                                .desired_width(120.0),
-                        );
-                        if ui.button("Save preset").clicked() {
-                            persist = true;
-                        }
-                    });
+
+                        });
 
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -1439,7 +1452,8 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
         .num_columns(2)
         .spacing([8.0, 4.0])
         .show(ui, |ui| {
-            ui.label("Baud");
+            let help = "Serial speed in bits per second. Must match the device.";
+            ui.label("Baud").on_hover_text(help);
             ui.horizontal(|ui| {
                 egui::ComboBox::from_id_salt("baud")
                     .selected_text(cfg.baud.to_string())
@@ -1448,18 +1462,21 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
                         for &b in COMMON_BAUDS {
                             ui.selectable_value(&mut cfg.baud, b, b.to_string());
                         }
-                    });
+                    })
+                    .response
+                    .on_hover_text(help);
                 ui.label("or");
                 ui.add(
                     egui::DragValue::new(&mut cfg.baud)
                         .speed(0.0)
                         .range(50..=6_000_000),
                 )
-                .on_hover_text("Click to type any baud rate");
+                .on_hover_text(format!("{help} Click to type a custom rate."));
             });
             ui.end_row();
 
-            ui.label("Data bits");
+            let help = "Data bits per character, usually 8. Must match the device.";
+            ui.label("Data bits").on_hover_text(help);
             egui::ComboBox::from_id_salt("databits")
                 .selected_text(format!("{}", u8::from(cfg.data_bits)))
                 .show_ui(ui, |ui| {
@@ -1472,10 +1489,13 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
                     ] {
                         ui.selectable_value(&mut cfg.data_bits, b, format!("{}", u8::from(b)));
                     }
-                });
+                })
+                .response
+                .on_hover_text(help);
             ui.end_row();
 
-            ui.label("Parity");
+            let help = "Optional error-checking bit. Must match the device.";
+            ui.label("Parity").on_hover_text(help);
             egui::ComboBox::from_id_salt("parity")
                 .selected_text(parity_label(cfg.parity))
                 .show_ui(ui, |ui| {
@@ -1483,10 +1503,13 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
                     for p in [Parity::None, Parity::Odd, Parity::Even] {
                         ui.selectable_value(&mut cfg.parity, p, parity_label(p));
                     }
-                });
+                })
+                .response
+                .on_hover_text(help);
             ui.end_row();
 
-            ui.label("Stop bits");
+            let help = "Bits marking the end of each character. Must match the device.";
+            ui.label("Stop bits").on_hover_text(help);
             egui::ComboBox::from_id_salt("stopbits")
                 .selected_text(format!("{}", u8::from(cfg.stop_bits)))
                 .show_ui(ui, |ui| {
@@ -1494,10 +1517,13 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
                     for s in [StopBits::One, StopBits::Two] {
                         ui.selectable_value(&mut cfg.stop_bits, s, format!("{}", u8::from(s)));
                     }
-                });
+                })
+                .response
+                .on_hover_text(help);
             ui.end_row();
 
-            ui.label("Flow control");
+            let help = "Pause transmission with XON/XOFF or RTS/CTS to avoid overruns. Must match the device.";
+            ui.label("Flow control").on_hover_text(help);
             egui::ComboBox::from_id_salt("flow")
                 .selected_text(flow_label(cfg.flow_control))
                 .show_ui(ui, |ui| {
@@ -1509,10 +1535,13 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
                     ] {
                         ui.selectable_value(&mut cfg.flow_control, f, flow_label(f));
                     }
-                });
+                })
+                .response
+                .on_hover_text(help);
             ui.end_row();
 
-            ui.label("Terminal");
+            let help = "How received \\r and \\n affect log lines. Independent of the Log/Hex/ANSI view.";
+            ui.label("Terminal").on_hover_text(help);
             egui::ComboBox::from_id_salt("terminal")
                 .selected_text(cfg.terminal.label())
                 .show_ui(ui, |ui| {
@@ -1529,10 +1558,23 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
                                 TerminalMode::Classic => "\\n, \\r\\n, or \\r each break a line",
                             });
                     }
-                });
+                })
+                .response
+                .on_hover_text(help);
             ui.end_row();
 
-            ui.label("Send ending");
+            let help = "Pause between outgoing bytes for typing, paste, macros, and files. 0 disables pacing.";
+            ui.label("Send delay").on_hover_text(help);
+            ui.add(
+                egui::DragValue::new(&mut cfg.send_delay_ms)
+                    .range(0..=60_000)
+                    .suffix(" ms"),
+            )
+            .on_hover_text(help);
+            ui.end_row();
+
+            let help = "Line ending sent when you press Enter, also appended to macro commands.";
+            ui.label("Send ending").on_hover_text(help);
             egui::ComboBox::from_id_salt("line_ending")
                 .selected_text(cfg.line_ending.label())
                 .show_ui(ui, |ui| {
@@ -1545,22 +1587,32 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
                     ] {
                         ui.selectable_value(&mut cfg.line_ending, e, e.label());
                     }
-                });
+                })
+                .response
+                .on_hover_text(help);
             ui.end_row();
         });
 
     ui.checkbox(
         &mut cfg.dtr_on_open,
         "Assert DTR on open (resets many boards)",
+    )
+    .on_hover_text("Set Data Terminal Ready when connecting. May reset the device.");
+    ui.checkbox(&mut cfg.rts_on_open, "Assert RTS on open")
+        .on_hover_text(
+        "Set Request to Send when connecting. Hardware flow control may manage it automatically.",
     );
-    ui.checkbox(&mut cfg.rts_on_open, "Assert RTS on open");
     ui.checkbox(
         &mut cfg.local_echo,
         "Local echo (show sent input in the log)",
-    );
+    )
+    .on_hover_text("Show outgoing input locally. Leave off if the device echoes it back.");
     ui.checkbox(
         &mut cfg.local_history,
         "Local history (Up/Down recall sent input, never sent)",
+    )
+    .on_hover_text(
+        "Use Up/Down to recall sent input in Log/Hex. ANSI/VT sends these keys to the device.",
     );
 }
 
@@ -1692,9 +1744,107 @@ fn windows_com_name(value: &str) -> Option<&str> {
 mod tests {
     use super::{macro_tooltip, port_choice_text};
     use crate::app::tests::{inert_handle, test_app};
+    use crate::test_ui::ContextTestExt as _;
     use egui::{Event, Key};
     use serialcore::config::TransmitMacro;
     use serialcore::store::PortId;
+
+    #[test]
+    fn small_port_dialogs_keep_actions_visible_and_options_scrollable() {
+        for editing in [false, true] {
+            let (mut app, _tx) = test_app("small-port-dialog");
+            if editing {
+                let id = PortId(0);
+                app.connections.push(app.make_connection(
+                    id,
+                    "probe".into(),
+                    Default::default(),
+                    Default::default(),
+                    inert_handle(id),
+                ));
+                app.open_port_options(0);
+            } else {
+                app.open_config_dialog();
+            }
+            let ctx = egui::Context::default();
+            let text_rect = |output: &egui::FullOutput, label: &str| {
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| {
+                        if let egui::Shape::Text(text) = &shape.shape {
+                            let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                            (text.galley.text() == label && shape.clip_rect.contains_rect(rect))
+                                .then_some(rect)
+                        } else {
+                            None
+                        }
+                    })
+                    .filter(|rect| rect.is_positive())
+            };
+            // Reuse the context to verify resizing an already-open dialog.
+            for size in [
+                egui::vec2(1100.0, 410.0),
+                egui::vec2(480.0, 280.0),
+                egui::vec2(320.0, 240.0),
+            ] {
+                let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                let draw = |app: &mut crate::app::App, events| {
+                    ctx.run_test_ui(
+                        egui::RawInput {
+                            screen_rect: Some(bounds),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| app.show_config_dialog(ui.ctx()),
+                    )
+                };
+                // Window placement uses the previous frame's measured size.
+                let _ = draw(&mut app, vec![]);
+                let output = draw(&mut app, vec![]);
+                for label in [
+                    if editing {
+                        "Port options"
+                    } else {
+                        "New connection"
+                    },
+                    if editing {
+                        "Apply & reconnect"
+                    } else {
+                        "Connect"
+                    },
+                    "Cancel",
+                ] {
+                    let rect = text_rect(&output, label)
+                        .unwrap_or_else(|| panic!("{label} missing at {size:?}"));
+                    assert!(
+                        bounds.contains_rect(rect),
+                        "{label} outside {size:?}: {rect:?}"
+                    );
+                }
+                let _ = draw(
+                    &mut app,
+                    vec![
+                        Event::PointerMoved(bounds.center()),
+                        Event::MouseWheel {
+                            phase: egui::TouchPhase::Move,
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(-2000.0, -2000.0),
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+                let output = draw(&mut app, vec![]);
+                // The final preset control is reachable by scrolling, while
+                // the footer stays visible throughout.
+                assert!(
+                    text_rect(&output, "Save preset").is_some(),
+                    "presets unreachable at {size:?}"
+                );
+                assert!(text_rect(&output, "Cancel").is_some());
+            }
+        }
+    }
 
     #[test]
     fn active_tab_meets_toolbar_at_the_configured_header_height() {
@@ -1705,7 +1855,7 @@ mod tests {
             ctx.set_visuals(crate::panes::chrome::app_visuals(dark));
             for width in [700.0, 1100.0] {
                 let mut header = egui::Rect::NOTHING;
-                let output = ctx.run(
+                let output = ctx.run_test_ui(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
@@ -1713,15 +1863,16 @@ mod tests {
                         )),
                         ..Default::default()
                     },
-                    |ctx| {
-                        app.show_header(ctx);
+                    |ui| {
+                        let ctx = &ui.ctx().clone();
+                        app.show_header(ui);
                         header = crate::panes::chrome::HeaderBackdrop::current(
                             ctx,
                             app.pane_widget_id("header_backdrop"),
                         )
                         .unwrap()
                         .rect;
-                        app.show_toolbar(ctx);
+                        app.show_toolbar(ui);
                     },
                 );
                 let tab = output
@@ -1729,10 +1880,10 @@ mod tests {
                     .iter()
                     .find_map(|shape| match &shape.shape {
                         egui::Shape::Rect(rect)
-                            if rect.rounding.nw == 8.0
+                            if rect.corner_radius.nw == 8
                                 && rect.fill
                                     == crate::panes::chrome::toolbar_fill(
-                                        &ctx.style().visuals,
+                                        &ctx.global_style().visuals,
                                         app.config.settings.header_opacity,
                                     ) =>
                         {
@@ -1744,7 +1895,7 @@ mod tests {
                 for shape in &output.shapes {
                     if let egui::Shape::Rect(rect) = &shape.shape {
                         if rect.rect == tab
-                            || (rect.rounding.nw == 7.0 && rect.rect.height() == 32.0)
+                            || (rect.corner_radius.nw == 7 && rect.rect.height() == 32.0)
                         {
                             assert!(
                                 shape.clip_rect.contains_rect(rect.rect),
@@ -1769,7 +1920,7 @@ mod tests {
         app.merged_tabs[0].name = "Wide tab ".repeat(100);
         let ctx = egui::Context::default();
         let mut render = || {
-            ctx.run(
+            ctx.run_test_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -1777,7 +1928,7 @@ mod tests {
                     )),
                     ..Default::default()
                 },
-                |ctx| app.show_header(ctx),
+                |ui| app.show_header(ui),
             )
         };
         render();
@@ -1786,7 +1937,7 @@ mod tests {
             .shapes
             .iter()
             .find_map(|shape| match &shape.shape {
-                egui::Shape::Rect(rect) if rect.rounding.nw == 8.0 => Some(rect.rect),
+                egui::Shape::Rect(rect) if rect.corner_radius.nw == 8 => Some(rect.rect),
                 _ => None,
             })
             .unwrap();
@@ -1828,7 +1979,7 @@ mod tests {
         let (mut app, _enum_tx) = test_app("dialog-accelerators");
         let ctx = egui::Context::default();
         for key in [Key::F1, Key::F2] {
-            let _ = ctx.run(
+            let _ = ctx.run_test_ui(
                 egui::RawInput {
                     events: vec![Event::Key {
                         key,
@@ -1839,7 +1990,8 @@ mod tests {
                     }],
                     ..Default::default()
                 },
-                |ctx| {
+                |ui| {
+                    let ctx = &ui.ctx().clone();
                     app.consume_app_shortcuts(ctx);
                     assert_eq!(app.show_about, key == Key::F1);
                     assert_eq!(app.show_settings, key == Key::F2);
@@ -1862,7 +2014,7 @@ mod tests {
             let ctx = egui::Context::default();
             let mut clicked = false;
             let mut render = |events| {
-                ctx.run(
+                ctx.run_test_ui(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
@@ -1871,8 +2023,9 @@ mod tests {
                         events,
                         ..Default::default()
                     },
-                    |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
+                    |ui| {
+                        let ctx = &ui.ctx().clone();
+                        egui::CentralPanel::default().show(ui, |ui| {
                             clicked |= ui.button("Background action").clicked();
                         });
                         app.show_settings_window(ctx);
@@ -1907,7 +2060,7 @@ mod tests {
             egui::Modifiers::CTRL,
             egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
         ] {
-            let _ = ctx.run(
+            let _ = ctx.run_test_ui(
                 egui::RawInput {
                     events: vec![Event::Key {
                         key: Key::M,
@@ -1918,7 +2071,8 @@ mod tests {
                     }],
                     ..Default::default()
                 },
-                |ctx| {
+                |ui| {
+                    let ctx = &ui.ctx().clone();
                     ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("text-field")));
                     app.consume_app_shortcuts(ctx);
                     let is_accelerator = modifiers.shift;
@@ -1934,7 +2088,7 @@ mod tests {
         let (mut app, _enum_tx) = test_app("new-merged-menu");
         let ctx = egui::Context::default();
         let frame = |app: &mut crate::app::App, events| {
-            ctx.run(
+            ctx.run_test_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -1943,8 +2097,9 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ctx| {
-                    app.show_header(ctx);
+                |ui| {
+                    let ctx = &ui.ctx().clone();
+                    app.show_header(ui);
                     app.show_merged_dialog(ctx);
                     app.show_tab_close_confirmation(ctx);
                 },
@@ -2082,7 +2237,7 @@ mod tests {
         app.request_close_connection(0);
         let ctx = egui::Context::default();
         let frame = |app: &mut crate::app::App, events| {
-            ctx.run(
+            ctx.run_test_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -2091,7 +2246,7 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ctx| app.show_header(ctx),
+                |ui| app.show_header(ui),
             )
         };
         let output = frame(&mut app, vec![]);
@@ -2124,7 +2279,7 @@ mod tests {
         };
         click(&mut app, egui::PointerButton::Secondary);
         assert!(
-            !ctx.is_context_menu_open(),
+            !egui::Popup::is_any_open(&ctx),
             "port options must stay inaccessible"
         );
         click(&mut app, egui::PointerButton::Middle);
@@ -2178,7 +2333,7 @@ mod tests {
         app.active = 1;
         let ctx = egui::Context::default();
         let mut frame = |events| {
-            ctx.run(
+            ctx.run_test_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -2187,7 +2342,7 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ctx| app.show_header(ctx),
+                |ui| app.show_header(ui),
             )
         };
         frame(vec![]);
@@ -2321,7 +2476,7 @@ mod tests {
             "left from the first tab wraps to Merged"
         );
         assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
 
         let ctx = egui::Context::default();
         app.merged_selected = false;
@@ -2334,7 +2489,7 @@ mod tests {
         assert_eq!(app.active, 1, "right selects the next connection tab");
         assert!(!app.merged_selected);
         assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
 
         let ctx = egui::Context::default();
         app.active = 0;
@@ -2346,7 +2501,7 @@ mod tests {
         assert_eq!(app.active, 1, "Ctrl+Shift+Tab selects the next tab");
         assert!(!app.merged_selected);
         assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
     }
 
     #[test]

@@ -12,12 +12,13 @@ impl App {
         let mut history_limit_changed = false;
         let mut history_limit_dragged = false;
         let mut vt_limit_editing = false;
+        let mut folder_to_open = None;
         if open {
             let response = super::chrome::app_modal(ctx, "Settings").show(ctx, |ui| {
                 ui.set_width(420.0);
                 super::chrome::dialog_style(ui);
                 super::chrome::modal_header(ui, "Settings", &mut open);
-                let max_height = (ctx.screen_rect().height() - 120.0).max(180.0);
+                let max_height = (ctx.content_rect().height() - 120.0).max(180.0);
                 egui::ScrollArea::vertical()
                     .id_salt("settings_scroll")
                     .max_height(max_height)
@@ -25,7 +26,7 @@ impl App {
                     .show(ui, |ui| {
                         settings_section(ui, "Appearance", "Customize the console and application theme.", |ui| {
                         if reset_setting(ui, "Theme", "Choose a light or dark appearance for the application and console. Each theme keeps its own base color.", &mut self.config.settings.theme, defaults.theme.clone()) {
-                            ctx.set_visuals(super::chrome::settings_visuals(&self.config.settings));
+                            super::chrome::apply_settings_visuals(ctx, &self.config.settings);
                             changed = true;
                         }
                         let mut dark = self.config.settings.theme != "light";
@@ -37,7 +38,7 @@ impl App {
                         if theme_changed {
                             self.config.settings.theme =
                                 if dark { "dark".into() } else { "light".into() };
-                            ctx.set_visuals(super::chrome::settings_visuals(&self.config.settings));
+                            super::chrome::apply_settings_visuals(ctx, &self.config.settings);
                             changed = true;
                         }
                         ui.end_row();
@@ -57,7 +58,7 @@ impl App {
                             changed
                         }).inner;
                         if color_changed || color_reset {
-                            ctx.set_visuals(super::chrome::settings_visuals(&self.config.settings));
+                            super::chrome::apply_settings_visuals(ctx, &self.config.settings);
                             changed = true;
                         }
                         ui.end_row();
@@ -106,20 +107,6 @@ impl App {
                             .changed();
                         ui.end_row();
 
-                        changed |= reset_setting(ui, "Send delay", "Set a minimum delay between outgoing bytes for typing, paste, macros, and file transfers. Use 0 for no delay; this can help slower devices keep up.", &mut self.config.settings.send_delay_ms, defaults.send_delay_ms);
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut self.config.settings.send_delay_ms)
-                                    .range(0..=60_000)
-                                    .suffix(" ms"),
-                            )
-                            .on_hover_text(
-                                "Minimum delay between outgoing bytes for typing, paste, macros, \
-                                 and file transfers. 0 sends without a delay. UTF-8 characters \
-                                 may contain multiple bytes.",
-                            )
-                            .changed();
-                        ui.end_row();
                         });
                         ui.add_space(10.0);
                         settings_section(ui, "History", "Manage retained console history and session captures.", |ui| {
@@ -190,10 +177,31 @@ impl App {
                         ui.end_row();
                         });
                         ui.add_space(10.0);
-                        ui.collapsing("Storage locations", |ui| {
-                            ui.weak(format!("Config: {}", self.paths.config_file.display()));
-                            ui.weak(format!("Sessions: {}", self.paths.sessions.display()));
-                        });
+                        egui::Frame::NONE
+                            .fill(ui.visuals().faint_bg_color)
+                            .stroke(ui.visuals().window_stroke)
+                            .corner_radius(8.0)
+                            .inner_margin(12.0)
+                            .show(ui, |ui| {
+                                ui.set_min_width((ui.available_width() - 1.0).max(0.0));
+                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                                ui.strong("Folders");
+                                ui.weak("Click a path to open it in your file manager.");
+                                for (label, file, logs) in [
+                                    ("Configuration", &self.paths.config_file, false),
+                                    ("Logs and session captures", &self.paths.crash_log, true),
+                                ] {
+                                    if let Some(directory) = file.parent() {
+                                        ui.add_space(8.0);
+                                        ui.label(label);
+                                        let path = directory.display().to_string();
+                                        if ui.link(&path).on_hover_text(format!("Open {path}")).clicked() {
+                                            // Defer until after the immutable paths borrow ends.
+                                            folder_to_open = Some(logs);
+                                        }
+                                    }
+                                }
+                            });
                         ui.add_space(8.0);
                         ui.weak(concat!(
                             "Rusty's Pigtail · v",
@@ -205,7 +213,7 @@ impl App {
                             .clicked()
                         {
                             self.reset_all_settings();
-                            ctx.set_visuals(super::chrome::settings_visuals(&self.config.settings));
+                            super::chrome::apply_settings_visuals(ctx, &self.config.settings);
                             history_limit_changed = true;
                             history_limit_dragged = false;
                             vt_limit_editing = false;
@@ -218,6 +226,9 @@ impl App {
             }
         }
 
+        if let Some(logs) = folder_to_open {
+            self.open_folder(logs);
+        }
         self.show_settings = open;
         if !vt_limit_editing || !open {
             for conn in &mut self.connections {
@@ -432,10 +443,10 @@ fn settings_section(
     description: &str,
     contents: impl FnOnce(&mut egui::Ui),
 ) {
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(ui.visuals().faint_bg_color)
         .stroke(ui.visuals().window_stroke)
-        .rounding(8.0)
+        .corner_radius(8.0)
         .inner_margin(12.0)
         .show(ui, |ui| {
             ui.set_min_width((ui.available_width() - 1.0).max(0.0));
@@ -470,7 +481,6 @@ mod tests {
         let defaults = serialcore::config::Settings::default();
         app.config.settings.theme = "light".into();
         app.config.settings.dark_base_color = serialcore::config::BaseColor::Red;
-        app.config.settings.send_delay_ms = 123;
         app.config.settings.max_lines = 50_000;
         app.config.settings.check_updates = false;
         app.config.settings.skipped_version = Some("9.0.0".into());

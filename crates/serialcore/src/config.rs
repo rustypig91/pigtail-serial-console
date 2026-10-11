@@ -221,7 +221,12 @@ impl LineEnding {
 
 /// Serial line parameters used both to open a port and to reopen it on reconnect.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PortConfig {
+    /// Minimum pause between outgoing serial bytes (0 disables pacing).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub send_delay_ms: u64,
+
     pub baud: u32,
     pub data_bits: DataBits,
     pub parity: Parity,
@@ -260,6 +265,7 @@ impl Default for PortConfig {
             line_ending: LineEnding::default(),
             local_echo: false,
             local_history: false,
+            send_delay_ms: 0,
         }
     }
 }
@@ -364,9 +370,6 @@ fn default_vt_scrollback_rows() -> usize {
 /// Global settings.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
-    /// Minimum pause between outgoing serial bytes (0 disables pacing).
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub send_delay_ms: u64,
     /// Retained rendered VT scrollback rows per connection.
     #[serde(
         default = "default_vt_scrollback_rows",
@@ -473,7 +476,6 @@ fn is_default_check_updates(value: &bool) -> bool {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            send_delay_ms: 0,
             vt_scrollback_rows: default_vt_scrollback_rows(),
             confirm_tab_close: true,
             max_lines: default_max_lines(),
@@ -706,12 +708,80 @@ pub struct Config {
 impl Config {
     /// Parse from a TOML string.
     pub fn from_toml(s: &str) -> Result<Config, toml::de::Error> {
-        toml::from_str(s)
+        let mut value: toml::Value = toml::from_str(s)?;
+        if let Some(settings) = value.get_mut("settings") {
+            if settings.is_table() {
+                if settings
+                    .as_table_mut()
+                    .expect("settings table")
+                    .remove("send_delay_ms")
+                    .is_some()
+                {
+                    tracing::warn!(section = "settings", option = "send_delay_ms", "ignoring obsolete configuration option; it will be omitted on the next save");
+                }
+                discard_invalid_options::<Settings>(settings, "settings", |settings| {
+                    matches!(settings.theme.as_str(), "dark" | "light")
+                        && (MIN_CONSOLE_FONT_SIZE..=MAX_CONSOLE_FONT_SIZE)
+                            .contains(&settings.console_font_size)
+                        && settings.vt_scrollback_rows <= MAX_VT_SCROLLBACK_ROWS
+                });
+            } else if let Some(table) = value.as_table_mut() {
+                tracing::warn!(
+                    section = "settings",
+                    "ignoring malformed configuration section; using default settings"
+                );
+                table.remove("settings");
+            }
+        }
+        for key in ["last_open", "preset"] {
+            if let Some(entries) = value.get_mut(key).and_then(toml::Value::as_array_mut) {
+                for (index, entry) in entries.iter_mut().enumerate() {
+                    discard_invalid_options::<PortConfig>(
+                        entry,
+                        &format!("{key}[{index}]"),
+                        |port| {
+                            port.send_delay_ms <= 60_000 && (50..=6_000_000).contains(&port.baud)
+                        },
+                    );
+                }
+            }
+        }
+        value.try_into()
     }
 
     /// Serialize to a TOML string.
     pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(self)
+    }
+}
+
+/// Validate each option separately so one bad value cannot discard valid peers.
+/// Deserialize against the defaults to reuse the field types and enum validation.
+fn discard_invalid_options<T>(value: &mut toml::Value, section: &str, valid: impl Fn(&T) -> bool)
+where
+    T: serde::de::DeserializeOwned + Serialize + Default,
+{
+    let defaults =
+        toml::Value::try_from(T::default()).expect("configuration defaults serialize to a table");
+    if let Some(table) = value.as_table_mut() {
+        table.retain(|key, value| {
+            let mut candidate = defaults.clone();
+            candidate
+                .as_table_mut()
+                .expect("defaults table")
+                .insert(key.to_owned(), value.clone());
+            match candidate.try_into::<T>() {
+                Ok(option) if valid(&option) => true,
+                _ => {
+                    tracing::warn!(
+                        section,
+                        option = key,
+                        "ignoring malformed configuration option; using its default value"
+                    );
+                    false
+                }
+            }
+        });
     }
 }
 
@@ -892,12 +962,89 @@ enabled = true
 
     #[test]
     fn send_delay_defaults_to_zero_and_round_trips() {
-        let mut settings: Settings = toml::from_str("max_lines = 1000").unwrap();
-        assert_eq!(settings.send_delay_ms, 0);
-        assert_eq!(Settings::default().send_delay_ms, 0);
-        settings.send_delay_ms = 25;
-        let restored: Settings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+        let mut port = PortConfig::default();
+        let old = toml::to_string(&port).unwrap();
+        assert!(!old.contains("send_delay_ms"));
+        assert_eq!(toml::from_str::<PortConfig>(&old).unwrap().send_delay_ms, 0);
+        port.send_delay_ms = 25;
+        let restored: PortConfig = toml::from_str(&toml::to_string(&port).unwrap()).unwrap();
         assert_eq!(restored.send_delay_ms, 25);
+    }
+
+    #[test]
+    fn obsolete_global_send_delay_is_ignored_and_removed_on_save() {
+        for value in ["25", "-1", "\"invalid\""] {
+            let config =
+                Config::from_toml(&format!("[settings]\nsend_delay_ms = {value}\n")).unwrap();
+            assert_eq!(config.settings, Settings::default());
+            assert!(!config.to_toml().unwrap().contains("send_delay_ms"));
+        }
+    }
+
+    #[test]
+    fn malformed_options_do_not_discard_valid_settings_or_connections() {
+        let config = Config::from_toml(
+            r#"
+            [settings]
+            max_lines = "bad"
+            wrap_lines = "bad"
+            dark_base_color = "purple"
+            theme = "unknown"
+            console_font_size = 0
+            vt_scrollback_rows = 100001
+            check_updates = false
+            light_base_color = "red"
+            [[last_open]]
+            baud = "bad"
+            data_bits = 9
+            send_delay_ms = -1
+            local_echo = true
+            [last_open.identity]
+            path_fallback = "/dev/test"
+            [[preset]]
+            name = "slow"
+            baud = 9600
+            send_delay_ms = 25
+            parity = "bad"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.settings,
+            Settings {
+                check_updates: false,
+                light_base_color: BaseColor::Red,
+                ..Settings::default()
+            }
+        );
+        assert_eq!(
+            config.last_open[0].config,
+            PortConfig {
+                local_echo: true,
+                ..PortConfig::default()
+            }
+        );
+        assert_eq!(
+            config.presets[0].config,
+            PortConfig {
+                baud: 9600,
+                send_delay_ms: 25,
+                ..PortConfig::default()
+            }
+        );
+        let saved = config.to_toml().unwrap();
+        assert!(!saved.contains("bad"));
+        assert!(!saved.contains("unknown"));
+        assert_eq!(Config::from_toml(&saved).unwrap(), config);
+    }
+
+    #[test]
+    fn malformed_settings_table_defaults_but_invalid_toml_still_errors() {
+        assert_eq!(
+            Config::from_toml("settings = 7").unwrap().settings,
+            Settings::default()
+        );
+        assert!(Config::from_toml("[settings").is_err());
     }
 
     #[test]
@@ -932,7 +1079,6 @@ enabled = true
     fn every_setting_override_round_trips_and_reset_removes_it() {
         let overrides: toml::Table = toml::from_str(
             r#"
-            send_delay_ms = 123
             vt_scrollback_rows = 123
             confirm_tab_close = false
             max_lines = 123
@@ -976,7 +1122,6 @@ enabled = true
             };
         }
         insert_defaults!(
-            send_delay_ms,
             vt_scrollback_rows,
             confirm_tab_close,
             max_lines,

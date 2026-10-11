@@ -57,16 +57,11 @@ impl Default for Workspace {
 }
 
 pub(super) fn show_panel(
-    panel: egui::TopBottomPanel,
-    ctx: &egui::Context,
-    parent: Option<&mut egui::Ui>,
+    panel: egui::Panel,
+    parent: &mut egui::Ui,
     draw: impl FnOnce(&mut egui::Ui),
 ) -> egui::Rect {
-    if let Some(ui) = parent {
-        panel.show_inside(ui, draw).response.rect
-    } else {
-        panel.show(ctx, draw).response.rect
-    }
+    panel.show(parent, draw).response.rect
 }
 
 impl App {
@@ -299,9 +294,9 @@ impl App {
         }
         self.save_pane(self.workspace.focused);
         self.workspace.panes[self.workspace.focused].search_focus_request = false;
-        let mut selection = egui::text_selection::LabelSelectionState::load(ctx);
-        selection.clear_selection();
-        selection.store(ctx);
+        ctx.plugin::<egui::text_selection::LabelSelectionState>()
+            .lock()
+            .clear_selection();
         self.workspace.focused = index;
         self.load_pane(index);
         // A search field in the old pane must not retain input.
@@ -405,13 +400,13 @@ impl App {
                     .clicked()
                 {
                     self.workspace.pending = Some(LayoutAction::Split(id, direction));
-                    ui.close_menu();
+                    ui.close();
                 }
             }
         } else {
             if ui.button("Move to other pane").clicked() {
                 self.workspace.pending = Some(LayoutAction::Move(id));
-                ui.close_menu();
+                ui.close();
             }
             for (label, direction) in [
                 ("Side by side", SplitDirection::Right),
@@ -422,12 +417,12 @@ impl App {
                     .clicked()
                 {
                     self.workspace.split = Some(direction);
-                    ui.close_menu();
+                    ui.close();
                 }
             }
             if ui.button("Close split (keep all tabs)").clicked() {
                 self.workspace.pending = Some(LayoutAction::Join);
-                ui.close_menu();
+                ui.close();
             }
         }
         ui.separator();
@@ -496,18 +491,22 @@ impl App {
         self.persist_workspace();
     }
 
-    pub(crate) fn show_workspace(&mut self, ctx: &egui::Context, console_tab_claimed: bool) {
+    pub(crate) fn show_workspace(&mut self, ui: &mut egui::Ui, console_tab_claimed: bool) {
+        let ctx = &ui.ctx().clone();
         self.reconcile_workspace();
         self.workspace.resizing = false;
         if let Some(direction) = self.workspace.split {
-            egui::TopBottomPanel::top("workspace_toolbar")
-                .default_height(super::chrome::HEADER_HEIGHT + 6.0)
+            egui::Panel::top("workspace_toolbar")
+                .default_size(super::chrome::HEADER_HEIGHT + 6.0)
                 .frame(
-                    egui::Frame::none()
-                        .fill(super::chrome::header_fill(&ctx.style().visuals, false))
-                        .inner_margin(egui::Margin::symmetric(8.0, 3.0)),
+                    egui::Frame::NONE
+                        .fill(super::chrome::header_fill(
+                            &ctx.global_style().visuals,
+                            false,
+                        ))
+                        .inner_margin(egui::Margin::symmetric(8, 3)),
                 )
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     ui.style_mut().interaction.selectable_labels = false;
                     super::chrome::header_style(ui);
                     ui.horizontal(|ui| {
@@ -523,8 +522,8 @@ impl App {
                     });
                 });
             egui::CentralPanel::default()
-                .frame(egui::Frame::none())
-                .show(ctx, |ui| {
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
                     let rect = ui.available_rect_before_wrap();
                     let horizontal = direction == SplitDirection::Right;
                     let length = if horizontal {
@@ -604,15 +603,15 @@ impl App {
                         self.maintain_search();
                         let mut pane = panes[index].take().unwrap();
                         pane.set_clip_rect(pane_rect.intersect(ui.clip_rect()));
-                        self.show_header_in(ctx, Some(&mut pane));
+                        self.show_header_in(ctx, &mut pane);
                         if self
                             .selected_tab_id()
                             .is_some_and(|id| self.visible_pane_tabs().contains(&id))
                         {
-                            self.show_toolbar_in(ctx, Some(&mut pane));
-                            self.show_status_footer_in(ctx, Some(&mut pane));
-                            self.show_plot_in(ctx, Some(&mut pane));
-                            self.show_console_in(ctx, console_tab_claimed, Some(&mut pane));
+                            self.show_toolbar_in(ctx, &mut pane);
+                            self.show_status_footer_in(ctx, &mut pane);
+                            self.show_plot_in(&mut pane);
+                            self.show_console_in(ctx, console_tab_claimed, &mut pane);
                         }
                         self.save_pane(index);
                         if index == self.workspace.focused {
@@ -620,6 +619,7 @@ impl App {
                                 pane_rect.shrink(0.5),
                                 0.0,
                                 egui::Stroke::new(1.0_f32, ui.visuals().selection.bg_fill),
+                                egui::StrokeKind::Middle,
                             );
                         }
                     }
@@ -628,11 +628,11 @@ impl App {
                 });
         } else {
             self.workspace.rects = [None; 2];
-            self.show_header(ctx);
-            self.show_toolbar(ctx);
-            self.show_status_footer(ctx);
-            self.show_plot(ctx);
-            self.show_console(ctx, console_tab_claimed);
+            self.show_header(ui);
+            self.show_toolbar(ui);
+            self.show_status_footer(ui);
+            self.show_plot(ui);
+            self.show_console(ui, console_tab_claimed);
         }
         if let Some(action) = self.workspace.pending.take() {
             self.apply_layout_action(action);
@@ -645,6 +645,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::app::tests::{inert_handle, test_app};
+    use crate::test_ui::ContextTestExt as _;
     use serialcore::{
         config::PortConfig,
         reader::ConnState,
@@ -720,19 +721,20 @@ mod tests {
         size: egui::Vec2,
         events: Vec<egui::Event>,
     ) -> egui::FullOutput {
-        ctx.run(
+        ctx.run_test_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
                 events,
                 ..Default::default()
             },
-            |ctx| {
+            |ui| {
+                let ctx = &ui.ctx().clone();
                 app.consume_app_shortcuts(ctx);
                 app.prepare_workspace(ctx);
                 app.consume_tab_switch_shortcut(ctx);
                 app.consume_console_view_shortcuts(ctx);
                 let claimed = app.claim_console_tab_before_layout(ctx);
-                app.show_workspace(ctx, claimed);
+                app.show_workspace(ui, claimed);
                 app.release_console_tab_after_layout(ctx, claimed);
             },
         )
@@ -959,7 +961,7 @@ mod tests {
             app.prepare_workspace(&ctx);
             assert_eq!(app.workspace.focused, 1, "Modifiers: {modifiers:?}");
             assert_eq!(ctx.input(|i| i.events.clone()), vec![event]);
-            let _ = ctx.end_pass();
+            let _ = ctx.end_test_pass();
         }
     }
 
@@ -1159,6 +1161,7 @@ mod tests {
             vec![
                 egui::Event::PointerMoved(pos),
                 egui::Event::MouseWheel {
+                    phase: egui::TouchPhase::Move,
                     unit: egui::MouseWheelUnit::Point,
                     delta: egui::vec2(0.0, 100.0),
                     modifiers: egui::Modifiers::NONE,
@@ -1252,11 +1255,11 @@ mod tests {
         frame(&mut app, &ctx, size, vec![pointer(end, false)]);
         let output = frame(&mut app, &ctx, size, vec![egui::Event::Copy]);
         assert!(
-            output.platform_output.copied_text.contains("LEFT OUTPUT"),
+            crate::panes::log::copied_text(&output.platform_output).contains("LEFT OUTPUT"),
             "{:?}",
-            output.platform_output.copied_text
+            crate::panes::log::copied_text(&output.platform_output)
         );
-        assert!(!output.platform_output.copied_text.contains("RIGHT"));
+        assert!(!crate::panes::log::copied_text(&output.platform_output).contains("RIGHT"));
         assert_eq!(app.workspace.focused, 0);
     }
     #[test]
@@ -1510,7 +1513,7 @@ mod tests {
                 app.workspace.focused = focused;
                 app.load_pane(focused);
                 // Exercise the actual exit hook, including a final unsaved resize.
-                eframe::App::on_exit(&mut app, None);
+                eframe::App::on_exit(&mut app);
                 let saved = serialcore::config::Config::from_toml(
                     &std::fs::read_to_string(&app.paths.config_file).unwrap(),
                 )
@@ -1560,7 +1563,7 @@ mod tests {
         ));
         assert!(app.config.split.is_some());
         app.apply_layout_action(LayoutAction::Join);
-        eframe::App::on_exit(&mut app, None);
+        eframe::App::on_exit(&mut app);
         let saved = serialcore::config::Config::from_toml(
             &std::fs::read_to_string(&app.paths.config_file).unwrap(),
         )
@@ -1700,7 +1703,7 @@ mod tests {
                 vec![pointer(pos, false), egui::Event::Copy],
             );
             assert!(
-                output.platform_output.copied_text.is_empty(),
+                crate::panes::log::copied_text(&output.platform_output).is_empty(),
                 "header selected hidden {mode} output"
             );
             assert!(if mode == "merged" {

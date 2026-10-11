@@ -194,7 +194,7 @@ impl App {
             }
             conn.handle.transmit_paced(
                 out,
-                std::time::Duration::from_millis(self.config.settings.send_delay_ms),
+                std::time::Duration::from_millis(conn.port_config.send_delay_ms),
             );
         }
         for line in echo_lines {
@@ -280,6 +280,7 @@ mod tests {
     use super::*;
     use crate::app::tests::{inert_handle, test_app};
     use crate::app::{App, Connection};
+    use crate::test_ui::ContextTestExt as _;
     use serialcore::config::{LineEnding, PortConfig};
     use serialcore::store::PortId;
 
@@ -291,7 +292,7 @@ mod tests {
             ..Default::default()
         });
         app.console_key_input(&ctx, 0);
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
     }
 
     fn enter() -> Event {
@@ -330,16 +331,17 @@ mod tests {
 
     /// Draw the focusable UI and process one complete input frame.
     fn frame(app: &mut App, ctx: &egui::Context, events: Vec<Event>) {
-        let _ = ctx.run(
+        let _ = ctx.run_test_ui(
             egui::RawInput {
                 events,
                 ..Default::default()
             },
-            |ctx| {
+            |ui| {
+                let ctx = &ui.ctx().clone();
                 let console_tab_claimed = app.claim_console_tab_before_layout(ctx);
-                app.show_header(ctx);
-                app.show_toolbar(ctx);
-                app.show_console(ctx, console_tab_claimed);
+                app.show_header(ui);
+                app.show_toolbar(ui);
+                app.show_console(ui, console_tab_claimed);
                 app.release_console_tab_after_layout(ctx, console_tab_claimed);
             },
         );
@@ -351,6 +353,40 @@ mod tests {
             .filter(|l| l.meta.flags.contains(LineFlags::TX_ECHO))
             .map(|l| l.text.to_string())
             .collect()
+    }
+
+    #[test]
+    fn typing_and_paste_use_only_the_target_connections_delay() {
+        let (mut app, _tx) = test_app("per-port-send-delay");
+        for (index, delay) in [20, 0].into_iter().enumerate() {
+            let id = PortId(index as u32);
+            let mut conn = app.make_connection(
+                id,
+                format!("device {index}"),
+                Default::default(),
+                PortConfig {
+                    send_delay_ms: delay,
+                    ..Default::default()
+                },
+                inert_handle(id),
+            );
+            conn.set_state(ConnState::Connected);
+            app.connections.push(conn);
+        }
+        let ctx = egui::Context::default();
+        for (index, event) in [
+            (0, Event::Text("typed".into())),
+            (1, Event::Paste("pasted".into())),
+        ] {
+            ctx.begin_pass(egui::RawInput {
+                events: vec![event],
+                ..Default::default()
+            });
+            assert!(app.console_key_input(&ctx, index));
+            let _ = ctx.end_test_pass();
+        }
+        assert!(app.connections[0].handle.has_used_pacing());
+        assert!(!app.connections[1].handle.has_used_pacing());
     }
 
     #[test]
@@ -488,13 +524,14 @@ mod tests {
             ..Default::default()
         });
         let console_tab_claimed = app.claim_console_tab_before_layout(&ctx);
-        app.show_header(&ctx);
+        let mut root_ui = egui::Ui::new(ctx.clone(), egui::Id::new("root"), egui::UiBuilder::new());
+        app.show_header(&mut root_ui);
         assert!(
             ctx.memory(|m| m.focused().is_some()),
             "the console's temporary guard must own focus during layout"
         );
 
-        app.show_console(&ctx, console_tab_claimed);
+        app.show_console(&mut root_ui, console_tab_claimed);
         app.release_console_tab_after_layout(&ctx, console_tab_claimed);
 
         assert!(
@@ -505,7 +542,7 @@ mod tests {
             ctx.memory(|m| m.focused().is_none()),
             "Tab must not leave a UI control focused"
         );
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
     }
 
     #[test]
@@ -518,15 +555,16 @@ mod tests {
         });
         let console_tab_claimed = app.claim_console_tab_before_layout(&ctx);
 
-        app.show_header(&ctx);
-        app.show_console(&ctx, console_tab_claimed);
+        let mut root_ui = egui::Ui::new(ctx.clone(), egui::Id::new("root"), egui::UiBuilder::new());
+        app.show_header(&mut root_ui);
+        app.show_console(&mut root_ui, console_tab_claimed);
         app.release_console_tab_after_layout(&ctx, console_tab_claimed);
 
         assert!(
             ctx.memory(|m| m.focused().is_some()),
             "without a connection, Tab must keep the UI focus egui assigned"
         );
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
     }
 
     #[test]
@@ -550,15 +588,16 @@ mod tests {
         });
         let console_tab_claimed = app.claim_console_tab_before_layout(&ctx);
 
-        app.show_header(&ctx);
-        app.show_console(&ctx, console_tab_claimed);
+        let mut root_ui = egui::Ui::new(ctx.clone(), egui::Id::new("root"), egui::UiBuilder::new());
+        app.show_header(&mut root_ui);
+        app.show_console(&mut root_ui, console_tab_claimed);
         app.release_console_tab_after_layout(&ctx, console_tab_claimed);
 
         assert!(
             ctx.memory(|m| m.focused().is_some()),
             "a Closed tab cannot receive input, so Tab must retain UI focus"
         );
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
     }
 
     #[test]
@@ -576,13 +615,14 @@ mod tests {
 
         let ctx = egui::Context::default();
         let mut menu_anchor = egui::Rect::NOTHING;
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run_test_ui(Default::default(), |ui| {
+            let _ctx = &ui.ctx().clone();
+            egui::CentralPanel::default().show(ui, |ui| {
                 menu_anchor = ui.button("menu anchor").rect;
             });
         });
         let pos = menu_anchor.center();
-        let _ = ctx.run(
+        let _ = ctx.run_test_ui(
             egui::RawInput {
                 events: vec![
                     Event::PointerMoved(pos),
@@ -601,15 +641,16 @@ mod tests {
                 ],
                 ..Default::default()
             },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            |ui| {
+                let _ctx = &ui.ctx().clone();
+                egui::CentralPanel::default().show(ui, |ui| {
                     ui.button("menu anchor").context_menu(|ui| {
                         let _ = ui.button("menu action");
                     });
                 });
             },
         );
-        assert!(ctx.is_context_menu_open());
+        assert!(egui::Popup::is_any_open(&ctx));
 
         ctx.begin_pass(egui::RawInput {
             events: vec![tab()],
@@ -621,12 +662,13 @@ mod tests {
             !console_tab_claimed,
             "an open context menu, not the console, owns Tab"
         );
-        app.show_header(&ctx);
+        let mut root_ui = egui::Ui::new(ctx.clone(), egui::Id::new("root"), egui::UiBuilder::new());
+        app.show_header(&mut root_ui);
         assert!(
             ctx.memory(|memory| memory.focused().is_some()),
             "Tab must remain available to UI focus navigation"
         );
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
     }
 
     #[test]
@@ -654,15 +696,16 @@ mod tests {
             "the overlay is not open yet when pre-layout ownership is decided"
         );
 
-        ctx.memory_mut(|memory| memory.open_popup(egui::Id::new("same-frame popup")));
+        egui::Popup::open_id(&ctx, egui::Id::new("same-frame popup"));
+        let mut root_ui = egui::Ui::new(ctx.clone(), egui::Id::new("root"), egui::UiBuilder::new());
 
-        app.show_console(&ctx, console_tab_claimed);
+        app.show_console(&mut root_ui, console_tab_claimed);
         app.release_console_tab_after_layout(&ctx, console_tab_claimed);
         assert!(
             !app.connections[0].follow,
             "the post-layout gate must not transmit Tab after a menu opens"
         );
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
     }
 
     #[test]
@@ -679,7 +722,7 @@ mod tests {
         app.connections.push(conn);
 
         let ctx = egui::Context::default();
-        ctx.memory_mut(|memory| memory.open_popup(egui::Id::new("test popup")));
+        egui::Popup::open_id(&ctx, egui::Id::new("test popup"));
         ctx.begin_pass(egui::RawInput {
             events: vec![tab()],
             ..Default::default()
@@ -690,12 +733,13 @@ mod tests {
             !console_tab_claimed,
             "an open popup, not the console, owns Tab"
         );
-        app.show_header(&ctx);
+        let mut root_ui = egui::Ui::new(ctx.clone(), egui::Id::new("root"), egui::UiBuilder::new());
+        app.show_header(&mut root_ui);
         assert!(
             ctx.memory(|memory| memory.focused().is_some()),
             "Tab must remain available to UI focus navigation"
         );
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
     }
 
     /// A single egui frame can contain multiple keyboard events. The Tab guard
@@ -725,12 +769,13 @@ mod tests {
         });
         let console_tab_claimed = app.claim_console_tab_before_layout(&ctx);
 
-        app.show_header(&ctx);
+        let mut root_ui = egui::Ui::new(ctx.clone(), egui::Id::new("root"), egui::UiBuilder::new());
+        app.show_header(&mut root_ui);
         assert_eq!(
             app.active, 1,
             "Enter in the Tab frame must not activate the first header tab"
         );
-        app.show_console(&ctx, console_tab_claimed);
+        app.show_console(&mut root_ui, console_tab_claimed);
         app.release_console_tab_after_layout(&ctx, console_tab_claimed);
 
         assert!(
@@ -742,7 +787,7 @@ mod tests {
             "Tab and Enter must be processed by the originally active console"
         );
         assert!(ctx.memory(|m| m.focused().is_none()));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
     }
 
     #[test]

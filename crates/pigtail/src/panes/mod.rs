@@ -4,7 +4,7 @@
 mod chrome;
 #[cfg(test)]
 pub(crate) use chrome::app_visuals;
-pub(crate) use chrome::settings_visuals;
+pub(crate) use chrome::apply_settings_visuals;
 mod connect;
 mod log;
 pub use log::wrap_len;

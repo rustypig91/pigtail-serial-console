@@ -1746,6 +1746,7 @@ pub struct App {
     /// race), and neither should silently erase the other before either is
     /// shown.
     pub connect_errors: VecDeque<ConnectError>,
+    folder_open_results: Vec<Receiver<ConnectError>>,
 }
 
 impl App {
@@ -1834,17 +1835,17 @@ impl App {
             font_toast: None,
             macro_runs: Vec::new(),
             connect_errors: VecDeque::new(),
+            folder_open_results: Vec::new(),
         }
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>, paths: AppPaths, config: Config) -> App {
         cc.egui_ctx.set_fonts(app_font_definitions());
         cc.egui_ctx
-            .style_mut(|style| style.spacing.menu_margin = egui::Margin::same(8.0));
+            .global_style_mut(|style| style.spacing.menu_margin = egui::Margin::same(8));
 
         // Theme from settings.
-        cc.egui_ctx
-            .set_visuals(crate::panes::settings_visuals(&config.settings));
+        crate::panes::apply_settings_visuals(&cc.egui_ctx, &config.settings);
 
         // The wake every background thread gets: an idle UI schedules no frames
         // of its own, so a repaint request is the only thing that brings it back.
@@ -2051,6 +2052,51 @@ impl App {
             return;
         }
         self.connect_errors.push_back(err);
+    }
+
+    /// Wait for launcher exit off the UI thread so failures remain observable.
+    pub(crate) fn open_folder(&mut self, logs: bool) {
+        let paths = self.paths.clone();
+        let wake = self.wake.clone();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let title = if logs {
+            "Could not open logs folder"
+        } else {
+            "Could not open configuration folder"
+        };
+        match std::thread::Builder::new()
+            .name("open-folder".into())
+            .spawn(move || {
+                let result = if logs {
+                    paths.open_logs_dir()
+                } else {
+                    paths.open_config_dir()
+                };
+                if let Err(error) = result {
+                    let _ = tx.send(ConnectError {
+                        title,
+                        message: format!("{error:#}"),
+                    });
+                }
+                // Disconnect before waking, including on a successful launch.
+                drop(tx);
+                wake.signal();
+            }) {
+            Ok(_) => self.folder_open_results.push(rx),
+            Err(error) => self.record_connect_error(title, error.to_string()),
+        }
+    }
+
+    fn poll_folder_open_results(&mut self) {
+        let mut pending = Vec::new();
+        for rx in std::mem::take(&mut self.folder_open_results) {
+            match rx.try_recv() {
+                Ok(error) => self.record_connect_error(error.title, error.message),
+                Err(crossbeam_channel::TryRecvError::Empty) => pending.push(rx),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {}
+            }
+        }
+        self.folder_open_results = pending;
     }
 
     /// Whether a modal dialog anchored at CENTER_CENTER (see `show_connect_error`)
@@ -2623,10 +2669,10 @@ impl App {
         let elapsed = dirty_since.elapsed();
         if elapsed >= CONFIG_WRITE_DELAY {
             if !self.flush_config() {
-                ctx.request_repaint_after(CONFIG_WRITE_DELAY);
+                crate::graphics::request_repaint_after(ctx, CONFIG_WRITE_DELAY);
             }
         } else {
-            ctx.request_repaint_after(CONFIG_WRITE_DELAY - elapsed);
+            crate::graphics::request_repaint_after(ctx, CONFIG_WRITE_DELAY - elapsed);
         }
     }
 
@@ -3691,8 +3737,10 @@ pub fn parse_hex_color(s: &str) -> Option<egui::Color32> {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &ui.ctx().clone();
         self.poll_enumerator();
+        self.poll_folder_open_results();
         self.poll_update_check();
         self.poll_update_install(ctx);
         if self.install_rx.is_some()
@@ -3745,7 +3793,7 @@ impl eframe::App for App {
         // event can activate that control before `show_console` gives Tab back
         // to the device.
         let console_tab_claimed = self.claim_console_tab_before_layout(ctx);
-        self.show_workspace(ctx, console_tab_claimed);
+        self.show_workspace(ui, console_tab_claimed);
         self.show_file_drop_overlay(ctx);
 
         // Floating windows.
@@ -3795,11 +3843,11 @@ impl eframe::App for App {
         // schedule the next one — that keeps a backlog draining, and keeps
         // follow-tail smooth through a burst.
         if any_data {
-            ctx.request_repaint_after(Duration::from_millis(16));
+            crate::graphics::request_animation_frame(ctx);
         }
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         self.persist_workspace();
         self.flush_config();
     }
@@ -3808,6 +3856,7 @@ impl eframe::App for App {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::test_ui::ContextTestExt as _;
     use serialcore::session::SessionWriter;
 
     fn scratch(name: &str) -> PathBuf {
@@ -4378,11 +4427,11 @@ pub(crate) mod tests {
         let ctx = egui::Context::default();
         ctx.set_fonts(fonts);
         ctx.begin_pass(Default::default());
-        assert!(ctx.fonts(|fonts| {
+        assert!(ctx.fonts_mut(|fonts| {
             let ui_font = egui::FontId::proportional(12.0);
             fonts.has_glyph(&ui_font, '↑') && fonts.has_glyph(&ui_font, '↓')
         }));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
     }
 
     /// Like `test_app`, but seeded with a config the test provides.
@@ -4403,6 +4452,81 @@ pub(crate) mod tests {
             rx,
         );
         (app, tx)
+    }
+
+    #[test]
+    fn discarded_configuration_values_emit_application_log_warnings() {
+        #[derive(Clone)]
+        struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for LogBuffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = LogBuffer(Default::default());
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            Config::from_toml(
+                r#"
+                [settings]
+                send_delay_ms = 20
+                console_font_size = "invalid"
+                theme = "invalid"
+                check_updates = false
+                [[preset]]
+                name = "slow"
+                baud = 9600
+                send_delay_ms = -1
+            "#,
+            )
+            .unwrap();
+            Config::from_toml("settings = 7").unwrap();
+        });
+        let log = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("WARN"), "{log}");
+        assert!(log.contains("obsolete configuration option"), "{log}");
+        assert!(log.contains("option=\"send_delay_ms\""), "{log}");
+        assert!(log.contains("option=\"console_font_size\""), "{log}");
+        assert!(log.contains("option=\"theme\""), "{log}");
+        assert!(log.contains("section=\"preset[0]\""), "{log}");
+        assert!(log.contains("malformed configuration section"), "{log}");
+        assert!(!log.contains("option=\"check_updates\""), "{log}");
+        assert!(!log.contains("option=\"baud\""), "{log}");
+    }
+
+    #[test]
+    fn folder_launcher_results_report_errors_and_preserve_pending_requests() {
+        let (mut app, _tx) = test_app("folder-launcher-results");
+        let (pending_tx, pending_rx) = crossbeam_channel::bounded(1);
+        let (failed_tx, failed_rx) = crossbeam_channel::bounded(1);
+        let (success_tx, success_rx) = crossbeam_channel::bounded(1);
+        failed_tx
+            .send(ConnectError {
+                title: "Could not open logs folder",
+                message: "launcher exited with status 7".into(),
+            })
+            .unwrap();
+        drop(success_tx);
+        app.folder_open_results = vec![pending_rx, failed_rx, success_rx];
+        app.poll_folder_open_results();
+        assert_eq!(app.folder_open_results.len(), 1);
+        assert_eq!(
+            app.connect_errors.front().unwrap().message,
+            "launcher exited with status 7"
+        );
+        drop(pending_tx);
+        app.poll_folder_open_results();
+        assert!(app.folder_open_results.is_empty());
+        assert_eq!(app.connect_errors.len(), 1);
     }
 
     fn update_test_app(name: &str) -> (App, crossbeam_channel::Sender<update::InstallEvent>) {
@@ -4462,6 +4586,33 @@ pub(crate) mod tests {
         app.start_update_check(true);
         assert!(app.install_rx.as_ref().unwrap().same_channel(&original));
         assert!(app.update_rx.is_none());
+    }
+
+    #[test]
+    fn pending_config_write_does_not_repaint_early_when_prediction_exceeds_deadline() {
+        let (mut app, _tx) = test_app("config-repaint-deadline");
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            let _ = ctx.run_test_ui(
+                egui::RawInput {
+                    predicted_dt: 2.0,
+                    ..Default::default()
+                },
+                |_| {},
+            );
+        }
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        ctx.set_request_repaint_callback(move |request| {
+            captured.lock().unwrap().push(request.delay);
+        });
+        app.write_config();
+        app.maintain_config(&ctx);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0] > Duration::ZERO);
+        assert!(requests[0] <= CONFIG_WRITE_DELAY);
+        assert!(app.config_dirty_since.is_some());
     }
 
     #[test]
@@ -6651,5 +6802,65 @@ pub(crate) mod tests {
         app.merged_dirty = true;
         app.maintain_merged();
         assert_eq!(app.merged_new_since_scroll, 0);
+    }
+}
+
+#[cfg(all(test, feature = "demo"))]
+mod render_diagnostic {
+    use super::*;
+    use crate::test_ui::ContextTestExt as _;
+    #[test]
+    #[ignore = "manual rendering performance diagnostic"]
+    fn render_load_diagnostic() {
+        for mode in ["log", "hex", "ansi", "plot", "large-log"] {
+            let (mut app, _tx) = tests::test_app(&format!("render-{mode}"));
+            app.seed_demo().unwrap();
+            app.connections[0].show_plot = mode == "plot";
+            app.connections[0].hex_view = mode == "hex";
+            app.connections[0].screen_view = mode == "ansi";
+            if mode == "large-log" {
+                let conn = &mut app.connections[0];
+                for i in 0..100_000 {
+                    conn.store.append(IncomingLine {
+                        text: format!(
+                            "sample {i}: {}",
+                            "temperature=24.84 humidity=46.25 ".repeat(4)
+                        ),
+                        ts: app.clock.now(),
+                        port: conn.id,
+                        flags: LineFlags::default(),
+                        spans: Default::default(),
+                        cursor: None,
+                    });
+                }
+            }
+            let ctx = egui::Context::default();
+            ctx.set_fonts(app_font_definitions());
+            let mut samples = Vec::new();
+            for i in 0..1050 {
+                let started = Instant::now();
+                let output = ctx.run_test_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1280.0, 900.0),
+                        )),
+                        time: Some(i as f64 / 60.0),
+                        ..Default::default()
+                    },
+                    |ui| app.show_workspace(ui, false),
+                );
+                let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+                std::hint::black_box(primitives);
+                if i >= 50 {
+                    samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "{mode}: median {:.3} ms; p95 {:.3} ms",
+                samples[500], samples[950]
+            );
+        }
     }
 }

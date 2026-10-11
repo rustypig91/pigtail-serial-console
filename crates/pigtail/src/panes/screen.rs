@@ -108,7 +108,7 @@ impl App {
         );
         let (pages, lines) = self.consume_scroll_shortcut(ui.ctx());
         let font = FontId::monospace(f32::from(self.config.settings.console_font_size));
-        let cell_size = ui.fonts(|f| Vec2::new(f.glyph_width(&font, 'M'), f.row_height(&font)));
+        let cell_size = ui.fonts_mut(|f| Vec2::new(f.glyph_width(&font, 'M'), f.row_height(&font)));
         let available = ui.available_size();
         let rows = (available.y / cell_size.y).floor().max(1.0) as u16;
         let cols = (available.x / cell_size.x).floor().max(1.0) as u16;
@@ -214,7 +214,7 @@ impl App {
                                 cell.contents().to_owned(),
                                 format,
                             );
-                            let galley = ui.fonts(|fonts| fonts.layout_job(job));
+                            let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
                             ui.painter().galley(pos, galley.clone(), fg);
                             if cell.bold() {
                                 ui.painter().galley(pos + Vec2::new(0.5, 0.0), galley, fg);
@@ -279,7 +279,7 @@ impl App {
                             cell.contents().to_owned(),
                             format,
                         );
-                        let galley = ui.fonts(|f| f.layout_job(job));
+                        let galley = ui.fonts_mut(|f| f.layout_job(job));
                         painter.galley(pos, galley.clone(), fg);
                         if cell.bold() {
                             painter.galley(pos + Vec2::new(0.5, 0.0), galley, fg);
@@ -349,6 +349,7 @@ fn color(color: vt100::Color, default: Color32) -> Color32 {
 mod tests {
     use super::*;
     use crate::app::tests::{inert_handle, test_app};
+    use crate::test_ui::ContextTestExt as _;
     use serialcore::config::DEFAULT_VT_SCROLLBACK_ROWS as VT_SCROLLBACK_ROWS;
     use serialcore::store::PortId;
 
@@ -443,7 +444,7 @@ mod tests {
         app.connections.push(conn);
         let ctx = egui::Context::default();
         let draw = |app: &mut App, events| {
-            let _ = ctx.run(
+            let _ = ctx.run_test_ui(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -452,8 +453,8 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| app.show_terminal_screen(ui, 0));
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| app.show_terminal_screen(ui, 0));
                 },
             );
         };
@@ -498,6 +499,7 @@ mod tests {
             vec![
                 egui::Event::PointerMoved(egui::pos2(100.0, 100.0)),
                 egui::Event::MouseWheel {
+                    phase: egui::TouchPhase::Move,
                     unit: egui::MouseWheelUnit::Point,
                     delta: Vec2::new(0.0, 100.0),
                     modifiers: egui::Modifiers::NONE,
@@ -598,18 +600,20 @@ mod tests {
             Vec2::new(400.0, 300.0),
             Vec2::new(1000.0, 700.0),
         ] {
-            let _ = ctx.run(
+            let _ = ctx.run_test_ui(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |ui| {
+                    let _ctx = &ui.ctx().clone();
+                    egui::CentralPanel::default().show(ui, |ui| {
                         let area = ui.available_size();
                         let font =
                             FontId::monospace(f32::from(app.config.settings.console_font_size));
-                        let cell =
-                            ui.fonts(|f| Vec2::new(f.glyph_width(&font, 'M'), f.row_height(&font)));
+                        let cell = ui.fonts_mut(|f| {
+                            Vec2::new(f.glyph_width(&font, 'M'), f.row_height(&font))
+                        });
                         app.show_terminal_screen(ui, 0);
                         assert_eq!(
                             app.connections[0].terminal.screen().size(),

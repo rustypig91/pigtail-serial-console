@@ -160,11 +160,11 @@ fn fit_bounds(all: &[SeriesEntry], map: AxisMap) -> Option<PlotBounds> {
 }
 
 impl App {
-    pub(crate) fn show_plot(&mut self, ctx: &egui::Context) {
-        self.show_plot_in(ctx, None);
+    pub(crate) fn show_plot(&mut self, ui: &mut egui::Ui) {
+        self.show_plot_in(ui);
     }
 
-    pub(crate) fn show_plot_in(&mut self, ctx: &egui::Context, parent: Option<&mut egui::Ui>) {
+    pub(crate) fn show_plot_in(&mut self, parent: &mut egui::Ui) {
         if self.merged_selected || self.connections.is_empty() {
             return;
         }
@@ -174,14 +174,12 @@ impl App {
             return;
         }
 
-        let max_height = parent.as_ref().map_or(f32::INFINITY, |ui| {
-            (ui.available_height() - 100.0).max(40.0)
-        });
-        let panel = egui::TopBottomPanel::bottom(self.pane_widget_id("plot"))
+        let max_height = (parent.available_height() - 100.0).max(40.0);
+        let panel = egui::Panel::bottom(self.pane_widget_id("plot"))
             .resizable(true)
-            .default_height(220.0)
-            .max_height(max_height);
-        super::workspace::show_panel(panel, ctx, parent, |ui| {
+            .default_size(220.0)
+            .max_size(max_height);
+        super::workspace::show_panel(panel, parent, |ui| {
             self.show_plot_header(ui, active);
             self.show_plot_body(ui, active);
         });
@@ -308,16 +306,24 @@ impl App {
                 ])
                 // Hovering a Y2 trace has to report the number the device
                 // actually printed, not where the trace was moved to.
-                .label_formatter(move |name, point| {
+                .label_formatter(move |params| {
+                    let (name, point) = match params {
+                        egui_plot::HoverPosition::NearDataPoint {
+                            plot_name,
+                            position,
+                            ..
+                        } => (*plot_name, position),
+                        egui_plot::HoverPosition::Elsewhere { position } => ("", position),
+                    };
                     let y = if secondary.contains(name) {
                         map.to_secondary(point.y)
                     } else {
                         point.y
                     };
                     if name.is_empty() {
-                        format!("t = {:.3}s\ny = {y:.4}", point.x)
+                        Some(format!("t = {:.3}s\ny = {y:.4}", point.x))
                     } else {
-                        format!("{name}\nt = {:.3}s\ny = {y:.4}", point.x)
+                        Some(format!("{name}\nt = {:.3}s\ny = {y:.4}", point.x))
                     }
                 });
         }
@@ -359,7 +365,7 @@ impl App {
                 for p in &mut pts {
                     p[1] = m.to_primary(p[1]);
                 }
-                let line = Line::new(PlotPoints::from(pts))
+                let line = Line::new(entry.series.name(), PlotPoints::from(pts))
                     .color(entry.color)
                     .name(entry.series.name());
                 pui.line(line);
@@ -367,7 +373,7 @@ impl App {
 
             if let Some(t) = selected_t {
                 pui.vline(
-                    VLine::new(t)
+                    VLine::new("", t)
                         .color(egui::Color32::from_gray(180))
                         .width(1.0_f32),
                 );

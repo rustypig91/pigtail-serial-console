@@ -2,7 +2,7 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "Run Pigtail",
+      "label": "Run Pigtail (debug)",
       "type": "process",
       "command": "cargo",
       "args": [
@@ -20,6 +20,25 @@
         "kind": "build",
         "isDefault": true
       }
+    },
+    {
+      "label": "Run Pigtail (Release)",
+      "type": "process",
+      "command": "cargo",
+      "args": [
+        "run",
+        "--release",
+        "-p",
+        "pigtail",
+        "--locked"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$rustc"
+      ],
+      "group": "build"
     },
     {
       "label": "Build Pigtail (Debug)",

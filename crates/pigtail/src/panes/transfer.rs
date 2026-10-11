@@ -22,14 +22,8 @@ impl App {
         if self.floating_window_open() {
             return;
         }
-        let Some(path) = dropped.path else {
-            self.record_connect_error(
-                "Couldn't open dropped file",
-                "This build can only send files that have a local filesystem path.".to_owned(),
-            );
-            return;
-        };
-        self.open_file_transfer(path, "Couldn't open dropped file");
+        let path = dropped.path();
+        self.open_file_transfer(path.to_owned(), "Couldn't open dropped file");
     }
 
     /// Open a native file picker for desktop sessions where the window backend
@@ -52,7 +46,7 @@ impl App {
         let Some(path) = rfd::FileDialog::new().pick_file() else {
             return;
         };
-        self.open_file_transfer(path, "Couldn't open selected file");
+        self.open_file_transfer(path.to_owned(), "Couldn't open selected file");
     }
 
     fn open_file_transfer(&mut self, path: PathBuf, error_title: &'static str) {
@@ -104,12 +98,13 @@ impl App {
             egui::Order::Foreground,
             egui::Id::new("file_drop_overlay"),
         ));
-        let rect = ctx.screen_rect().shrink(28.0);
+        let rect = ctx.content_rect().shrink(28.0);
         painter.rect_filled(rect, 8.0, egui::Color32::from_black_alpha(190));
         painter.rect_stroke(
             rect,
             8.0,
             egui::Stroke::new(2.0_f32, egui::Color32::LIGHT_BLUE),
+            egui::StrokeKind::Middle,
         );
         painter.text(
             rect.center(),
@@ -204,6 +199,7 @@ impl App {
                     conn.display_label().to_owned(),
                     conn.state,
                     conn.port_config.baud,
+                    conn.port_config.send_delay_ms,
                 )
             });
         let mut cancel = false;
@@ -224,7 +220,7 @@ impl App {
                     .spacing([16.0, 5.0])
                     .show(ui, |ui| {
                         ui.label("Device");
-                        ui.label(target.as_ref().map_or("closed", |(name, _, _)| name));
+                        ui.label(target.as_ref().map_or("closed", |(name, _, _, _)| name));
                         ui.end_row();
                         ui.label("File");
                         ui.label(&dialog.file_name)
@@ -331,7 +327,10 @@ impl App {
                 if let Some(error) = &dialog.prepare_error {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                 } else if let Some(prepared) = &dialog.prepared {
-                    let baud = target.as_ref().map_or(115_200, |(_, _, baud)| *baud).max(1);
+                    let baud = target
+                        .as_ref()
+                        .map_or(115_200, |(_, _, baud, _)| *baud)
+                        .max(1);
                     let wire_time = Duration::from_secs_f64(
                         prepared.total_bytes() as f64 * 10.0 / f64::from(baud),
                     );
@@ -341,7 +340,7 @@ impl App {
                         format_duration(
                             prepared
                                 .estimated_duration_with_delay(Duration::from_millis(
-                                    self.config.settings.send_delay_ms
+                                    target.as_ref().map_or(0, |(_, _, _, delay)| *delay)
                                 ))
                                 .saturating_add(wire_time)
                         )
@@ -357,7 +356,7 @@ impl App {
                 ui.horizontal(|ui| {
                     let connected = target
                         .as_ref()
-                        .is_some_and(|(_, state, _)| *state == ConnState::Connected);
+                        .is_some_and(|(_, state, _, _)| *state == ConnState::Connected);
                     if ui
                         .add_enabled(
                             dialog.prepared.is_some() && connected,
@@ -411,7 +410,7 @@ impl App {
         });
         conn.handle.start_transfer_paced(
             prepared,
-            Duration::from_millis(self.config.settings.send_delay_ms),
+            Duration::from_millis(conn.port_config.send_delay_ms),
         );
     }
 
@@ -533,5 +532,57 @@ fn format_duration(duration: Duration) -> String {
         format!("{:.1} s", duration.as_secs_f64())
     } else {
         format!("{:.1} min", duration.as_secs_f64() / 60.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::tests::{inert_handle, test_app};
+    use serialcore::config::PortConfig;
+
+    #[test]
+    fn file_transfer_uses_its_target_delay_instead_of_the_selected_port() {
+        for delay in [0, 25] {
+            let (mut app, _tx) = test_app("file-transfer-port-delay");
+            for (index, send_delay_ms) in [25, delay].into_iter().enumerate() {
+                let id = PortId(index as u32);
+                let mut conn = app.make_connection(
+                    id,
+                    format!("device {index}"),
+                    Default::default(),
+                    PortConfig {
+                        send_delay_ms,
+                        ..Default::default()
+                    },
+                    inert_handle(id),
+                );
+                conn.set_state(ConnState::Connected);
+                app.connections.push(conn);
+            }
+            app.active = 0;
+            let path = PathBuf::from("sample.txt");
+            app.file_transfer_dialog = Some(FileTransferDialog {
+                port: PortId(1),
+                path: path.clone(),
+                file_name: "sample.txt".into(),
+                source_size: 3,
+                preview: b"abc".to_vec(),
+                options: Default::default(),
+                prepared: Some(transfer::PreparedTransfer {
+                    path,
+                    data: b"abc".to_vec(),
+                    line_ends: Vec::new(),
+                    line_delay: Duration::ZERO,
+                    char_delay: Duration::ZERO,
+                }),
+                prepare_rx: None,
+                prepare_error: None,
+            });
+            app.begin_prepared_file_transfer();
+            assert!(!app.connections[0].handle.has_used_pacing());
+            assert_eq!(app.connections[1].handle.has_used_pacing(), delay != 0);
+            assert!(app.connections[1].transfer_progress.is_some());
+        }
     }
 }
