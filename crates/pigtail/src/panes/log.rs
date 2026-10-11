@@ -47,10 +47,10 @@ fn search_query_field(
     let margin = egui::vec2(8.0, 6.0);
     let width = width.min((ui.available_width() - 2.0 * margin.x).max(24.0));
     let font = egui::TextStyle::Body.resolve(ui.style());
-    let height = (ui.fonts(|fonts| fonts.row_height(&font)) + 2.0 * margin.y)
+    let height = (ui.fonts_mut(|fonts| fonts.row_height(&font)) + 2.0 * margin.y)
         .max(ui.spacing().interact_size.y);
     let (_, rect) = ui.allocate_space(egui::vec2(width + 2.0 * margin.x, height));
-    // egui 0.30 allocates the full galley width even for clipped single-line
+    // egui allocates the full galley width even for clipped single-line
     // edits. Keep that extra allocation in a child so it cannot move controls.
     let mut field_ui = ui.new_child(
         egui::UiBuilder::new()
@@ -277,15 +277,11 @@ impl Metrics {
         port_tag_chars: usize,
         tx_marker: bool,
     ) -> Metrics {
-        let (row_height, advance) = ui.fonts(|f| (f.row_height(&font), f.glyph_width(&font, '0')));
-        // epaint snaps the pen to a whole pixel after every glyph, so the
-        // advance a row is actually laid out with is the rounded one — and
-        // since the pen lands back on a pixel each time, that rounding never
-        // accumulates. Predicting with the unrounded advance instead drifts by
-        // a column every few characters, which is enough to put a line's real
-        // height a row off what the index reserved for it.
-        let ppp = ui.ctx().pixels_per_point();
-        let char_w = ((advance * ppp).round() / ppp).max(1.0);
+        let (row_height, advance) =
+            ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0')));
+        // Shaped text retains fractional advances. Use that same width for
+        // virtual rows rather than rounding each character to a device pixel.
+        let char_w = advance;
 
         // What precedes the text, reserved on every row so the text column never
         // moves. Kept as narrow as it can be: this is dead space on the majority
@@ -390,14 +386,53 @@ struct RowCtx<'a> {
     row_id: egui::Id,
 }
 
-// egui 0.30 exposes label selection text through its copy output only. Capture
+// egui exposes label selection text through its copy output only. Capture
 // a synthetic copy at end-of-pass, after egui assembles all selected labels,
 // and restore the output before the integration can touch the OS clipboard.
 #[derive(Clone, Default)]
 struct SearchSelectionCapture {
-    pending: Option<(egui::Id, String)>,
+    pending: Option<(egui::Id, Vec<egui::OutputCommand>)>,
     ready: Option<(egui::Id, String)>,
-    registered: bool,
+}
+
+struct SearchSelectionOutput;
+
+impl egui::plugin::Plugin for SearchSelectionOutput {
+    fn debug_name(&self) -> &'static str {
+        "console_search_selection"
+    }
+
+    fn output_hook(&mut self, ctx: &egui::Context, output: &mut egui::FullOutput) {
+        let id = search_selection_id(ctx);
+        let pending = ctx.data_mut(|data| {
+            data.get_temp_mut_or_default::<SearchSelectionCapture>(id)
+                .pending
+                .take()
+        });
+        if let Some((target, previous_commands)) = pending {
+            // Label selection emits CopyText at the end of the pass. Capture it
+            // after all UI plugins finish, before the native clipboard sees it.
+            let commands =
+                std::mem::replace(&mut output.platform_output.commands, previous_commands);
+            let text = commands
+                .iter()
+                .filter_map(|command| match command {
+                    egui::OutputCommand::CopyText(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            output.platform_output.commands.extend(
+                commands
+                    .into_iter()
+                    .filter(|command| !matches!(command, egui::OutputCommand::CopyText(_))),
+            );
+            ctx.data_mut(|data| {
+                data.get_temp_mut_or_default::<SearchSelectionCapture>(id)
+                    .ready = Some((target, text));
+            });
+            ctx.request_repaint();
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -438,7 +473,10 @@ fn search_selection_id(ctx: &egui::Context) -> egui::Id {
 
 fn request_search_selection(ctx: &egui::Context, target: egui::Id) -> bool {
     if ctx.memory(|m| m.focused().is_some())
-        || !egui::text_selection::LabelSelectionState::load(ctx).has_selection()
+        || !ctx
+            .plugin::<egui::text_selection::LabelSelectionState>()
+            .lock()
+            .has_selection()
         || ctx.input(|i| {
             i.events
                 .iter()
@@ -448,37 +486,10 @@ fn request_search_selection(ctx: &egui::Context, target: egui::Id) -> bool {
         return false;
     }
     let id = search_selection_id(ctx);
-    let registered = ctx.data(|data| {
-        data.get_temp::<SearchSelectionCapture>(id)
-            .is_some_and(|capture| capture.registered)
-    });
-    if !registered {
-        ctx.on_end_pass(
-            "console_search_selection",
-            std::sync::Arc::new(|ctx| {
-                let id = search_selection_id(ctx);
-                let pending = ctx.data_mut(|data| {
-                    data.get_temp_mut_or_default::<SearchSelectionCapture>(id)
-                        .pending
-                        .take()
-                });
-                if let Some((target, previous_clipboard)) = pending {
-                    let text = ctx.output_mut(|output| {
-                        std::mem::replace(&mut output.copied_text, previous_clipboard)
-                    });
-                    ctx.data_mut(|data| {
-                        data.get_temp_mut_or_default::<SearchSelectionCapture>(id)
-                            .ready = Some((target, text));
-                    });
-                    ctx.request_repaint();
-                }
-            }),
-        );
-    }
-    let previous_clipboard = ctx.output_mut(|output| std::mem::take(&mut output.copied_text));
+    ctx.add_plugin(SearchSelectionOutput);
+    let previous_clipboard = ctx.output_mut(|output| std::mem::take(&mut output.commands));
     ctx.data_mut(|data| {
         let capture = data.get_temp_mut_or_default::<SearchSelectionCapture>(id);
-        capture.registered = true;
         capture.pending = Some((target, previous_clipboard));
     });
     ctx.input_mut(|i| i.events.push(egui::Event::Copy));
@@ -508,9 +519,7 @@ impl App {
     /// widget focus. Check this both before layout and before transmitting: an
     /// overlay can be opened by another event in the same input batch as Tab.
     pub(crate) fn keyboard_overlay_open(&self, ctx: &egui::Context) -> bool {
-        self.floating_window_open()
-            || ctx.is_context_menu_open()
-            || ctx.memory(|memory| memory.any_popup_open())
+        self.floating_window_open() || egui::Popup::is_any_open(ctx)
     }
 
     /// Reserve an unfocused live console's Tab before egui lays out focusable
@@ -603,17 +612,17 @@ impl App {
             return;
         }
         let fade = ((SIZE_TOAST_SECS - age) / SIZE_TOAST_FADE_SECS).clamp(0.0, 1.0) as f32;
-        let visuals = ctx.style().visuals.clone();
+        let visuals = ctx.global_style().visuals.clone();
         egui::Area::new(egui::Id::new("console_size_toast"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .interactable(false)
             .show(ctx, |ui| {
                 ui.set_opacity(fade);
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(visuals.window_fill)
                     .stroke(visuals.window_stroke)
-                    .rounding(8.0)
+                    .corner_radius(8.0)
                     .inner_margin(egui::vec2(18.0, 12.0))
                     .show(ui, |ui| {
                         // An `Area` is laid out around its content, so there is
@@ -771,15 +780,15 @@ impl App {
         false
     }
 
-    pub(crate) fn show_console(&mut self, ctx: &egui::Context, console_tab_claimed: bool) {
-        self.show_console_in(ctx, console_tab_claimed, None);
+    pub(crate) fn show_console(&mut self, ui: &mut egui::Ui, console_tab_claimed: bool) {
+        self.show_console_in(&ui.ctx().clone(), console_tab_claimed, ui);
     }
 
     pub(crate) fn show_console_in(
         &mut self,
         ctx: &egui::Context,
         console_tab_claimed: bool,
-        parent: Option<&mut egui::Ui>,
+        parent: &mut egui::Ui,
     ) {
         let input_enabled = self.pane_input_enabled();
         if input_enabled && !self.show_search {
@@ -902,11 +911,7 @@ impl App {
                 });
             }
         };
-        if let Some(ui) = parent {
-            egui::CentralPanel::default().show_inside(ui, draw);
-        } else {
-            egui::CentralPanel::default().show(ctx, draw);
-        }
+        egui::CentralPanel::default().show(parent, draw);
 
         if capture_selection {
             // Keep the synthetic event away from device input and later windows.
@@ -1024,6 +1029,7 @@ impl App {
                     resp.rect,
                     5.0,
                     egui::Stroke::new(1.0_f32, ui.visuals().warn_fg_color),
+                    egui::StrokeKind::Middle,
                 );
                 resp.clone()
                     .on_hover_text(format!("Invalid regex\n{error}"));
@@ -1164,6 +1170,7 @@ impl App {
                     resp.rect,
                     5.0,
                     egui::Stroke::new(1.0_f32, ui.visuals().warn_fg_color),
+                    egui::StrokeKind::Middle,
                 );
                 resp.clone()
                     .on_hover_text(format!("Invalid regex\n{error}"));
@@ -1396,8 +1403,12 @@ impl App {
         let following = conn.follow && scroll_offset.is_none();
 
         let mut area = egui::ScrollArea::vertical()
+            .animated(false)
             .auto_shrink([false, false])
-            .drag_to_scroll(false);
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Never,
+                ..Default::default()
+            });
         if let Some(off) = scroll_offset {
             // Clamp before layout: egui otherwise paints an out-of-range
             // centered search result for one frame, then clamps at end-of-pass.
@@ -1443,7 +1454,7 @@ impl App {
             );
             rect.min.y =
                 ui.max_rect().top() + conn.wrap_index.start_row(retained.start) as f32 * row_height;
-            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 let mut entry = retained.start;
                 while entry < retained.end {
@@ -1632,9 +1643,13 @@ impl App {
         ui.spacing_mut().item_spacing.y = 0.0;
 
         let mut area = egui::ScrollArea::vertical()
+            .animated(false)
             .id_salt(("merged_scroll", merged_tab_id))
             .auto_shrink([false, false])
-            .drag_to_scroll(false);
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Never,
+                ..Default::default()
+            });
         if let Some(offset) = scroll_offset {
             let max_offset = (n_rows as f32 * row_height - ui.available_height()).max(0.0);
             area = area.vertical_scroll_offset(offset.clamp(0.0, max_offset));
@@ -1671,7 +1686,7 @@ impl App {
             );
             rect.min.y =
                 ui.max_rect().top() + merged_wrap.start_row(retained.start) as f32 * row_height;
-            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 let mut entry = retained.start;
                 while entry < retained.end {
@@ -1775,8 +1790,12 @@ impl App {
         ui.spacing_mut().item_spacing.y = 0.0;
 
         let mut area = egui::ScrollArea::vertical()
+            .animated(false)
             .auto_shrink([false, false])
-            .drag_to_scroll(false);
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Never,
+                ..Default::default()
+            });
         if let Some(offset) = keyboard_scroll_offset(
             ui,
             "scroll_area",
@@ -2129,7 +2148,7 @@ fn show_rows_with_header(
         let mut rect = ui.max_rect();
         rect.min.y += first as f32 * row_height;
         rect.max.y = rect.min.y + end.saturating_sub(first) as f32 * row_height;
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
             ui.skip_ahead_auto_ids(first);
             draw(ui, first..end)
         });
@@ -2255,7 +2274,7 @@ fn console_menu(
         ui.add_enabled_ui(!selection.text.is_empty(), |ui| {
             if super::chrome::menu_item(ui, "Copy", "Ctrl+Shift+C").clicked() {
                 ui.ctx().copy_text(selection.text.clone());
-                ui.close_menu();
+                ui.close();
             }
             ui.separator();
             for (label, action) in [
@@ -2278,7 +2297,7 @@ fn console_menu(
                     .clicked()
                 {
                     menu.selection = Some((action, selection.text.clone()));
-                    ui.close_menu();
+                    ui.close();
                 }
             }
         });
@@ -2310,18 +2329,18 @@ fn console_menu(
                 .clicked()
             {
                 menu.set_ts = Some(f);
-                ui.close_menu();
+                ui.close();
             }
         }
     });
     if own_console {
         if ui.button("Toggle hex view").clicked() {
             menu.toggle_hex = true;
-            ui.close_menu();
+            ui.close();
         }
         if super::chrome::menu_item(ui, "Toggle plot", "Ctrl+Shift+P").clicked() {
             menu.toggle_plot = true;
-            ui.close_menu();
+            ui.close();
         }
     }
     ui.separator();
@@ -2329,29 +2348,29 @@ fn console_menu(
         && super::chrome::menu_item(ui, "Search…", "Ctrl+Shift+F").clicked()
     {
         menu.toggle_search = true;
-        ui.close_menu();
+        ui.close();
     }
     if (own_console || merged_view) && ui.button("Filters…").clicked() {
         menu.open_filters = true;
-        ui.close_menu();
+        ui.close();
     }
     if (own_console || merged_view)
         && super::chrome::menu_item(ui, "Save view…", "Ctrl+Shift+S").clicked()
     {
         menu.export = Some(false);
-        ui.close_menu();
+        ui.close();
     }
     if super::chrome::menu_item(ui, "Macros…", "Ctrl+Shift+M").clicked() {
         menu.open_macros = true;
-        ui.close_menu();
+        ui.close();
     }
     if ui.button("Highlight rules…").clicked() {
         menu.open_highlight = true;
-        ui.close_menu();
+        ui.close();
     }
     if own_console && ui.button("Plot extraction…").clicked() {
         menu.open_extract = true;
-        ui.close_menu();
+        ui.close();
     }
     if merged_view {
         ui.separator();
@@ -2378,15 +2397,15 @@ fn console_menu(
                 .clicked()
             {
                 menu.toggle_dtr = true;
-                ui.close_menu();
+                ui.close();
             }
             if ui.button("Toggle RTS").clicked() {
                 menu.toggle_rts = true;
-                ui.close_menu();
+                ui.close();
             }
             if ui.button("Send break").clicked() {
                 menu.send_break = true;
-                ui.close_menu();
+                ui.close();
             }
         });
         if own_console {
@@ -2398,11 +2417,11 @@ fn console_menu(
             {
                 menu.set_mark = true;
                 menu.mark_line = line;
-                ui.close_menu();
+                ui.close();
             }
             if has_mark && ui.button("Clear time mark").clicked() {
                 menu.clear_mark = true;
-                ui.close_menu();
+                ui.close();
             }
         }
     }
@@ -2423,7 +2442,7 @@ fn console_menu(
         .clicked()
     {
         menu.clear_console = true;
-        ui.close_menu();
+        ui.close();
     }
 }
 
@@ -2432,11 +2451,11 @@ fn export_menu(ui: &mut egui::Ui, menu: &mut MenuAction) {
         super::chrome::menu_style(ui);
         if super::chrome::menu_item(ui, "Text (.txt)", "Ctrl+Shift+S").clicked() {
             menu.export = Some(false);
-            ui.close_menu();
+            ui.close();
         }
         if ui.button("CSV (.csv)").clicked() {
             menu.export = Some(true);
-            ui.close_menu();
+            ui.close();
         }
     });
 }
@@ -2444,7 +2463,7 @@ fn export_menu(ui: &mut egui::Ui, menu: &mut MenuAction) {
 /// Use the last rendered offset so paging works without hovering the console.
 fn keyboard_scroll_offset(
     ui: &egui::Ui,
-    salt: impl std::hash::Hash,
+    salt: impl egui::AsId,
     pages: f32,
     lines: f32,
     row_height: f32,
@@ -2453,7 +2472,7 @@ fn keyboard_scroll_offset(
     if pages == 0.0 && lines == 0.0 {
         return None;
     }
-    let id = ui.make_persistent_id(egui::Id::new(salt));
+    let id = ui.make_persistent_id(egui::IdSalt::new(salt));
     let state = egui::scroll_area::State::load(ui.ctx(), id).unwrap_or_default();
     let view_height = ui.available_height();
     let max_offset = (content_height - view_height).max(0.0);
@@ -2482,13 +2501,16 @@ fn console_drag(ctx: &egui::Context) -> Option<ConsoleDrag> {
     }
     let drag = ctx.data(|data| data.get_temp::<ConsoleDrag>(console_drag_id()))?;
     (ctx.dragged_id() == Some(drag.widget)
-        && egui::text_selection::LabelSelectionState::load(ctx).has_selection())
+        && ctx
+            .plugin::<egui::text_selection::LabelSelectionState>()
+            .lock()
+            .has_selection())
     .then_some(drag)
 }
 
 fn selection_scroll_offset(
     ui: &egui::Ui,
-    salt: impl std::hash::Hash,
+    salt: impl egui::AsId,
     row_height: f32,
     content_height: f32,
 ) -> Option<f32> {
@@ -2507,7 +2529,7 @@ fn selection_scroll_offset(
     };
     let speed = (distance * 12.0).clamp(-row_height * 40.0, row_height * 40.0);
     let dt = ui.input(|i| i.stable_dt).min(0.05);
-    let id = ui.make_persistent_id(egui::Id::new(salt));
+    let id = ui.make_persistent_id(egui::IdSalt::new(salt));
     let state = egui::scroll_area::State::load(ui.ctx(), id).unwrap_or_default();
     let offset =
         (state.offset.y + speed * dt).clamp(0.0, (content_height - viewport.height()).max(0.0));
@@ -2611,7 +2633,11 @@ fn selection_entries(
         return 0..0;
     }
     let mut range = visible;
-    if egui::text_selection::LabelSelectionState::load(ctx).has_selection() {
+    if ctx
+        .plugin::<egui::text_selection::LabelSelectionState>()
+        .lock()
+        .has_selection()
+    {
         if let Some((previous_view, first, last)) = *saved {
             if previous_view == view {
                 // Find the surviving portion of the retained span in this view.
@@ -2667,7 +2693,9 @@ fn user_scrolled(ui: &egui::Ui) -> bool {
     ui.rect_contains_pointer(rect)
         && ui.input(|i| {
             let wheel = !i.modifiers.command
-                && (i.raw_scroll_delta.y != 0.0 || i.smooth_scroll_delta.y != 0.0);
+            && (i.events.iter().any(
+                |event| matches!(event, egui::Event::MouseWheel { delta, .. } if delta.y != 0.0),
+            ) || i.smooth_scroll_delta.y != 0.0);
             let drag = i.pointer.is_decidedly_dragging()
                 && i.pointer
                     .press_origin()
@@ -2688,7 +2716,10 @@ fn ctrl_wheel_steps(ctx: &egui::Context) -> i32 {
             .iter()
             .filter_map(|e| match e {
                 egui::Event::MouseWheel {
-                    delta, modifiers, ..
+                    phase: egui::TouchPhase::Move,
+                    delta,
+                    modifiers,
+                    ..
                 } if modifiers.command => Some(delta.y),
                 _ => None,
             })
@@ -2860,7 +2891,8 @@ fn recolor_selection(painted: &mut egui::Galley, original: &egui::Galley, dark: 
     };
     for (row, original_row) in painted.rows.iter_mut().zip(&original.rows) {
         let start = original_row.visuals.mesh.vertices.len();
-        let vertices = &mut row.visuals.mesh.vertices;
+        let visuals = &mut std::sync::Arc::make_mut(&mut row.row).visuals;
+        let vertices = &mut visuals.mesh.vertices;
         if vertices.len() != start + 4 || vertices[start].color == egui::Color32::TRANSPARENT {
             continue;
         }
@@ -2870,7 +2902,7 @@ fn recolor_selection(painted: &mut egui::Galley, original: &egui::Galley, dark: 
         }
         // Each visible glyph is a quad. Test its center to avoid recoloring an
         // adjacent glyph whose antialiasing extends across the selection edge.
-        let (glyphs, _) = vertices[row.visuals.glyph_vertex_range.clone()].as_chunks_mut::<4>();
+        let (glyphs, _) = vertices[visuals.glyph_vertex_range.clone()].as_chunks_mut::<4>();
         for quad in glyphs {
             let center = quad[0].pos.lerp(quad[3].pos, 0.5);
             if bounds.x_range().contains(center.x) {
@@ -2977,7 +3009,7 @@ fn wrapped_text(
     if m.cols > 0 && max_rows != u32::MAX {
         job.wrap.max_rows = max_rows as usize;
     }
-    let galley = ui.fonts(|f| f.layout_job(job));
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
     let (_auto_id, rect) = ui.allocate_space(egui::vec2(avail, height.max(galley.size().y)));
     let response = ui.interact(rect, row_id.with("text"), egui::Sense::click_and_drag());
     if response.is_pointer_button_down_on() && ui.input(|i| i.pointer.interact_pos().is_some()) {
@@ -3000,7 +3032,7 @@ fn wrapped_text(
     };
     // Retained off-screen rows must register their selection endpoints and
     // clipboard text, but must not extend the drag. An empty vertical clip
-    // still overlaps the selection horizontally in egui 0.30, which makes
+    // still overlaps the selection horizontally in egui, which makes
     // every hidden row below the viewport look like a drag target at its edge.
     let clip = ui.clip_rect();
     if !clip.intersects(rect) {
@@ -3009,10 +3041,14 @@ fn wrapped_text(
     // Label selection treats any held pointer button as a selection drag.
     // Keep right clicks from collapsing the selection before opening its menu.
     let mut selection_response = response.clone();
-    selection_response.is_pointer_button_down_on &= ui.input(|i| i.pointer.primary_down());
+    selection_response.flags.set(
+        egui::response::Flags::IS_POINTER_BUTTON_DOWN_ON,
+        response.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down()),
+    );
     // Press and release may both arrive in one frame, leaving no button down.
-    selection_response.sense.drag &=
-        ui.input(|i| i.pointer.primary_down() || i.pointer.primary_pressed());
+    if !ui.input(|i| i.pointer.primary_down() || i.pointer.primary_pressed()) {
+        selection_response.sense = egui::Sense::click();
+    }
     if m.selectable {
         egui::text_selection::LabelSelectionState::label_text_selection(
             ui,
@@ -3028,7 +3064,7 @@ fn wrapped_text(
             .galley(rect.left_top(), galley.clone(), fallback);
     }
 
-    // egui 0.30 keeps selection ranges private. Its selection painter appends
+    // egui keeps selection ranges private. Its selection painter appends
     // four rectangle vertices per selected row; compare with the original
     // galley so search/highlight backgrounds cannot count as selected text.
     if response.secondary_clicked() {
@@ -3052,8 +3088,13 @@ fn wrapped_text(
                                 if added.len() != 4 {
                                     return false;
                                 }
-                                let bounds = egui::Rect::from_min_max(added[0].pos, added[3].pos)
-                                    .translate(rect.min.to_vec2())
+                                let bounds = added
+                                    .iter()
+                                    .fold(egui::Rect::NOTHING, |bounds, vertex| {
+                                        bounds
+                                            .union(egui::Rect::from_min_max(vertex.pos, vertex.pos))
+                                    })
+                                    .translate(rect.min.to_vec2() + painted.pos.to_vec2())
                                     .intersect(clip);
                                 bounds.width() > 0.0 && bounds.contains(pointer)
                             })
@@ -3073,12 +3114,10 @@ fn wrapped_text(
     }
     if let Some((index, color)) = caret {
         let cursor = egui::text::CCursor {
-            index,
+            index: index.into(),
             prefer_next_row: true,
         };
-        let caret_rect = galley
-            .pos_from_ccursor(cursor)
-            .translate(rect.min.to_vec2());
+        let caret_rect = galley.pos_from_cursor(cursor).translate(rect.min.to_vec2());
         ui.painter().line_segment(
             [caret_rect.left_top(), caret_rect.left_bottom()],
             egui::Stroke::new(1.0_f32, color),
@@ -3380,7 +3419,20 @@ fn fmt_delta(micros: i64) -> String {
 }
 
 #[cfg(test)]
+pub(super) fn copied_text(output: &egui::PlatformOutput) -> String {
+    output
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            egui::OutputCommand::CopyText(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(test)]
 mod tests {
+    use crate::test_ui::ContextTestExt as _;
     #[test]
     fn long_search_text_keeps_controls_in_place() {
         for merged in [false, true] {
@@ -3404,7 +3456,7 @@ mod tests {
                     app.connections[0].search_query = query.clone();
                     app.merged_search_query = query;
                     let mut bounds = egui::Rect::NOTHING;
-                    let output = ctx.run(
+                    let output = ctx.run_test_ui(
                         egui::RawInput {
                             screen_rect: Some(egui::Rect::from_min_size(
                                 egui::Pos2::ZERO,
@@ -3412,8 +3464,8 @@ mod tests {
                             )),
                             ..Default::default()
                         },
-                        |ctx| {
-                            egui::CentralPanel::default().show(ctx, |ui| {
+                        |ui| {
+                            egui::CentralPanel::default().show(ui, |ui| {
                                 app.show_header_search(ui);
                                 bounds = ui.min_rect();
                             });
@@ -3462,7 +3514,7 @@ mod tests {
                 app.merged_search_query = "[".into();
                 // A 240-point pane leaves 224 points inside the toolbar;
                 // nested UI margins can reduce the search row further.
-                let _ = ctx.run(
+                let _ = ctx.run_test_ui(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
@@ -3470,8 +3522,9 @@ mod tests {
                         )),
                         ..Default::default()
                     },
-                    |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
+                    |ui| {
+
+                        egui::CentralPanel::default().show(ui, |ui| {
                             let available = ui.available_rect_before_wrap();
                             app.show_header_search(ui);
                             assert!(
@@ -3525,7 +3578,7 @@ mod tests {
             app.config.settings.timestamp_format = TimestampFormat::None;
             let ctx = egui::Context::default();
             let draw = |app: &mut App, events| {
-                ctx.run(
+                ctx.run_test_ui(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
@@ -3534,9 +3587,9 @@ mod tests {
                         events,
                         ..Default::default()
                     },
-                    |ctx| {
-                        app.show_toolbar(ctx);
-                        app.show_console(ctx, false);
+                    |ui| {
+                        app.show_toolbar(ui);
+                        app.show_console(ui, false);
                     },
                 )
             };
@@ -3566,7 +3619,10 @@ mod tests {
             let _ = draw(&mut app, vec![egui::Event::PointerMoved(end)]);
             let _ = draw(&mut app, vec![button(end, false)]);
             let output = draw(&mut app, vec![egui::Event::Copy]);
-            assert_eq!(output.platform_output.copied_text.trim(), "console text");
+            assert_eq!(
+                crate::panes::log::copied_text(&output.platform_output).trim(),
+                "console text"
+            );
         }
     }
 
@@ -3605,7 +3661,7 @@ mod tests {
                 app.merged_follow = false;
                 let ctx = egui::Context::default();
                 let draw = |app: &mut App| {
-                    let _ = ctx.run(
+                    let _ = ctx.run_test_ui(
                         egui::RawInput {
                             screen_rect: Some(egui::Rect::from_min_size(
                                 egui::Pos2::ZERO,
@@ -3613,8 +3669,8 @@ mod tests {
                             )),
                             ..Default::default()
                         },
-                        |ctx| {
-                            egui::CentralPanel::default().show(ctx, |ui| {
+                        |ui| {
+                            egui::CentralPanel::default().show(ui, |ui| {
                                 if merged {
                                     app.show_merged_rows(ui, &mut MenuAction::default());
                                 } else {
@@ -3656,8 +3712,8 @@ mod tests {
         for dark in [false, true] {
             let ctx = egui::Context::default();
             ctx.set_visuals(super::super::app_visuals(dark));
-            let _ = ctx.run(Default::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = ctx.run_test_ui(Default::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     let ansi = egui::Color32::RED;
                     let search = egui::Color32::YELLOW;
                     let mut job = LayoutJob::default();
@@ -3673,12 +3729,12 @@ mod tests {
                     );
                     job.wrap.max_width = 35.0;
                     job.wrap.break_anywhere = true;
-                    let original = ui.fonts(|fonts| fonts.layout_job(job));
+                    let original = ui.fonts_mut(|fonts| fonts.layout_job(job));
                     assert!(original.rows.len() > 1);
                     let mut painted = original.clone();
-                    let range = egui::text_selection::CursorRange::two(
-                        original.from_ccursor(egui::text::CCursor::new(1)),
-                        original.from_ccursor(egui::text::CCursor::new(6)),
+                    let range = egui::text_selection::CCursorRange::two(
+                        egui::text::CCursor::new(1),
+                        egui::text::CCursor::new(6),
                     );
                     egui::text_selection::visuals::paint_text_selection(
                         &mut painted,
@@ -3689,7 +3745,8 @@ mod tests {
                     let mut cleared = (*painted).clone();
                     for (row, old) in cleared.rows.iter_mut().zip(&original.rows) {
                         for vertex in
-                            &mut row.visuals.mesh.vertices[old.visuals.mesh.vertices.len()..]
+                            &mut std::sync::Arc::make_mut(&mut row.row).visuals.mesh.vertices
+                                [old.visuals.mesh.vertices.len()..]
                         {
                             vertex.color = egui::Color32::TRANSPARENT;
                         }
@@ -3782,7 +3839,7 @@ mod tests {
             let ctx = egui::Context::default();
             ctx.set_visuals(super::super::app_visuals(dark));
             let draw = |app: &mut App, events| {
-                ctx.run(
+                ctx.run_test_ui(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
@@ -3791,9 +3848,10 @@ mod tests {
                         events,
                         ..Default::default()
                     },
-                    |ctx| {
+                    |ui| {
+                        let ctx = &ui.ctx().clone();
                         ctx.copy_text("clipboard sentinel".into());
-                        app.show_console(ctx, false);
+                        app.show_console(ui, false);
                     },
                 )
             };
@@ -3855,6 +3913,8 @@ mod tests {
                     .hit,
                 "a fast primary click must collapse the old selection"
             );
+            egui::Popup::close_all(&ctx);
+            let _ = draw(&mut app, vec![]);
             let _ = draw(
                 &mut app,
                 vec![egui::Event::PointerMoved(start), button(start, true)],
@@ -3866,14 +3926,17 @@ mod tests {
                 vec![egui::Event::PointerMoved(point), secondary(point, true)],
             );
             let output = draw(&mut app, vec![secondary(point, false)]);
-            assert_eq!(output.platform_output.copied_text, "clipboard sentinel");
+            assert_eq!(
+                crate::panes::log::copied_text(&output.platform_output),
+                "clipboard sentinel"
+            );
             let _ = draw(&mut app, vec![]);
             let selected = ctx
                 .data(|data| data.get_temp::<SelectionMenu>(selection_menu_id()))
                 .unwrap();
             assert!(selected.hit, "right click within selected characters");
             assert_eq!(selected.text, text);
-            assert!(ctx.is_context_menu_open());
+            assert!(egui::Popup::is_any_open(&ctx));
             app.apply_menu(
                 0,
                 MenuAction {
@@ -3987,7 +4050,7 @@ mod tests {
             app.config.settings.timestamp_format = TimestampFormat::None;
             let ctx = egui::Context::default();
             let draw = |app: &mut App, events| {
-                ctx.run(
+                ctx.run_test_ui(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
@@ -3996,10 +4059,11 @@ mod tests {
                         events,
                         ..Default::default()
                     },
-                    |ctx| {
+                    |ui| {
+                        let ctx = &ui.ctx().clone();
                         ctx.copy_text("clipboard sentinel".into());
-                        app.show_toolbar(ctx);
-                        app.show_console(ctx, false);
+                        app.show_toolbar(ui);
+                        app.show_console(ui, false);
                     },
                 )
             };
@@ -4029,7 +4093,10 @@ mod tests {
                 modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
             };
             let output = draw(&mut app, vec![shortcut()]);
-            assert_eq!(output.platform_output.copied_text, "clipboard sentinel");
+            assert_eq!(
+                crate::panes::log::copied_text(&output.platform_output),
+                "clipboard sentinel"
+            );
             assert!(app.show_search);
             assert!(app.search_focus_request);
             let _ = draw(&mut app, vec![]);
@@ -4049,12 +4116,12 @@ mod tests {
                 .char_range()
                 .unwrap();
             assert_eq!(
-                range.sorted()[0].index..range.sorted()[1].index,
-                0..text.chars().count()
+                range.sorted_cursors()[0].index..range.sorted_cursors()[1].index,
+                egui::text::CharIndex::from(0)..text.chars().count().into()
             );
-            let mut selection = egui::text_selection::LabelSelectionState::load(&ctx);
-            selection.clear_selection();
-            selection.store(&ctx);
+            ctx.plugin::<egui::text_selection::LabelSelectionState>()
+                .lock()
+                .clear_selection();
             let _ = draw(&mut app, vec![shortcut()]);
             let _ = draw(&mut app, vec![]);
             assert!(
@@ -4075,7 +4142,10 @@ mod tests {
             );
             let _ = draw(&mut app, vec![button(point, false)]);
             let output = draw(&mut app, vec![shortcut()]);
-            assert_eq!(output.platform_output.copied_text, "clipboard sentinel");
+            assert_eq!(
+                crate::panes::log::copied_text(&output.platform_output),
+                "clipboard sentinel"
+            );
             let _ = draw(&mut app, vec![]);
             let query = if merged {
                 &app.merged_search_query
@@ -4153,7 +4223,7 @@ mod tests {
             let ctx = egui::Context::default();
             let scroll_id = std::cell::Cell::new(None);
             let draw = |app: &mut App, events| {
-                ctx.run(
+                ctx.run_test_ui(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
@@ -4162,18 +4232,18 @@ mod tests {
                         events,
                         ..Default::default()
                     },
-                    |ctx| {
-                        app.show_header(ctx);
-                        app.show_toolbar(ctx);
-                        egui::CentralPanel::default().show(ctx, |ui| {
+                    |ui| {
+                        app.show_header(ui);
+                        app.show_toolbar(ui);
+                        egui::CentralPanel::default().show(ui, |ui| {
                             let salt = if merged {
                                 let tab = app
                                     .loaded_merged_tab
                                     .and_then(|i| app.merged_tabs.get(i))
                                     .map(|tab| tab.id);
-                                egui::Id::new(("merged_scroll", tab))
+                                egui::IdSalt::new(("merged_scroll", tab))
                             } else {
-                                egui::Id::new("scroll_area")
+                                egui::IdSalt::new("scroll_area")
                             };
                             scroll_id.set(Some(ui.make_persistent_id(salt)));
                             if merged {
@@ -4218,11 +4288,14 @@ mod tests {
             );
             let output = draw(&mut app, vec![egui::Event::Copy, button(gutter, false)]);
             assert!(
-                output.platform_output.copied_text.is_empty(),
+                crate::panes::log::copied_text(&output.platform_output).is_empty(),
                 "gutter drag selected UI text: {}",
-                output.platform_output.copied_text
+                crate::panes::log::copied_text(&output.platform_output)
             );
-            assert!(!egui::text_selection::LabelSelectionState::load(&ctx).has_selection());
+            assert!(!ctx
+                .plugin::<egui::text_selection::LabelSelectionState>()
+                .lock()
+                .has_selection());
             let _ = draw(
                 &mut app,
                 vec![egui::Event::PointerMoved(start), button(start, true)],
@@ -4300,7 +4373,10 @@ mod tests {
             } else {
                 let _ = draw(&mut app, vec![button(end, false)]);
             }
-            assert!(egui::text_selection::LabelSelectionState::load(&ctx).has_selection());
+            assert!(ctx
+                .plugin::<egui::text_selection::LabelSelectionState>()
+                .lock()
+                .has_selection());
             if late_data {
                 // A late batch from another reader is sorted before existing
                 // rows, then maintain_merged renumbers every sequence key.
@@ -4334,7 +4410,7 @@ mod tests {
             }
             let _ = draw(&mut app, vec![]);
             let output = draw(&mut app, vec![egui::Event::Copy]);
-            let copied = output.platform_output.copied_text;
+            let copied = crate::panes::log::copied_text(&output.platform_output);
             assert!(
                 !copied.contains("115200"),
                 "footer leaked into selection: {copied}"
@@ -4365,9 +4441,9 @@ mod tests {
                 assert!(copied.contains("row 030 selection text"));
                 assert!(!copied.contains("row 060"));
             }
-            let mut selection = egui::text_selection::LabelSelectionState::load(&ctx);
-            selection.clear_selection();
-            selection.store(&ctx);
+            ctx.plugin::<egui::text_selection::LabelSelectionState>()
+                .lock()
+                .clear_selection();
             let _ = draw(&mut app, vec![]);
             let (_, first, last) = app.selection_rows.unwrap();
             assert!(
@@ -4410,7 +4486,7 @@ mod tests {
             });
             app.consume_console_view_shortcuts(&ctx);
             let remaining = ctx.input(|i| i.events.len());
-            let _ = ctx.end_pass();
+            let _ = ctx.end_test_pass();
             remaining
         };
         let modifiers = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
@@ -4495,7 +4571,7 @@ mod tests {
                 })
                 .collect();
             let mut remaining = 0;
-            let _ = ctx.run(
+            let _ = ctx.run_test_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -4504,10 +4580,13 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |ui| {
+                    let ctx = &ui.ctx().clone();
+                    egui::CentralPanel::default().show(ui, |ui| {
                         let (pages, lines) = app.consume_scroll_shortcut(ctx);
-                        let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+                        let mut area = egui::ScrollArea::vertical()
+                            .animated(false)
+                            .auto_shrink([false, false]);
                         if let Some(offset) = keyboard_scroll_offset(
                             ui,
                             "scroll_area",
@@ -4576,8 +4655,8 @@ mod tests {
     #[test]
     fn moving_the_caret_keeps_text_and_wrapping_unchanged() {
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run_test_ui(Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 let m = Metrics::new(
                     ui,
                     egui::FontId::monospace(12.0),
@@ -4620,8 +4699,8 @@ mod tests {
                         assert_eq!(job.text, text, "caret must not enter selectable text");
                         job.wrap.max_width = m.wrap_width();
                         job.wrap.break_anywhere = true;
-                        let galley = ui.fonts(|f| f.layout_job(job));
-                        let geometry: Vec<_> = galley.rows.iter().map(|row| row.rect).collect();
+                        let galley = ui.fonts_mut(|f| f.layout_job(job));
+                        let geometry: Vec<_> = galley.rows.iter().map(|row| row.rect()).collect();
                         if let Some(expected) = &baseline {
                             assert_eq!(&geometry, expected);
                         } else {
@@ -4631,8 +4710,8 @@ mod tests {
                         if text == "abcdefgh" {
                             assert_eq!(galley.rows.len(), 1);
                         }
-                        let cursor_rect = galley.pos_from_ccursor(egui::text::CCursor {
-                            index: line_caret(&line).unwrap(),
+                        let cursor_rect = galley.pos_from_cursor(egui::text::CCursor {
+                            index: line_caret(&line).unwrap().into(),
                             prefer_next_row: true,
                         });
                         assert!(cursor_rect.height() > 0.0);
@@ -4647,8 +4726,8 @@ mod tests {
         let (mut app, _enum_tx) = test_app("empty-merged-console");
         let ctx = egui::Context::default();
         let render = |app: &mut App| {
-            let output = ctx.run(egui::RawInput::default(), |ctx| {
-                app.show_console(ctx, false);
+            let output = ctx.run_test_ui(egui::RawInput::default(), |ui| {
+                app.show_console(ui, false);
             });
             output
                 .shapes
@@ -4722,25 +4801,34 @@ mod tests {
 
         let ctx = egui::Context::default();
         let mut job = None;
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run_test_ui(Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 job = Some(build_job(ui, &line, &rctx));
             });
         });
         let sections = job.unwrap().sections;
         assert_eq!(sections.len(), 3);
-        assert_eq!(sections[0].byte_range, 0..3);
+        assert_eq!(
+            sections[0].byte_range,
+            egui::text::ByteIndex::from(0)..egui::text::ByteIndex::from(3)
+        );
         assert_eq!(
             sections[0].format.background,
             egui::Color32::from_rgb(0xCD, 0x31, 0x31)
         );
-        assert_eq!(sections[1].byte_range, 3..6);
+        assert_eq!(
+            sections[1].byte_range,
+            egui::text::ByteIndex::from(3)..egui::text::ByteIndex::from(6)
+        );
         assert_eq!(
             sections[1].format.background,
             egui::Color32::from_rgb(0xFF, 0xD5, 0x4A)
         );
         assert_eq!(sections[1].format.color, egui::Color32::BLACK);
-        assert_eq!(sections[2].byte_range, 6..10);
+        assert_eq!(
+            sections[2].byte_range,
+            egui::text::ByteIndex::from(6)..egui::text::ByteIndex::from(10)
+        );
         assert_eq!(
             sections[2].format.background,
             egui::Color32::from_rgb(0xCD, 0x31, 0x31)
@@ -4798,8 +4886,8 @@ mod tests {
 
         let ctx = egui::Context::default();
         let mut job = None;
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run_test_ui(Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 job = Some(build_job(ui, &line, &rctx));
             });
         });
@@ -4807,11 +4895,20 @@ mod tests {
         let sections = job.unwrap().sections;
         let device_color = egui::Color32::from_rgb(0x34, 0x98, 0xdb);
         assert_eq!(sections.len(), 3);
-        assert_eq!(sections[0].byte_range, 0..3);
+        assert_eq!(
+            sections[0].byte_range,
+            egui::text::ByteIndex::from(0)..egui::text::ByteIndex::from(3)
+        );
         assert_eq!(sections[0].format.color, device_color);
-        assert_eq!(sections[1].byte_range, 3..6);
+        assert_eq!(
+            sections[1].byte_range,
+            egui::text::ByteIndex::from(3)..egui::text::ByteIndex::from(6)
+        );
         assert_eq!(sections[1].format.color, highlight_color);
-        assert_eq!(sections[2].byte_range, 6..10);
+        assert_eq!(
+            sections[2].byte_range,
+            egui::text::ByteIndex::from(6)..egui::text::ByteIndex::from(10)
+        );
         assert_eq!(sections[2].format.color, device_color);
     }
 
@@ -4872,15 +4969,18 @@ mod tests {
 
             let ctx = egui::Context::default();
             let mut job = None;
-            let _ = ctx.run(Default::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = ctx.run_test_ui(Default::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     job = Some(build_job(ui, &line, &rctx));
                 });
             });
 
             let sections = job.unwrap().sections;
             assert_eq!(sections.len(), 1);
-            assert_eq!(sections[0].byte_range, 0..3);
+            assert_eq!(
+                sections[0].byte_range,
+                egui::text::ByteIndex::from(0)..egui::text::ByteIndex::from(3)
+            );
             assert_eq!(sections[0].format.color, expected_color);
             assert_ne!(sections[0].format.color, highlight_color);
         }
@@ -4913,8 +5013,8 @@ mod tests {
 
         let ctx = egui::Context::default();
         let mut query = String::new();
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run_test_ui(Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 let response = ui.text_edit_singleline(&mut query);
                 response.request_focus();
             });
@@ -4924,8 +5024,8 @@ mod tests {
         // The field is still rendered in the frame where its Close button is
         // handled. Without the explicit surrender, its now-stale id survives
         // into the next input frame and makes both sides reject Tab.
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run_test_ui(Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 let response = ui.text_edit_singleline(&mut query);
                 assert!(response.has_focus());
                 surrender_search_focus_on_close(&response, &response, true);
@@ -4945,14 +5045,15 @@ mod tests {
         });
         let console_tab_claimed = app.claim_console_tab_before_layout(&ctx);
         assert!(console_tab_claimed);
-        app.show_header(&ctx);
-        app.show_console(&ctx, console_tab_claimed);
+        let mut root_ui = egui::Ui::new(ctx.clone(), egui::Id::new("root"), egui::UiBuilder::new());
+        app.show_header(&mut root_ui);
+        app.show_console(&mut root_ui, console_tab_claimed);
         app.release_console_tab_after_layout(&ctx, console_tab_claimed);
         assert!(
             app.connections[0].follow,
             "the Tab after closing search must reach the live console"
         );
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
     }
 
     #[test]
@@ -5333,7 +5434,7 @@ mod tests {
     fn hex_rows_keep_the_virtualized_pitch_exact() {
         let ctx = egui::Context::default();
         let mut seen = None;
-        let _ = ctx.run(
+        let _ = ctx.run_test_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -5341,8 +5442,9 @@ mod tests {
                 )),
                 ..Default::default()
             },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            |ui| {
+
+                egui::CentralPanel::default().show(ui, |ui| {
                     let m = Metrics::new(
                         ui,
                         egui::FontId::monospace(12.0),
@@ -5354,9 +5456,9 @@ mod tests {
                     let row_height = m.row_height;
                     ui.spacing_mut().item_spacing.y = 0.0;
                     let rows = 100;
-                    let output = egui::ScrollArea::vertical()
+                    let output = egui::ScrollArea::vertical().animated(false)
                         .auto_shrink([false, false])
-                        .drag_to_scroll(false)
+                        .scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Never, ..Default::default() })
                         .vertical_scroll_offset(rows as f32 * row_height - ui.available_height())
                         .show_rows(ui, row_height, rows, |ui, range| {
                             for row in range {

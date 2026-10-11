@@ -110,8 +110,8 @@ impl App {
             || self.config_dialog.is_some()
             || self.rename_dialog.is_some()
             || self.file_transfer_dialog.is_some()
-            || ctx.is_context_menu_open()
-            || ctx.memory(|memory| memory.any_popup_open() || memory.focused().is_some())
+            || egui::Popup::is_any_open(ctx)
+            || ctx.memory(|memory| memory.focused().is_some())
         {
             return;
         }
@@ -262,15 +262,12 @@ impl App {
 
     /// The top header: one tab per connection or merged view, `+`, and global
     /// actions collected under an ellipsis menu.
-    pub(crate) fn show_header(&mut self, ctx: &egui::Context) {
-        self.show_header_in(ctx, None);
+    pub(crate) fn show_header(&mut self, ui: &mut egui::Ui) {
+        self.show_header_in(&ui.ctx().clone(), ui);
     }
 
-    pub(crate) fn show_header_in(&mut self, ctx: &egui::Context, parent: Option<&mut egui::Ui>) {
-        let painter = parent
-            .as_ref()
-            .map(|ui| ui.painter().clone())
-            .unwrap_or_else(|| ctx.layer_painter(egui::LayerId::background()));
+    pub(crate) fn show_header_in(&mut self, ctx: &egui::Context, parent: &mut egui::Ui) {
+        let painter = parent.painter().clone();
         let mut backdrop = super::chrome::HeaderBackdrop::reserve(painter.clone());
         let background_slot = painter.add(egui::Shape::Noop);
         let corners_slot = painter.add(egui::Shape::Noop);
@@ -305,16 +302,15 @@ impl App {
             || self.file_transfer_dialog.is_some();
 
         let header_rect = super::workspace::show_panel(
-            egui::TopBottomPanel::top(self.pane_widget_id("header"))
-                .default_height(super::chrome::HEADER_HEIGHT + 6.0)
+            egui::Panel::top(self.pane_widget_id("header"))
+                .default_size(super::chrome::HEADER_HEIGHT + 6.0)
                 .show_separator_line(false)
-                .frame(egui::Frame::none().inner_margin(egui::Margin {
-                    left: 10.0,
-                    right: 8.0,
-                    top: 6.0,
-                    bottom: 0.0,
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin {
+                    left: 10,
+                    right: 8,
+                    top: 6,
+                    bottom: 0,
                 })),
-            ctx,
             parent,
             |ui| {
                 // Status and navigation labels must not join console text selection.
@@ -362,7 +358,7 @@ impl App {
                         let (offset, _, _) = ctx.data(|data| data.get_temp::<(f32, f32, f32)>(metrics_id)).unwrap_or_default();
                         let mut requested_offset = None;
                         let mut area = egui::ScrollArea::horizontal()
-                            .drag_to_scroll(false)
+                            .scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Never, ..Default::default() })
                             .id_salt(scroll_id)
                             .max_width(visible_width)
                             .auto_shrink([true, true]);
@@ -426,15 +422,15 @@ impl App {
                                                     self.show_tab_layout_menu(ui, tab_id);
                                                     if ui.button("Rename…").clicked() {
                                                         rename_tab = Some(i);
-                                                        ui.close_menu();
+                                                        ui.close();
                                                     }
                                                     if ui.button("Port options…").clicked() {
                                                         port_options = Some(i);
-                                                        ui.close_menu();
+                                                        ui.close();
                                                     }
                                                     if ui.button("Close tab").clicked() {
                                                         to_close = Some(i);
-                                                        ui.close_menu();
+                                                        ui.close();
                                                     }
                                                 });
                                             }
@@ -467,11 +463,11 @@ impl App {
                                                     self.show_tab_layout_menu(ui, tab_id);
                                                     if ui.button("Options").clicked() {
                                                         edit_merged = Some(i);
-                                                        ui.close_menu();
+                                                        ui.close();
                                                     }
                                                     if ui.button("Close tab").clicked() {
                                                         close_merged = Some(i);
-                                                        ui.close_menu();
+                                                        ui.close();
                                                     }
                                                 });
                                             }
@@ -497,7 +493,7 @@ impl App {
                                             TabId::Connection(id) => set_active = self.connections.iter().position(|c| c.id == *id),
                                             TabId::Merged(id) => select_merged = self.merged_tabs.iter().position(|t| t.id == *id),
                                         }
-                                        ui.close_menu();
+                                        ui.close();
                                     }
                                 }
                             });
@@ -507,11 +503,11 @@ impl App {
                             super::chrome::menu_style(ui);
                             if ui.button("New connection").clicked() {
                                 new_tab = true;
-                                ui.close_menu();
+                                ui.close();
                             }
                             if ui.button("New merged view").clicked() {
                                 new_merged = true;
-                                ui.close_menu();
+                                ui.close();
                             }
                         });
                     });
@@ -550,7 +546,7 @@ impl App {
             },
         );
 
-        let fill = super::chrome::header_fill(&ctx.style().visuals, false);
+        let fill = super::chrome::header_fill(&ctx.global_style().visuals, false);
         let mut background = Vec::new();
         let mut corners = Vec::new();
         if active_tab_rect.is_positive() {
@@ -671,34 +667,33 @@ impl App {
         self.show_app_menu(ui);
         let export = ui
             .scope(|ui| {
-                egui::menu::menu_custom_button(
-                    ui,
+                egui::containers::menu::MenuButton::from_button(
                     egui::Button::new(" ")
                         .frame(false)
                         .min_size(egui::vec2(36.0, 32.0)),
-                    |ui| {
-                        super::chrome::menu_style(ui);
-                        for (label, csv) in [("Export text…", false), ("Export CSV…", true)] {
-                            if super::chrome::menu_item(
-                                ui,
-                                label,
-                                if csv { "" } else { "Ctrl+Shift+S" },
-                            )
-                            .clicked()
-                            {
-                                if self.merged_selected {
-                                    self.export_merged_view(csv);
-                                } else if let Some(active) = self.active_index() {
-                                    self.export_active_view(active, csv);
-                                }
-                                ui.close_menu();
-                            }
-                        }
-                    },
                 )
+                .ui(ui, |ui| {
+                    super::chrome::menu_style(ui);
+                    for (label, csv) in [("Export text…", false), ("Export CSV…", true)] {
+                        if super::chrome::menu_item(
+                            ui,
+                            label,
+                            if csv { "" } else { "Ctrl+Shift+S" },
+                        )
+                        .clicked()
+                        {
+                            if self.merged_selected {
+                                self.export_merged_view(csv);
+                            } else if let Some(active) = self.active_index() {
+                                self.export_active_view(active, csv);
+                            }
+                            ui.close();
+                        }
+                    }
+                })
             })
             .inner
-            .response
+            .0
             .on_hover_text("Export current view");
         super::chrome::paint_action_frame(ui, &export, false);
         super::chrome::paint_export(ui, export.rect);
@@ -745,7 +740,7 @@ impl App {
                     .clicked()
                 {
                     self.choose_file_transfer();
-                    ui.close_menu();
+                    ui.close();
                 }
                 ui.separator();
                 if super::chrome::menu_item(ui, "Macros", "Ctrl+Shift+M")
@@ -753,15 +748,15 @@ impl App {
                     .clicked()
                 {
                     self.show_macros_win = true;
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui.button("Show keyboard shortcuts").clicked() {
                     self.show_keyboard_shortcuts = true;
-                    ui.close_menu();
+                    ui.close();
                 }
                 if super::chrome::menu_item(ui, "Settings", "F2").clicked() {
                     self.show_settings = true;
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui
                     .button("Open configuration folder")
@@ -774,7 +769,7 @@ impl App {
                             format!("{error:#}"),
                         );
                     }
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui
                     .button("Open logs folder")
@@ -789,7 +784,7 @@ impl App {
                             format!("{error:#}"),
                         );
                     }
-                    ui.close_menu();
+                    ui.close();
                 }
                 let updating = self.update_rx.is_some() || self.install_rx.is_some();
                 let update_unavailable = if self.demo_mode {
@@ -806,7 +801,7 @@ impl App {
                     .clicked()
                 {
                     self.start_update_check(true);
-                    ui.close_menu();
+                    ui.close();
                 }
                 ui.separator();
                 if ui
@@ -817,11 +812,11 @@ impl App {
                     ui.ctx().open_url(egui::OpenUrl::new_tab(
                         "https://buymeacoffee.com/rustypig91g",
                     ));
-                    ui.close_menu();
+                    ui.close();
                 }
                 if super::chrome::menu_item(ui, "About", "F1").clicked() {
                     self.show_about = true;
-                    ui.close_menu();
+                    ui.close();
                 }
             })
             .response
@@ -843,7 +838,7 @@ impl App {
             let scrollbar = &mut ui.spacing_mut().scroll;
             scrollbar.floating_allocated_width = scrollbar.bar_width + 8.0;
             super::chrome::modal_header(ui, "Keyboard shortcuts", &mut open);
-            let height = (ctx.screen_rect().height() - 160.0).clamp(180.0, 600.0);
+            let height = (ctx.content_rect().height() - 160.0).clamp(180.0, 600.0);
             egui::ScrollArea::vertical()
                 .max_height(height)
                 .min_scrolled_height(height)
@@ -948,28 +943,27 @@ impl App {
 
     /// The reference toolbar leaves the left side empty and groups the primary
     /// view switches and icon actions on the right.
-    pub(crate) fn show_toolbar(&mut self, ctx: &egui::Context) {
-        self.show_toolbar_in(ctx, None);
+    pub(crate) fn show_toolbar(&mut self, ui: &mut egui::Ui) {
+        self.show_toolbar_in(&ui.ctx().clone(), ui);
     }
 
-    pub(crate) fn show_toolbar_in(&mut self, ctx: &egui::Context, parent: Option<&mut egui::Ui>) {
+    pub(crate) fn show_toolbar_in(&mut self, ctx: &egui::Context, parent: &mut egui::Ui) {
         let long_running_macros =
             self.long_running_macro_indicators(Instant::now(), self.macro_target_port());
         let mut stop_macro_run = None;
         let mut select_view = None;
         let mut toggle_plot = false;
         let toolbar_rect = super::workspace::show_panel(
-            egui::TopBottomPanel::top(self.pane_widget_id("console_toolbar"))
-                .default_height(32.0 + 10.0)
+            egui::Panel::top(self.pane_widget_id("console_toolbar"))
+                .default_size(32.0 + 10.0)
                 .frame(
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(super::chrome::toolbar_fill(
-                            &ctx.style().visuals,
+                            &ctx.global_style().visuals,
                             self.config.settings.header_opacity,
                         ))
-                        .inner_margin(egui::Margin::symmetric(8.0, 5.0)),
+                        .inner_margin(egui::Margin::symmetric(8, 5)),
                 ),
-            ctx,
             parent,
             |ui| {
                 ui.style_mut().interaction.selectable_labels = false;
@@ -1058,21 +1052,20 @@ impl App {
     }
 
     /// A slim status strip with a compact pin-to-bottom toggle.
-    pub(crate) fn show_status_footer(&mut self, ctx: &egui::Context) {
-        self.show_status_footer_in(ctx, None);
+    pub(crate) fn show_status_footer(&mut self, ui: &mut egui::Ui) {
+        self.show_status_footer_in(&ui.ctx().clone(), ui);
     }
 
-    pub(crate) fn show_status_footer_in(
-        &mut self,
-        ctx: &egui::Context,
-        parent: Option<&mut egui::Ui>,
-    ) {
-        let dark = ctx.style().visuals.dark_mode;
+    pub(crate) fn show_status_footer_in(&mut self, ctx: &egui::Context, parent: &mut egui::Ui) {
+        let dark = ctx.global_style().visuals.dark_mode;
         let mut toggle_pin = false;
         super::workspace::show_panel(
-            egui::TopBottomPanel::bottom(self.pane_widget_id("status_footer")).frame(
-                egui::Frame::none()
-                    .fill(super::chrome::header_fill(&ctx.style().visuals, true))
+            egui::Panel::bottom(self.pane_widget_id("status_footer")).frame(
+                egui::Frame::NONE
+                    .fill(super::chrome::header_fill(
+                        &ctx.global_style().visuals,
+                        true,
+                    ))
                     .stroke(egui::Stroke::new(
                         1.0_f32,
                         if dark {
@@ -1081,9 +1074,8 @@ impl App {
                             egui::Color32::from_rgb(211, 220, 232)
                         },
                     ))
-                    .inner_margin(egui::Margin::symmetric(10.0, 3.0)),
+                    .inner_margin(egui::Margin::symmetric(10, 3)),
             ),
-            ctx,
             parent,
             |ui| {
                 ui.style_mut().interaction.selectable_labels = false;
@@ -1191,7 +1183,7 @@ impl App {
                         .clicked()
                     {
                         self.show_error_win = Some(self.connections[active].id);
-                        ui.close_menu();
+                        ui.close();
                     }
                 }
             }
@@ -1216,7 +1208,7 @@ impl App {
                         if ui
                             .add_enabled(
                                 conn.state != ConnState::Closed,
-                                egui::SelectableLabel::new(
+                                egui::Button::selectable(
                                     selected == Some(conn.id),
                                     short_label(conn.display_label()),
                                 ),
@@ -1720,6 +1712,7 @@ fn windows_com_name(value: &str) -> Option<&str> {
 mod tests {
     use super::{macro_tooltip, port_choice_text};
     use crate::app::tests::{inert_handle, test_app};
+    use crate::test_ui::ContextTestExt as _;
     use egui::{Event, Key};
     use serialcore::config::TransmitMacro;
     use serialcore::store::PortId;
@@ -1733,7 +1726,7 @@ mod tests {
             ctx.set_visuals(crate::panes::chrome::app_visuals(dark));
             for width in [700.0, 1100.0] {
                 let mut header = egui::Rect::NOTHING;
-                let output = ctx.run(
+                let output = ctx.run_test_ui(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
@@ -1741,15 +1734,16 @@ mod tests {
                         )),
                         ..Default::default()
                     },
-                    |ctx| {
-                        app.show_header(ctx);
+                    |ui| {
+                        let ctx = &ui.ctx().clone();
+                        app.show_header(ui);
                         header = crate::panes::chrome::HeaderBackdrop::current(
                             ctx,
                             app.pane_widget_id("header_backdrop"),
                         )
                         .unwrap()
                         .rect;
-                        app.show_toolbar(ctx);
+                        app.show_toolbar(ui);
                     },
                 );
                 let tab = output
@@ -1757,10 +1751,10 @@ mod tests {
                     .iter()
                     .find_map(|shape| match &shape.shape {
                         egui::Shape::Rect(rect)
-                            if rect.rounding.nw == 8.0
+                            if rect.corner_radius.nw == 8
                                 && rect.fill
                                     == crate::panes::chrome::toolbar_fill(
-                                        &ctx.style().visuals,
+                                        &ctx.global_style().visuals,
                                         app.config.settings.header_opacity,
                                     ) =>
                         {
@@ -1772,7 +1766,7 @@ mod tests {
                 for shape in &output.shapes {
                     if let egui::Shape::Rect(rect) = &shape.shape {
                         if rect.rect == tab
-                            || (rect.rounding.nw == 7.0 && rect.rect.height() == 32.0)
+                            || (rect.corner_radius.nw == 7 && rect.rect.height() == 32.0)
                         {
                             assert!(
                                 shape.clip_rect.contains_rect(rect.rect),
@@ -1797,7 +1791,7 @@ mod tests {
         app.merged_tabs[0].name = "Wide tab ".repeat(100);
         let ctx = egui::Context::default();
         let mut render = || {
-            ctx.run(
+            ctx.run_test_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -1805,7 +1799,7 @@ mod tests {
                     )),
                     ..Default::default()
                 },
-                |ctx| app.show_header(ctx),
+                |ui| app.show_header(ui),
             )
         };
         render();
@@ -1814,7 +1808,7 @@ mod tests {
             .shapes
             .iter()
             .find_map(|shape| match &shape.shape {
-                egui::Shape::Rect(rect) if rect.rounding.nw == 8.0 => Some(rect.rect),
+                egui::Shape::Rect(rect) if rect.corner_radius.nw == 8 => Some(rect.rect),
                 _ => None,
             })
             .unwrap();
@@ -1856,7 +1850,7 @@ mod tests {
         let (mut app, _enum_tx) = test_app("dialog-accelerators");
         let ctx = egui::Context::default();
         for key in [Key::F1, Key::F2] {
-            let _ = ctx.run(
+            let _ = ctx.run_test_ui(
                 egui::RawInput {
                     events: vec![Event::Key {
                         key,
@@ -1867,7 +1861,8 @@ mod tests {
                     }],
                     ..Default::default()
                 },
-                |ctx| {
+                |ui| {
+                    let ctx = &ui.ctx().clone();
                     app.consume_app_shortcuts(ctx);
                     assert_eq!(app.show_about, key == Key::F1);
                     assert_eq!(app.show_settings, key == Key::F2);
@@ -1890,7 +1885,7 @@ mod tests {
             let ctx = egui::Context::default();
             let mut clicked = false;
             let mut render = |events| {
-                ctx.run(
+                ctx.run_test_ui(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
@@ -1899,8 +1894,9 @@ mod tests {
                         events,
                         ..Default::default()
                     },
-                    |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
+                    |ui| {
+                        let ctx = &ui.ctx().clone();
+                        egui::CentralPanel::default().show(ui, |ui| {
                             clicked |= ui.button("Background action").clicked();
                         });
                         app.show_settings_window(ctx);
@@ -1935,7 +1931,7 @@ mod tests {
             egui::Modifiers::CTRL,
             egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
         ] {
-            let _ = ctx.run(
+            let _ = ctx.run_test_ui(
                 egui::RawInput {
                     events: vec![Event::Key {
                         key: Key::M,
@@ -1946,7 +1942,8 @@ mod tests {
                     }],
                     ..Default::default()
                 },
-                |ctx| {
+                |ui| {
+                    let ctx = &ui.ctx().clone();
                     ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("text-field")));
                     app.consume_app_shortcuts(ctx);
                     let is_accelerator = modifiers.shift;
@@ -1962,7 +1959,7 @@ mod tests {
         let (mut app, _enum_tx) = test_app("new-merged-menu");
         let ctx = egui::Context::default();
         let frame = |app: &mut crate::app::App, events| {
-            ctx.run(
+            ctx.run_test_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -1971,8 +1968,9 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ctx| {
-                    app.show_header(ctx);
+                |ui| {
+                    let ctx = &ui.ctx().clone();
+                    app.show_header(ui);
                     app.show_merged_dialog(ctx);
                     app.show_tab_close_confirmation(ctx);
                 },
@@ -2110,7 +2108,7 @@ mod tests {
         app.request_close_connection(0);
         let ctx = egui::Context::default();
         let frame = |app: &mut crate::app::App, events| {
-            ctx.run(
+            ctx.run_test_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -2119,7 +2117,7 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ctx| app.show_header(ctx),
+                |ui| app.show_header(ui),
             )
         };
         let output = frame(&mut app, vec![]);
@@ -2152,7 +2150,7 @@ mod tests {
         };
         click(&mut app, egui::PointerButton::Secondary);
         assert!(
-            !ctx.is_context_menu_open(),
+            !egui::Popup::is_any_open(&ctx),
             "port options must stay inaccessible"
         );
         click(&mut app, egui::PointerButton::Middle);
@@ -2206,7 +2204,7 @@ mod tests {
         app.active = 1;
         let ctx = egui::Context::default();
         let mut frame = |events| {
-            ctx.run(
+            ctx.run_test_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -2215,7 +2213,7 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ctx| app.show_header(ctx),
+                |ui| app.show_header(ui),
             )
         };
         frame(vec![]);
@@ -2349,7 +2347,7 @@ mod tests {
             "left from the first tab wraps to Merged"
         );
         assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
 
         let ctx = egui::Context::default();
         app.merged_selected = false;
@@ -2362,7 +2360,7 @@ mod tests {
         assert_eq!(app.active, 1, "right selects the next connection tab");
         assert!(!app.merged_selected);
         assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
 
         let ctx = egui::Context::default();
         app.active = 0;
@@ -2374,7 +2372,7 @@ mod tests {
         assert_eq!(app.active, 1, "Ctrl+Shift+Tab selects the next tab");
         assert!(!app.merged_selected);
         assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
     }
 
     #[test]

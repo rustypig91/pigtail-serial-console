@@ -17,7 +17,7 @@ impl App {
                 ui.set_width(420.0);
                 super::chrome::dialog_style(ui);
                 super::chrome::modal_header(ui, "Settings", &mut open);
-                let max_height = (ctx.screen_rect().height() - 120.0).max(180.0);
+                let max_height = (ctx.content_rect().height() - 120.0).max(180.0);
                 egui::ScrollArea::vertical()
                     .id_salt("settings_scroll")
                     .max_height(max_height)
@@ -25,7 +25,7 @@ impl App {
                     .show(ui, |ui| {
                         settings_section(ui, "Appearance", "Customize the console and application theme.", |ui| {
                         if reset_setting(ui, "Theme", "Choose a light or dark appearance for the application and console. Each theme keeps its own base color.", &mut self.config.settings.theme, defaults.theme.clone()) {
-                            ctx.set_visuals(super::chrome::settings_visuals(&self.config.settings));
+                            super::chrome::apply_settings_visuals(ctx, &self.config.settings);
                             changed = true;
                         }
                         let mut dark = self.config.settings.theme != "light";
@@ -37,7 +37,7 @@ impl App {
                         if theme_changed {
                             self.config.settings.theme =
                                 if dark { "dark".into() } else { "light".into() };
-                            ctx.set_visuals(super::chrome::settings_visuals(&self.config.settings));
+                            super::chrome::apply_settings_visuals(ctx, &self.config.settings);
                             changed = true;
                         }
                         ui.end_row();
@@ -57,7 +57,7 @@ impl App {
                             changed
                         }).inner;
                         if color_changed || color_reset {
-                            ctx.set_visuals(super::chrome::settings_visuals(&self.config.settings));
+                            super::chrome::apply_settings_visuals(ctx, &self.config.settings);
                             changed = true;
                         }
                         ui.end_row();
@@ -205,7 +205,7 @@ impl App {
                             .clicked()
                         {
                             self.reset_all_settings();
-                            ctx.set_visuals(super::chrome::settings_visuals(&self.config.settings));
+                            super::chrome::apply_settings_visuals(ctx, &self.config.settings);
                             history_limit_changed = true;
                             history_limit_dragged = false;
                             vt_limit_editing = false;
@@ -432,10 +432,10 @@ fn settings_section(
     description: &str,
     contents: impl FnOnce(&mut egui::Ui),
 ) {
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(ui.visuals().faint_bg_color)
         .stroke(ui.visuals().window_stroke)
-        .rounding(8.0)
+        .corner_radius(8.0)
         .inner_margin(12.0)
         .show(ui, |ui| {
             ui.set_min_width((ui.available_width() - 1.0).max(0.0));

@@ -4,21 +4,30 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use eframe::egui_wgpu::{SurfaceErrorAction, WgpuConfiguration};
-use eframe::wgpu::SurfaceError;
+use eframe::wgpu::CurrentSurfaceTexture;
 
 pub fn configuration(context: Arc<OnceLock<egui::Context>>) -> WgpuConfiguration {
-    let on_surface_error = Arc::new(move |error| {
-        tracing::warn!(%error, "rendering surface error");
+    let on_surface_status = Arc::new(move |status: &CurrentSurfaceTexture| {
+        if matches!(
+            status,
+            CurrentSurfaceTexture::Occluded | CurrentSurfaceTexture::Success(_)
+        ) {
+            return SurfaceErrorAction::SkipFrame;
+        }
+        tracing::warn!(?status, "rendering surface status");
         // Recovery skips this frame. An idle terminal otherwise has no reason
         // to repaint, so schedule a retry even without serial output or input.
-        if error != SurfaceError::OutOfMemory {
+        if !matches!(status, CurrentSurfaceTexture::Validation) {
             if let Some(context) = context.get() {
                 context.request_repaint_after(Duration::from_millis(100));
             }
         }
-        match error {
-            SurfaceError::Lost | SurfaceError::Outdated => SurfaceErrorAction::RecreateSurface,
-            SurfaceError::Timeout | SurfaceError::OutOfMemory => SurfaceErrorAction::SkipFrame,
+        match status {
+            CurrentSurfaceTexture::Lost => SurfaceErrorAction::RecreateSurface,
+            CurrentSurfaceTexture::Outdated | CurrentSurfaceTexture::Suboptimal(_) => {
+                SurfaceErrorAction::Reconfigure
+            }
+            _ => SurfaceErrorAction::SkipFrame,
         }
     });
     WgpuConfiguration {
@@ -27,8 +36,11 @@ pub fn configuration(context: Arc<OnceLock<egui::Context>>) -> WgpuConfiguration
         // on surfaces that only support FIFO. Forcing Mailbox would instead
         // fail startup on adapters without support for it.
         #[cfg(target_os = "linux")]
-        present_mode: eframe::wgpu::PresentMode::AutoNoVsync,
-        on_surface_error,
+        surface: eframe::egui_wgpu::SurfaceConfig {
+            present_mode: eframe::wgpu::PresentMode::AutoNoVsync,
+            ..eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY
+        },
+        on_surface_status,
         ..Default::default()
     }
 }
@@ -36,6 +48,7 @@ pub fn configuration(context: Arc<OnceLock<egui::Context>>) -> WgpuConfiguration
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_ui::ContextTestExt as _;
     use std::sync::Mutex;
 
     #[test]
@@ -51,16 +64,16 @@ mod tests {
         let configuration = configuration(shared);
 
         for error in [
-            SurfaceError::Lost,
-            SurfaceError::Outdated,
-            SurfaceError::Timeout,
+            CurrentSurfaceTexture::Lost,
+            CurrentSurfaceTexture::Outdated,
+            CurrentSurfaceTexture::Timeout,
         ] {
             // Consume startup repaint requests, then leave the UI idle.
             for _ in 0..3 {
-                let _ = context.run(Default::default(), |_| {});
+                let _ = context.run_test_ui(Default::default(), |_| {});
             }
             requests.lock().unwrap().clear();
-            (configuration.on_surface_error)(error);
+            (configuration.on_surface_status)(&error);
             let requests = requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
             // egui subtracts its predicted frame time from the requested delay.
@@ -68,9 +81,9 @@ mod tests {
             assert!(requests[0] <= Duration::from_millis(100));
         }
 
-        let _ = context.run(Default::default(), |_| {});
+        let _ = context.run_test_ui(Default::default(), |_| {});
         requests.lock().unwrap().clear();
-        (configuration.on_surface_error)(SurfaceError::OutOfMemory);
+        (configuration.on_surface_status)(&CurrentSurfaceTexture::Validation);
         assert!(requests.lock().unwrap().is_empty());
     }
 }

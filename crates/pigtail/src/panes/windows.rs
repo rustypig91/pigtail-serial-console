@@ -88,14 +88,49 @@ impl App {
         {
             return; // Modal dialogs handle Escape themselves.
         }
-        if ctx.is_context_menu_open() || !ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if egui::Popup::is_any_open(ctx) || !ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             return;
         }
+        let open_windows = [
+            ("Settings", self.show_settings),
+            ("About", self.show_about),
+            ("Keyboard shortcuts", self.show_keyboard_shortcuts),
+            ("Filters", self.show_filters_win),
+            ("Highlight rules", self.show_highlight_win),
+            ("Plot extraction", self.show_extract_win),
+            ("Transmit macros", self.show_macros_win),
+            ("Close tab?", self.tab_close_confirmation.is_some()),
+            ("error_window", self.show_error_win.is_some()),
+            (
+                "Remove expired session captures?",
+                self.retention_cleanup_confirmation.is_some(),
+            ),
+            (
+                "Macro is running",
+                self.macro_running_edit_confirmation.is_some(),
+            ),
+            ("Edit macro", self.macro_editor.is_some()),
+            ("Add macro", self.macro_editor.is_some()),
+            (
+                "Shortcut already used",
+                self.macro_shortcut_conflict.is_some(),
+            ),
+            ("Port options", self.config_dialog.is_some()),
+            ("New connection", self.config_dialog.is_some()),
+            ("Rename tab", self.rename_dialog.is_some()),
+            ("Send file", self.file_transfer_dialog.is_some()),
+            (
+                "file_transfer_progress",
+                self.connections
+                    .iter()
+                    .any(|conn| conn.transfer_progress.is_some()),
+            ),
+        ];
+        let matches_window =
+            |id: egui::Id, name: &str| id == egui::Id::new(name) || id == egui::Id::new(Some(name));
         let top = ctx.memory(|m| {
             // Let dropdowns and context menus handle Escape first.
-            if m.any_popup_open() {
-                return None;
-            }
+
             // The layer order retains closed windows; only consider visible
             // top-level windows when selecting the next Escape target.
             m.layer_ids()
@@ -103,11 +138,22 @@ impl App {
                     layer.order == egui::Order::Middle
                         && m.areas().is_visible(layer)
                         && m.areas().parent_layer(*layer).is_none()
+                        && (open_windows
+                            .iter()
+                            .any(|(name, open)| *open && matches_window(layer.id, name))
+                            || self
+                                .connect_errors
+                                .front()
+                                .is_some_and(|error| matches_window(layer.id, error.title))
+                            || self
+                                .update_dialog
+                                .as_ref()
+                                .is_some_and(|dialog| matches_window(layer.id, &dialog.title)))
                 })
                 .last()
         });
         let Some(top) = top else { return };
-        let is_window = |name: &str| top.id == egui::Id::new(name);
+        let is_window = |name: &str| matches_window(top.id, name);
         let mut closed = false;
         for (name, open) in [
             ("Settings", &mut self.show_settings),
@@ -639,6 +685,7 @@ fn show_filter_controls(
 #[cfg(test)]
 mod tests {
     use crate::app::tests::test_app;
+    use crate::test_ui::ContextTestExt as _;
 
     #[test]
     fn escape_closes_modal_over_focused_search_without_closing_search() {
@@ -663,15 +710,16 @@ mod tests {
                 app.search_focus_request = true;
                 let ctx = egui::Context::default();
                 let frame = |app: &mut crate::app::App, events| {
-                    ctx.run(
+                    ctx.run_test_ui(
                         egui::RawInput {
                             events,
                             ..Default::default()
                         },
-                        |ctx| {
+                        |ui| {
+                            let ctx = &ui.ctx().clone();
                             app.consume_app_shortcuts(ctx);
                             app.close_window_on_escape(ctx);
-                            app.show_workspace(ctx, false);
+                            app.show_workspace(ui, false);
                             app.show_settings_window(ctx);
                             app.show_about_window(ctx);
                         },
@@ -719,10 +767,11 @@ mod tests {
         ));
         app.tab_close_confirmation = Some((crate::app::TabId::Connection(id), true));
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        let _ = ctx.run_test_ui(egui::RawInput::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             app.show_tab_close_confirmation(ctx);
         });
-        let _ = ctx.run(
+        let _ = ctx.run_test_ui(
             egui::RawInput {
                 events: vec![egui::Event::Key {
                     key: egui::Key::Escape,
@@ -733,7 +782,8 @@ mod tests {
                 }],
                 ..Default::default()
             },
-            |ctx| {
+            |ui| {
+                let ctx = &ui.ctx().clone();
                 app.close_window_on_escape(ctx);
                 app.show_tab_close_confirmation(ctx);
                 assert!(!ctx.input(|input| input.key_pressed(egui::Key::Escape)));
@@ -750,7 +800,8 @@ mod tests {
         let ctx = egui::Context::default();
         app.show_settings = true;
         app.show_filters_win = true;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        let _ = ctx.run_test_ui(egui::RawInput::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             app.show_tool_windows(ctx);
             app.show_settings_window(ctx);
         });
@@ -764,7 +815,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        let _ = ctx.run(input.clone(), |ctx| {
+        let _ = ctx.run_test_ui(input.clone(), |ui| {
+            let ctx = &ui.ctx().clone();
             app.close_window_on_escape(ctx);
             app.show_settings_window(ctx);
             assert!(!app.show_settings);
@@ -772,18 +824,21 @@ mod tests {
             assert!(!ctx.input(|i| i.key_pressed(egui::Key::Escape)));
             app.show_tool_windows(ctx);
         });
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        let _ = ctx.run_test_ui(egui::RawInput::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             app.show_tool_windows(ctx);
         });
-        ctx.memory_mut(|m| m.open_popup(egui::Id::new("dropdown")));
-        let _ = ctx.run(input.clone(), |ctx| {
+        egui::Popup::open_id(&ctx, egui::Id::new("dropdown"));
+        let _ = ctx.run_test_ui(input.clone(), |ui| {
+            let ctx = &ui.ctx().clone();
             app.close_window_on_escape(ctx);
             assert!(app.show_filters_win);
             assert!(ctx.input(|i| i.key_pressed(egui::Key::Escape)));
             app.show_tool_windows(ctx);
         });
-        ctx.memory_mut(|m| m.close_popup());
-        let _ = ctx.run(input, |ctx| {
+        egui::Popup::close_all(&ctx);
+        let _ = ctx.run_test_ui(input, |ui| {
+            let ctx = &ui.ctx().clone();
             app.close_window_on_escape(ctx);
             assert!(!app.show_filters_win);
             assert!(!ctx.input(|i| i.key_pressed(egui::Key::Escape)));

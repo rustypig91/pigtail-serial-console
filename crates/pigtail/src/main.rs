@@ -9,6 +9,8 @@ mod graphics;
 mod panes;
 mod paths;
 mod terminal;
+#[cfg(test)]
+mod test_ui;
 mod wrap;
 
 use anyhow::Context;

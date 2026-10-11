@@ -22,14 +22,8 @@ impl App {
         if self.floating_window_open() {
             return;
         }
-        let Some(path) = dropped.path else {
-            self.record_connect_error(
-                "Couldn't open dropped file",
-                "This build can only send files that have a local filesystem path.".to_owned(),
-            );
-            return;
-        };
-        self.open_file_transfer(path, "Couldn't open dropped file");
+        let path = dropped.path();
+        self.open_file_transfer(path.to_owned(), "Couldn't open dropped file");
     }
 
     /// Open a native file picker for desktop sessions where the window backend
@@ -52,7 +46,7 @@ impl App {
         let Some(path) = rfd::FileDialog::new().pick_file() else {
             return;
         };
-        self.open_file_transfer(path, "Couldn't open selected file");
+        self.open_file_transfer(path.to_owned(), "Couldn't open selected file");
     }
 
     fn open_file_transfer(&mut self, path: PathBuf, error_title: &'static str) {
@@ -104,12 +98,13 @@ impl App {
             egui::Order::Foreground,
             egui::Id::new("file_drop_overlay"),
         ));
-        let rect = ctx.screen_rect().shrink(28.0);
+        let rect = ctx.content_rect().shrink(28.0);
         painter.rect_filled(rect, 8.0, egui::Color32::from_black_alpha(190));
         painter.rect_stroke(
             rect,
             8.0,
             egui::Stroke::new(2.0_f32, egui::Color32::LIGHT_BLUE),
+            egui::StrokeKind::Middle,
         );
         painter.text(
             rect.center(),

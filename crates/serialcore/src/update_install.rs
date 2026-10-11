@@ -149,7 +149,12 @@ fn copy_verified(
     if downloaded != asset.size {
         return Err("The download was incomplete. Please try again.".into());
     }
-    if format!("{:x}", hash.finalize()) != asset.digest {
+    let digest: String = hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if digest != asset.digest {
         return Err("The update checksum did not match. Please try again.".into());
     }
     Ok(())
@@ -573,7 +578,7 @@ function Remove-Item { param($LiteralPath, [switch]$Recurse, [switch]$Force, $Er
         Asset {
             url: String::new(),
             size: 3,
-            digest: format!("{:x}", Sha256::digest(b"abc")),
+            digest: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
         }
     }
 

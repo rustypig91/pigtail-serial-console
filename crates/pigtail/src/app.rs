@@ -1840,11 +1840,10 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: AppPaths, config: Config) -> App {
         cc.egui_ctx.set_fonts(app_font_definitions());
         cc.egui_ctx
-            .style_mut(|style| style.spacing.menu_margin = egui::Margin::same(8.0));
+            .global_style_mut(|style| style.spacing.menu_margin = egui::Margin::same(8));
 
         // Theme from settings.
-        cc.egui_ctx
-            .set_visuals(crate::panes::settings_visuals(&config.settings));
+        crate::panes::apply_settings_visuals(&cc.egui_ctx, &config.settings);
 
         // The wake every background thread gets: an idle UI schedules no frames
         // of its own, so a repaint request is the only thing that brings it back.
@@ -3691,7 +3690,8 @@ pub fn parse_hex_color(s: &str) -> Option<egui::Color32> {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &ui.ctx().clone();
         self.poll_enumerator();
         self.poll_update_check();
         self.poll_update_install(ctx);
@@ -3745,7 +3745,7 @@ impl eframe::App for App {
         // event can activate that control before `show_console` gives Tab back
         // to the device.
         let console_tab_claimed = self.claim_console_tab_before_layout(ctx);
-        self.show_workspace(ctx, console_tab_claimed);
+        self.show_workspace(ui, console_tab_claimed);
         self.show_file_drop_overlay(ctx);
 
         // Floating windows.
@@ -3808,6 +3808,7 @@ impl eframe::App for App {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::test_ui::ContextTestExt as _;
     use serialcore::session::SessionWriter;
 
     fn scratch(name: &str) -> PathBuf {
@@ -4378,11 +4379,11 @@ pub(crate) mod tests {
         let ctx = egui::Context::default();
         ctx.set_fonts(fonts);
         ctx.begin_pass(Default::default());
-        assert!(ctx.fonts(|fonts| {
+        assert!(ctx.fonts_mut(|fonts| {
             let ui_font = egui::FontId::proportional(12.0);
             fonts.has_glyph(&ui_font, '↑') && fonts.has_glyph(&ui_font, '↓')
         }));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
     }
 
     /// Like `test_app`, but seeded with a config the test provides.

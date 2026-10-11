@@ -129,11 +129,11 @@ pub(super) fn device_tab(
     };
     ui.painter().rect_filled(
         rect,
-        egui::Rounding {
-            nw: 8.0,
-            ne: 8.0,
-            sw: 0.0,
-            se: 0.0,
+        egui::CornerRadius {
+            nw: 8,
+            ne: 8,
+            sw: 0,
+            se: 0,
         },
         fill,
     );
@@ -216,10 +216,15 @@ pub(super) fn window_controls(ui: &mut Ui) -> [Response; 3] {
                         Rect::from_center_size(c + Vec2::new(1.5, -1.5), Vec2::splat(9.0)),
                         0.0,
                         stroke,
+                        egui::StrokeKind::Middle,
                     );
                 }
-                ui.painter()
-                    .rect_stroke(Rect::from_center_size(c, Vec2::splat(10.0)), 0.0, stroke);
+                ui.painter().rect_stroke(
+                    Rect::from_center_size(c, Vec2::splat(10.0)),
+                    0.0,
+                    stroke,
+                    egui::StrokeKind::Middle,
+                );
             }
             _ => {
                 ui.painter()
@@ -240,7 +245,7 @@ pub(super) fn drag_window(ui: &mut Ui) {
     );
     let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
     let press_id = response.id.with("last_window_press");
-    let options = ui.ctx().options(|options| options.input_options.clone());
+    let options = ui.ctx().options(|options| options.input_options);
     let (time, pos) = ui.input(|input| (input.time, input.pointer.interact_pos()));
     // Native dragging can consume the release event. Detect the second press
     // ourselves, before starting another native drag, so double-click works
@@ -292,7 +297,7 @@ impl App {
         }) {
             return;
         }
-        let rect = ctx.screen_rect();
+        let rect = ctx.content_rect();
         let edge = 8.0;
         let corner = 20.0;
         use egui::ResizeDirection::*;
@@ -428,8 +433,13 @@ pub(super) enum SearchControl {
 pub(super) fn search_control(ui: &mut Ui, control: SearchControl) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(28.0, 28.0), Sense::click());
     let visuals = ui.style().interact(&response);
-    ui.painter()
-        .rect(rect, 5.0, visuals.bg_fill, visuals.bg_stroke);
+    ui.painter().rect(
+        rect,
+        5.0,
+        visuals.bg_fill,
+        visuals.bg_stroke,
+        egui::StrokeKind::Middle,
+    );
     let center = rect.center();
     let point = |x, y| center + Vec2::new(x, y);
     let stroke = Stroke::new(1.4_f32, visuals.fg_stroke.color);
@@ -565,6 +575,7 @@ pub(super) fn action_button(
                         1.0_f32,
                         ui.visuals().selection.stroke.color.gamma_multiply(strength),
                     ),
+                    egui::StrokeKind::Middle,
                 );
                 ui.ctx().request_repaint();
             } else {
@@ -591,6 +602,7 @@ pub(super) fn action_button(
                 Rect::from_min_max(c + Vec2::new(-4.0, -4.0), c + Vec2::new(4.0, 6.0)),
                 1.0,
                 stroke,
+                egui::StrokeKind::Middle,
             );
             ui.painter().line_segment(
                 [c + Vec2::new(-2.0, -7.0), c + Vec2::new(2.0, -7.0)],
@@ -630,7 +642,8 @@ pub(super) fn paint_action_frame(ui: &Ui, response: &Response, selected: bool) {
     } else {
         Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color)
     };
-    ui.painter().rect(rect, 5.0, fill, border);
+    ui.painter()
+        .rect(rect, 5.0, fill, border, egui::StrokeKind::Middle);
 }
 
 pub(super) fn paint_export(ui: &Ui, rect: Rect) {
@@ -707,6 +720,16 @@ fn visual_base_color(visuals: &egui::Visuals) -> serialcore::config::BaseColor {
     }
 }
 
+pub(crate) fn apply_settings_visuals(ctx: &egui::Context, settings: &serialcore::config::Settings) {
+    let visuals = settings_visuals(settings);
+    ctx.set_theme(if visuals.dark_mode {
+        egui::Theme::Dark
+    } else {
+        egui::Theme::Light
+    });
+    ctx.set_visuals(visuals);
+}
+
 pub(crate) fn settings_visuals(settings: &serialcore::config::Settings) -> egui::Visuals {
     let dark = settings.theme != "light";
     palette_visuals(
@@ -725,7 +748,7 @@ pub(crate) fn palette_visuals(dark: bool, base: serialcore::config::BaseColor) -
     } else {
         egui::Visuals::light()
     };
-    visuals.menu_rounding = egui::Rounding::same(8.0);
+    visuals.menu_corner_radius = egui::CornerRadius::same(8);
     visuals.selection.bg_fill = if dark {
         Color32::from_rgb(29, 68, 104)
     } else {
@@ -782,7 +805,7 @@ pub(crate) fn palette_visuals(dark: bool, base: serialcore::config::BaseColor) -
         widgets.bg_fill = palette_color(widgets.bg_fill, base);
         widgets.weak_bg_fill = palette_color(widgets.weak_bg_fill, base);
         widgets.bg_stroke.color = palette_color(widgets.bg_stroke.color, base);
-        widgets.rounding = egui::Rounding::same(5.0);
+        widgets.corner_radius = egui::CornerRadius::same(5);
     }
     visuals
 }
@@ -834,6 +857,7 @@ pub(super) fn view_selector(
         7.0,
         surface(ui, false),
         Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        egui::StrokeKind::Middle,
     );
     let mut left = track.left() + 3.0;
     let mut responses = Vec::new();
@@ -875,6 +899,7 @@ pub(super) fn view_selector(
         5.0,
         ui.visuals().selection.bg_fill,
         ui.visuals().selection.stroke,
+        egui::StrokeKind::Middle,
     );
     for (index, (response, (icon, label, tooltip))) in responses.into_iter().zip(modes).enumerate()
     {
@@ -929,8 +954,12 @@ fn paint_view_content(ui: &Ui, rect: Rect, icon: ViewIcon, label: &str, color: C
             ui.painter().line_segment([points[1], points[5]], pen);
         }
         ViewIcon::Terminal => {
-            ui.painter()
-                .rect_stroke(Rect::from_center_size(c, Vec2::new(15.0, 12.0)), 2.0, pen);
+            ui.painter().rect_stroke(
+                Rect::from_center_size(c, Vec2::new(15.0, 12.0)),
+                2.0,
+                pen,
+                egui::StrokeKind::Middle,
+            );
             ui.painter().add(egui::Shape::line(
                 vec![
                     c + Vec2::new(-4.5, -2.5),
@@ -1009,9 +1038,9 @@ pub(super) fn menu_item(ui: &mut Ui, label: &str, shortcut: &str) -> Response {
 }
 
 pub(super) fn dialog_frame(ctx: &egui::Context) -> egui::Frame {
-    egui::Frame::window(&ctx.style())
+    egui::Frame::window(&ctx.global_style())
         .inner_margin(20.0)
-        .rounding(10.0)
+        .corner_radius(10.0)
 }
 
 pub(super) fn dialog_style(ui: &mut Ui) {
@@ -1044,6 +1073,7 @@ pub(super) fn modal_header(ui: &mut Ui, title: &str, open: &mut bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_ui::ContextTestExt as _;
 
     #[test]
     fn clear_button_click_pulses_then_fades_and_can_restart() {
@@ -1051,20 +1081,21 @@ mod tests {
         ctx.set_visuals(app_visuals(true));
         let render = |time, events| {
             let mut response = None;
-            let output = ctx.run(
+            let output = ctx.run_test_ui(
                 egui::RawInput {
                     time: Some(time),
                     events,
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |ui| {
+                    let _ctx = &ui.ctx().clone();
+                    egui::CentralPanel::default().show(ui, |ui| {
                         response =
                             Some(action_button(ui, ActionIcon::Clear, false, "Clear console"));
                     });
                 },
             );
-            let pulse_color = ctx.style().visuals.selection.bg_fill;
+            let pulse_color = ctx.global_style().visuals.selection.bg_fill;
             let pulse_alpha = output
                 .shapes
                 .iter()
@@ -1072,7 +1103,13 @@ mod tests {
                     egui::Shape::Rect(rect)
                         if rect.fill != Color32::TRANSPARENT
                             && rect.stroke.color
-                                != ctx.style().visuals.widgets.noninteractive.bg_stroke.color
+                                != ctx
+                                    .global_style()
+                                    .visuals
+                                    .widgets
+                                    .noninteractive
+                                    .bg_stroke
+                                    .color
                             && rect.rect == response.as_ref().unwrap().rect =>
                     {
                         Some(rect.fill.a())
@@ -1115,15 +1152,16 @@ mod tests {
         let id = egui::Id::new("test_view_selector");
         let render = |time, selected, events| {
             let mut clicked = None;
-            let output = ctx.run(
+            let output = ctx.run_test_ui(
                 egui::RawInput {
                     time: Some(time),
                     events,
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(500.0, 200.0))),
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |ui| {
+                    let _ctx = &ui.ctx().clone();
+                    egui::CentralPanel::default().show(ui, |ui| {
                         clicked = view_selector(ui, id, selected, false);
                     });
                 },
@@ -1133,7 +1171,7 @@ mod tests {
                 .iter()
                 .find_map(|shape| match &shape.shape {
                     egui::Shape::Rect(rect)
-                        if rect.fill == ctx.style().visuals.selection.bg_fill =>
+                        if rect.fill == ctx.global_style().visuals.selection.bg_fill =>
                     {
                         Some(rect.rect)
                     }
@@ -1186,8 +1224,9 @@ mod tests {
                         .get_mut(&egui::ViewportId::ROOT)
                         .unwrap()
                         .maximized = Some(maximized);
-                    ctx.run(input, |ctx| {
-                        app.show_header(ctx);
+                    ctx.run_test_ui(input, |ui| {
+                        let _ctx = &ui.ctx().clone();
+                        app.show_header(ui);
                     })
                 };
                 render(0.0, vec![]);
@@ -1222,7 +1261,7 @@ mod tests {
         for (press, motion, expected) in [(edge, content, true), (content, edge, false)] {
             let (app, _tx) = crate::app::tests::test_app("resize-batched-motion");
             let ctx = egui::Context::default();
-            let output = ctx.run(
+            let output = ctx.run_test_ui(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 400.0))),
                     events: vec![
@@ -1256,7 +1295,7 @@ mod tests {
         let (app, _tx) = crate::app::tests::test_app("resize-current-bounds");
         let ctx = egui::Context::default();
         let render = |size, events| {
-            ctx.run(
+            ctx.run_test_ui(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
                     events,
@@ -1306,14 +1345,15 @@ mod tests {
             let (mut app, _tx) = crate::app::tests::test_app("window-resize");
             let ctx = egui::Context::default();
             let mut render = |events| {
-                ctx.run(
+                ctx.run_test_ui(
                     egui::RawInput {
                         screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 400.0))),
                         events,
                         ..Default::default()
                     },
-                    |ctx| {
-                        app.show_workspace(ctx, false);
+                    |ui| {
+                        let ctx = &ui.ctx().clone();
+                        app.show_workspace(ui, false);
                         app.show_window_resize(ctx);
                     },
                 )
@@ -1355,7 +1395,7 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.set_visuals(app_visuals(true));
         let mut render = |size, pos: Option<Pos2>| {
-            ctx.run(
+            ctx.run_test_ui(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
                     events: pos.map_or_else(
@@ -1364,8 +1404,9 @@ mod tests {
                     ),
                     ..Default::default()
                 },
-                |ctx| {
-                    app.show_workspace(ctx, false);
+                |ui| {
+                    let ctx = &ui.ctx().clone();
+                    app.show_workspace(ui, false);
                     // Simulate a content widget choosing its cursor first.
                     ctx.set_cursor_icon(egui::CursorIcon::Text);
                     app.show_window_resize(ctx);
@@ -1421,7 +1462,7 @@ mod tests {
                 let viewport = input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
                 viewport.maximized = Some(maximized);
                 viewport.fullscreen = Some(fullscreen);
-                ctx.run(input, |ctx| app.show_window_resize(ctx))
+                ctx.run_test_ui(input, |ctx| app.show_window_resize(ctx))
             };
             render(vec![]);
             let output = render(vec![
@@ -1448,13 +1489,14 @@ mod tests {
     fn window_drag_starts_on_primary_press_without_waiting_for_motion() {
         let ctx = egui::Context::default();
         let render = |events| {
-            ctx.run(
+            ctx.run_test_ui(
                 egui::RawInput {
                     events,
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::TopBottomPanel::top("drag_header").show(ctx, drag_window);
+                |ui| {
+                    let _ctx = &ui.ctx().clone();
+                    egui::Panel::top("drag_header").show(ui, drag_window);
                 },
             )
         };
@@ -1499,8 +1541,9 @@ mod tests {
                     .get_mut(&egui::ViewportId::ROOT)
                     .unwrap()
                     .maximized = Some(maximized);
-                let output = ctx.run(input, |ctx| {
-                    egui::TopBottomPanel::top("controls").show(ctx, |ui| {
+                let output = ctx.run_test_ui(input, |ui| {
+                    let _ctx = &ui.ctx().clone();
+                    egui::Panel::top("controls").show(ui, |ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let responses = window_controls(ui);
                             rectangles = responses.map(|response| response.rect);

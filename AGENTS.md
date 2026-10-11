@@ -198,6 +198,21 @@ digest; older releases without these assets cannot be installed automatically.
 
 ### Rendering and diagnostics
 
+Dependencies were checked against the registry and updated to current stable versions
+on 2026-10-11. The GUI uses eframe/egui 0.36.2, egui_plot 0.37.0 and wgpu 30.0.1.
+This includes the upstream fix for DX12 diagnostic hooks being initialized when
+DX12 is disabled, which caused AMD Vulkan presentation to flood Windows logs.
+Automatic backend selection and environment overrides remain available.
+The migration uses parent-UI panels, output hooks for clipboard selection capture,
+and fractional font advances for console wrapping. Headless UI tests explicitly
+discard texture uploads because they have no GPU consumer.
+The Windows migration passed workspace tests, Clippy, formatting and the demo
+feature check. A captured demo frame confirmed the saved dark theme, console and
+plot layout; an automatic-backend run no longer emitted the repeated AMD DXGI
+resource-state diagnostics. This machine still logs a missing Rockstar Social
+Club Vulkan layer manifest registered by another application. Linux runtime and
+Windows sleep/resume validation remain necessary on the affected hardware.
+
 The application uses eframe's wgpu renderer with standard wgpu backend and adapter
 selection, including its `WGPU_BACKEND` and `WGPU_POWER_PREF` environment overrides.
 The direct wgpu dependency enables its standard backend features (eframe disables
@@ -212,10 +227,10 @@ retain the default presentation mode. This does not change backend selection.
 The affected machine must still validate the fix with repeated sleep/wake cycles,
 including idle and active serial connections, minimized windows, and monitor changes.
 
-Lost/outdated rendering surfaces are reconfigured, and a repaint is scheduled
+Lost rendering surfaces are recreated; outdated/suboptimal surfaces are reconfigured, and a repaint is scheduled
 after 100 ms; timeouts also retry, including when the terminal is otherwise idle.
 This handles recoverable presentation errors, not full GPU device loss or native
-driver crashes. Out-of-memory surface errors are logged without scheduling retries.
+driver crashes. Occluded windows skip frames quietly. Surface validation failures are logged without scheduling retries.
 
 Normal builds write tracing diagnostics (including returned eframe errors) to
 `app.log` alongside `crash.log`. The latest launch replaces `app.log`, preserving

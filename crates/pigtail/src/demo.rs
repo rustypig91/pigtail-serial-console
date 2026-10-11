@@ -184,6 +184,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_ui::ContextTestExt as _;
 
     #[test]
     fn demo_hex_view_renders_sample_bytes_for_both_devices() {
@@ -202,8 +203,9 @@ mod tests {
             app.connections[active].hex_view = true;
             app.connections[active].follow = false;
             let ctx = egui::Context::default();
-            let output = ctx.run(egui::RawInput::default(), |ctx| {
-                app.show_console(ctx, false);
+            let output = ctx.run_test_ui(egui::RawInput::default(), |ui| {
+                let ctx = &ui.ctx().clone();
+                app.show_console(ui, false);
             });
             assert!(
                 output.shapes.iter().any(|shape| {
@@ -231,7 +233,7 @@ mod tests {
         std::fs::write(&file, "sample data").unwrap();
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(
+        let _ = ctx.run_test_ui(
             egui::RawInput {
                 dropped_files: vec![egui::DroppedFile {
                     path: Some(file),

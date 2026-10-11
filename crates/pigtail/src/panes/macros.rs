@@ -38,8 +38,8 @@ impl App {
     /// Reserve an assigned Ctrl+Shift+digit chord before raw console input.
     pub(crate) fn consume_macro_shortcut(&mut self, ctx: &egui::Context) {
         if self.floating_window_open()
-            || ctx.is_context_menu_open()
-            || ctx.memory(|memory| memory.any_popup_open() || memory.focused().is_some())
+            || egui::Popup::is_any_open(ctx)
+            || ctx.memory(|memory| memory.focused().is_some())
             || self.macro_target_port().is_none()
         {
             return;
@@ -891,10 +891,7 @@ fn show_macro_steps(ui: &mut egui::Ui, editor: &mut MacroEditor) {
                         MacroStep::WaitFor { .. } => "Wait for",
                     };
                     if ui
-                        .add_sized(
-                            [72.0, row_height],
-                            egui::SelectableLabel::new(selected, kind),
-                        )
+                        .add_sized([72.0, row_height], egui::Button::selectable(selected, kind))
                         .clicked()
                     {
                         editor.step_selection = Some(step_index);
@@ -1190,6 +1187,7 @@ fn transfer_macro_shortcut(macros: &mut [TransmitMacro], target: usize, digit: u
 mod tests {
     use super::*;
     use crate::app::tests::{inert_handle, test_app};
+    use crate::test_ui::ContextTestExt as _;
     use serialcore::config::{LineEnding, PortConfig};
 
     fn app_with_macro(delay_ms: u64) -> App {
@@ -1801,7 +1799,7 @@ mod tests {
             let mut app = app_with_macro(100);
             app.config.macros[0].shortcut = Some(0);
             let ctx = egui::Context::default();
-            let _ = ctx.run(
+            let _ = ctx.run_test_ui(
                 egui::RawInput {
                     events: vec![egui::Event::Key {
                         key,
@@ -1817,7 +1815,8 @@ mod tests {
                     }],
                     ..Default::default()
                 },
-                |ctx| {
+                |ui| {
+                    let ctx = &ui.ctx().clone();
                     app.consume_macro_shortcut(ctx);
                     assert!(ctx.input(|input| input.events.is_empty()));
                 },
@@ -1846,7 +1845,7 @@ mod tests {
 
         assert_eq!(app.macro_runs.len(), 1);
         assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
     }
 
     #[test]
@@ -1873,7 +1872,7 @@ mod tests {
 
         assert_eq!(app.macro_runs.len(), 1);
         assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
     }
 
     #[test]
@@ -1911,7 +1910,7 @@ mod tests {
             [Some(0), Some(1)]
         );
         assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
     }
 
     #[test]
@@ -1932,7 +1931,7 @@ mod tests {
         app.consume_macro_shortcut(&ctx);
         assert_eq!(app.macro_runs.len(), 1);
         app.stop_macro(0);
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
 
         // egui determines repeat state from the key-down state retained
         // across passes, regardless of the repeat value supplied in RawInput.
@@ -1945,7 +1944,7 @@ mod tests {
 
         assert!(app.macro_runs.is_empty());
         assert!(ctx.input(|input| input.events.is_empty()));
-        let _ = ctx.end_pass();
+        let _ = ctx.end_test_pass();
     }
 
     #[test]
