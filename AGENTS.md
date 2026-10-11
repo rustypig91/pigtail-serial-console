@@ -42,6 +42,7 @@ For Rust changes, choose checks appropriate to the affected code:
 ```sh
 cargo fmt --all -- --check
 cargo test --workspace --locked
+cargo test --workspace --all-features --locked
 cargo clippy --workspace --all-targets --locked
 cargo check -p pigtail --features demo --locked
 ```
@@ -198,6 +199,13 @@ digest; older releases without these assets cannot be installed automatically.
 
 ### Rendering and diagnostics
 
+The [wgpu migration review](docs/wgpu-migration-review.md) records comparative
+CPU timings, native software and Intel Vulkan checks, memory overhead, and
+remaining hardware validation. CI runs workspace tests with all features so
+demo-only API migrations are checked too. Headless test frames supply finite
+window bounds. Repeated application animation/selection-scroll redraw requests
+are paced independently of vsync, while reader wakes remain immediate.
+
 Dependencies were checked against the registry and updated to current stable versions
 on 2026-10-11. The GUI uses eframe/egui 0.36.2, egui_plot 0.37.0 and wgpu 30.0.1.
 This includes the upstream fix for DX12 diagnostic hooks being initialized when
@@ -227,8 +235,10 @@ retain the default presentation mode. This does not change backend selection.
 The affected machine must still validate the fix with repeated sleep/wake cycles,
 including idle and active serial connections, minimized windows, and monitor changes.
 
-Lost rendering surfaces are recreated; outdated/suboptimal surfaces are reconfigured, and a repaint is scheduled
-after 100 ms; timeouts also retry, including when the terminal is otherwise idle.
+Lost rendering surfaces are recreated; outdated/suboptimal surfaces are reconfigured.
+eframe requests the recovery frame for lost/outdated surfaces and renders suboptimal
+frames before reconfiguring. The status callback also requests a delayed repaint;
+in particular, timeouts retry after at most 100 ms even when the terminal is idle.
 This handles recoverable presentation errors, not full GPU device loss or native
 driver crashes. Occluded windows skip frames quietly. Surface validation failures are logged without scheduling retries.
 

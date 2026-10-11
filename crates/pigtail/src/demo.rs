@@ -186,6 +186,19 @@ mod tests {
     use super::*;
     use crate::test_ui::ContextTestExt as _;
 
+    #[derive(Debug)]
+    struct DroppedTestFile(std::path::PathBuf);
+
+    impl egui::DroppedFile for DroppedTestFile {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            std::fs::read(&self.0).map_err(|error| error.to_string())
+        }
+    }
+
     #[test]
     fn demo_hex_view_renders_sample_bytes_for_both_devices() {
         let dir = tempfile::tempdir().unwrap();
@@ -204,7 +217,6 @@ mod tests {
             app.connections[active].follow = false;
             let ctx = egui::Context::default();
             let output = ctx.run_test_ui(egui::RawInput::default(), |ui| {
-                let ctx = &ui.ctx().clone();
                 app.show_console(ui, false);
             });
             assert!(
@@ -235,10 +247,7 @@ mod tests {
         let ctx = egui::Context::default();
         let _ = ctx.run_test_ui(
             egui::RawInput {
-                dropped_files: vec![egui::DroppedFile {
-                    path: Some(file),
-                    ..Default::default()
-                }],
+                dropped_files: vec![std::sync::Arc::new(DroppedTestFile(file))],
                 ..Default::default()
             },
             |ctx| app.poll_file_drop(ctx),
@@ -282,7 +291,7 @@ mod tests {
             .iter()
             .any(|s| s.rgb != serialcore::store::ColorSpan::NO_COLOR));
         assert!(conn.raw_ring.contains(&0x1b));
-        assert!(!app.connections[0].drain_events(1_000_000));
+        assert!(!app.connections[0].drain_events(1_000_000, RECEIVE_FRAME_BUDGET));
         assert_eq!(app.connections[0].state, ConnState::Connected);
 
         app.save_session();
@@ -309,7 +318,7 @@ mod tests {
 
         assert_eq!(app.connections[0].state, ConnState::Connected);
         assert_eq!(app.connections[0].raw_ring, raw);
-        assert!(!app.connections[0].drain_events(1_000_000));
+        assert!(!app.connections[0].drain_events(1_000_000, RECEIVE_FRAME_BUDGET));
         assert!(!app.connect_errors.is_empty());
         let identity = app.connections[0].identity.clone();
         assert!(matches!(

@@ -6654,3 +6654,63 @@ pub(crate) mod tests {
         assert_eq!(app.merged_new_since_scroll, 0);
     }
 }
+
+#[cfg(all(test, feature = "demo"))]
+mod render_diagnostic {
+    use super::*;
+    use crate::test_ui::ContextTestExt as _;
+    #[test]
+    #[ignore = "manual rendering performance diagnostic"]
+    fn render_load_diagnostic() {
+        for mode in ["log", "hex", "ansi", "plot", "large-log"] {
+            let (mut app, _tx) = tests::test_app(&format!("render-{mode}"));
+            app.seed_demo().unwrap();
+            app.connections[0].show_plot = mode == "plot";
+            app.connections[0].hex_view = mode == "hex";
+            app.connections[0].screen_view = mode == "ansi";
+            if mode == "large-log" {
+                let conn = &mut app.connections[0];
+                for i in 0..100_000 {
+                    conn.store.append(IncomingLine {
+                        text: format!(
+                            "sample {i}: {}",
+                            "temperature=24.84 humidity=46.25 ".repeat(4)
+                        ),
+                        ts: app.clock.now(),
+                        port: conn.id,
+                        flags: LineFlags::default(),
+                        spans: Default::default(),
+                        cursor: None,
+                    });
+                }
+            }
+            let ctx = egui::Context::default();
+            ctx.set_fonts(app_font_definitions());
+            let mut samples = Vec::new();
+            for i in 0..1050 {
+                let started = Instant::now();
+                let output = ctx.run_test_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1280.0, 900.0),
+                        )),
+                        time: Some(i as f64 / 60.0),
+                        ..Default::default()
+                    },
+                    |ui| app.show_workspace(ui, false),
+                );
+                let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+                std::hint::black_box(primitives);
+                if i >= 50 {
+                    samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "{mode}: median {:.3} ms; p95 {:.3} ms",
+                samples[500], samples[950]
+            );
+        }
+    }
+}

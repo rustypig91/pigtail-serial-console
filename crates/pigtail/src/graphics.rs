@@ -6,6 +6,17 @@ use std::time::Duration;
 use eframe::egui_wgpu::{SurfaceErrorAction, WgpuConfiguration};
 use eframe::wgpu::CurrentSurfaceTexture;
 
+/// Pace our animations without relying on the surface's presentation mode.
+/// Input and reader wakes can still request an earlier frame.
+pub fn request_animation_frame(context: &egui::Context) {
+    // egui subtracts predicted_dt from delayed repaint requests. Compensate
+    // so a 16 ms animation interval does not become an immediate busy loop.
+    let predicted = context.input(|input| input.predicted_dt);
+    context.request_repaint_after(
+        Duration::from_millis(16) + Duration::try_from_secs_f32(predicted).unwrap_or_default(),
+    );
+}
+
 pub fn configuration(context: Arc<OnceLock<egui::Context>>) -> WgpuConfiguration {
     let on_surface_status = Arc::new(move |status: &CurrentSurfaceTexture| {
         if matches!(
@@ -50,6 +61,28 @@ mod tests {
     use super::*;
     use crate::test_ui::ContextTestExt as _;
     use std::sync::Mutex;
+
+    #[test]
+    fn animation_repaints_are_delayed_but_do_not_postpone_input() {
+        let context = egui::Context::default();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        context.set_request_repaint_callback(move |request| {
+            captured.lock().unwrap().push(request.delay);
+        });
+        for _ in 0..3 {
+            let _ = context.run_test_ui(Default::default(), |_| {});
+        }
+        requests.lock().unwrap().clear();
+        request_animation_frame(&context);
+        assert_eq!(*requests.lock().unwrap(), [Duration::from_millis(16)]);
+        context.request_repaint();
+        request_animation_frame(&context);
+        assert_eq!(
+            *requests.lock().unwrap(),
+            [Duration::from_millis(16), Duration::ZERO]
+        );
+    }
 
     #[test]
     fn surface_recovery_wakes_an_idle_ui_without_serial_events() {

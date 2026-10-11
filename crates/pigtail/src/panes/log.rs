@@ -640,7 +640,7 @@ impl App {
             });
         // An idle console schedules no frames of its own, so the fade has to ask
         // for them — including the one that clears the readout.
-        ctx.request_repaint();
+        crate::graphics::request_animation_frame(ctx);
     }
 
     /// Apply console commands before layout and raw serial input.
@@ -2534,7 +2534,7 @@ fn selection_scroll_offset(
     let offset =
         (state.offset.y + speed * dt).clamp(0.0, (content_height - viewport.height()).max(0.0));
     if offset != state.offset.y {
-        ui.ctx().request_repaint();
+        crate::graphics::request_animation_frame(ui.ctx());
     }
     Some(offset)
 }

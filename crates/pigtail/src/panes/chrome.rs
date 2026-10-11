@@ -577,7 +577,7 @@ pub(super) fn action_button(
                     ),
                     egui::StrokeKind::Middle,
                 );
-                ui.ctx().request_repaint();
+                crate::graphics::request_animation_frame(ui.ctx());
             } else {
                 ui.ctx().data_mut(|data| data.remove::<f64>(pulse_id));
             }
