@@ -123,8 +123,13 @@ application.
 - Drop files onto a console, or use **Send file…**, to send raw bytes, paced text lines, or hex-decoded data
 - Named transmit macros with reorderable command, delay, and regex wait steps,
   finite or indefinite looping, and assignable Ctrl+Shift+0 through Ctrl+Shift+9 shortcuts
-- Global send delay in Settings (milliseconds between outgoing bytes, default 0),
-  applied to typing, paste, macros, and file transfers
+- Per-connection **Send delay** in Port options (milliseconds between outgoing bytes,
+  default 0), applied to typing, paste, macros, and file transfers. The delay is saved
+  with each connection and port preset. The obsolete global delay setting is ignored
+  on load and removed on the next save; it is not migrated. Malformed global
+  settings and port-option values fall back individually to defaults, preserving
+  valid neighboring options. Unknown keys are omitted on save. Invalid TOML syntax
+  still fails configuration loading.
 - DTR/RTS toggles and break signal
 - Export the current (filtered) view to `.txt` or `.csv`
 - Startup notice when a newer release is published, with "skip this version" and

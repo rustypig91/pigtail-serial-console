@@ -194,7 +194,7 @@ impl App {
             }
             conn.handle.transmit_paced(
                 out,
-                std::time::Duration::from_millis(self.config.settings.send_delay_ms),
+                std::time::Duration::from_millis(conn.port_config.send_delay_ms),
             );
         }
         for line in echo_lines {
@@ -353,6 +353,40 @@ mod tests {
             .filter(|l| l.meta.flags.contains(LineFlags::TX_ECHO))
             .map(|l| l.text.to_string())
             .collect()
+    }
+
+    #[test]
+    fn typing_and_paste_use_only_the_target_connections_delay() {
+        let (mut app, _tx) = test_app("per-port-send-delay");
+        for (index, delay) in [20, 0].into_iter().enumerate() {
+            let id = PortId(index as u32);
+            let mut conn = app.make_connection(
+                id,
+                format!("device {index}"),
+                Default::default(),
+                PortConfig {
+                    send_delay_ms: delay,
+                    ..Default::default()
+                },
+                inert_handle(id),
+            );
+            conn.set_state(ConnState::Connected);
+            app.connections.push(conn);
+        }
+        let ctx = egui::Context::default();
+        for (index, event) in [
+            (0, Event::Text("typed".into())),
+            (1, Event::Paste("pasted".into())),
+        ] {
+            ctx.begin_pass(egui::RawInput {
+                events: vec![event],
+                ..Default::default()
+            });
+            assert!(app.console_key_input(&ctx, index));
+            let _ = ctx.end_test_pass();
+        }
+        assert!(app.connections[0].handle.has_used_pacing());
+        assert!(!app.connections[1].handle.has_used_pacing());
     }
 
     #[test]

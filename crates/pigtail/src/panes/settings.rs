@@ -107,20 +107,6 @@ impl App {
                             .changed();
                         ui.end_row();
 
-                        changed |= reset_setting(ui, "Send delay", "Set a minimum delay between outgoing bytes for typing, paste, macros, and file transfers. Use 0 for no delay; this can help slower devices keep up.", &mut self.config.settings.send_delay_ms, defaults.send_delay_ms);
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut self.config.settings.send_delay_ms)
-                                    .range(0..=60_000)
-                                    .suffix(" ms"),
-                            )
-                            .on_hover_text(
-                                "Minimum delay between outgoing bytes for typing, paste, macros, \
-                                 and file transfers. 0 sends without a delay. UTF-8 characters \
-                                 may contain multiple bytes.",
-                            )
-                            .changed();
-                        ui.end_row();
                         });
                         ui.add_space(10.0);
                         settings_section(ui, "History", "Manage retained console history and session captures.", |ui| {
@@ -495,7 +481,6 @@ mod tests {
         let defaults = serialcore::config::Settings::default();
         app.config.settings.theme = "light".into();
         app.config.settings.dark_base_color = serialcore::config::BaseColor::Red;
-        app.config.settings.send_delay_ms = 123;
         app.config.settings.max_lines = 50_000;
         app.config.settings.check_updates = false;
         app.config.settings.skipped_version = Some("9.0.0".into());

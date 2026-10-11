@@ -796,7 +796,7 @@ impl App {
         let mut bytes = command.as_bytes().to_vec();
         bytes.extend_from_slice(conn.port_config.line_ending.bytes());
         if !bytes.is_empty() {
-            let delay = Duration::from_millis(self.config.settings.send_delay_ms);
+            let delay = Duration::from_millis(conn.port_config.send_delay_ms);
             if delay.is_zero() && !conn.handle.has_used_pacing() {
                 conn.handle.transmit(bytes);
             } else {
@@ -1234,11 +1234,36 @@ mod tests {
     }
 
     #[test]
+    fn macro_pacing_uses_the_target_connections_delay() {
+        let mut app = app_with_macro(0);
+        app.connections[0].port_config.send_delay_ms = 20;
+        let id = PortId(1);
+        let mut conn = app.make_connection(
+            id,
+            "other".into(),
+            Default::default(),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        conn.set_state(ConnState::Connected);
+        app.connections.push(conn);
+        // The selected connection is paced; targeting another one must use its
+        // own zero delay, including sends addressed through a merged view.
+        let mut pending = None;
+        assert!(app.send_macro_command(id, "fast", &mut pending));
+        assert!(pending.is_none());
+        assert!(!app.connections[1].handle.has_used_pacing());
+        assert!(app.send_macro_command(PortId(0), "slow", &mut pending));
+        assert!(pending.is_some());
+        assert!(app.connections[0].handle.has_used_pacing());
+    }
+
+    #[test]
     fn unpaced_macro_waits_for_queued_paced_output_before_starting_its_delay() {
         for file_transfer in [false, true] {
             let mut app = app_with_macro(100);
             // Output queued with the previous setting can still pace a macro
-            // after the user disables the global delay.
+            // after the user disables the connection's send delay.
             if file_transfer {
                 app.connections[0].handle.start_transfer_paced(
                     serialcore::transfer::PreparedTransfer {
@@ -1283,7 +1308,7 @@ mod tests {
     #[test]
     fn paced_command_finishes_before_starting_its_delay() {
         let mut app = app_with_macro(100);
-        app.config.settings.send_delay_ms = 20;
+        app.connections[0].port_config.send_delay_ms = 20;
         let ctx = egui::Context::default();
         let started = Instant::now();
         assert!(app.start_macro(0, started));
@@ -1312,7 +1337,7 @@ mod tests {
     fn paced_macro_wait_retains_early_responses_and_ignores_old_output() {
         for (early_response, delay_ms) in [(false, 0), (true, 0), (false, 100), (true, 100)] {
             let mut app = app_with_macro(100);
-            app.config.settings.send_delay_ms = 20;
+            app.connections[0].port_config.send_delay_ms = 20;
             app.config.macros[0].steps = vec![
                 MacroStep::Command {
                     text: "reboot".into(),
@@ -1361,7 +1386,7 @@ mod tests {
     #[test]
     fn disabling_pacing_does_not_reuse_the_previous_commands_receive_start() {
         let mut app = app_with_macro(0);
-        app.config.settings.send_delay_ms = 20;
+        app.connections[0].port_config.send_delay_ms = 20;
         app.config.macros[0].steps = vec![
             MacroStep::Command {
                 text: "first".into(),
@@ -1390,7 +1415,7 @@ mod tests {
         // The first command's reply arrives while it is still sending. The
         // next command uses the newly disabled pacing setting.
         app.connections[0].push_raw_bytes(b"READY");
-        app.config.settings.send_delay_ms = 0;
+        app.connections[0].port_config.send_delay_ms = 0;
         tx.send(started).unwrap();
         app.maintain_macro_runs_at(started, &ctx);
         assert_eq!(echoed(&app), ["first", "second"]);
@@ -1425,7 +1450,7 @@ mod tests {
     #[test]
     fn paced_macro_does_not_repeat_or_advance_after_a_failed_send() {
         let mut app = app_with_macro(0);
-        app.config.settings.send_delay_ms = 20;
+        app.connections[0].port_config.send_delay_ms = 20;
         app.config.macros[0].repeat_indefinitely = true;
         app.config.macros[0].steps = vec![MacroStep::Command {
             text: "first".into(),

@@ -1525,6 +1525,19 @@ fn connect_controls(ui: &mut egui::Ui, cfg: &mut PortConfig) {
                 });
             ui.end_row();
 
+            ui.label("Send delay");
+            ui.add(
+                egui::DragValue::new(&mut cfg.send_delay_ms)
+                    .range(0..=60_000)
+                    .suffix(" ms"),
+            )
+            .on_hover_text(
+                "Minimum delay between outgoing bytes on this connection for typing, paste, \
+                 macros, and file transfers. 0 sends without a delay. UTF-8 characters \
+                 may contain multiple bytes.",
+            );
+            ui.end_row();
+
             ui.label("Send ending");
             egui::ComboBox::from_id_salt("line_ending")
                 .selected_text(cfg.line_ending.label())
