@@ -329,10 +329,10 @@ the branch. All builds upload the packages and screenshot as
 artifacts on that workflow run, with a separate artifact for each platform.
 Only `v*` tag builds create a GitHub release, after both Linux and Windows
 builds succeed. APT publishing runs after the release succeeds.
-Pull requests also build when labeled `build` (both platforms), `build-linux`
-(Linux packages and screenshot), or `build-windows` (Windows packages).
-Adding a label starts a build; subsequent commits rebuild the selected platforms.
-PR builds upload artifacts to their workflow run.
+Every branch push and pull request builds both platforms, runs workspace tests
+with all features, and uploads packages and the Linux screenshot to the workflow
+run. Pull requests do not require build labels. A push to a branch with an open
+pull request triggers both the push and pull-request workflows.
 Rerunning a failed platform replaces its workflow artifacts while retaining
 successful platforms' artifacts from earlier attempts of the same run.
 
