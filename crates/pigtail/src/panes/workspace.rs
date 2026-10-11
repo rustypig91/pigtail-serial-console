@@ -1510,7 +1510,7 @@ mod tests {
                 app.workspace.focused = focused;
                 app.load_pane(focused);
                 // Exercise the actual exit hook, including a final unsaved resize.
-                eframe::App::on_exit(&mut app, None);
+                eframe::App::on_exit(&mut app);
                 let saved = serialcore::config::Config::from_toml(
                     &std::fs::read_to_string(&app.paths.config_file).unwrap(),
                 )
@@ -1560,7 +1560,7 @@ mod tests {
         ));
         assert!(app.config.split.is_some());
         app.apply_layout_action(LayoutAction::Join);
-        eframe::App::on_exit(&mut app, None);
+        eframe::App::on_exit(&mut app);
         let saved = serialcore::config::Config::from_toml(
             &std::fs::read_to_string(&app.paths.config_file).unwrap(),
         )

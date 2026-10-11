@@ -36,6 +36,13 @@ warning. Choose **More info → Run anyway**. Use either the setup installer or
 MSI; Windows treats them as separate products. Setup offers installation for
 just your user or for all users.
 
+On Linux, Vulkan support is recommended; `mesa-vulkan-drivers` supports Intel/AMD GPUs and software
+rendering, while NVIDIA GPUs use their vendor's Vulkan driver.
+
+For troubleshooting, Linux diagnostics are in `~/.local/share/pigtail/app.log`
+(or `$XDG_DATA_HOME/pigtail/app.log` when set); Windows diagnostics are in
+`%APPDATA%\pigtail\pigtail\data\app.log`.
+
 Ubuntu 22.04 or newer (amd64) can also install through the shared
 [Rusty APT repository](https://github.com/rustypig91/rusty-apt) once configured:
 

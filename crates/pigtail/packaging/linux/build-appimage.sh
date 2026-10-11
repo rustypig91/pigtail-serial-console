@@ -36,9 +36,9 @@ curl -sSfLo "$WORK/linuxdeploy-plugin-appimage" \
 chmod +x "$WORK/linuxdeploy" "$WORK/linuxdeploy-plugin-appimage"
 export PATH="$WORK:$PATH"
 
-# winit and glutin dlopen their X11/xkb libraries, so they do not show up in the
+# winit dlopens its X11/xkb libraries, so they do not show up in the
 # binary's ELF needed-list and linuxdeploy cannot discover them on its own.
-# GL/EGL are deliberately left out: those must come from the host's drivers.
+# Graphics loaders and GPU drivers come from the host, including Vulkan ICD files.
 ldconfig_bin=""
 for candidate in ldconfig /sbin/ldconfig /usr/sbin/ldconfig; do
     if command -v "$candidate" >/dev/null 2>&1; then

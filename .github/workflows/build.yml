@@ -88,7 +88,7 @@ jobs:
             libudev-dev \
             libx11-6 libxcursor1 libxi6 libxrandr2 \
             libxkbcommon0 libxkbcommon-x11-0 \
-            xvfb xauth xdotool imagemagick libgl1-mesa-dri libglx-mesa0
+            xvfb xauth xdotool imagemagick libvulkan1 mesa-vulkan-drivers
 
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
