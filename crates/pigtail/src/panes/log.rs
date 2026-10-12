@@ -2268,8 +2268,11 @@ impl App {
         ) {
             area = area.vertical_scroll_offset(offset);
         } else if let Some(row) = goto.and_then(|abs| hex_row_for_byte(&segments, abs)) {
+            // Clamp before painting, as in Log: egui clamps its stored offset
+            // only after layout, otherwise leaving a blank tail for one frame.
+            let max_offset = (rows as f32 * row_height - ui.available_height()).max(0.0);
             area = area.vertical_scroll_offset(
-                (row as f32 * row_height - ui.available_height() * 0.5).max(0.0),
+                (row as f32 * row_height - ui.available_height() * 0.5).clamp(0.0, max_offset),
             );
         } else if following {
             // Pin to the bottom; see the console's forced-offset pin. Hex rows are
@@ -6854,6 +6857,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn hex_search_navigation_clamps_before_painting_the_last_row() {
+        let (mut app, _tx) = test_app("hex-search-bottom");
+        let port = PortId(1);
+        let mut conn = app.make_connection(
+            port,
+            "probe".into(),
+            Default::default(),
+            Default::default(),
+            inert_handle(port),
+        );
+        conn.hex_view = true;
+        conn.follow = false;
+        conn.raw_sessions.push(RawSession {
+            start: 0,
+            label: None,
+        });
+        conn.push_raw_bytes(&vec![b'A'; 1600]);
+        conn.search_query = "A".into();
+        app.connections.push(conn);
+        app.maintain_search();
+        app.connections[0].hex_search.position = Some(98);
+        app.search_step(1);
+
+        let ctx = egui::Context::default();
+        let mut bottom = 0.0;
+        let mut row_height = 0.0;
+        let output = ctx.run_test_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 400.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    bottom = ui.available_rect_before_wrap().bottom();
+                    row_height = Metrics::new(
+                        ui,
+                        app.console_font(),
+                        TimestampFormat::None,
+                        false,
+                        0,
+                        false,
+                    )
+                    .row_height;
+                    app.show_hex_rows(ui, 0, &mut MenuAction::default());
+                });
+            },
+        );
+        let last_row_y = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text().starts_with("00000630") => {
+                    Some(text.pos.y)
+                }
+                _ => None,
+            })
+            .expect("last matching row is painted");
+        assert!(
+            last_row_y > bottom - 2.0 * row_height,
+            "navigation must not leave blank space below the last row: {last_row_y} vs {bottom}"
+        );
     }
 
     #[test]

@@ -128,7 +128,9 @@ application.
   and scrollbar match markers. Next/Previous and Enter/Shift+Enter navigate
   matching rows and scroll them into view, using Hex's own count and cursor.
   Partial rows are rechecked as bytes arrive or are evicted; session boundaries
-  prevent searches joining independent captures. Closing search removes Hex
+  prevent searches joining independent captures. Hex search navigation clamps
+  its scroll offset before painting, keeping matches near the end from briefly
+  leaving blank space below the last row. Closing search removes Hex
   highlighting. Raw data remains complete and all retained byte rows stay visible.
 - Custom window header with draggable device tabs, status dots, close buttons,
   and minimize/maximize/close controls. Drag empty header space to move the window,
