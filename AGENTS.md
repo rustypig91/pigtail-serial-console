@@ -101,6 +101,8 @@ application.
   Opening the history menu also records the current query. Empty queries and invalid
   regex are skipped; repeating a query with the same settings moves it to the top.
   Recall keys are consumed before text editing and never sent to the device.
+  The search field expands into available toolbar space, with room reserved
+  for its controls; long queries remain clipped without moving those controls.
 - Highlight rules (color/bold by pattern)
 - Multiple ports as persistent, user-named tabs, plus optional merged views that label
   and interleave selected connections by timestamp.

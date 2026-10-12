@@ -1308,7 +1308,7 @@ impl App {
                 &mut entry,
                 search_id,
                 &mut self.search_history,
-                (ui.available_width() - reserved).clamp(40.0, 320.0),
+                (ui.available_width() - reserved).max(40.0),
                 input_enabled,
                 target,
             );
@@ -1498,7 +1498,7 @@ impl App {
                 &mut entry,
                 search_id,
                 &mut self.search_history,
-                (ui.available_width() - reserved).clamp(40.0, 320.0),
+                (ui.available_width() - reserved).max(40.0),
                 input_enabled,
                 target,
             );
@@ -4134,7 +4134,8 @@ mod tests {
     #[test]
     fn long_search_text_keeps_controls_in_place() {
         for merged in [false, true] {
-            for width in [224.0, 400.0, 714.0] {
+            let mut wide_layout: Option<(f32, f32)> = None;
+            for width in [224.0, 400.0, 714.0, 1100.0] {
                 let (mut app, _tx) = crate::app::tests::test_app("long-search");
                 let id = serialcore::store::PortId(1);
                 app.connections.push(app.make_connection(
@@ -4183,6 +4184,16 @@ mod tests {
                     } else {
                         baseline = Some(layout);
                     }
+                }
+                if width >= 714.0 {
+                    let toggle = baseline.unwrap().1;
+                    if let Some((previous_width, previous_toggle)) = wide_layout {
+                        assert!(
+                            (toggle.x - previous_toggle - (width - previous_width)).abs() < 0.01,
+                            "the search field should absorb extra width, merged={merged}"
+                        );
+                    }
+                    wide_layout = Some((width, toggle.x));
                 }
             }
         }
