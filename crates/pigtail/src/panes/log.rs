@@ -94,7 +94,7 @@ fn search_query_field(
                 top: 6,
                 bottom: 6,
             })
-            .desired_width((width - 20.0).max(4.0)),
+            .desired_width(rect.width()),
     );
     let arrow_rect =
         egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + 24.0, rect.bottom()));
@@ -4129,6 +4129,48 @@ mod tests {
         assert_eq!(entry, expected);
         assert!(!egui::Popup::is_id_open(&ctx, id.with("history_menu")));
         assert!(ctx.memory(|memory| memory.has_focus(id)));
+    }
+
+    #[test]
+    fn search_controls_sit_directly_beside_the_textbox() {
+        let ctx = egui::Context::default();
+        let mut history = SearchHistory::default();
+        let id = egui::Id::new("search-controls-gap");
+        for width in [40.0, 300.0, 800.0] {
+            for query in ["short".to_owned(), "d".repeat(500)] {
+                let mut entry = SearchEntry::new(&query, false, false);
+                let _ = ctx.run_test_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1200.0, 400.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let field = search_query_field(
+                                ui,
+                                &mut entry,
+                                id,
+                                &mut history,
+                                width,
+                                true,
+                                id,
+                            );
+                            let control = ui.selectable_label(false, ".*");
+                            assert!(
+                                (control.rect.left() - field.rect.right() - 4.0).abs() < 0.01,
+                                "unexpected gap beside textbox: field={:?}, control={:?}",
+                                field.rect,
+                                control.rect
+                            );
+                        });
+                    },
+                );
+            }
+        }
     }
 
     #[test]

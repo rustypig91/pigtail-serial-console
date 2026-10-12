@@ -103,6 +103,8 @@ application.
   Recall keys are consumed before text editing and never sent to the device.
   The search field expands into available toolbar space, with room reserved
   for its controls; long queries remain clipped without moving those controls.
+  The textbox fills its allocated field width, leaving only the normal widget
+  spacing before the regex control.
 - Highlight rules (color/bold by pattern)
 - Multiple ports as persistent, user-named tabs, plus optional merged views that label
   and interleave selected connections by timestamp.
