@@ -8,6 +8,7 @@ mod app;
 mod graphics;
 mod panes;
 mod paths;
+mod search_history;
 mod terminal;
 #[cfg(test)]
 mod test_ui;

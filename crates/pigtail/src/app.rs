@@ -531,17 +531,18 @@ pub struct Connection {
     pub mark_micros: Option<i64>,
     /// Show the raw-byte hex view instead of decoded lines (spec §7.11).
     pub hex_view: bool,
+    pub(crate) hex_search: crate::panes::HexSearch,
     pub screen_view: bool,
     pub screen_search: crate::panes::ScreenSearch,
     pub terminal: crate::terminal::Terminal,
     pub vt_scrollback_rows: usize,
-    // Filtering (spec §7.8).
+    // Cached line-visibility predicate derived from the search controls.
     pub filter_rules: Vec<FilterRule>,
-    pub filter_combine: Combine,
     pub filter_index: FilterIndex,
     pub filter_dirty: bool,
-    pub filter_errors: Vec<(usize, String)>,
     // Search (spec §7.8).
+    pub search_filter: SearchFilter,
+    pub search_filter_suspended: bool,
     pub search_query: String,
     pub search_case_sensitive: bool,
     pub search_regex: bool,
@@ -588,6 +589,42 @@ pub struct Connection {
 fn normalized_tab_name(name: &str) -> Option<String> {
     let name = name.trim();
     (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// Search controls line visibility without changing capture or retained history.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchFilter {
+    #[default]
+    Highlight,
+    OnlyMatches,
+    HideMatches,
+}
+
+impl SearchFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Highlight => "Highlight",
+            Self::OnlyMatches => "Only matches",
+            Self::HideMatches => "Hide matches",
+        }
+    }
+
+    fn rules(self, query: &str, case_sensitive: bool, regex: bool) -> Vec<FilterRule> {
+        if self == Self::Highlight
+            || query.is_empty()
+            || search_pattern(query, case_sensitive, regex).is_err()
+        {
+            Vec::new()
+        } else {
+            vec![FilterRule {
+                pattern: query.into(),
+                is_regex: regex,
+                case_sensitive,
+                invert: self == Self::HideMatches,
+                enabled: true,
+            }]
+        }
+    }
 }
 
 impl Connection {
@@ -1002,13 +1039,15 @@ impl Connection {
             store,
             filter_index,
             filter_rules,
+            search_filter_suspended,
             filter_generation,
             wrap_index,
             ..
         } = self;
-        let filter_active = !filter_rules
-            .iter()
-            .all(|r| !r.enabled || r.pattern.is_empty());
+        let filter_active = !*search_filter_suspended
+            && !filter_rules
+                .iter()
+                .all(|r| !r.enabled || r.pattern.is_empty());
         let matching = filter_index.matching();
         let first_abs = store.first_abs_index();
         let entries = if filter_active {
@@ -1028,12 +1067,36 @@ impl Connection {
         });
     }
 
-    /// True if at least one filter rule is enabled and non-empty.
+    /// True when the cached search predicate restricts line visibility.
     pub fn filter_index_active(&self) -> bool {
-        !self
-            .filter_rules
-            .iter()
-            .all(|r| !r.enabled || r.pattern.is_empty())
+        !self.search_filter_suspended
+            && !self
+                .filter_rules
+                .iter()
+                .all(|r| !r.enabled || r.pattern.is_empty())
+    }
+
+    /// Maintain the search-derived visible-line index, including mutable tails.
+    pub(crate) fn maintain_search_filter(&mut self) {
+        let rules = self.search_filter.rules(
+            &self.search_query,
+            self.search_case_sensitive,
+            self.search_regex,
+        );
+        if self.filter_rules != rules {
+            self.filter_rules = rules;
+            self.filter_dirty = true;
+        }
+        let (set, _) = FilterSet::compile(&self.filter_rules, Combine::And);
+        if self.filter_dirty {
+            self.filter_dirty = false;
+            self.filter_index.rebuild(&self.store, &set);
+            // The displayed set just changed out from under the row index.
+            self.filter_generation += 1;
+        } else {
+            self.filter_index.prune_evicted(&self.store);
+            self.filter_index.extend(&self.store, &set);
+        }
     }
 
     /// Compile any changed extraction rules and, when they have changed,
@@ -1452,12 +1515,9 @@ struct MergedTabState {
     pub merged_upto: HashMap<PortId, u64>,
     /// Mutable source tails (absolute index, byte length), including while parked.
     pub merged_provisional: HashMap<PortId, (u64, u32)>,
-    /// Filter state owned by the loaded merged tab. A merged filter is kept
-    /// separate from every port's filter so its meaning does not depend on
-    /// whichever real tab happened to be active last.
+    /// Cached visibility predicate derived from the loaded merged tab's search.
+    /// It is independent of each connection's search and visibility mode.
     pub merged_filter_rules: Vec<FilterRule>,
-    pub merged_filter_combine: Combine,
-    pub merged_filter_errors: Vec<(usize, String)>,
     pub merged_filter_dirty: bool,
     /// Cached subset of `merged` that passes the merged filter. This is only
     /// consulted while a rule is active; the ordinary unfiltered path reads
@@ -1468,6 +1528,8 @@ struct MergedTabState {
     pub merged_filter_upto_seq: u64,
     /// Search state owned by the loaded merged tab. Matches keep the complete
     /// merged key so navigation can identify both the port and its line.
+    pub merged_search_filter: SearchFilter,
+    pub merged_search_filter_suspended: bool,
     pub merged_search_query: String,
     pub merged_search_case_sensitive: bool,
     pub merged_search_regex: bool,
@@ -1502,13 +1564,13 @@ impl Default for MergedTabState {
             merged_upto: HashMap::new(),
             merged_provisional: HashMap::new(),
             merged_filter_rules: Vec::new(),
-            merged_filter_combine: Combine::And,
-            merged_filter_errors: Vec::new(),
             merged_filter_dirty: true,
             merged_filtered: Vec::new(),
             merged_filter_generation: 0,
             merged_filter_source_generation: 0,
             merged_filter_upto_seq: 0,
+            merged_search_filter: SearchFilter::Highlight,
+            merged_search_filter_suspended: false,
             merged_search_query: String::new(),
             merged_search_case_sensitive: false,
             merged_search_regex: false,
@@ -1540,14 +1602,6 @@ impl MergedTabState {
             &mut app.merged_pruned_before,
         );
         std::mem::swap(&mut self.merged_filter_rules, &mut app.merged_filter_rules);
-        std::mem::swap(
-            &mut self.merged_filter_combine,
-            &mut app.merged_filter_combine,
-        );
-        std::mem::swap(
-            &mut self.merged_filter_errors,
-            &mut app.merged_filter_errors,
-        );
         std::mem::swap(&mut self.merged_filter_dirty, &mut app.merged_filter_dirty);
         std::mem::swap(&mut self.merged_filtered, &mut app.merged_filtered);
         std::mem::swap(
@@ -1561,6 +1615,14 @@ impl MergedTabState {
         std::mem::swap(
             &mut self.merged_filter_upto_seq,
             &mut app.merged_filter_upto_seq,
+        );
+        std::mem::swap(
+            &mut self.merged_search_filter,
+            &mut app.merged_search_filter,
+        );
+        std::mem::swap(
+            &mut self.merged_search_filter_suspended,
+            &mut app.merged_search_filter_suspended,
         );
         std::mem::swap(&mut self.merged_search_query, &mut app.merged_search_query);
         std::mem::swap(&mut self.merged_search_regex, &mut app.merged_search_regex);
@@ -1594,6 +1656,7 @@ impl MergedTabState {
 }
 
 pub struct App {
+    pub(crate) search_history: crate::search_history::SearchHistory,
     pub(crate) demo_mode: bool,
     pub clock: SessionClock,
     pub config: Config,
@@ -1644,12 +1707,9 @@ pub struct App {
     pub merged_upto: HashMap<PortId, u64>,
     /// Mutable source tails (absolute index, byte length) observed by this view.
     pub merged_provisional: HashMap<PortId, (u64, u32)>,
-    /// Filter state owned by the loaded merged tab. A merged filter is kept
-    /// separate from every port's filter so its meaning does not depend on
-    /// whichever real tab happened to be active last.
+    /// Cached visibility predicate derived from the loaded merged tab's search.
+    /// It is independent of each connection's search and visibility mode.
     pub merged_filter_rules: Vec<FilterRule>,
-    pub merged_filter_combine: Combine,
-    pub merged_filter_errors: Vec<(usize, String)>,
     pub merged_filter_dirty: bool,
     /// Cached subset of `merged` that passes the merged filter. This is only
     /// consulted while a rule is active; the ordinary unfiltered path reads
@@ -1660,6 +1720,8 @@ pub struct App {
     pub merged_filter_upto_seq: u64,
     /// Search state owned by the loaded merged tab. Matches keep the complete
     /// merged key so navigation can identify both the port and its line.
+    pub merged_search_filter: SearchFilter,
+    pub merged_search_filter_suspended: bool,
     pub merged_search_query: String,
     pub merged_search_case_sensitive: bool,
     pub merged_search_regex: bool,
@@ -1705,7 +1767,6 @@ pub struct App {
     /// Value being edited in Settings. It is kept separate from the saved
     /// configuration until the number box loses focus.
     pub(crate) session_retention_draft: Option<u32>,
-    pub show_filters_win: bool,
     pub show_highlight_win: bool,
     pub show_extract_win: bool,
     /// `Some(port_id)` while the popup showing that connection's `last_error`
@@ -1768,6 +1829,7 @@ impl App {
             selection_rows: None,
             active: 0,
             workspace: crate::panes::Workspace::default(),
+            search_history: Default::default(),
             next_port_id: 0,
             config_dialog: None,
             rename_dialog: None,
@@ -1783,13 +1845,13 @@ impl App {
             merged_upto: HashMap::new(),
             merged_provisional: HashMap::new(),
             merged_filter_rules: Vec::new(),
-            merged_filter_combine: Combine::And,
-            merged_filter_errors: Vec::new(),
             merged_filter_dirty: true,
             merged_filtered: Vec::new(),
             merged_filter_generation: 0,
             merged_filter_source_generation: 0,
             merged_filter_upto_seq: 0,
+            merged_search_filter: SearchFilter::Highlight,
+            merged_search_filter_suspended: false,
             merged_search_query: String::new(),
             merged_search_case_sensitive: false,
             merged_search_regex: false,
@@ -1819,7 +1881,6 @@ impl App {
             macro_shortcut_conflict: None,
             retention_cleanup_confirmation: None,
             session_retention_draft: None,
-            show_filters_win: false,
             show_highlight_win: false,
             show_extract_win: false,
             show_error_win: None,
@@ -2570,6 +2631,7 @@ impl App {
             transfer_progress: None,
             mark_micros: None,
             hex_view: false,
+            hex_search: Default::default(),
             screen_view: false,
             screen_search: Default::default(),
             terminal: crate::terminal::Terminal::new(
@@ -2586,10 +2648,10 @@ impl App {
                 .vt_scrollback_rows
                 .min(serialcore::config::MAX_VT_SCROLLBACK_ROWS),
             filter_rules: Vec::new(),
-            filter_combine: Combine::And,
             filter_index: FilterIndex::new(),
             filter_dirty: false,
-            filter_errors: Vec::new(),
+            search_filter: SearchFilter::Highlight,
+            search_filter_suspended: false,
             search_query: String::new(),
             search_case_sensitive: false,
             search_regex: false,
@@ -2909,18 +2971,47 @@ impl App {
     }
 
     /// Extend/rebuild each connection's filter index and prune evicted entries.
-    fn maintain_filters(&mut self) {
+    pub(crate) fn maintain_filters(&mut self) {
         for conn in &mut self.connections {
-            let (set, errors) = FilterSet::compile(&conn.filter_rules, conn.filter_combine);
-            conn.filter_errors = errors;
-            if conn.filter_dirty {
-                conn.filter_dirty = false;
-                conn.filter_index.rebuild(&conn.store, &set);
-                // The displayed set just changed out from under the row index.
-                conn.filter_generation += 1;
+            conn.maintain_search_filter();
+        }
+    }
+
+    /// Closing search suspends line filtering while retaining the query and mode.
+    pub(crate) fn set_search_visible(&mut self, visible: bool) {
+        if !visible && self.show_search {
+            let entry = if self.merged_selected {
+                Some(crate::search_history::SearchEntry::new(
+                    &self.merged_search_query,
+                    self.merged_search_regex,
+                    self.merged_search_case_sensitive,
+                ))
             } else {
-                conn.filter_index.prune_evicted(&conn.store);
-                conn.filter_index.extend(&conn.store, &set);
+                self.connections.get(self.active).map(|conn| {
+                    crate::search_history::SearchEntry::new(
+                        &conn.search_query,
+                        conn.search_regex,
+                        conn.search_case_sensitive,
+                    )
+                })
+            };
+            if let Some(entry) = entry {
+                self.search_history.remember(entry);
+            }
+        }
+        self.show_search = visible;
+        let suspended = !visible;
+        if self.merged_selected {
+            if self.merged_search_filter_suspended != suspended {
+                self.merged_search_filter_suspended = suspended;
+                self.merged_filter_dirty = true;
+                self.maintain_merged_filter(false);
+            }
+        } else if let Some(conn) = self.connections.get_mut(self.active) {
+            if conn.search_filter_suspended != suspended {
+                conn.search_filter_suspended = suspended;
+                conn.filter_generation += 1;
+                conn.maintain_search_filter();
             }
         }
     }
@@ -2930,6 +3021,10 @@ impl App {
         let Some(conn) = self.connections.get_mut(self.active) else {
             return;
         };
+        if conn.hex_view {
+            conn.maintain_hex_search();
+            return;
+        }
         if conn.search_query.is_empty() {
             conn.search_matches.clear();
             conn.search_pos = None;
@@ -3260,15 +3355,13 @@ impl App {
         }
     }
 
-    /// True when the loaded merged tab has at least one enabled, non-empty
-    /// filter rule. This deliberately follows `Connection::filter_index_active`:
-    /// even an invalid active rule keeps the filtered view selected while its
-    /// compile error is shown in the filter window.
+    /// True when the loaded merged search is restricting line visibility.
     pub(crate) fn merged_filter_active(&self) -> bool {
-        !self
-            .merged_filter_rules
-            .iter()
-            .all(|r| !r.enabled || r.pattern.is_empty())
+        !self.merged_search_filter_suspended
+            && !self
+                .merged_filter_rules
+                .iter()
+                .all(|r| !r.enabled || r.pattern.is_empty())
     }
 
     /// The entries currently displayed by the loaded merged tab.
@@ -3298,10 +3391,17 @@ impl App {
     /// for every paint. Filter edits and merged reorders rebuild it; ordinary
     /// output appends new matches and only re-tests each port's mutable newest
     /// line (the same provisional-line rule used by `FilterIndex`).
-    fn maintain_merged_filter(&mut self, any_data: bool) {
-        let (set, errors) =
-            FilterSet::compile(&self.merged_filter_rules, self.merged_filter_combine);
-        self.merged_filter_errors = errors;
+    pub(crate) fn maintain_merged_filter(&mut self, any_data: bool) {
+        let rules = self.merged_search_filter.rules(
+            &self.merged_search_query,
+            self.merged_search_case_sensitive,
+            self.merged_search_regex,
+        );
+        if self.merged_filter_rules != rules {
+            self.merged_filter_rules = rules;
+            self.merged_filter_dirty = true;
+        }
+        let (set, _) = FilterSet::compile(&self.merged_filter_rules, Combine::And);
 
         if !self.merged_filter_active() {
             if !self.merged_filtered.is_empty() {
@@ -3405,9 +3505,9 @@ impl App {
         self.merged_filter_upto_seq = self.merged_seq;
     }
 
-    /// Maintain search matches over exactly what the merged view displays.
+    /// Count matches over the complete merged history, including hidden lines.
     pub(crate) fn maintain_merged_search(&mut self, any_data: bool) {
-        let source_generation = self.merged_view_generation();
+        let source_generation = self.merged_generation;
         if self.merged_search_query.is_empty() {
             self.merged_search_matches.clear();
             self.merged_search_pos = None;
@@ -3430,7 +3530,8 @@ impl App {
         if self.merged_search_dirty || self.merged_search_source_generation != source_generation {
             self.merged_search_dirty = false;
             self.merged_search_matches = self
-                .merged_view()
+                .merged
+                .as_slice()
                 .iter()
                 .copied()
                 .filter(|entry| merged_entry_searches(&self.connections, *entry, &re))
@@ -3446,7 +3547,7 @@ impl App {
             .merged_search_pos
             .and_then(|pos| self.merged_search_matches.get(pos))
             .map(|entry| entry.seq);
-        let view = self.merged_view();
+        let view = self.merged.as_slice();
         if let Some(first) = view.first().map(|entry| entry.seq) {
             let keep = self
                 .merged_search_matches
@@ -3461,7 +3562,8 @@ impl App {
         if any_data {
             let old_upto = self.merged_search_upto_seq;
             let mut candidates: Vec<(MergedEntry, bool)> = self
-                .merged_view()
+                .merged
+                .as_slice()
                 .iter()
                 .copied()
                 .filter(|entry| entry.seq >= old_upto)
@@ -3475,7 +3577,8 @@ impl App {
                     continue;
                 };
                 let Some(entry) = self
-                    .merged_view()
+                    .merged
+                    .as_slice()
                     .iter()
                     .rev()
                     .find(|entry| entry.port == conn.id && entry.abs == abs)
@@ -3608,6 +3711,7 @@ impl App {
             conn.raw_ring.clear();
             conn.raw_contiguous_start = conn.raw_base;
             conn.raw_sessions.clear();
+            conn.hex_search = Default::default();
             // Everything derived from the lines that just went away. The dirty
             // flags make the next frame rebuild both indices against the now
             // empty store rather than leaving stale absolute indices behind.
@@ -3650,7 +3754,6 @@ impl App {
             || self.macro_shortcut_conflict.is_some()
             || self.retention_cleanup_confirmation.is_some()
             || self.tab_close_confirmation.is_some()
-            || self.show_filters_win
             || self.show_highlight_win
             || self.show_extract_win
             || self.show_error_win.is_some()
@@ -3668,7 +3771,9 @@ impl App {
     /// Jump to the next/previous search match.
     pub fn search_step(&mut self, dir: i64) {
         if self.merged_selected {
-            if self.merged_search_matches.is_empty() {
+            if self.merged_search_filter == SearchFilter::HideMatches
+                || self.merged_search_matches.is_empty()
+            {
                 return;
             }
             let len = self.merged_search_matches.len() as i64;
@@ -3691,7 +3796,15 @@ impl App {
             conn.screen_search.step(dir);
             return;
         }
-        if conn.search_matches.is_empty() {
+        if conn.hex_view {
+            conn.maintain_hex_search();
+            conn.hex_search.step(dir);
+            if conn.hex_search.scroll_to.is_some() {
+                conn.follow = false;
+            }
+            return;
+        }
+        if conn.search_filter == SearchFilter::HideMatches || conn.search_matches.is_empty() {
             return;
         }
         let len = conn.search_matches.len() as i64;
@@ -4724,7 +4837,7 @@ pub(crate) mod tests {
         app.merged_search_case_sensitive = true;
         app.merged_follow = false;
         app.merged_tx_port = Some(PortId(2));
-        app.merged_filter_combine = Combine::Or;
+        app.merged_search_filter = SearchFilter::OnlyMatches;
         app.create_merged_tab(vec![PortId(2), PortId(3)]);
         assert_eq!(app.merged_tabs.len(), 2);
         assert_eq!(
@@ -4740,7 +4853,10 @@ pub(crate) mod tests {
         assert!(app.merged_search_case_sensitive);
         assert!(!app.merged_follow);
         assert_eq!(app.merged_tx_port, Some(PortId(2)));
-        assert!(matches!(app.merged_filter_combine, Combine::Or));
+        assert!(matches!(
+            app.merged_search_filter,
+            SearchFilter::OnlyMatches
+        ));
         assert_eq!(app.merged_search_matches.len(), 2);
         app.clear_console(None);
         assert_eq!(app.connections[0].store.len(), 0);
@@ -5103,6 +5219,133 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn search_modes_filter_history_without_removing_data() {
+        let (mut app, _tx) = test_app("search-visibility");
+        add_merged_test_connection(
+            &mut app,
+            PortId(1),
+            "probe",
+            &[
+                ("keep [A", 1, LineFlags::default()),
+                ("drop", 2, LineFlags::default()),
+                ("keep [a", 3, LineFlags::default()),
+            ],
+        );
+        app.maintain_merged();
+        for (mode, query, case, regex, expected) in [
+            (SearchFilter::Highlight, "keep", false, false, vec![0, 1, 2]),
+            (SearchFilter::OnlyMatches, "[A", false, false, vec![0, 2]),
+            (SearchFilter::OnlyMatches, "[A", true, false, vec![0]),
+            (SearchFilter::HideMatches, "[A", true, false, vec![1, 2]),
+            (SearchFilter::HideMatches, "keep", false, false, vec![1]),
+            (SearchFilter::OnlyMatches, "^keep", false, true, vec![0, 2]),
+            (SearchFilter::OnlyMatches, "missing", false, false, vec![]),
+            (
+                SearchFilter::HideMatches,
+                "missing",
+                false,
+                false,
+                vec![0, 1, 2],
+            ),
+            (SearchFilter::OnlyMatches, "[", false, true, vec![0, 1, 2]),
+            (SearchFilter::HideMatches, "", false, false, vec![0, 1, 2]),
+        ] {
+            let conn = &mut app.connections[0];
+            conn.search_filter = mode;
+            conn.search_query = query.into();
+            conn.search_case_sensitive = case;
+            conn.search_regex = regex;
+            conn.search_dirty = true;
+            app.merged_search_filter = mode;
+            app.merged_search_query = query.into();
+            app.merged_search_case_sensitive = case;
+            app.merged_search_regex = regex;
+            app.merged_search_dirty = true;
+            app.maintain_filters();
+            app.maintain_search();
+            app.maintain_merged_filter(false);
+            app.maintain_merged_search(false);
+            let conn = &mut app.connections[0];
+            conn.sync_wrap(0);
+            let actual = if conn.filter_index_active() {
+                conn.filter_index.matching().to_vec()
+            } else {
+                (0..3).collect()
+            };
+            assert_eq!(actual, expected, "{mode:?}: {query}");
+            assert_eq!(conn.wrap_index.len(), expected.len());
+            assert_eq!(
+                app.merged_view()
+                    .iter()
+                    .map(|entry| entry.abs)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(app.connections[0].store.len(), 3);
+            assert_eq!(app.merged.len(), 3);
+            assert_eq!(
+                app.connections[0].search_matches.len(),
+                app.merged_search_matches.len()
+            );
+        }
+        app.connections[0].search_filter = SearchFilter::OnlyMatches;
+        app.connections[0].search_query = "keep".into();
+        app.merged_search_filter = SearchFilter::HideMatches;
+        app.merged_search_query = "keep".into();
+        app.maintain_filters();
+        app.maintain_merged_filter(false);
+        assert_eq!(app.connections[0].filter_index.matching(), &[0, 2]);
+        assert_eq!(
+            app.merged_view()
+                .iter()
+                .map(|entry| entry.abs)
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        app.merged_selected = true;
+        app.merged_scroll_to = None;
+        app.search_step(1);
+        assert!(
+            app.merged_scroll_to.is_none(),
+            "hidden matches cannot be navigated to"
+        );
+    }
+
+    #[test]
+    fn search_filter_retests_growing_lines_in_both_directions() {
+        for mode in [SearchFilter::OnlyMatches, SearchFilter::HideMatches] {
+            let (mut app, _tx) = test_app("search-filter-growing");
+            add_merged_test_connection(
+                &mut app,
+                PortId(1),
+                "probe",
+                &[("boot", 1, LineFlags::PROVISIONAL)],
+            );
+            app.maintain_merged();
+            app.connections[0].search_filter = mode;
+            app.connections[0].search_query = "ready".into();
+            app.merged_search_filter = mode;
+            app.merged_search_query = "ready".into();
+            for (text, matches) in [("boot", false), ("ready", true), ("waiting", false)] {
+                app.connections[0].store.append(IncomingLine {
+                    text: text.into(),
+                    ts: app.clock.now(),
+                    port: PortId(1),
+                    flags: LineFlags::PROVISIONAL | LineFlags::CONTINUATION,
+                    spans: Default::default(),
+                    cursor: None,
+                });
+                app.maintain_filters();
+                app.maintain_merged_filter(true);
+                let visible = matches ^ (mode == SearchFilter::HideMatches);
+                assert_eq!(app.connections[0].filter_index.len(), usize::from(visible));
+                assert_eq!(app.merged_view().len(), usize::from(visible));
+                assert_eq!(app.connections[0].store.len(), 1);
+            }
+        }
+    }
+
+    #[test]
     fn merged_filter_and_search_use_the_interleaved_view() {
         let (mut app, _enum_tx) = test_app("merged-filter-search");
         add_merged_test_connection(
@@ -5124,10 +5367,8 @@ pub(crate) mod tests {
             ],
         );
         app.maintain_merged();
-        app.merged_filter_rules.push(FilterRule {
-            pattern: "ERROR".into(),
-            ..FilterRule::default()
-        });
+        app.merged_search_query = "ERROR".into();
+        app.merged_search_filter = SearchFilter::OnlyMatches;
         app.merged_filter_dirty = true;
         app.maintain_merged_filter(false);
 
@@ -5162,10 +5403,8 @@ pub(crate) mod tests {
             &[("booting", 1, LineFlags::PROVISIONAL)],
         );
         app.maintain_merged();
-        app.merged_filter_rules.push(FilterRule {
-            pattern: "ERROR".into(),
-            ..FilterRule::default()
-        });
+        app.merged_search_query = "ERROR".into();
+        app.merged_search_filter = SearchFilter::OnlyMatches;
         app.merged_filter_dirty = true;
         app.maintain_merged_filter(false);
         assert!(app.merged_view().is_empty());
@@ -5208,10 +5447,9 @@ pub(crate) mod tests {
             );
             app.create_merged_tab(vec![PortId(1), PortId(2)]);
             if filtered {
-                app.merged_filter_rules.push(FilterRule {
-                    pattern: ".*".into(),
-                    ..FilterRule::default()
-                });
+                app.merged_search_query = ".*".into();
+                app.merged_search_regex = true;
+                app.merged_search_filter = SearchFilter::OnlyMatches;
                 app.merged_filter_dirty = true;
                 app.select_merged_tab(0);
             }
@@ -5270,10 +5508,8 @@ pub(crate) mod tests {
             );
             app.create_merged_tab(vec![PortId(1)]);
             if filtered {
-                app.merged_filter_rules.push(FilterRule {
-                    pattern: "ERROR".into(),
-                    ..FilterRule::default()
-                });
+                app.merged_search_query = "ERROR".into();
+                app.merged_search_filter = SearchFilter::OnlyMatches;
                 app.merged_filter_dirty = true;
             }
             app.merged_search_query = "ERROR".into();
@@ -5323,10 +5559,9 @@ pub(crate) mod tests {
         assert_eq!(app.merged_search_matches.len(), 2);
         let unfiltered_generation = app.merged_view_generation();
 
-        app.merged_filter_rules.push(FilterRule {
-            pattern: "keep".into(),
-            ..FilterRule::default()
-        });
+        app.merged_search_query = "keep".into();
+        app.merged_search_dirty = true;
+        app.merged_search_filter = SearchFilter::OnlyMatches;
         app.merged_filter_dirty = true;
         app.maintain_merged_filter(false);
         assert_ne!(app.merged_view_generation(), unfiltered_generation);
@@ -5334,12 +5569,13 @@ pub(crate) mod tests {
         assert_eq!(app.merged_search_matches.len(), 1);
         assert_eq!(app.merged_search_matches[0].abs, 0);
 
-        app.merged_filter_rules[0].enabled = false;
+        app.merged_search_filter = SearchFilter::Highlight;
         app.merged_filter_dirty = true;
         app.maintain_merged_filter(false);
         assert_eq!(app.merged_view_generation(), unfiltered_generation);
         app.maintain_merged_search(false);
-        assert_eq!(app.merged_search_matches.len(), 2);
+        assert_eq!(app.merged_search_matches.len(), 1);
+        assert_eq!(app.merged_view().len(), 2);
     }
 
     #[test]
@@ -5362,10 +5598,8 @@ pub(crate) mod tests {
             ],
         );
         app.maintain_merged();
-        app.merged_filter_rules.push(FilterRule {
-            pattern: "hit".into(),
-            ..FilterRule::default()
-        });
+        app.merged_search_query = "hit".into();
+        app.merged_search_filter = SearchFilter::OnlyMatches;
         app.merged_filter_dirty = true;
         app.maintain_merged_filter(false);
         app.merged_search_query = "hit".into();

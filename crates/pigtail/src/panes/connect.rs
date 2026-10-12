@@ -720,7 +720,7 @@ impl App {
         )
         .clicked()
         {
-            self.show_search = !self.show_search;
+            self.set_search_visible(!self.show_search);
             if self.show_search {
                 self.search_focus_request = true;
             }
@@ -920,6 +920,7 @@ impl App {
     }
 
     pub(crate) fn show_toolbar_in(&mut self, ctx: &egui::Context, parent: &mut egui::Ui) {
+        self.set_search_visible(self.show_search);
         let long_running_macros =
             self.long_running_macro_indicators(Instant::now(), self.macro_target_port());
         let mut stop_macro_run = None;
@@ -1061,17 +1062,7 @@ impl App {
                     let width = ui.available_width();
                     let (follow, unread) = if self.merged_selected {
                         ui.weak("Merged");
-                        ui.weak(format!("{} lines", self.merged.len()));
-                        if width > 400.0 && self.merged_filter_active() {
-                            ui.weak(format!("{} shown", self.merged_view().len()));
-                        }
-                        if width > 500.0 && !self.merged_search_matches.is_empty() {
-                            ui.weak(format!(
-                                "match {}/{}",
-                                self.merged_search_pos.map_or(0, |p| p + 1),
-                                self.merged_search_matches.len()
-                            ));
-                        }
+                        ui.weak(format!("{} lines", self.merged_view().len()));
                         let selected_label = self
                             .merged_tx_port
                             .and_then(|id| self.connections.iter().find(|conn| conn.id == id))
@@ -1114,23 +1105,19 @@ impl App {
                         if let Some(err) = &conn.last_error {
                             status.on_hover_text(&err.msg);
                         }
-                        ui.weak(format!("{} lines", conn.store.next_abs_index()));
+                        let lines =
+                            if !conn.hex_view && !conn.screen_view && conn.filter_index_active() {
+                                conn.filter_index.len()
+                            } else {
+                                conn.store.len()
+                            };
+                        ui.weak(format!("{lines} lines"));
                         if width > 450.0 {
                             ui.weak(conn.port_config.summary());
                         }
                         if let Some(err) = &conn.last_error {
                             ui.colored_label(egui::Color32::from_rgb(255, 95, 95), "Error")
                                 .on_hover_text(&err.msg);
-                        }
-                        if width > 550.0 && conn.filter_index_active() {
-                            ui.weak(format!("{} shown", conn.filter_index.len()));
-                        }
-                        if width > 650.0 && !conn.screen_view && !conn.search_matches.is_empty() {
-                            ui.weak(format!(
-                                "match {}/{}",
-                                conn.search_pos.map_or(0, |p| p + 1),
-                                conn.search_matches.len()
-                            ));
                         }
                         if width > 750.0
                             && (conn.store.evicted_any()

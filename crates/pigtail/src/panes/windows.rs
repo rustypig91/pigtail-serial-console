@@ -1,9 +1,8 @@
-//! Floating tool windows (filters, highlight, plot extraction), toggled from the
+//! Floating tool windows (highlight, plot extraction), toggled from the
 //! console right-click menu so the main window stays uncluttered.
 
 use crate::app::{App, TabId};
 use serialcore::config::{ExtractMode, ExtractRule, HighlightRule};
-use serialcore::filter::{Combine, FilterRule};
 use serialcore::reader::ErrorScope;
 
 impl App {
@@ -95,7 +94,6 @@ impl App {
             ("Settings", self.show_settings),
             ("About", self.show_about),
             ("Keyboard shortcuts", self.show_keyboard_shortcuts),
-            ("Filters", self.show_filters_win),
             ("Highlight rules", self.show_highlight_win),
             ("Plot extraction", self.show_extract_win),
             ("Transmit macros", self.show_macros_win),
@@ -160,7 +158,6 @@ impl App {
             ("Settings", &mut self.show_settings),
             ("About", &mut self.show_about),
             ("Keyboard shortcuts", &mut self.show_keyboard_shortcuts),
-            ("Filters", &mut self.show_filters_win),
             ("Highlight rules", &mut self.show_highlight_win),
             ("Plot extraction", &mut self.show_extract_win),
             ("Transmit macros", &mut self.show_macros_win),
@@ -239,7 +236,6 @@ impl App {
     }
 
     pub(crate) fn show_tool_windows(&mut self, ctx: &egui::Context) {
-        self.show_filters_window(ctx);
         self.show_highlight_window(ctx);
         self.show_extract_window(ctx);
         self.show_error_window(ctx);
@@ -296,44 +292,6 @@ impl App {
         if !open || dismiss {
             self.show_error_win = None;
         }
-    }
-
-    fn show_filters_window(&mut self, ctx: &egui::Context) {
-        if !self.show_filters_win {
-            return;
-        }
-        let mut open = self.show_filters_win;
-        egui::Window::new("Filters")
-            .open(&mut open)
-            .default_width(300.0)
-            .frame(super::chrome::dialog_frame(ctx))
-            .show(ctx, |ui| {
-                super::chrome::dialog_style(ui);
-                if self.merged_selected {
-                    ui.weak("Rules here apply only to the merged view.");
-                    show_filter_controls(
-                        ui,
-                        &mut self.merged_filter_rules,
-                        &mut self.merged_filter_combine,
-                        &mut self.merged_filter_dirty,
-                        &self.merged_filter_errors,
-                    );
-                    return;
-                }
-                let Some(active) = self.active_index() else {
-                    ui.weak("Connect a port to filter.");
-                    return;
-                };
-                let conn = &mut self.connections[active];
-                show_filter_controls(
-                    ui,
-                    &mut conn.filter_rules,
-                    &mut conn.filter_combine,
-                    &mut conn.filter_dirty,
-                    &conn.filter_errors,
-                );
-            });
-        self.show_filters_win = open;
     }
 
     fn show_highlight_window(&mut self, ctx: &egui::Context) {
@@ -631,61 +589,6 @@ impl App {
     }
 }
 
-fn show_filter_controls(
-    ui: &mut egui::Ui,
-    rules: &mut Vec<FilterRule>,
-    combine: &mut Combine,
-    dirty: &mut bool,
-    errors: &[(usize, String)],
-) {
-    ui.horizontal(|ui| {
-        ui.label("Combine:");
-        let mut changed = ui.selectable_value(combine, Combine::And, "AND").changed();
-        changed |= ui.selectable_value(combine, Combine::Or, "OR").changed();
-        *dirty |= changed;
-    });
-    ui.label("Filter reveals matching history, not just new output.");
-
-    let mut remove: Option<usize> = None;
-    for (i, rule) in rules.iter_mut().enumerate() {
-        ui.group(|ui| {
-            ui.horizontal(|ui| {
-                *dirty |= ui.checkbox(&mut rule.enabled, "").changed();
-                *dirty |= ui
-                    .add(
-                        egui::TextEdit::singleline(&mut rule.pattern)
-                            .desired_width(160.0)
-                            .hint_text("pattern"),
-                    )
-                    .changed();
-                if ui.small_button("🗑").clicked() {
-                    remove = Some(i);
-                }
-            });
-            ui.horizontal(|ui| {
-                let mut changed = ui.checkbox(&mut rule.is_regex, "regex").changed();
-                changed |= ui.checkbox(&mut rule.case_sensitive, "case").changed();
-                changed |= ui.checkbox(&mut rule.invert, "invert").changed();
-                *dirty |= changed;
-            });
-        });
-    }
-    if let Some(i) = remove {
-        rules.remove(i);
-        *dirty = true;
-    }
-    if ui.button("+ Add filter").clicked() {
-        rules.push(FilterRule::default());
-        *dirty = true;
-    }
-    for (i, err) in errors {
-        ui.colored_label(
-            egui::Color32::from_rgb(0xff, 0x88, 0x55),
-            format!("rule {}: {err}", i + 1),
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::app::tests::test_app;
@@ -694,7 +597,7 @@ mod tests {
     #[test]
     fn escape_closes_merged_options_above_a_tool_window() {
         let (mut app, _tx) = test_app("escape-merged-options");
-        app.show_filters_win = true;
+        app.show_highlight_win = true;
         app.merged_dialog = Some(crate::app::MergedDialog {
             editing: None,
             name: "Merged".into(),
@@ -719,7 +622,7 @@ mod tests {
             |ui| {
                 app.close_window_on_escape(ui.ctx());
                 assert!(app.merged_dialog.is_none());
-                assert!(app.show_filters_win);
+                assert!(app.show_highlight_win);
                 assert!(!ui.input(|input| input.key_pressed(egui::Key::Escape)));
             },
         );
@@ -837,7 +740,7 @@ mod tests {
         let (mut app, _enum_tx) = test_app("escape-windows");
         let ctx = egui::Context::default();
         app.show_settings = true;
-        app.show_filters_win = true;
+        app.show_highlight_win = true;
         let _ = ctx.run_test_ui(egui::RawInput::default(), |ui| {
             let ctx = &ui.ctx().clone();
             app.show_tool_windows(ctx);
@@ -858,7 +761,7 @@ mod tests {
             app.close_window_on_escape(ctx);
             app.show_settings_window(ctx);
             assert!(!app.show_settings);
-            assert!(app.show_filters_win);
+            assert!(app.show_highlight_win);
             assert!(!ctx.input(|i| i.key_pressed(egui::Key::Escape)));
             app.show_tool_windows(ctx);
         });
@@ -870,7 +773,7 @@ mod tests {
         let _ = ctx.run_test_ui(input.clone(), |ui| {
             let ctx = &ui.ctx().clone();
             app.close_window_on_escape(ctx);
-            assert!(app.show_filters_win);
+            assert!(app.show_highlight_win);
             assert!(ctx.input(|i| i.key_pressed(egui::Key::Escape)));
             app.show_tool_windows(ctx);
         });
@@ -878,7 +781,7 @@ mod tests {
         let _ = ctx.run_test_ui(input, |ui| {
             let ctx = &ui.ctx().clone();
             app.close_window_on_escape(ctx);
-            assert!(!app.show_filters_win);
+            assert!(!app.show_highlight_win);
             assert!(!ctx.input(|i| i.key_pressed(egui::Key::Escape)));
         });
     }
