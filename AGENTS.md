@@ -59,7 +59,46 @@ The following describes user-visible behavior to preserve when modifying the
 application.
 
 - Auto-reconnect by USB VID/PID/serial number, with a visible marker showing exactly where a gap occurred
-- Regex or plain-text filtering and search over full scrollback
+- Regex or plain-text search over full scrollback. Log and merged-view search
+  has a compact search display dropdown: **Highlight**, **Only matches**, and
+  **Hide matches**. The button shows the selected mode's icon (highlighter,
+  funnel, or crossed-out eye), and the dropdown repeats each icon beside its
+  label. It sits immediately to the right of the case-sensitivity control.
+  Hover shows the short “Search display mode” tooltip and current mode.
+  The query, regex and case controls determine which lines match. Only
+  **Highlight** colors all search matches and shows scrollbar match markers;
+  **Only matches** colors just the current match, preserving a visible navigation
+  target while leaving other matching lines unhighlighted.
+  Changes apply to retained history and incoming output; empty queries and
+  invalid regex show all lines. **Hide matches** disables Next/Previous because
+  their target lines are hidden; it keeps the same current/total match indicator
+  and remembers the selected match. Returning to Highlight or Only matches
+  reveals that match and resumes navigation from it. Match counts are shown only in the search
+  header, not the footer. The footer has one “x lines” count for the retained
+  lines displayed in Log or the merged view, including active search filtering;
+  it has no separate “shown” count. Hex and ANSI/VT report the retained Log line
+  count. Closing search by any path (×, Escape, the search
+  toolbar button, or its context-menu toggle) restores all lines and removes
+  search highlighting while retaining the query, current match and selected
+  mode. Reopening search reuses that text and resumes the selected mode. Each connection and
+  merged view remembers its mode for the current run; startup defaults to
+  **Highlight**. Nothing is saved or migrated. Hex and ANSI/VT display
+  remain independent of line filtering. Text/CSV exports use the displayed Log
+  subset; raw capture remains complete. There is no separate Filters window or
+  Add as filter action; **Search selection** stays in the selection menu.
+- Search history is shared across connection tabs, merged views, and split panes
+  for the current run only, with at most 50 unique text/regex/case combinations.
+  The small chevron inside the left side of the search field opens a scrollable
+  **Recent searches** menu, newest first. Selecting an entry restores its query,
+  regex and case settings, updates results, and returns focus to the search field;
+  the current search display mode stays unchanged. Plain **Up/Down** in the focused
+  search field recalls older/newer entries without wrapping. Down past the newest
+  entry restores the text and settings present before browsing. Editing a recalled
+  entry starts a new draft. Completed searches are recorded on Enter/Next/Previous,
+  leaving or closing the field, switching its tab, or starting history browsing.
+  Opening the history menu also records the current query. Empty queries and invalid
+  regex are skipped; repeating a query with the same settings moves it to the top.
+  Recall keys are consumed before text editing and never sent to the device.
 - Highlight rules (color/bold by pattern)
 - Multiple ports as persistent, user-named tabs, plus optional merged views that label
   and interleave selected connections by timestamp.
@@ -73,7 +112,16 @@ application.
   its name and included connections at any time. Drag merged tabs alongside
   connection tabs to reorder them. Closing either kind of tab asks for confirmation
   unless you have disabled that preference.
-- Hex view alongside the text view
+- Hex view alongside the text view. Search in Hex is always Highlight: the
+  search display-mode button is hidden, and Log's remembered filter mode does
+  not affect it. Plain-text and regex queries search the displayed hexadecimal
+  byte values and ASCII column within each 16-byte row, excluding offsets and
+  session markers. All matches are highlighted, with a brighter current row
+  and scrollbar match markers. Next/Previous and Enter/Shift+Enter navigate
+  matching rows and scroll them into view, using Hex's own count and cursor.
+  Partial rows are rechecked as bytes arrive or are evicted; session boundaries
+  prevent searches joining independent captures. Closing search removes Hex
+  highlighting. Raw data remains complete and all retained byte rows stay visible.
 - Custom window header with draggable device tabs, status dots, close buttons,
   and minimize/maximize/close controls. Drag empty header space to move the window,
   double-click it to maximize or restore, and drag an edge or corner to resize.
@@ -170,6 +218,8 @@ Use **Ctrl+Shift+Space** to pin the console to the bottom. On connection tabs,
 **Ctrl+Shift+Q / W / E** selects the **Log / Hex / ANSI** view.
 Use **Ctrl+Shift+P** to toggle the plot on connection tabs.
 Use **Ctrl+Shift+M** to open the transmit macros window.
+The console right-click menu has no **Toggle plot** or **Toggle hex view** items;
+use the toolbar controls or their keyboard shortcuts.
 
 ## Installation and update behavior
 

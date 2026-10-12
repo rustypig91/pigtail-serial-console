@@ -863,8 +863,8 @@ mod tests {
 
         let ctx = egui::Context::default();
         frame(&mut app, &ctx, Vec::new());
-        // Text field -> regex -> case -> Prev -> Next -> Close.
-        for _ in 0..5 {
+        // Text field -> history -> regex -> case -> display mode -> Prev -> Next -> Close.
+        for _ in 0..7 {
             frame(&mut app, &ctx, vec![tab()]);
         }
         frame(&mut app, &ctx, vec![enter()]);

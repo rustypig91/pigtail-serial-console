@@ -129,6 +129,7 @@ impl App {
             conn.search_regex,
         );
         let requested = conn.screen_search.scroll_to.take();
+        let show_matches = !conn.search_filter_suspended;
         if requested.is_some() {
             conn.follow = false;
         }
@@ -227,7 +228,11 @@ impl App {
                 for row in 0..rows {
                     let line = first + usize::from(row);
                     let start = search.matches.partition_point(|(r, _)| *r < line);
-                    let end = search.matches.partition_point(|(r, _)| *r <= line);
+                    let end = if show_matches {
+                        search.matches.partition_point(|(r, _)| *r <= line)
+                    } else {
+                        start
+                    };
                     for col in 0..cols {
                         let Some(cell) = screen.cell(row, col) else {
                             continue;

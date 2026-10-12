@@ -8,6 +8,7 @@ pub(crate) use chrome::apply_settings_visuals;
 mod connect;
 mod log;
 pub use log::wrap_len;
+pub(crate) use log::HexSearch;
 
 mod macros;
 mod plot;

@@ -4,6 +4,7 @@
 //! that toggles everything else so the main view stays clean.
 
 use crate::app::{compile_search, App, CompiledHighlight, Connection, MergedEntry, RawSession};
+use crate::search_history::{SearchBrowse, SearchEntry, SearchHistory};
 use crate::wrap::{rows_for, WrapIndex};
 use egui::text::LayoutJob;
 use serialcore::clock::Timestamp;
@@ -39,35 +40,146 @@ fn surrender_search_focus_on_close(
 
 fn search_query_field(
     ui: &mut egui::Ui,
-    query: &mut String,
+    entry: &mut SearchEntry,
     id: egui::Id,
-    regex: bool,
+    history: &mut SearchHistory,
     width: f32,
+    input_enabled: bool,
+    target: egui::Id,
 ) -> egui::Response {
+    let browse_id = id.with(("history_browse", target));
+    // Consume recall before TextEdit handles vertical cursor motion.
+    let before = entry.clone();
+    if input_enabled && ui.memory(|memory| memory.has_focus(id)) {
+        let direction = ui.input_mut(|input| {
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                Some(true)
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                Some(false)
+            } else {
+                None
+            }
+        });
+        if let Some(older) = direction {
+            *entry = ui.ctx().data_mut(|data| {
+                data.get_temp_mut_or_default::<SearchBrowse>(browse_id)
+                    .recall(history, entry, older)
+            });
+            select_search_query(ui.ctx(), id, &entry.query);
+        }
+    }
     let margin = egui::vec2(8.0, 6.0);
     let width = width.min((ui.available_width() - 2.0 * margin.x).max(24.0));
     let font = egui::TextStyle::Body.resolve(ui.style());
     let height = (ui.fonts_mut(|fonts| fonts.row_height(&font)) + 2.0 * margin.y)
         .max(ui.spacing().interact_size.y);
     let (_, rect) = ui.allocate_space(egui::vec2(width + 2.0 * margin.x, height));
-    // egui allocates the full galley width even for clipped single-line
-    // edits. Keep that extra allocation in a child so it cannot move controls.
+    // Keep the arrow inside the field so narrow panes retain the same layout.
     let mut field_ui = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    field_ui.add(
-        egui::TextEdit::singleline(query)
+    let mut response = field_ui.add(
+        egui::TextEdit::singleline(&mut entry.query)
             .id(id)
-            .hint_text(if regex {
+            .hint_text(if entry.regex {
                 "Search regex…"
             } else {
                 "Search text…"
             })
-            .margin(margin)
-            .desired_width(width),
-    )
+            .margin(egui::Margin {
+                left: 28,
+                right: 8,
+                top: 6,
+                bottom: 6,
+            })
+            .desired_width((width - 20.0).max(4.0)),
+    );
+    let arrow_rect =
+        egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + 24.0, rect.bottom()));
+    let arrow = ui
+        .interact(arrow_rect, id.with("history_arrow"), egui::Sense::click())
+        .on_hover_text("Recent searches · Up/Down in the search field");
+    let menu_id = id.with("history_menu");
+    let open = egui::Popup::is_id_open(ui.ctx(), menu_id) || arrow.clicked();
+    let color = if arrow.hovered() || open {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    if arrow.hovered() || open {
+        ui.painter().rect_filled(
+            arrow_rect.shrink(3.0),
+            3.0,
+            ui.visuals().widgets.hovered.weak_bg_fill,
+        );
+    }
+    let center = arrow_rect.center();
+    ui.painter().add(egui::Shape::line(
+        vec![
+            center + egui::vec2(-3.0, -1.5),
+            center + egui::vec2(0.0, 1.5),
+            center + egui::vec2(3.0, -1.5),
+        ],
+        egui::Stroke::new(1.2, color),
+    ));
+    if arrow.clicked() {
+        history.remember(entry.clone());
+    }
+    let mut selected = None;
+    egui::Popup::menu(&arrow)
+        .id(menu_id)
+        .anchor(rect)
+        .width(rect.width().max(220.0))
+        .gap(4.0)
+        .show(|ui| {
+            super::chrome::menu_style(ui);
+            ui.weak("Recent searches");
+            ui.separator();
+            if history.entries.is_empty() {
+                ui.weak("No searches yet");
+            } else {
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        for item in &history.entries {
+                            let flags = match (item.regex, item.case_sensitive) {
+                                (true, true) => "  .* Aa",
+                                (true, false) => "  .*",
+                                (false, true) => "  Aa",
+                                (false, false) => "",
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::selectable(*entry == *item, &item.query)
+                                        .shortcut_text(
+                                            egui::RichText::new(flags.trim()).size(11.0).weak(),
+                                        )
+                                        .truncate(),
+                                )
+                                .on_hover_text(&item.query)
+                                .clicked()
+                            {
+                                selected = Some(item.clone());
+                                ui.close();
+                            }
+                        }
+                    });
+            }
+        });
+    if let Some(selected) = selected {
+        history.remember(selected.clone());
+        *entry = selected;
+        ui.ctx()
+            .data_mut(|data| data.remove::<SearchBrowse>(browse_id));
+        select_search_query(ui.ctx(), id, &entry.query);
+        response.request_focus();
+    }
+    if *entry != before {
+        response.mark_changed();
+    }
+    response
 }
 
 /// One run of bytes as the hex view lays it out: the 16-byte rows it still has
@@ -150,6 +262,195 @@ fn hex_row(segments: &[HexSegment], mut row: usize) -> Option<HexRow<'_>> {
     None
 }
 
+/// Search the displayed byte/ASCII columns, independently of Log filters.
+#[derive(Default)]
+pub(crate) struct HexSearch {
+    query: SearchEntry,
+    source: Option<(u64, usize, usize)>,
+    re: Option<regex::Regex>,
+    tested_end: u64,
+    pub matches: Vec<u64>,
+    pub position: Option<usize>,
+    pub scroll_to: Option<u64>,
+}
+
+impl HexSearch {
+    fn refresh(
+        &mut self,
+        query: SearchEntry,
+        base: u64,
+        bytes: &std::collections::VecDeque<u8>,
+        sessions: &[RawSession],
+    ) {
+        let source = (base, bytes.len(), sessions.len());
+        if self.source == Some(source) && self.query == query {
+            return;
+        }
+        let query_changed = self.query != query;
+        let end = base + bytes.len() as u64;
+        let rebuild = query_changed
+            || self.source.is_none_or(|old| old.2 != sessions.len())
+            || end < self.tested_end;
+        let current = (!query_changed)
+            .then(|| self.position.and_then(|pos| self.matches.get(pos)).copied())
+            .flatten();
+        let base_changed = self.source.is_some_and(|old| old.0 != base);
+        if query_changed || self.source.is_none() {
+            self.re = compile_search(&query.query, query.case_sensitive, query.regex);
+        }
+        self.query = query;
+        self.source = Some(source);
+        if rebuild {
+            self.matches.clear();
+            self.scroll_to = None;
+        }
+        let segments = hex_segments(sessions, base, bytes.len());
+        let first = segments
+            .first()
+            .map(|segment| segment.origin + segment.first_row as u64 * 16);
+        self.matches
+            .retain(|abs| first.is_some_and(|first| *abs >= first));
+        if let Some(re) = &self.re {
+            for (index, segment) in segments.iter().enumerate() {
+                // Eviction may remove a prefix of a still-resident first row.
+                let retest_first = !rebuild && base_changed && index == 0;
+                let start = if rebuild {
+                    segment.first_row
+                } else {
+                    (((self.tested_end.saturating_sub(1)).saturating_sub(segment.origin) / 16)
+                        as usize)
+                        .max(segment.first_row)
+                };
+                let rows =
+                    (start..=segment.last_row).chain(retest_first.then_some(segment.first_row));
+                for row in rows {
+                    let abs = segment.origin + row as u64 * 16;
+                    if let Ok(pos) = self.matches.binary_search(&abs) {
+                        self.matches.remove(pos);
+                    }
+                    let text = hex_byte_row(base, bytes, segment.origin, segment.end, row);
+                    if re.find_iter(&text[10..]).any(|hit| !hit.is_empty()) {
+                        let pos = self.matches.binary_search(&abs).unwrap_err();
+                        self.matches.insert(pos, abs);
+                    }
+                }
+            }
+        } else {
+            self.matches.clear();
+        }
+        self.tested_end = end;
+        self.position = current
+            .and_then(|abs| self.matches.binary_search(&abs).ok())
+            .or_else(|| self.matches.len().checked_sub(1));
+    }
+
+    pub(crate) fn step(&mut self, direction: i64) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let position = (self.position.unwrap_or(0) as i64 + direction)
+            .rem_euclid(self.matches.len() as i64) as usize;
+        self.position = Some(position);
+        self.scroll_to = Some(self.matches[position]);
+    }
+}
+
+impl Connection {
+    pub(crate) fn maintain_hex_search(&mut self) {
+        self.hex_search.refresh(
+            SearchEntry::new(
+                &self.search_query,
+                self.search_regex,
+                self.search_case_sensitive,
+            ),
+            self.raw_base,
+            &self.raw_ring,
+            &self.raw_sessions,
+        );
+    }
+}
+
+fn hex_byte_row(
+    base: u64,
+    bytes: &std::collections::VecDeque<u8>,
+    origin: u64,
+    end: u64,
+    row: usize,
+) -> String {
+    let offset = row * 16;
+    let mut hex = String::with_capacity(48);
+    let mut ascii = String::with_capacity(16);
+    for col in 0..16 {
+        let abs = origin + (offset + col) as u64;
+        let byte = (abs >= base && abs < end)
+            .then(|| bytes.get((abs - base) as usize).copied())
+            .flatten();
+        match byte {
+            Some(byte) => {
+                hex.push_str(&format!("{byte:02X} "));
+                ascii.push(if (0x20..0x7f).contains(&byte) {
+                    byte as char
+                } else {
+                    '.'
+                });
+            }
+            None => {
+                hex.push_str("   ");
+                ascii.push(' ');
+            }
+        }
+    }
+    format!("{offset:08X}  {hex} |{ascii}|")
+}
+
+fn hex_search_job(
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+    re: Option<&regex::Regex>,
+    current: bool,
+) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let format = egui::TextFormat {
+        font_id: font,
+        color,
+        ..Default::default()
+    };
+    let mut offset = 0;
+    if let Some(re) = re {
+        for hit in re.find_iter(&text[10..]).filter(|hit| !hit.is_empty()) {
+            let start = 10 + hit.start();
+            let end = 10 + hit.end();
+            job.append(&text[offset..start], 0.0, format.clone());
+            let mut highlighted = format.clone();
+            highlighted.background = if current {
+                egui::Color32::from_rgb(0xff, 0xd5, 0x4a)
+            } else {
+                egui::Color32::from_rgb(0x6b, 0x5a, 0x1f)
+            };
+            if current {
+                highlighted.color = egui::Color32::BLACK;
+            }
+            job.append(&text[start..end], 0.0, highlighted);
+            offset = end;
+        }
+    }
+    job.append(&text[offset..], 0.0, format);
+    job
+}
+
+fn hex_row_for_byte(segments: &[HexSegment], abs: u64) -> Option<usize> {
+    let mut offset = 0;
+    for segment in segments {
+        let first = segment.origin + segment.first_row as u64 * 16;
+        if abs >= first && abs < segment.end {
+            return Some(offset + ((abs - segment.origin) / 16) as usize - segment.first_row);
+        }
+        offset += segment.rows();
+    }
+    None
+}
+
 /// Horizontal gap between a row's markers (port tag, timestamp, the sent-line
 /// ">") and the text they precede.
 const ROW_GAP: f32 = 6.0;
@@ -182,9 +483,6 @@ struct MenuAction {
     selection: Option<(SelectionAction, String)>,
     macro_editor_open: bool,
     set_ts: Option<TimestampFormat>,
-    toggle_hex: bool,
-    toggle_plot: bool,
-    open_filters: bool,
     open_highlight: bool,
     open_extract: bool,
     open_macros: bool,
@@ -918,7 +1216,7 @@ impl App {
             ctx.input_mut(|i| i.events.retain(|event| !matches!(event, egui::Event::Copy)));
         }
         if open_search {
-            self.show_search = true;
+            self.set_search_visible(true);
             self.search_focus_request = true;
         }
         if open_dialog {
@@ -956,6 +1254,7 @@ impl App {
     }
 
     pub(crate) fn show_header_search(&mut self, ui: &mut egui::Ui) {
+        self.set_search_visible(self.show_search);
         if !self.show_search {
             return;
         }
@@ -982,20 +1281,40 @@ impl App {
         // The toolbar can move search between rows as the window resizes.
         // Keep its identity tied to the pane rather than the layout's parent UI.
         let search_id = self.pane_widget_id("search_query");
+        let display_menu_id = self.pane_widget_id("search_display_menu");
+        let target = self.search_target();
         ui.horizontal_wrapped(|ui| {
             let show_count = ui.available_width() >= 360.0;
             let reserved = if show_count { 234.0 } else { 204.0 };
+            let reserved = reserved
+                + if self.connections[active].screen_view || self.connections[active].hex_view {
+                    0.0
+                } else {
+                    32.0
+                };
             let conn = &mut self.connections[active];
             if select_query {
                 select_search_query(ui.ctx(), search_id, &conn.search_query);
             }
+            let mut entry = SearchEntry::new(
+                &conn.search_query,
+                conn.search_regex,
+                conn.search_case_sensitive,
+            );
+            self.search_history
+                .observe(search_id, target, entry.clone());
             let resp = search_query_field(
                 ui,
-                &mut conn.search_query,
+                &mut entry,
                 search_id,
-                conn.search_regex,
+                &mut self.search_history,
                 (ui.available_width() - reserved).clamp(40.0, 320.0),
+                input_enabled,
+                target,
             );
+            conn.search_query = entry.query;
+            conn.search_regex = entry.regex;
+            conn.search_case_sensitive = entry.case_sensitive;
             if resp.changed() {
                 conn.search_dirty = true;
                 conn.search_pos = None;
@@ -1018,6 +1337,24 @@ impl App {
                 conn.search_dirty = true;
                 conn.search_pos = None;
             }
+            if !conn.screen_view && !conn.hex_view {
+                let previous_mode = conn.search_filter;
+                search_filter_controls(ui, &mut conn.search_filter, display_menu_id);
+                if previous_mode == crate::app::SearchFilter::HideMatches
+                    && conn.search_filter != previous_mode
+                {
+                    conn.scroll_to = conn
+                        .search_pos
+                        .and_then(|pos| conn.search_matches.get(pos))
+                        .copied();
+                }
+            }
+            if conn.hex_view {
+                conn.maintain_hex_search();
+            }
+            let navigation_enabled = conn.screen_view
+                || conn.hex_view
+                || conn.search_filter != crate::app::SearchFilter::HideMatches;
             let error = crate::app::search_pattern(
                 &conn.search_query,
                 conn.search_case_sensitive,
@@ -1057,7 +1394,7 @@ impl App {
                 }
             }
             if ui
-                .add_enabled_ui(error.is_none(), |ui| {
+                .add_enabled_ui(error.is_none() && navigation_enabled, |ui| {
                     super::chrome::search_control(ui, super::chrome::SearchControl::Previous)
                 })
                 .inner
@@ -1066,7 +1403,7 @@ impl App {
                 prev = true;
             }
             if ui
-                .add_enabled_ui(error.is_none(), |ui| {
+                .add_enabled_ui(error.is_none() && navigation_enabled, |ui| {
                     super::chrome::search_control(ui, super::chrome::SearchControl::Next)
                 })
                 .inner
@@ -1088,6 +1425,11 @@ impl App {
                     ui.weak(format!("{n}/{}", conn.screen_search.matches.len()))
                         .on_hover_text("Matches in VT history");
                 }
+            } else if conn.hex_view {
+                if show_count && !conn.hex_search.matches.is_empty() {
+                    let n = conn.hex_search.position.map_or(0, |pos| pos + 1);
+                    ui.weak(format!("{n}/{}", conn.hex_search.matches.len()));
+                }
             } else if show_count && !conn.search_matches.is_empty() {
                 let n = conn.search_pos.map(|p| p + 1).unwrap_or(0);
                 ui.weak(format!("{n}/{}", conn.search_matches.len()));
@@ -1098,6 +1440,19 @@ impl App {
                 close = true;
             }
             surrender_search_focus_on_close(&resp, &close_button, close);
+            let entry = SearchEntry::new(
+                &conn.search_query,
+                conn.search_regex,
+                conn.search_case_sensitive,
+            );
+            if next || prev || resp.lost_focus() {
+                self.search_history.remember(entry.clone());
+            }
+            self.search_history.observe(search_id, target, entry);
+            if !navigation_enabled {
+                next = false;
+                prev = false;
+            }
         });
         if next || prev {
             self.maintain_search();
@@ -1109,10 +1464,9 @@ impl App {
             self.search_step(-1);
         }
         if close {
-            self.show_search = false;
-            self.connections[active].search_query.clear();
-            self.connections[active].search_dirty = true;
+            self.set_search_visible(false);
         }
+        self.connections[active].maintain_search_filter();
     }
 
     fn show_merged_search_bar(&mut self, ui: &mut egui::Ui, select_query: bool) {
@@ -1124,19 +1478,33 @@ impl App {
         let mut close = false;
         let mut focus = std::mem::take(&mut self.search_focus_request);
         let search_id = self.pane_widget_id("search_query");
+        let display_menu_id = self.pane_widget_id("search_display_menu");
+        let target = self.search_target();
         ui.horizontal_wrapped(|ui| {
             let show_count = ui.available_width() >= 360.0;
-            let reserved = if show_count { 234.0 } else { 204.0 };
+            let reserved = if show_count { 266.0 } else { 236.0 };
             if select_query {
                 select_search_query(ui.ctx(), search_id, &self.merged_search_query);
             }
+            let mut entry = SearchEntry::new(
+                &self.merged_search_query,
+                self.merged_search_regex,
+                self.merged_search_case_sensitive,
+            );
+            self.search_history
+                .observe(search_id, target, entry.clone());
             let resp = search_query_field(
                 ui,
-                &mut self.merged_search_query,
+                &mut entry,
                 search_id,
-                self.merged_search_regex,
+                &mut self.search_history,
                 (ui.available_width() - reserved).clamp(40.0, 320.0),
+                input_enabled,
+                target,
             );
+            self.merged_search_query = entry.query;
+            self.merged_search_regex = entry.regex;
+            self.merged_search_case_sensitive = entry.case_sensitive;
             if resp.changed() {
                 self.merged_search_dirty = true;
                 self.merged_search_pos = None;
@@ -1159,6 +1527,18 @@ impl App {
                 self.merged_search_dirty = true;
                 self.merged_search_pos = None;
             }
+            let previous_mode = self.merged_search_filter;
+            search_filter_controls(ui, &mut self.merged_search_filter, display_menu_id);
+            if previous_mode == crate::app::SearchFilter::HideMatches
+                && self.merged_search_filter != previous_mode
+            {
+                self.merged_scroll_to = self
+                    .merged_search_pos
+                    .and_then(|pos| self.merged_search_matches.get(pos))
+                    .copied();
+            }
+            let navigation_enabled =
+                self.merged_search_filter != crate::app::SearchFilter::HideMatches;
             let error = crate::app::search_pattern(
                 &self.merged_search_query,
                 self.merged_search_case_sensitive,
@@ -1192,7 +1572,7 @@ impl App {
                 }
             }
             if ui
-                .add_enabled_ui(error.is_none(), |ui| {
+                .add_enabled_ui(error.is_none() && navigation_enabled, |ui| {
                     super::chrome::search_control(ui, super::chrome::SearchControl::Previous)
                 })
                 .inner
@@ -1201,7 +1581,7 @@ impl App {
                 prev = true;
             }
             if ui
-                .add_enabled_ui(error.is_none(), |ui| {
+                .add_enabled_ui(error.is_none() && navigation_enabled, |ui| {
                     super::chrome::search_control(ui, super::chrome::SearchControl::Next)
                 })
                 .inner
@@ -1221,6 +1601,19 @@ impl App {
                 close = true;
             }
             surrender_search_focus_on_close(&resp, &close_button, close);
+            let entry = SearchEntry::new(
+                &self.merged_search_query,
+                self.merged_search_regex,
+                self.merged_search_case_sensitive,
+            );
+            if next || prev || resp.lost_focus() {
+                self.search_history.remember(entry.clone());
+            }
+            self.search_history.observe(search_id, target, entry);
+            if !navigation_enabled {
+                next = false;
+                prev = false;
+            }
         });
         if next || prev {
             self.maintain_merged_search(false);
@@ -1232,10 +1625,10 @@ impl App {
             self.search_step(-1);
         }
         if close {
-            self.show_search = false;
-            self.merged_search_query.clear();
-            self.merged_search_dirty = true;
+            self.set_search_visible(false);
         }
+        self.maintain_merged_filter(false);
+        self.maintain_merged_search(false);
     }
 
     fn show_single_rows(&mut self, ui: &mut egui::Ui, active: usize, menu: &mut MenuAction) {
@@ -1293,16 +1686,18 @@ impl App {
         // hang every live reading off whenever the restored capture happened to
         // begin, which can be days back and moves as the scrollback is evicted.
         let mark = Some(conn.mark_micros.unwrap_or(0));
-        let filter_active = !conn
-            .filter_rules
-            .iter()
-            .all(|r| !r.enabled || r.pattern.is_empty());
+        let filter_active = conn.filter_index_active();
 
-        let search_re = compile_search(
-            &conn.search_query,
-            conn.search_case_sensitive,
-            conn.search_regex,
-        );
+        let search_re = (!conn.search_filter_suspended
+            && conn.search_filter != crate::app::SearchFilter::HideMatches)
+            .then(|| {
+                compile_search(
+                    &conn.search_query,
+                    conn.search_case_sensitive,
+                    conn.search_regex,
+                )
+            })
+            .flatten();
         let cur_match_abs = conn
             .search_pos
             .and_then(|p| conn.search_matches.get(p))
@@ -1475,7 +1870,13 @@ impl App {
                         prev_micros,
                         mark,
                         highlight: highlights,
-                        search_re: search_re.as_ref(),
+                        search_re: if conn.search_filter == crate::app::SearchFilter::Highlight
+                            || cur_match_abs == Some(abs)
+                        {
+                            search_re.as_ref()
+                        } else {
+                            None
+                        },
                         is_search_current: cur_match_abs == Some(abs),
                         port_tag: None,
                         row_id: egui::Id::new(("console_row", conn.id, abs)),
@@ -1514,7 +1915,17 @@ impl App {
         let top_row = (output.state.offset.y / row_height).floor().max(0.0) as u64;
         conn.top_line = (entries > 0).then(|| abs_of(conn.wrap_index.entry_at_row(top_row)));
 
-        draw_search_ticks(ui, output.inner_rect, conn, row_of_line, n_rows);
+        if !conn.search_filter_suspended
+            && conn.search_filter == crate::app::SearchFilter::Highlight
+        {
+            draw_search_ticks(
+                ui,
+                output.inner_rect,
+                &conn.search_matches,
+                row_of_line,
+                n_rows,
+            );
+        }
     }
 
     fn show_merged_rows(&mut self, ui: &mut egui::Ui, menu: &mut MenuAction) {
@@ -1531,11 +1942,18 @@ impl App {
         let filter_active = self.merged_filter_active();
         let view_generation = self.merged_view_generation();
         let goto = self.merged_scroll_to.take();
-        let search_re = compile_search(
-            &self.merged_search_query,
-            self.merged_search_case_sensitive,
-            self.merged_search_regex,
-        );
+        let highlight_all_matches =
+            self.merged_search_filter == crate::app::SearchFilter::Highlight;
+        let search_re = (!self.merged_search_filter_suspended
+            && self.merged_search_filter != crate::app::SearchFilter::HideMatches)
+            .then(|| {
+                compile_search(
+                    &self.merged_search_query,
+                    self.merged_search_case_sensitive,
+                    self.merged_search_regex,
+                )
+            })
+            .flatten();
         let cur_match_seq = self
             .merged_search_pos
             .and_then(|pos| self.merged_search_matches.get(pos))
@@ -1712,7 +2130,11 @@ impl App {
                         prev_micros: None,
                         mark: session_start,
                         highlight: highlights,
-                        search_re: search_re.as_ref(),
+                        search_re: if highlight_all_matches || cur_match_seq == Some(seq) {
+                            search_re.as_ref()
+                        } else {
+                            None
+                        },
                         is_search_current: cur_match_seq == Some(seq),
                         port_tag: Some((short_tag(conn.merged_label(), tag_chars), color)),
                         row_id: egui::Id::new(("merged_row", port, abs)),
@@ -1740,6 +2162,10 @@ impl App {
     }
 
     fn show_hex_rows(&mut self, ui: &mut egui::Ui, active: usize, menu: &mut MenuAction) {
+        if self.show_search {
+            self.connections[active].maintain_hex_search();
+        }
+        let goto = self.connections[active].hex_search.scroll_to.take();
         let header_height = super::chrome::HeaderBackdrop::current(
             ui.ctx(),
             self.pane_widget_id("header_backdrop"),
@@ -1805,6 +2231,10 @@ impl App {
             rows as f32 * row_height,
         ) {
             area = area.vertical_scroll_offset(offset);
+        } else if let Some(row) = goto.and_then(|abs| hex_row_for_byte(&segments, abs)) {
+            area = area.vertical_scroll_offset(
+                (row as f32 * row_height - ui.available_height() * 0.5).max(0.0),
+            );
         } else if following {
             // Pin to the bottom; see the console's forced-offset pin. Hex rows are
             // full-height monospace labels with zero inter-row spacing, so the
@@ -1838,59 +2268,42 @@ impl App {
                     // scrolls a different row into this same screen slot every
                     // time new bytes arrive.
                     let row_id = ui.id().with(("hex_row", active, row));
-                    let (text, color) = match item {
-                        HexRow::Boundary(label) => (format!("── {label} ──"), BOUNDARY_COLOR),
+                    let color = ui.visuals().strong_text_color();
+                    let job = match item {
+                        HexRow::Boundary(label) => {
+                            let mut job = LayoutJob::default();
+                            job.append(
+                                &format!("── {label} ──"),
+                                0.0,
+                                egui::TextFormat {
+                                    font_id: font.clone(),
+                                    color: BOUNDARY_COLOR,
+                                    ..Default::default()
+                                },
+                            );
+                            job
+                        }
                         HexRow::Bytes { origin, end, row } => {
-                            let offset = row * 16;
-                            let mut hex = String::with_capacity(48);
-                            let mut ascii = String::with_capacity(16);
-                            for col in 0..16 {
-                                // Addressed from the run's own origin, so a byte
-                                // belonging to the run below — or one already
-                                // evicted from the front — leaves a hole rather
-                                // than being pulled into this dump.
-                                let abs = origin + (offset + col) as u64;
-                                let byte = if abs >= conn.raw_base && abs < end {
-                                    conn.raw_ring.get((abs - conn.raw_base) as usize).copied()
-                                } else {
-                                    None
-                                };
-                                match byte {
-                                    Some(b) => {
-                                        hex.push_str(&format!("{b:02X} "));
-                                        ascii.push(if (0x20..0x7f).contains(&b) {
-                                            b as char
-                                        } else {
-                                            '.'
-                                        });
-                                    }
-                                    None => {
-                                        hex.push_str("   ");
-                                        ascii.push(' ');
-                                    }
-                                }
-                            }
-                            (
-                                format!("{offset:08X}  {hex} |{ascii}|"),
-                                ui.visuals().strong_text_color(),
+                            let text =
+                                hex_byte_row(conn.raw_base, &conn.raw_ring, origin, end, row);
+                            let abs = origin + row as u64 * 16;
+                            let current = conn
+                                .hex_search
+                                .position
+                                .and_then(|pos| conn.hex_search.matches.get(pos))
+                                .copied()
+                                == Some(abs);
+                            hex_search_job(
+                                &text,
+                                font.clone(),
+                                color,
+                                self.show_search
+                                    .then_some(conn.hex_search.re.as_ref())
+                                    .flatten(),
+                                current,
                             )
                         }
                     };
-                    let mut job = LayoutJob::default();
-                    job.append(
-                        &text,
-                        0.0,
-                        egui::TextFormat {
-                            // The console font, whose own row height is what
-                            // `row_height` reserves per row — rows must stay exactly
-                            // that tall for the pin-to-bottom math below (and
-                            // `show_rows`' own virtualization) to line up with what
-                            // is actually painted.
-                            font_id: font.clone(),
-                            color,
-                            ..Default::default()
-                        },
-                    );
                     // `LayoutJob`'s galley can be fractionally taller than the
                     // font's advertised row height. Letting that allocate directly
                     // in `show_rows` makes the painted rows drift from the fixed
@@ -1921,6 +2334,15 @@ impl App {
             row_height,
         );
         self.connections[active].pin_view_h = output.inner_rect.height();
+        if self.show_search {
+            draw_search_ticks(
+                ui,
+                output.inner_rect,
+                &self.connections[active].hex_search.matches,
+                |abs| hex_row_for_byte(&segments, abs).map(|row| row as u64),
+                rows as u64,
+            );
+        }
     }
 
     /// Apply the actions collected from the right-click menu.
@@ -1951,7 +2373,7 @@ impl App {
                         conn.search_dirty = true;
                         conn.search_pos = None;
                     }
-                    self.show_search = true;
+                    self.set_search_visible(true);
                     self.search_focus_request = true;
                 }
                 SelectionAction::Macro => {
@@ -2005,9 +2427,6 @@ impl App {
         if menu.open_macros {
             self.show_macros_win = true;
         }
-        if menu.open_filters {
-            self.show_filters_win = !self.show_filters_win;
-        }
         if menu.open_highlight {
             self.show_highlight_win = !self.show_highlight_win;
         }
@@ -2015,7 +2434,7 @@ impl App {
             self.show_extract_win = !self.show_extract_win;
         }
         if menu.toggle_search {
-            self.show_search = !self.show_search;
+            self.set_search_visible(!self.show_search);
             if self.show_search {
                 self.search_focus_request = true;
             }
@@ -2034,13 +2453,6 @@ impl App {
             self.clear_console(menu.port);
         }
         if let Some(conn) = target.and_then(|i| self.connections.get_mut(i)) {
-            if menu.toggle_hex {
-                conn.screen_view = false;
-                conn.hex_view = !conn.hex_view;
-            }
-            if menu.toggle_plot {
-                conn.show_plot = !conn.show_plot;
-            }
             if set_mark {
                 // The line the menu was opened over — "here" — falling back to
                 // the newest line when it was opened over empty space.
@@ -2070,9 +2482,6 @@ impl App {
             if menu.send_break && live {
                 conn.handle.send_break();
             }
-        }
-        if menu.toggle_hex {
-            self.save_session();
         }
     }
 
@@ -2244,6 +2653,113 @@ fn write_merged_export(
     Ok(())
 }
 
+fn search_filter_controls(
+    ui: &mut egui::Ui,
+    mode: &mut crate::app::SearchFilter,
+    menu_id: egui::Id,
+) -> egui::Response {
+    use crate::app::SearchFilter;
+    let response = ui.add_sized([26.0, 28.0], egui::Button::new(" "));
+    egui::Popup::menu(&response).id(menu_id).show(|ui| {
+        super::chrome::menu_style(ui);
+        ui.set_min_width(176.0);
+        for (value, tooltip) in [
+            (
+                SearchFilter::Highlight,
+                "Show all lines and highlight matches",
+            ),
+            (
+                SearchFilter::OnlyMatches,
+                "Show matching lines and highlight only the current match",
+            ),
+            (
+                SearchFilter::HideMatches,
+                "Hide matching lines without highlighting",
+            ),
+        ] {
+            let item = ui
+                .add(egui::Button::selectable(
+                    *mode == value,
+                    format!("      {}", value.label()),
+                ))
+                .on_hover_text(tooltip);
+            paint_search_display_icon(ui, item.rect.left_center() + egui::vec2(16.0, 0.0), value);
+            if item.clicked() {
+                *mode = value;
+                ui.close();
+            }
+        }
+    });
+    paint_search_display_icon(ui, response.rect.center(), *mode);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            format!("Search display mode: {}", mode.label()),
+        )
+    });
+    response.on_hover_text(format!("Search display mode: {}", mode.label()))
+}
+
+fn paint_search_display_icon(ui: &egui::Ui, center: egui::Pos2, mode: crate::app::SearchFilter) {
+    use crate::app::SearchFilter;
+    let stroke = egui::Stroke::new(1.4, ui.visuals().text_color());
+    let point = |x, y| center + egui::vec2(x, y);
+    match mode {
+        SearchFilter::Highlight => {
+            ui.painter().add(egui::Shape::closed_line(
+                [
+                    (-6.0, 2.0),
+                    (2.0, -6.0),
+                    (6.0, -2.0),
+                    (-2.0, 6.0),
+                    (-5.0, 6.0),
+                ]
+                .map(|(x, y)| point(x, y))
+                .to_vec(),
+                stroke,
+            ));
+            ui.painter()
+                .line_segment([point(-6.0, 8.0), point(6.0, 8.0)], stroke);
+        }
+        SearchFilter::OnlyMatches => {
+            ui.painter().add(egui::Shape::closed_line(
+                [
+                    (-7.0, -5.0),
+                    (7.0, -5.0),
+                    (2.0, 1.0),
+                    (2.0, 6.0),
+                    (-2.0, 6.0),
+                    (-2.0, 1.0),
+                ]
+                .map(|(x, y)| point(x, y))
+                .to_vec(),
+                stroke,
+            ));
+        }
+        SearchFilter::HideMatches => {
+            ui.painter().add(egui::Shape::closed_line(
+                [
+                    (-8.0, 0.0),
+                    (-4.0, -4.0),
+                    (0.0, -5.0),
+                    (4.0, -4.0),
+                    (8.0, 0.0),
+                    (4.0, 4.0),
+                    (0.0, 5.0),
+                    (-4.0, 4.0),
+                ]
+                .map(|(x, y)| point(x, y))
+                .to_vec(),
+                stroke,
+            ));
+            ui.painter().circle_stroke(center, 2.0, stroke);
+            ui.painter()
+                .line_segment([point(-7.0, -7.0), point(7.0, 7.0)], stroke);
+        }
+    }
+}
+
 /// The right-click menu, common to rows and empty areas.
 ///
 /// `target` says which connection the port-specific items act on and which row
@@ -2312,8 +2828,8 @@ fn console_menu(
     // actually act on it, rather than the whole menu — see there.
     let row_label = target.as_ref().and_then(|t| t.label);
     // The active tab's own console: a single connection's view, or its hex
-    // dump. Hex, plot and time marks remain exclusive to it; search, filtering
-    // and export also have explicit merged-view implementations.
+    // dump. Time marks remain exclusive to it; search and export also have
+    // explicit merged-view implementations.
     let own_console = !merged_view && target.is_some() && row_label.is_none();
     ui.menu_button("Timestamps", |ui| {
         super::chrome::menu_style(ui);
@@ -2333,25 +2849,11 @@ fn console_menu(
             }
         }
     });
-    if own_console {
-        if ui.button("Toggle hex view").clicked() {
-            menu.toggle_hex = true;
-            ui.close();
-        }
-        if super::chrome::menu_item(ui, "Toggle plot", "Ctrl+Shift+P").clicked() {
-            menu.toggle_plot = true;
-            ui.close();
-        }
-    }
     ui.separator();
     if (own_console || merged_view)
         && super::chrome::menu_item(ui, "Search…", "Ctrl+Shift+F").clicked()
     {
         menu.toggle_search = true;
-        ui.close();
-    }
-    if (own_console || merged_view) && ui.button("Filters…").clicked() {
-        menu.open_filters = true;
         ui.close();
     }
     if (own_console || merged_view)
@@ -3263,18 +3765,18 @@ fn build_job(ui: &egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> LayoutJob 
 fn draw_search_ticks(
     ui: &egui::Ui,
     rect: egui::Rect,
-    conn: &Connection,
+    matches: &[u64],
     row_of_line: impl Fn(u64) -> Option<u64>,
     total_rows: u64,
 ) {
-    if conn.search_matches.is_empty() || total_rows == 0 {
+    if matches.is_empty() || total_rows == 0 {
         return;
     }
     let painter = ui.painter_at(rect);
     let x = rect.right() - 3.0;
     let color = egui::Color32::from_rgb(0xff, 0xd5, 0x4a);
-    let step = (conn.search_matches.len() / 2000).max(1);
-    for (k, &abs) in conn.search_matches.iter().enumerate() {
+    let step = (matches.len() / 2000).max(1);
+    for (k, &abs) in matches.iter().enumerate() {
         if k % step != 0 {
             continue;
         }
@@ -3468,6 +3970,154 @@ mod tests {
     }
 
     #[test]
+    fn search_history_recall_restores_options_and_draft_in_every_view() {
+        for view in 0..4 {
+            let (mut app, _tx) = test_app("search-history-recall");
+            let port = PortId(1);
+            app.connections.push(app.make_connection(
+                port,
+                "probe".into(),
+                Default::default(),
+                Default::default(),
+                inert_handle(port),
+            ));
+            app.connections[0].hex_view = view == 1;
+            app.connections[0].screen_view = view == 2;
+            if view == 3 {
+                app.create_merged_tab(vec![port]);
+            }
+            app.show_search = true;
+            app.connections[0].search_query = "draft".into();
+            app.merged_search_query = "draft".into();
+            let previous = SearchEntry::new("error.*", true, true);
+            app.search_history.remember(previous.clone());
+            let ctx = egui::Context::default();
+            let draw = |app: &mut App, events| {
+                ctx.run_test_ui(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.show_header_search(ui),
+                )
+            };
+            let _ = draw(&mut app, vec![]);
+            ctx.memory_mut(|memory| memory.request_focus(app.pane_widget_id("search_query")));
+            for (key, expected) in [
+                (egui::Key::ArrowUp, previous),
+                (
+                    egui::Key::ArrowDown,
+                    SearchEntry::new("draft", false, false),
+                ),
+            ] {
+                let _ = draw(
+                    &mut app,
+                    vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+                let actual = if view == 3 {
+                    SearchEntry::new(
+                        &app.merged_search_query,
+                        app.merged_search_regex,
+                        app.merged_search_case_sensitive,
+                    )
+                } else {
+                    let conn = &app.connections[0];
+                    SearchEntry::new(
+                        &conn.search_query,
+                        conn.search_regex,
+                        conn.search_case_sensitive,
+                    )
+                };
+                assert_eq!(actual, expected, "view={view}");
+                assert!(
+                    !ctx.input(|input| input.key_pressed(key)),
+                    "recall key must be consumed"
+                );
+            }
+            app.set_search_visible(false);
+            assert_eq!(app.search_history.entries[0].query, "draft");
+        }
+    }
+
+    #[test]
+    fn search_history_dropdown_selects_query_and_options() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("history-field");
+        let mut history = SearchHistory::default();
+        let expected = SearchEntry::new("alarm", true, true);
+        history.remember(expected.clone());
+        let mut entry = SearchEntry::new("draft", false, false);
+        let field_rect = std::cell::Cell::new(egui::Rect::NOTHING);
+        let mut draw = |events: Vec<egui::Event>| {
+            ctx.run_test_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    field_rect.set(
+                        search_query_field(ui, &mut entry, id, &mut history, 300.0, true, id).rect,
+                    );
+                },
+            )
+        };
+        let _ = draw(vec![]);
+        let arrow = field_rect.get().left_center() + egui::vec2(12.0, 0.0);
+        let _ = draw(vec![
+            egui::Event::PointerMoved(arrow),
+            egui::Event::PointerButton {
+                pos: arrow,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let _ = draw(vec![egui::Event::PointerButton {
+            pos: arrow,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(egui::Popup::is_id_open(&ctx, id.with("history_menu")));
+        let _ = draw(vec![]);
+        let output = draw(vec![]);
+        let position = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text().starts_with("alarm") => {
+                    Some(text.pos + egui::vec2(12.0, 6.0))
+                }
+                _ => None,
+            })
+            .expect("history entry is visible in dropdown");
+        let _ = draw(vec![
+            egui::Event::PointerMoved(position),
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let _ = draw(vec![egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert_eq!(entry, expected);
+        assert!(!egui::Popup::is_id_open(&ctx, id.with("history_menu")));
+        assert!(ctx.memory(|memory| memory.has_focus(id)));
+    }
+
+    #[test]
     fn long_search_text_keeps_controls_in_place() {
         for merged in [false, true] {
             for width in [224.0, 400.0, 714.0] {
@@ -3577,7 +4227,6 @@ mod tests {
     use super::*;
     use crate::app::tests::{inert_handle, test_app};
     use serialcore::config::{PortConfig, PortIdentity};
-    use serialcore::filter::{FilterRule, FilterSet};
     use serialcore::store::{ColorSpan, IncomingLine, LineMeta};
 
     #[test]
@@ -5195,8 +5844,405 @@ mod tests {
     }
 
     #[test]
+    fn search_display_modes_highlight_all_or_only_the_current_match() {
+        for merged in [false, true] {
+            let (mut app, _tx) = test_app("search-highlighting-mode");
+            let id = PortId(0);
+            let mut conn = app.make_connection(
+                id,
+                "probe".into(),
+                Default::default(),
+                Default::default(),
+                inert_handle(id),
+            );
+            conn.follow = false;
+            for (i, text) in ["keep one", "drop", "keep two"].iter().enumerate() {
+                conn.store.append(IncomingLine {
+                    text: (*text).into(),
+                    ts: ts(i as i64),
+                    port: id,
+                    flags: LineFlags::default(),
+                    spans: Default::default(),
+                    cursor: None,
+                });
+            }
+            app.connections.push(conn);
+            if merged {
+                app.create_merged_tab(vec![id]);
+                app.merged_follow = false;
+            }
+            app.connections[0].search_query = "keep".into();
+            app.merged_search_query = "keep".into();
+            app.connections[0].search_dirty = true;
+            app.merged_search_dirty = true;
+            let ctx = egui::Context::default();
+            for mode in [
+                crate::app::SearchFilter::Highlight,
+                crate::app::SearchFilter::OnlyMatches,
+                crate::app::SearchFilter::HideMatches,
+            ] {
+                app.connections[0].search_filter = mode;
+                app.merged_search_filter = mode;
+                app.maintain_filters();
+                app.maintain_merged_filter(false);
+                app.maintain_search();
+                app.maintain_merged_search(false);
+                for current in [0, 1] {
+                    app.connections[0].search_pos = Some(current);
+                    app.merged_search_pos = Some(current);
+                    let draw = |app: &mut App| {
+                        ctx.run_test_ui(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(900.0, 400.0),
+                                )),
+                                ..Default::default()
+                            },
+                            |ui| app.show_console(ui, false),
+                        )
+                    };
+                    let _ = draw(&mut app);
+                    let output = draw(&mut app);
+                    let matching_jobs = output
+                        .shapes
+                        .iter()
+                        .filter_map(|shape| {
+                            if let egui::Shape::Text(text) = &shape.shape {
+                                text.galley
+                                    .job
+                                    .text
+                                    .starts_with("keep")
+                                    .then_some(&text.galley.job)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        matching_jobs.len(),
+                        if mode == crate::app::SearchFilter::HideMatches {
+                            0
+                        } else {
+                            2
+                        }
+                    );
+                    for job in matching_jobs {
+                        assert_eq!(
+                            job.sections
+                                .iter()
+                                .any(|section| section.format.background
+                                    != egui::Color32::TRANSPARENT),
+                            mode == crate::app::SearchFilter::Highlight
+                                || (mode == crate::app::SearchFilter::OnlyMatches
+                                    && job.text
+                                        == if current == 0 { "keep one" } else { "keep two" }),
+                            "{mode:?}, merged={merged}, current={current}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn search_display_dropdown_applies_modes_and_retains_them_after_closing() {
+        for merged in [false, true] {
+            let (mut app, _tx) = test_app("search-mode-buttons");
+            let id = PortId(0);
+            let mut conn = app.make_connection(
+                id,
+                "probe".into(),
+                Default::default(),
+                Default::default(),
+                inert_handle(id),
+            );
+            for (i, text) in ["keep one", "drop", "keep two"].iter().enumerate() {
+                conn.store.append(IncomingLine {
+                    text: (*text).into(),
+                    ts: ts(i as i64),
+                    port: id,
+                    flags: LineFlags::default(),
+                    spans: Default::default(),
+                    cursor: None,
+                });
+            }
+            app.connections.push(conn);
+            if merged {
+                app.create_merged_tab(vec![id]);
+            }
+            app.connections[0].search_query = "keep".into();
+            app.merged_search_query = "keep".into();
+            app.show_search = true;
+            app.connections[0].search_dirty = true;
+            app.merged_search_dirty = true;
+            app.maintain_search();
+            app.maintain_merged_search(false);
+            app.connections[0].search_pos = Some(0);
+            app.merged_search_pos = Some(0);
+            let ctx = egui::Context::default();
+            let draw = |app: &mut App, events| {
+                ctx.run_test_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(900.0, 400.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.show_header_search(ui),
+                )
+            };
+            for (mode, count) in [
+                (crate::app::SearchFilter::OnlyMatches, 2),
+                (crate::app::SearchFilter::HideMatches, 1),
+                (crate::app::SearchFilter::Highlight, 3),
+            ] {
+                egui::Popup::open_id(&ctx, app.pane_widget_id("search_display_menu"));
+                let _ = draw(&mut app, vec![]);
+                let output = draw(&mut app, vec![]);
+                let rect = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| {
+                        if let egui::Shape::Text(text) = &shape.shape {
+                            (text.galley.text().trim() == mode.label())
+                                .then(|| egui::Rect::from_min_size(text.pos, text.galley.size()))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap();
+                let pos = rect.center();
+                let button = |pressed| egui::Event::PointerButton {
+                    pos,
+                    pressed,
+                    button: egui::PointerButton::Primary,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                let _ = draw(&mut app, vec![egui::Event::PointerMoved(pos), button(true)]);
+                let _ = draw(&mut app, vec![button(false)]);
+                if merged {
+                    assert_eq!(app.merged_search_filter, mode);
+                    assert_eq!(app.merged_view().len(), count);
+                    assert_eq!(
+                        app.connections[0].search_filter,
+                        crate::app::SearchFilter::Highlight
+                    );
+                } else {
+                    assert_eq!(app.connections[0].search_filter, mode);
+                    app.connections[0].sync_wrap(0);
+                    assert_eq!(app.connections[0].wrap_index.len(), count);
+                }
+                assert_eq!(app.connections[0].store.len(), 3);
+                assert_eq!(
+                    if merged {
+                        app.merged_search_pos
+                    } else {
+                        app.connections[0].search_pos
+                    },
+                    Some(0)
+                );
+                let output = draw(&mut app, vec![]);
+                assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "1/2")),
+                    "match position remains visible in {mode:?}");
+                if mode == crate::app::SearchFilter::HideMatches {
+                    app.search_step(1);
+                    assert_eq!(
+                        if merged {
+                            app.merged_search_pos
+                        } else {
+                            app.connections[0].search_pos
+                        },
+                        Some(0)
+                    );
+                }
+            }
+            assert_eq!(
+                if merged {
+                    app.merged_scroll_to.map(|entry| entry.abs)
+                } else {
+                    app.connections[0].scroll_to
+                },
+                Some(0)
+            );
+            app.search_step(1);
+            assert_eq!(
+                if merged {
+                    app.merged_search_pos
+                } else {
+                    app.connections[0].search_pos
+                },
+                Some(1),
+                "navigation resumes from the saved match"
+            );
+            if merged {
+                app.merged_search_filter = crate::app::SearchFilter::OnlyMatches;
+            } else {
+                app.connections[0].search_filter = crate::app::SearchFilter::OnlyMatches;
+            }
+            app.search_focus_request = true;
+            let _ = draw(&mut app, vec![]);
+            let _ = draw(
+                &mut app,
+                vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            assert!(!app.show_search);
+            assert_eq!(
+                if merged {
+                    app.merged_search_filter
+                } else {
+                    app.connections[0].search_filter
+                },
+                crate::app::SearchFilter::OnlyMatches
+            );
+            assert!(!if merged {
+                app.merged_filter_active()
+            } else {
+                app.connections[0].filter_index_active()
+            });
+            assert_eq!(
+                if merged {
+                    &app.merged_search_query
+                } else {
+                    &app.connections[0].search_query
+                },
+                "keep"
+            );
+            app.set_search_visible(true);
+            let _ = draw(&mut app, vec![]);
+            if merged {
+                assert_eq!(app.merged_view().len(), 2);
+            } else {
+                app.connections[0].sync_wrap(0);
+                assert_eq!(app.connections[0].wrap_index.len(), 2);
+            }
+            let fresh = app.make_connection(
+                PortId(1),
+                "fresh".into(),
+                Default::default(),
+                Default::default(),
+                inert_handle(PortId(1)),
+            );
+            assert_eq!(fresh.search_filter, crate::app::SearchFilter::Highlight);
+        }
+    }
+
+    #[test]
+    fn closing_search_toggle_reveals_lines_and_reopening_reuses_the_query() {
+        for merged in [false, true] {
+            for mode in [
+                crate::app::SearchFilter::OnlyMatches,
+                crate::app::SearchFilter::HideMatches,
+            ] {
+                let (mut app, _tx) = test_app("close-search-toggle");
+                let id = PortId(0);
+                let mut conn = app.make_connection(
+                    id,
+                    "probe".into(),
+                    Default::default(),
+                    Default::default(),
+                    inert_handle(id),
+                );
+                for (i, text) in ["keep one", "drop", "keep two"].iter().enumerate() {
+                    conn.store.append(IncomingLine {
+                        text: (*text).into(),
+                        ts: ts(i as i64),
+                        port: id,
+                        flags: LineFlags::default(),
+                        spans: Default::default(),
+                        cursor: None,
+                    });
+                }
+                app.connections.push(conn);
+                if merged {
+                    app.create_merged_tab(vec![id]);
+                }
+                app.connections[0].search_filter = mode;
+                app.connections[0].search_query = "keep".into();
+                app.merged_search_filter = mode;
+                app.merged_search_query = "keep".into();
+                app.set_search_visible(true);
+                app.maintain_filters();
+                app.maintain_merged_filter(false);
+                let expected = if mode == crate::app::SearchFilter::OnlyMatches {
+                    2
+                } else {
+                    1
+                };
+                let view_len = |app: &mut App| {
+                    if merged {
+                        app.merged_view().len()
+                    } else {
+                        app.connections[0].sync_wrap(0);
+                        app.connections[0].wrap_index.len()
+                    }
+                };
+                assert_eq!(view_len(&mut app), expected);
+                for visible in [false, true] {
+                    app.apply_menu(
+                        0,
+                        MenuAction {
+                            toggle_search: true,
+                            ..Default::default()
+                        },
+                    );
+                    // A later maintenance frame must not silently reapply hidden filtering.
+                    app.maintain_filters();
+                    app.maintain_merged_filter(false);
+                    assert_eq!(app.show_search, visible);
+                    assert_eq!(view_len(&mut app), if visible { expected } else { 3 });
+                    assert_eq!(
+                        if merged {
+                            &app.merged_search_query
+                        } else {
+                            &app.connections[0].search_query
+                        },
+                        "keep"
+                    );
+                    assert_eq!(
+                        if merged {
+                            app.merged_search_filter
+                        } else {
+                            app.connections[0].search_filter
+                        },
+                        mode
+                    );
+                    if !visible {
+                        let mut text = Vec::new();
+                        if merged {
+                            write_merged_export(
+                                &mut text,
+                                &app.connections,
+                                app.merged_view(),
+                                false,
+                            )
+                            .unwrap();
+                        } else {
+                            write_active_export(&mut text, &app.connections[0], false).unwrap();
+                        }
+                        let text = String::from_utf8(text).unwrap();
+                        assert!(
+                            text.contains("keep one")
+                                && text.contains("drop")
+                                && text.contains("keep two")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn active_export_writes_only_the_filtered_view() {
-        let (app, _enum_tx) = test_app("active-export");
+        let (mut app, _enum_tx) = test_app("active-export");
         let id = PortId(1);
         let mut conn = app.make_connection(
             id,
@@ -5215,23 +6261,33 @@ mod tests {
                 cursor: None,
             });
         }
-        conn.filter_rules = vec![FilterRule {
-            pattern: "keep".into(),
-            is_regex: false,
-            ..Default::default()
-        }];
-        let (filter, errors) = FilterSet::compile(&conn.filter_rules, conn.filter_combine);
-        assert!(errors.is_empty());
-        conn.filter_index.rebuild(&conn.store, &filter);
+        conn.search_query = "keep".into();
+        conn.search_filter = crate::app::SearchFilter::OnlyMatches;
+        app.connections.push(conn);
+        app.maintain_filters();
+        let conn = &app.connections[0];
 
         let mut csv = Vec::new();
-        write_active_export(&mut csv, &conn, true).unwrap();
+        write_active_export(&mut csv, conn, true).unwrap();
         let csv = String::from_utf8(csv).unwrap();
         let lines: Vec<_> = csv.lines().collect();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], "wall_time,micros,flags,text");
         assert!(lines[1].ends_with(",2,0,\"keep, \"\"quoted\"\"\""));
         assert!(!csv.contains("drop"));
+        for (mode, keep, drop) in [
+            (crate::app::SearchFilter::HideMatches, false, true),
+            (crate::app::SearchFilter::Highlight, true, true),
+        ] {
+            app.connections[0].search_filter = mode;
+            app.maintain_filters();
+            let mut text = Vec::new();
+            write_active_export(&mut text, &app.connections[0], false).unwrap();
+            let text = String::from_utf8(text).unwrap();
+            assert_eq!(text.contains("keep"), keep);
+            assert_eq!(text.contains("drop"), drop);
+            assert_eq!(app.connections[0].store.len(), 2);
+        }
     }
 
     #[test]
@@ -5464,6 +6520,118 @@ mod tests {
     /// A text galley is slightly taller than `Fonts::row_height` at common font
     /// sizes; allocating it directly used to extend `content_size` below the
     /// computed bottom-pin offset, leaving the last line partly out of view.
+    #[test]
+    fn hex_search_matches_byte_values_and_ascii_with_incremental_rows() {
+        let mut search = HexSearch::default();
+        let mut bytes = std::collections::VecDeque::from(b"rea".to_vec());
+        let sessions = vec![RawSession {
+            start: 0,
+            label: None,
+        }];
+        let query = SearchEntry::new("ready", false, false);
+        search.refresh(query.clone(), 0, &bytes, &sessions);
+        assert!(search.matches.is_empty());
+        bytes.extend(b"dy".iter().copied());
+        search.refresh(query.clone(), 0, &bytes, &sessions);
+        assert_eq!(search.matches, [0]);
+        bytes.extend(b"...........READY".iter().copied());
+        search.refresh(query.clone(), 0, &bytes, &sessions);
+        assert_eq!(search.matches, [0, 16]);
+        search.refresh(SearchEntry::new("ready", false, true), 0, &bytes, &sessions);
+        assert_eq!(search.matches, [0]);
+        search.refresh(
+            SearchEntry::new("72 65 61 64 79", false, false),
+            0,
+            &bytes,
+            &sessions,
+        );
+        assert_eq!(search.matches, [0]);
+        search.refresh(SearchEntry::new("r.ad.", true, false), 0, &bytes, &sessions);
+        assert_eq!(search.matches, [0, 16]);
+        for _ in 0..2 {
+            bytes.pop_front();
+        }
+        search.refresh(query, 2, &bytes, &sessions);
+        assert_eq!(search.matches, [16], "eviction removes partial matches");
+        search.refresh(SearchEntry::new("[", true, false), 2, &bytes, &sessions);
+        assert!(search.matches.is_empty());
+    }
+
+    #[test]
+    fn hex_search_highlights_and_navigates_independently_of_log_filter_mode() {
+        let (mut app, _tx) = test_app("hex-search");
+        let port = PortId(1);
+        let mut conn = app.make_connection(
+            port,
+            "probe".into(),
+            Default::default(),
+            Default::default(),
+            inert_handle(port),
+        );
+        conn.hex_view = true;
+        conn.raw_sessions.push(RawSession {
+            start: 0,
+            label: None,
+        });
+        conn.push_raw_bytes(b"ready...........ready");
+        conn.search_query = "ready".into();
+        app.connections.push(conn);
+        app.show_search = true;
+        let ctx = egui::Context::default();
+        for mode in [
+            crate::app::SearchFilter::Highlight,
+            crate::app::SearchFilter::OnlyMatches,
+            crate::app::SearchFilter::HideMatches,
+        ] {
+            app.connections[0].search_filter = mode;
+            app.maintain_search();
+            assert_eq!(app.connections[0].hex_search.matches, [0, 16]);
+            app.connections[0].hex_search.position = Some(1);
+            app.search_step(1);
+            assert_eq!(app.connections[0].hex_search.scroll_to, Some(0));
+            assert!(!app.connections[0].follow);
+            let output =
+                ctx.run_test_ui(egui::RawInput::default(), |ui| app.show_console(ui, false));
+            let rows: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text().starts_with("000000") => {
+                        Some(&text.galley.job)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(rows.len(), 2, "Hex must never filter rows");
+            for row in rows {
+                assert!(
+                    row.sections
+                        .iter()
+                        .any(|section| section.format.background != egui::Color32::TRANSPARENT),
+                    "both matching rows must be highlighted"
+                );
+            }
+            assert_eq!(
+                app.connections[0].search_filter, mode,
+                "Log mode stays remembered"
+            );
+        }
+        app.set_search_visible(false);
+        let output = ctx.run_test_ui(egui::RawInput::default(), |ui| app.show_console(ui, false));
+        for shape in output.shapes {
+            if let egui::Shape::Text(text) = shape.shape {
+                if text.galley.text().starts_with("000000") {
+                    assert!(text
+                        .galley
+                        .job
+                        .sections
+                        .iter()
+                        .all(|section| section.format.background == egui::Color32::TRANSPARENT));
+                }
+            }
+        }
+    }
+
     #[test]
     fn hex_rows_keep_the_virtualized_pitch_exact() {
         let ctx = egui::Context::default();
