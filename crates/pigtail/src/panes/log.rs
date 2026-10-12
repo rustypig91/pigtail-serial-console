@@ -1922,7 +1922,7 @@ impl App {
                 ui,
                 output.inner_rect,
                 &conn.search_matches,
-                row_of_line,
+                |abs| row_of_line(*abs),
                 n_rows,
             );
         }
@@ -2159,6 +2159,20 @@ impl App {
             self.merged_new_since_scroll = 0;
         }
         self.merged_pin_view_h = output.inner_rect.height();
+        if !self.merged_search_filter_suspended && highlight_all_matches {
+            draw_search_ticks(
+                ui,
+                output.inner_rect,
+                &self.merged_search_matches,
+                |target| {
+                    let entry = view
+                        .binary_search_by_key(&target.seq, |entry| entry.seq)
+                        .ok()?;
+                    Some(merged_wrap.start_row(entry))
+                },
+                n_rows,
+            );
+        }
     }
 
     fn show_hex_rows(&mut self, ui: &mut egui::Ui, active: usize, menu: &mut MenuAction) {
@@ -2339,7 +2353,7 @@ impl App {
                 ui,
                 output.inner_rect,
                 &self.connections[active].hex_search.matches,
-                |abs| hex_row_for_byte(&segments, abs).map(|row| row as u64),
+                |abs| hex_row_for_byte(&segments, *abs).map(|row| row as u64),
                 rows as u64,
             );
         }
@@ -3762,11 +3776,11 @@ fn build_job(ui: &egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> LayoutJob 
     job
 }
 
-fn draw_search_ticks(
+fn draw_search_ticks<T>(
     ui: &egui::Ui,
     rect: egui::Rect,
-    matches: &[u64],
-    row_of_line: impl Fn(u64) -> Option<u64>,
+    matches: &[T],
+    row_of_line: impl Fn(&T) -> Option<u64>,
     total_rows: u64,
 ) {
     if matches.is_empty() || total_rows == 0 {
@@ -3776,7 +3790,7 @@ fn draw_search_ticks(
     let x = rect.right() - 3.0;
     let color = egui::Color32::from_rgb(0xff, 0xd5, 0x4a);
     let step = (matches.len() / 2000).max(1);
-    for (k, &abs) in matches.iter().enumerate() {
+    for (k, abs) in matches.iter().enumerate() {
         if k % step != 0 {
             continue;
         }
@@ -5841,6 +5855,60 @@ mod tests {
         let tag = short_tag("abcdefghijklmnopqrstuvwxyz", MAX_MERGED_TAG_CHARS);
         assert_eq!(tag, "[abcdefghijklmnopqrstuvw…]");
         assert_eq!(tag.chars().count(), MAX_MERGED_TAG_CHARS + 2);
+    }
+
+    #[test]
+    fn merged_search_scrollbar_marks_follow_display_mode_and_visibility() {
+        let (mut app, _tx) = test_app("merged-search-ticks");
+        let port = PortId(1);
+        let mut conn = app.make_connection(
+            port,
+            "probe".into(),
+            Default::default(),
+            Default::default(),
+            inert_handle(port),
+        );
+        for (i, text) in ["keep one", "drop", "keep two"].iter().enumerate() {
+            conn.store.append(IncomingLine {
+                text: (*text).into(),
+                ts: ts(i as i64),
+                port,
+                flags: LineFlags::default(),
+                spans: Default::default(),
+                cursor: None,
+            });
+        }
+        app.connections.push(conn);
+        app.create_merged_tab(vec![port]);
+        app.merged_search_query = "keep".into();
+        app.merged_search_dirty = true;
+        app.maintain_merged_search(false);
+        let ctx = egui::Context::default();
+        for (mode, visible, expected) in [
+            (crate::app::SearchFilter::Highlight, true, 2),
+            (crate::app::SearchFilter::OnlyMatches, true, 0),
+            (crate::app::SearchFilter::HideMatches, true, 0),
+            (crate::app::SearchFilter::Highlight, false, 0),
+            (crate::app::SearchFilter::Highlight, true, 2),
+        ] {
+            app.merged_search_filter = mode;
+            app.set_search_visible(visible);
+            app.maintain_merged_filter(false);
+            let output = ctx.run_test_ui(egui::RawInput::default(), |ui| {
+                app.show_console(ui, false);
+            });
+            let ticks = output
+                .shapes
+                .iter()
+                .filter(|shape| {
+                    matches!(&shape.shape, egui::Shape::LineSegment { points, stroke }
+                    if stroke.color == egui::Color32::from_rgb(0xff, 0xd5, 0x4a)
+                        && stroke.width == 2.0
+                        && (points[1].x - points[0].x - 3.0).abs() < 0.01)
+                })
+                .count();
+            assert_eq!(ticks, expected, "{mode:?}, visible={visible}");
+        }
     }
 
     #[test]

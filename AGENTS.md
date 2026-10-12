@@ -82,7 +82,9 @@ application.
   search highlighting while retaining the query, current match and selected
   mode. Reopening search reuses that text and resumes the selected mode. Each connection and
   merged view remembers its mode for the current run; startup defaults to
-  **Highlight**. Nothing is saved or migrated. Hex and ANSI/VT display
+  **Highlight**. Nothing is saved or migrated. Merged-view scrollbar match
+  markers use merged sequence keys and wrapped row positions, so matches from
+  different connections stay correctly placed. Hex and ANSI/VT display
   remain independent of line filtering. Text/CSV exports use the displayed Log
   subset; raw capture remains complete. There is no separate Filters window or
   Add as filter action; **Search selection** stays in the selection menu.
