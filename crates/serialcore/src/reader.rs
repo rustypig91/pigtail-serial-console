@@ -62,6 +62,7 @@ pub enum ConnState {
     Connected,
     Lost,
     Reconnecting,
+    DeviceMissing,
     Closed,
 }
 
@@ -73,6 +74,7 @@ impl std::fmt::Display for ConnState {
             ConnState::Connected => "connected",
             ConnState::Lost => "lost",
             ConnState::Reconnecting => "reconnecting",
+            ConnState::DeviceMissing => "device missing",
             ConnState::Closed => "closed",
         };
         f.write_str(s)
@@ -368,6 +370,7 @@ type Opener = Box<dyn FnMut() -> Result<Box<dyn ByteSource>, SourceError> + Send
 /// than something each of the dozen send sites has to remember: one missed wake
 /// means that event sits in the channel until some unrelated input happens to
 /// redraw the app.
+#[derive(Clone)]
 struct EventTx {
     tx: Sender<ReaderEvent>,
     wake: Wake,
@@ -518,8 +521,10 @@ fn run(
                 (opener, false)
             } else {
                 let mut first = true;
+                let status_tx = event_tx.clone();
                 let opener: Opener = Box::new(move || {
                     let path = resolve_path(&identity, &pcfg, &mut first, &initial_path)?;
+                    status_tx.send(ReaderEvent::State(ConnState::Reconnecting));
                     Ok(Box::new(SerialSource::open(&path, &pcfg)?) as Box<dyn ByteSource>)
                 });
                 (opener, true)
@@ -527,8 +532,10 @@ fn run(
             #[cfg(not(debug_assertions))]
             {
                 let mut first = true;
+                let status_tx = event_tx.clone();
                 let opener: Opener = Box::new(move || {
                     let path = resolve_path(&identity, &pcfg, &mut first, &initial_path)?;
+                    status_tx.send(ReaderEvent::State(ConnState::Reconnecting));
                     Ok(Box::new(SerialSource::open(&path, &pcfg)?) as Box<dyn ByteSource>)
                 });
                 (opener, true)
@@ -571,17 +578,9 @@ fn run(
     let mut pending = Batch::default();
     let mut backoff = Duration::from_millis(100);
     let mut lost_at: Option<Instant> = None;
-    let mut first_connect = true;
+    event_tx.send(ReaderEvent::State(ConnState::Connecting));
 
     'outer: loop {
-        // (Re)connect phase.
-        let state = if first_connect {
-            ConnState::Connecting
-        } else {
-            ConnState::Reconnecting
-        };
-        event_tx.send(ReaderEvent::State(state));
-
         // Reported once per distinct message within a (re)connect phase: an
         // open failure like permission denied won't clear itself between
         // backoff retries, so repeating it every attempt would just spam
@@ -600,7 +599,10 @@ fn run(
                         return;
                     }
                     let msg = e.to_string();
-                    if last_reported.as_deref() != Some(msg.as_str()) {
+                    if matches!(e, SourceError::DeviceMissing(_)) {
+                        event_tx.send(ReaderEvent::State(ConnState::DeviceMissing));
+                        last_reported = None;
+                    } else if last_reported.as_deref() != Some(msg.as_str()) {
                         event_tx.send(ReaderEvent::connection_error(msg.clone()));
                         last_reported = Some(msg);
                     }
@@ -634,7 +636,6 @@ fn run(
             );
         }
         backoff = Duration::from_millis(100);
-        first_connect = false;
         event_tx.send(ReaderEvent::State(ConnState::Connected));
 
         // Read loop.
@@ -817,7 +818,7 @@ fn resolve_path(
             if !identity.has_usb() && !identity.path_fallback.is_empty() {
                 Ok(identity.path_fallback.clone())
             } else {
-                Err(SourceError::Disconnected("device not present".into()))
+                Err(SourceError::DeviceMissing("device not present".into()))
             }
         }
     }

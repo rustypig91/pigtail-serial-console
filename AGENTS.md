@@ -137,9 +137,22 @@ application.
   double-click it to maximize or restore, and drag an edge or corner to resize.
   View controls, search, clear, export, and the app menu sit above the console;
   ANSI/VT sits beside Hex; highlights are in the overflow menu. A thin footer shows
-  connection status, line counts, port settings, and view diagnostics, with a
-  clickable pin icon for autoscroll. The header tint blends subtly
+  one combined connection/error status at the bottom left, line counts and port
+  settings, with a clickable pin icon for autoscroll. History eviction does not add a
+  “History limited” indicator to the footer. The header tint blends subtly
   with scrolling terminal history and its timestamps underneath it.
+  The combined status shows green **Connected**, yellow **Device missing** when
+  no device is available, and yellow **Reconnecting** after discovery while
+  opening the port. Other waiting/closed states are yellow. Failures replace
+  the connection label with a short red description (permission denied, port
+  busy, capture/send/control failure); dropped commands and an already active
+  transfer are yellow warnings. Hover shows full details immediately, including
+  after clicking the status; it does not use the usual tooltip delay or click
+  suppression. There is no separate Error tag. Device absence clears obsolete
+  link errors without clearing
+  unrelated session failures, which remain visible until dismissed. Successful
+  reconnection clears link errors. Error details remain available in the
+  overflow menu.
 - Optional **ANSI/VT** screen for interactive shells and device menus: cursor
   positioning, erase and redraw operations, scrolling regions, styled/colored
   text, and alternate screen buffers. Select **Log**, **Hex**, or **ANSI/VT** in

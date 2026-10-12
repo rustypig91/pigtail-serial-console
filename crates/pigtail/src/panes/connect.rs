@@ -1100,10 +1100,13 @@ impl App {
                         (self.merged_follow, self.merged_new_since_scroll)
                     } else if let Some(active) = self.active_index() {
                         let conn = &self.connections[active];
-                        let status =
-                            ui.colored_label(state_color(conn.state), conn.state.to_string());
-                        if let Some(err) = &conn.last_error {
-                            status.on_hover_text(&err.msg);
+                        let (label, color, details) = connection_status(conn);
+                        let status = ui.colored_label(color, label);
+                        if status.contains_pointer() {
+                            egui::Tooltip::for_widget(&status).show(|ui| {
+                                ui.set_max_width(ui.spacing().tooltip_width);
+                                ui.label(details);
+                            });
                         }
                         let lines =
                             if !conn.hex_view && !conn.screen_view && conn.filter_index_active() {
@@ -1114,19 +1117,6 @@ impl App {
                         ui.weak(format!("{lines} lines"));
                         if width > 450.0 {
                             ui.weak(conn.port_config.summary());
-                        }
-                        if let Some(err) = &conn.last_error {
-                            ui.colored_label(egui::Color32::from_rgb(255, 95, 95), "Error")
-                                .on_hover_text(&err.msg);
-                        }
-                        if width > 750.0
-                            && (conn.store.evicted_any()
-                                || conn.raw_evicted_any
-                                || conn.series_evicted_any)
-                        {
-                            ui.weak("History limited").on_hover_text(
-                                "Live history or plotted series limited; full capture on disk",
-                            );
                         }
                         (conn.follow, conn.new_since_scroll)
                     } else {
@@ -1619,10 +1609,82 @@ fn flow_label(f: FlowControl) -> &'static str {
     }
 }
 
+fn connection_status(conn: &crate::app::Connection) -> (&str, egui::Color32, &str) {
+    let warning = egui::Color32::from_rgb(0xe5, 0xc0, 0x40);
+    if let Some(error) = &conn.last_error {
+        let (label, is_warning) = short_error(&error.msg);
+        let color = if is_warning {
+            warning
+        } else {
+            egui::Color32::from_rgb(255, 95, 95)
+        };
+        return (label, color, &error.msg);
+    }
+    let (label, details) = match conn.state {
+        ConnState::Connected => ("Connected", "Device connected."),
+        ConnState::DeviceMissing => (
+            "Device missing",
+            "Device not connected. Pigtail will reconnect automatically when it becomes available.",
+        ),
+        ConnState::Connecting => ("Connecting", "Looking for the device."),
+        ConnState::Reconnecting => ("Reconnecting", "Device found. Attempting to connect."),
+        ConnState::Lost => (
+            "Connection lost",
+            "Connection interrupted. Checking for the device.",
+        ),
+        ConnState::Disconnected => ("Disconnected", "Device disconnected."),
+        ConnState::Closed => ("Closed", "Connection closed."),
+    };
+    let color = if conn.state == ConnState::Connected {
+        state_color(conn.state)
+    } else {
+        warning
+    };
+    (label, color, details)
+}
+
+fn short_error(msg: &str) -> (&'static str, bool) {
+    if msg.ends_with(": dropped, not connected") {
+        return ("Command not sent", true);
+    }
+    let lower = msg.to_lowercase();
+    let label = if lower.starts_with("session log:") {
+        "Capture unavailable"
+    } else if lower.starts_with("log write:") {
+        "Capture write failed"
+    } else if lower.starts_with("clear log:") {
+        "Clear capture failed"
+    } else if lower.starts_with("transmit:") {
+        "Send failed"
+    } else if lower.starts_with("file transfer:") {
+        if lower.contains("already active") {
+            return ("Transfer already active", true);
+        }
+        "File transfer failed"
+    } else if lower.starts_with("dtr:") {
+        "DTR failed"
+    } else if lower.starts_with("rts:") {
+        "RTS failed"
+    } else if lower.starts_with("break:") {
+        "Break failed"
+    } else if lower.contains("permission denied") || lower.contains("access is denied") {
+        "Permission denied"
+    } else if lower.contains("in use") || lower.contains("busy") {
+        "Port busy"
+    } else if lower.contains("cannot disambiguate") {
+        "Multiple matching devices"
+    } else if lower.starts_with("io error:") || lower.starts_with("source disconnected:") {
+        "Receive failed"
+    } else {
+        "Connection failed"
+    };
+    (label, false)
+}
+
 fn state_color(state: ConnState) -> egui::Color32 {
     match state {
         ConnState::Connected => egui::Color32::from_rgb(0x33, 0xcc, 0x66),
-        ConnState::Connecting | ConnState::Reconnecting => {
+        ConnState::Connecting | ConnState::Reconnecting | ConnState::DeviceMissing => {
             egui::Color32::from_rgb(0xe5, 0xc0, 0x40)
         }
         ConnState::Lost => egui::Color32::from_rgb(0xff, 0x55, 0x55),
@@ -1735,6 +1797,162 @@ mod tests {
     use egui::{Event, Key};
     use serialcore::config::TransmitMacro;
     use serialcore::store::PortId;
+
+    #[test]
+    fn footer_tooltip_appears_without_delay_and_survives_clicking() {
+        let (mut app, _tx) = test_app("immediate-status-tooltip");
+        let id = PortId(0);
+        app.connections.push(app.make_connection(
+            id,
+            "probe".into(),
+            Default::default(),
+            Default::default(),
+            inert_handle(id),
+        ));
+        app.connections[0].state = serialcore::reader::ConnState::DeviceMissing;
+        let ctx = egui::Context::default();
+        let mut frame = |time, events| {
+            ctx.run_test_ui(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.show_status_footer(ui),
+            )
+        };
+        let initial = frame(0.0, vec![]);
+        let pos = initial
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    (text.galley.text() == "Device missing")
+                        .then(|| text.pos + text.galley.size() * 0.5)
+                } else {
+                    None
+                }
+            })
+            .expect("status label");
+        frame(0.01, vec![Event::PointerMoved(pos)]);
+        let has_tooltip = |output: &egui::FullOutput| {
+            output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text().starts_with("Device not connected."))
+        })
+        };
+        assert!(
+            has_tooltip(&frame(0.02, vec![])),
+            "tooltip must appear before the usual delay"
+        );
+        let click = |pressed| Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        assert!(has_tooltip(&frame(0.03, vec![click(true)])));
+        assert!(has_tooltip(&frame(0.04, vec![click(false)])));
+        assert!(
+            has_tooltip(&frame(0.05, vec![])),
+            "clicking must not suppress the tooltip"
+        );
+        let outside = egui::pos2(500.0, 100.0);
+        frame(0.06, vec![Event::PointerMoved(outside)]);
+        assert!(
+            !has_tooltip(&frame(0.07, vec![])),
+            "tooltip closes after leaving the status"
+        );
+    }
+
+    #[test]
+    fn footer_merges_connection_state_and_error_into_one_status() {
+        let (mut app, _tx) = test_app("combined-footer-status");
+        let id = PortId(0);
+        app.connections.push(app.make_connection(
+            id,
+            "probe".into(),
+            Default::default(),
+            Default::default(),
+            inert_handle(id),
+        ));
+        let green = egui::Color32::from_rgb(0x33, 0xcc, 0x66);
+        let yellow = egui::Color32::from_rgb(0xe5, 0xc0, 0x40);
+        let red = egui::Color32::from_rgb(255, 95, 95);
+        let ctx = egui::Context::default();
+        for (state, error, label, color) in [
+            (
+                serialcore::reader::ConnState::Connected,
+                None,
+                "Connected",
+                green,
+            ),
+            (
+                serialcore::reader::ConnState::DeviceMissing,
+                None,
+                "Device missing",
+                yellow,
+            ),
+            (
+                serialcore::reader::ConnState::Reconnecting,
+                None,
+                "Reconnecting",
+                yellow,
+            ),
+            (
+                serialcore::reader::ConnState::Reconnecting,
+                Some("/dev/ttyUSB0: permission denied"),
+                "Permission denied",
+                red,
+            ),
+            (
+                serialcore::reader::ConnState::Connected,
+                Some("log write: disk full"),
+                "Capture write failed",
+                red,
+            ),
+            (
+                serialcore::reader::ConnState::DeviceMissing,
+                Some("transmit: dropped, not connected"),
+                "Command not sent",
+                yellow,
+            ),
+        ] {
+            app.connections[0].state = state;
+            app.connections[0].last_error = error.map(crate::app::TabError::connection);
+            let output = ctx.run_test_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 300.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.show_status_footer(ui),
+            );
+            let texts: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        Some(text)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let status = texts
+                .iter()
+                .find(|text| text.galley.text() == label)
+                .unwrap_or_else(|| panic!("missing status: {label}"));
+            assert_eq!(status.galley.job.sections[0].format.color, color);
+            assert!(!texts.iter().any(|text| text.galley.text() == "Error"));
+            if error.is_some() {
+                assert!(!texts.iter().any(|text| text.galley.text() == "Connected"
+                    || text.galley.text() == "Reconnecting"
+                    || text.galley.text() == "Device missing"));
+            }
+        }
+    }
 
     #[test]
     fn small_port_dialogs_keep_actions_visible_and_options_scrollable() {

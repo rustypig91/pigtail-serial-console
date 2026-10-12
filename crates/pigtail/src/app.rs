@@ -828,16 +828,18 @@ impl Connection {
                 if s != ConnState::Connected {
                     self.store.finalize_last_provisional();
                     self.mark_raw_discontinuity();
-                } else if matches!(
-                    self.last_error,
-                    Some(TabError {
-                        scope: ErrorScope::Connection,
-                        ..
-                    })
-                ) {
-                    // A successful (re)connect means whatever was wrong
-                    // with the *link* no longer applies; don't leave a
-                    // stale error showing once the port is open again.
+                }
+                if matches!(s, ConnState::Connected | ConnState::DeviceMissing)
+                    && matches!(
+                        self.last_error,
+                        Some(TabError {
+                            scope: ErrorScope::Connection,
+                            ..
+                        })
+                    )
+                {
+                    // A successful connection or confirmed absence supersedes
+                    // the previous link failure. Absence is a waiting state.
                     // Session-scoped errors (a capture file that couldn't
                     // be opened, say) are untouched by reconnecting, so
                     // they survive it.
@@ -6084,6 +6086,41 @@ pub(crate) mod tests {
             app.connections[0].last_error.as_ref().unwrap().msg,
             "transmit: dropped, not connected"
         );
+    }
+
+    #[test]
+    fn missing_device_clears_link_errors_but_preserves_capture_failures() {
+        let (app, _enum_tx) = test_app("missing-device-status");
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            identity("A1"),
+            PortConfig::default(),
+            inert_handle(id),
+        );
+        conn.last_error = Some(TabError::connection("permission denied"));
+        conn.apply_reader_event(ReaderEvent::State(ConnState::DeviceMissing));
+        assert_eq!(conn.state, ConnState::DeviceMissing);
+        assert!(conn.last_error.is_none());
+        conn.apply_reader_event(ReaderEvent::State(ConnState::Reconnecting));
+        assert!(conn.last_error.is_none());
+
+        conn.apply_reader_event(ReaderEvent::Error {
+            scope: ErrorScope::Session,
+            msg: "log write: disk full".into(),
+        });
+        for state in [
+            ConnState::DeviceMissing,
+            ConnState::Reconnecting,
+            ConnState::Connected,
+        ] {
+            conn.apply_reader_event(ReaderEvent::State(state));
+            assert_eq!(
+                conn.last_error.as_ref().unwrap().msg,
+                "log write: disk full"
+            );
+        }
     }
 
     /// The bounded reader backlog reports a gap before the output it retained.
