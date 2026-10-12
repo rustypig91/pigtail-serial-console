@@ -96,7 +96,8 @@ application.
   the current search display mode stays unchanged. Plain **Up/Down** in the focused
   search field recalls older/newer entries without wrapping. Down past the newest
   entry restores the text and settings present before browsing. Editing a recalled
-  entry starts a new draft. Completed searches are recorded on Enter/Next/Previous,
+  entry starts a new draft. Modified arrows (including Shift/Alt+Up/Down) remain
+  available for text editing. Completed searches are recorded on Enter/Next/Previous,
   leaving or closing the field, switching its tab, or starting history browsing.
   Opening the history menu also records the current query. Empty queries and invalid
   regex are skipped; repeating a query with the same settings moves it to the top.
@@ -122,7 +123,8 @@ application.
   search display-mode button is hidden, and Log's remembered filter mode does
   not affect it. Plain-text and regex queries search the displayed hexadecimal
   byte values and ASCII column within each 16-byte row, excluding offsets and
-  session markers. All matches are highlighted, with a brighter current row
+  session markers, including when long-running captures have offsets wider than
+  eight hexadecimal digits. All matches are highlighted, with a brighter current row
   and scrollbar match markers. Next/Previous and Enter/Shift+Enter navigate
   matching rows and scroll them into view, using Hex's own count and cursor.
   Partial rows are rechecked as bytes arrive or are evicted; session boundaries

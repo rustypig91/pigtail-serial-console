@@ -52,13 +52,23 @@ fn search_query_field(
     let before = entry.clone();
     if input_enabled && ui.memory(|memory| memory.has_focus(id)) {
         let direction = ui.input_mut(|input| {
-            if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
-                Some(true)
-            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
-                Some(false)
-            } else {
-                None
-            }
+            // consume_key uses logical modifier matching, which also accepts
+            // Shift/Alt arrows. Leave those events for normal text editing.
+            let key = [egui::Key::ArrowUp, egui::Key::ArrowDown]
+                .into_iter()
+                .find(|key| {
+                    input.events.iter().any(|event| {
+                        matches!(event, egui::Event::Key {
+                            key: event_key, pressed: true, modifiers, ..
+                        } if event_key == key && modifiers.matches_exact(egui::Modifiers::NONE))
+                    })
+                })?;
+            input.events.retain(|event| {
+                !matches!(event, egui::Event::Key {
+                    key: event_key, pressed: true, modifiers, ..
+                } if *event_key == key && modifiers.matches_exact(egui::Modifiers::NONE))
+            });
+            Some(key == egui::Key::ArrowUp)
         });
         if let Some(older) = direction {
             *entry = ui.ctx().data_mut(|data| {
@@ -329,7 +339,10 @@ impl HexSearch {
                         self.matches.remove(pos);
                     }
                     let text = hex_byte_row(base, bytes, segment.origin, segment.end, row);
-                    if re.find_iter(&text[10..]).any(|hit| !hit.is_empty()) {
+                    if re
+                        .find_iter(&text[hex_columns_start(&text)..])
+                        .any(|hit| !hit.is_empty())
+                    {
                         let pos = self.matches.binary_search(&abs).unwrap_err();
                         self.matches.insert(pos, abs);
                     }
@@ -403,6 +416,11 @@ fn hex_byte_row(
     format!("{offset:08X}  {hex} |{ascii}|")
 }
 
+/// Offsets grow beyond eight digits in long-running captures.
+fn hex_columns_start(text: &str) -> usize {
+    text.find("  ").expect("hex row has an offset separator") + 2
+}
+
 fn hex_search_job(
     text: &str,
     font: egui::FontId,
@@ -418,9 +436,13 @@ fn hex_search_job(
     };
     let mut offset = 0;
     if let Some(re) = re {
-        for hit in re.find_iter(&text[10..]).filter(|hit| !hit.is_empty()) {
-            let start = 10 + hit.start();
-            let end = 10 + hit.end();
+        let columns_start = hex_columns_start(text);
+        for hit in re
+            .find_iter(&text[columns_start..])
+            .filter(|hit| !hit.is_empty())
+        {
+            let start = columns_start + hit.start();
+            let end = columns_start + hit.end();
             job.append(&text[offset..start], 0.0, format.clone());
             let mut highlighted = format.clone();
             highlighted.background = if current {
@@ -3984,6 +4006,43 @@ mod tests {
     }
 
     #[test]
+    fn modified_arrows_edit_search_text_without_recalling_history() {
+        for modifiers in [egui::Modifiers::SHIFT, egui::Modifiers::ALT] {
+            for key in [egui::Key::ArrowUp, egui::Key::ArrowDown] {
+                let ctx = egui::Context::default();
+                let id = egui::Id::new("modified-search-arrow");
+                let mut history = SearchHistory::default();
+                history.remember(SearchEntry::new("previous", true, true));
+                let draft = SearchEntry::new("draft", false, false);
+                let mut entry = draft.clone();
+                let mut draw = |events| {
+                    ctx.run_test_ui(
+                        egui::RawInput {
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            search_query_field(ui, &mut entry, id, &mut history, 300.0, true, id);
+                        },
+                    )
+                };
+                let _ = draw(vec![]);
+                ctx.memory_mut(|memory| memory.request_focus(id));
+                select_search_query(&ctx, id, &draft.query);
+                let _ = draw(vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }]);
+                assert_eq!(entry, draft, "{modifiers:?} + {key:?}");
+                assert_eq!(history.entries.len(), 1, "editing does not record a search");
+            }
+        }
+    }
+
+    #[test]
     fn search_history_recall_restores_options_and_draft_in_every_view() {
         for view in 0..4 {
             let (mut app, _tx) = test_app("search-history-recall");
@@ -6676,6 +6735,50 @@ mod tests {
         assert_eq!(search.matches, [16], "eviction removes partial matches");
         search.refresh(SearchEntry::new("[", true, false), 2, &bytes, &sessions);
         assert!(search.matches.is_empty());
+    }
+
+    #[test]
+    fn hex_search_excludes_wide_offsets_and_keeps_highlights_aligned() {
+        // Simulate a capture with over 4 GiB received and only its tail retained.
+        let base = 0x1_0000_0000;
+        let bytes = std::collections::VecDeque::from(b"A".to_vec());
+        let sessions = [RawSession {
+            start: 0,
+            label: None,
+        }];
+        let mut search = HexSearch::default();
+        search.refresh(
+            SearchEntry::new("00", false, false),
+            base,
+            &bytes,
+            &sessions,
+        );
+        assert!(
+            search.matches.is_empty(),
+            "offset digits are not searchable"
+        );
+        search.refresh(
+            SearchEntry::new("^41", true, false),
+            base,
+            &bytes,
+            &sessions,
+        );
+        assert_eq!(search.matches, [base]);
+        let text = hex_byte_row(base, &bytes, 0, base + 1, (base / 16) as usize);
+        let job = hex_search_job(
+            &text,
+            egui::FontId::monospace(12.0),
+            egui::Color32::WHITE,
+            search.re.as_ref(),
+            false,
+        );
+        let highlighted: Vec<_> = job
+            .sections
+            .iter()
+            .filter(|section| section.format.background != egui::Color32::TRANSPARENT)
+            .map(|section| &job.text[section.byte_range.start.0..section.byte_range.end.0])
+            .collect();
+        assert_eq!(highlighted, ["41"]);
     }
 
     #[test]
