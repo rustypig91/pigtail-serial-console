@@ -25,8 +25,8 @@ const HEADER_LEN: u64 = 6;
 
 // Cleanup must never unlink a capture owned by a live reader, including when
 // multiple readers happen to share the same device identity.
-fn active_captures() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
-    static ACTIVE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+fn active_captures() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, u64>> {
+    static ACTIVE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, u64>>> =
         std::sync::OnceLock::new();
     ACTIVE.get_or_init(Default::default)
 }
@@ -74,6 +74,9 @@ impl SessionWriter {
         // name with `create_new` gives each capture a file of its own; sharing
         // one truncates the earlier capture and then interleaves the two
         // writers, each at its own file offset.
+        // Publish the sidecar and register its writer under the same lock so
+        // cleanup cannot mistake a newly created capture for a closed one.
+        let mut active = active_captures().lock().expect("active captures lock");
         let (file, bin_path, meta_path) = create_unique(dir, &base)?;
 
         let json = serde_json::to_string_pretty(meta)
@@ -84,10 +87,7 @@ impl SessionWriter {
         file.write_all(MAGIC)?;
         file.write_all(&VERSION.to_le_bytes())?;
 
-        active_captures()
-            .lock()
-            .expect("active captures lock")
-            .insert(bin_path.clone());
+        active.insert(bin_path.clone(), 0);
         Ok(SessionWriter {
             file,
             bin_path,
@@ -123,6 +123,12 @@ impl SessionWriter {
     /// with the truncation: a `BufWriter` position left past the new end would
     /// otherwise reopen the hole as a run of zero bytes.
     pub fn truncate(&mut self) -> std::io::Result<()> {
+        let mut active = active_captures().lock().expect("active captures lock");
+        // Invalidate incremental counts on every clear, even if new output
+        // grows past the previous file size before the next cleanup pass.
+        if let Some(generation) = active.get_mut(&self.bin_path) {
+            *generation = generation.wrapping_add(1);
+        }
         self.file.flush()?;
         let file = self.file.get_mut();
         file.set_len(HEADER_LEN)?;
@@ -448,6 +454,7 @@ struct CaptureLines {
     completed: usize,
     mode: crate::config::TerminalMode,
     cleared: bool,
+    generation: Option<u64>,
 }
 
 /// Incremental line-based cleanup. Files still contributing to a device's log
@@ -460,6 +467,11 @@ pub struct SessionCleanup {
 
 impl SessionCleanup {
     fn lines(&mut self, path: &Path, meta: &SessionMeta) -> std::io::Result<usize> {
+        let generation = active_captures()
+            .lock()
+            .expect("active captures lock")
+            .get(path)
+            .copied();
         let len = std::fs::metadata(path)?.len();
         let state = self
             .counts
@@ -470,14 +482,20 @@ impl SessionCleanup {
                 completed: 0,
                 mode: meta.config.terminal,
                 cleared: meta.cleared,
+                generation,
             });
-        if len < state.pos || state.mode != meta.config.terminal || state.cleared != meta.cleared {
+        if len < state.pos
+            || state.mode != meta.config.terminal
+            || state.cleared != meta.cleared
+            || state.generation != generation
+        {
             *state = CaptureLines {
                 pos: HEADER_LEN,
                 framer: crate::framer::Framer::with_mode(meta.config.terminal),
                 completed: 0,
                 mode: meta.config.terminal,
                 cleared: meta.cleared,
+                generation,
             };
         }
         let mut framed = Vec::new();
@@ -495,6 +513,18 @@ impl SessionCleanup {
             completed = completed.saturating_add(framed.len());
             framed.clear();
         })?;
+        if active_captures()
+            .lock()
+            .expect("active captures lock")
+            .get(path)
+            .copied()
+            != generation
+        {
+            return Err(std::io::Error::new(
+                ErrorKind::Interrupted,
+                "capture changed during cleanup scan",
+            ));
+        }
         state.pos = pos;
         state.framer = framer;
         state.completed = completed;
@@ -536,17 +566,19 @@ impl SessionCleanup {
             let active = active_captures()
                 .lock()
                 .expect("active captures lock")
-                .contains(path);
+                .contains_key(path);
+            // Validate even captures outside the window before deleting them.
+            let Ok(lines) = self.lines(path, meta) else {
+                continue;
+            };
             if !active && (*remaining == 0 || *cleared) {
                 remove.push(path.clone());
                 continue;
             }
-            if let Ok(lines) = self.lines(path, meta) {
-                // Restored nonempty logs have one closing session marker;
-                // live output does not have that marker yet.
-                *remaining = remaining
-                    .saturating_sub(lines.saturating_add(usize::from(!active && lines > 0)));
-            }
+            // Restored nonempty logs have one closing session marker;
+            // live output does not have that marker yet.
+            *remaining =
+                remaining.saturating_sub(lines.saturating_add(usize::from(!active && lines > 0)));
             *cleared |= meta.cleared;
         }
         let removed = remove_session_paths(&remove)?;
@@ -562,7 +594,7 @@ pub fn remove_session_paths(paths: &[PathBuf]) -> std::io::Result<usize> {
     let active = active_captures().lock().expect("active captures lock");
     let mut removed = 0;
     for path in paths {
-        if active.contains(path) {
+        if active.contains_key(path) {
             continue;
         }
         match std::fs::remove_file(path) {
@@ -704,6 +736,38 @@ mod tests {
         assert!(!old.exists());
         assert!(live.exists());
         assert!(invalid.exists());
+    }
+
+    #[test]
+    fn cleanup_preserves_invalid_captures_outside_the_line_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let invalid = saved_capture(dir.path(), 1, "A", &[b"old\n"]);
+        std::fs::write(&invalid, b"invalid header").unwrap();
+        let newest = saved_capture(dir.path(), 2, "A", &[b"new\n"]);
+        assert_eq!(SessionCleanup::default().cleanup(dir.path(), 2).unwrap(), 0);
+        assert!(invalid.exists());
+        assert!(meta_path_for(&invalid).exists());
+        assert!(newest.exists());
+    }
+
+    #[test]
+    fn cleanup_recounts_after_repeated_clear_and_regrowth() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = SessionWriter::create(dir.path(), &sample_meta()).unwrap();
+        let path = writer.bin_path().to_path_buf();
+        let mut cleanup = SessionCleanup::default();
+        writer.truncate().unwrap();
+        writer.write_record(0, b"a\nb\nc\n").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(cleanup.lines(&path, &read_meta(&path).unwrap()).unwrap(), 3);
+        writer.truncate().unwrap();
+        // Regrow beyond the cached offset without crossing another record
+        // boundary there; size and the already-set clear flag cannot detect it.
+        writer
+            .write_record(1, b"one much longer replacement line\n")
+            .unwrap();
+        writer.flush().unwrap();
+        assert_eq!(cleanup.lines(&path, &read_meta(&path).unwrap()).unwrap(), 1);
     }
 
     #[test]

@@ -235,7 +235,11 @@ with the log framer, including a final partial line. A capture stays whole while
 any of its lines or its closing marker contributes to the retained Log window;
 when none fits, its `.session.bin` and metadata sidecar are deleted together.
 Active writers are protected, and their raw capture remains complete. Clear
-boundaries discard older saved captures too. Unreadable captures are preserved.
+boundaries discard older saved captures too. Every clear invalidates cached line
+counts, including repeated clears followed by regrowth between cleanup passes.
+Capture creation registers the live writer before cleanup can classify it as
+closed. Unreadable captures are validated and preserved even outside the line
+window.
 The obsolete `session_retention_days` setting is ignored and omitted on save;
 there is no age retention control or cleanup confirmation in Settings.
 
