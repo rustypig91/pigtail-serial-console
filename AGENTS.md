@@ -153,6 +153,12 @@ application.
   unrelated session failures, which remain visible until dismissed. Successful
   reconnection clears link errors. Error details remain available in the
   overflow menu.
+  Console context menus belong to the pane's selected view rather than a
+  virtualized row. Incoming output may scroll or evict the clicked row while
+  the menu stays open at its original position. Row actions keep the original
+  line and connection target, including in merged logs; they do not follow
+  whichever row later appears beneath the pointer. This also applies to Hex.
+  Menus still close on an action, Escape, or an outside click.
 - Optional **ANSI/VT** screen for interactive shells and device menus: cursor
   positioning, erase and redraw operations, scrolling regions, styled/colored
   text, and alternate screen buffers. Select **Log**, **Hex**, or **ANSI/VT** in
@@ -240,6 +246,8 @@ gesture boundaries do not change the size.
 Use **Ctrl+Shift+Space** to pin the console to the bottom. On connection tabs,
 **Ctrl+Shift+Q / W / E** selects the **Log / Hex / ANSI** view.
 Use **Ctrl+Shift+P** to toggle the plot on connection tabs.
+The plot panel's **Plot extraction…** button opens extraction settings,
+including when no series have been extracted yet.
 Use **Ctrl+Shift+M** to open the transmit macros window.
 The console right-click menu has no **Toggle plot** or **Toggle hex view** items;
 use the toolbar controls or their keyboard shortcuts.
