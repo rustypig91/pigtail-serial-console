@@ -242,9 +242,14 @@ when none fits, its `.session.bin` and metadata sidecar are deleted together.
 Active writers are protected by process-local registration and OS locks on
 `.session.lock` sidecars, and their raw capture remains complete. Cleanup defers
 a device while another Pigtail process owns one of its captures; other devices
-continue cleanup. Lock sidecars are removed with discarded captures. Clear
+continue cleanup. Lock sidecars are removed with discarded captures. A persistent
+`.session-directory.lock` serializes capture creation and cleanup across
+processes so a reused name cannot inherit an unlinked lock handle or a stale
+deletion decision. Clear
 boundaries discard older saved captures too. Every clear invalidates cached line
 counts, including repeated clears followed by regrowth between cleanup passes.
+Foreign writers invalidate their device's cached counts; changed closed files
+are recounted before their lines contribute to deletion budgets.
 Capture creation registers the live writer before cleanup can classify it as
 closed. Unreadable captures are validated and preserved even outside the line
 window.

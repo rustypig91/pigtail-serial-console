@@ -78,6 +78,7 @@ impl SessionWriter {
         // writers, each at its own file offset.
         // Publish the sidecar and register its writer under the same lock so
         // cleanup cannot mistake a newly created capture for a closed one.
+        let _directory_lock = lock_capture_directory(dir)?;
         let mut active = active_captures().lock().expect("active captures lock");
         let (file, capture_lock, bin_path, meta_path) = create_unique(dir, &base)?;
 
@@ -335,6 +336,20 @@ fn lock_path_for(bin_path: &Path) -> PathBuf {
     bin_path.with_extension("lock")
 }
 
+// Serialize creation and deletion across processes. Per-capture lock files may
+// be removed only while no creator can have opened the old lock inode and then
+// acquire it after unlinking. Keep this directory lock file permanently.
+fn lock_capture_directory(dir: &Path) -> std::io::Result<File> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(".session-directory.lock"))?;
+    lock.lock()?;
+    Ok(lock)
+}
+
 /// Create a lock sidecar for legacy captures too, so deleting an old path and
 /// reusing it for a new capture coordinate through the same OS lock.
 fn try_capture_lock(bin_path: &Path) -> std::io::Result<File> {
@@ -497,6 +512,7 @@ struct CaptureLines {
     mode: crate::config::TerminalMode,
     cleared: bool,
     generation: Option<u64>,
+    modified: std::time::SystemTime,
 }
 
 /// Incremental line-based cleanup. Files still contributing to a device's log
@@ -514,7 +530,9 @@ impl SessionCleanup {
             .expect("active captures lock")
             .get(path)
             .copied();
-        let len = std::fs::metadata(path)?.len();
+        let metadata = std::fs::metadata(path)?;
+        let len = metadata.len();
+        let modified = metadata.modified()?;
         let state = self
             .counts
             .entry(path.to_path_buf())
@@ -525,11 +543,15 @@ impl SessionCleanup {
                 mode: meta.config.terminal,
                 cleared: meta.cleared,
                 generation,
+                modified,
             });
         if len < state.pos
             || state.mode != meta.config.terminal
             || state.cleared != meta.cleared
             || state.generation != generation
+            // Closed captures cannot legitimately grow. A different process
+            // may have cleared/replaced one since our previous pass.
+            || (generation.is_none() && state.modified != modified)
         {
             *state = CaptureLines {
                 pos: HEADER_LEN,
@@ -538,6 +560,7 @@ impl SessionCleanup {
                 mode: meta.config.terminal,
                 cleared: meta.cleared,
                 generation,
+                modified,
             };
         }
         let mut framed = Vec::new();
@@ -567,6 +590,7 @@ impl SessionCleanup {
                 "capture changed during cleanup scan",
             ));
         }
+        state.modified = modified;
         state.pos = pos;
         state.framer = framer;
         state.completed = completed;
@@ -582,6 +606,9 @@ impl SessionCleanup {
         if !dir.exists() {
             return Ok(0);
         }
+        // Keep the snapshot stable through deletion: another cleanup must not
+        // remove a path and let a writer reuse it before we apply our budget.
+        let _directory_lock = lock_capture_directory(dir)?;
         let mut captures = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             let path = entry?.path();
@@ -601,6 +628,14 @@ impl SessionCleanup {
             let active = active_captures().lock().expect("active captures lock");
             if !active.contains_key(path) && try_capture_lock(path).is_err() {
                 foreign_devices.insert(meta.identity.clone());
+            }
+        }
+        // A foreign clear has no process-local generation counter. Discard
+        // cached counts while its writer is active, even if timestamps have
+        // insufficient resolution to distinguish the replacement data.
+        for (path, meta, _) in &captures {
+            if foreign_devices.contains(&meta.identity) {
+                self.counts.remove(path);
             }
         }
         captures.retain(|(_, meta, _)| !foreign_devices.contains(&meta.identity));
@@ -634,7 +669,7 @@ impl SessionCleanup {
                 remaining.saturating_sub(lines.saturating_add(usize::from(!active && lines > 0)));
             *cleared |= meta.cleared;
         }
-        let removed = remove_session_paths(&remove)?;
+        let removed = remove_session_paths_locked(&remove)?;
         self.counts.retain(|path, _| path.exists());
         Ok(removed)
     }
@@ -644,6 +679,16 @@ impl SessionCleanup {
 ///
 /// Only captures outside the retained history should be passed here.
 pub fn remove_session_paths(paths: &[PathBuf]) -> std::io::Result<usize> {
+    let mut removed = 0;
+    for path in paths {
+        let _directory_lock = lock_capture_directory(path.parent().unwrap_or(Path::new(".")))?;
+        removed += remove_session_paths_locked(std::slice::from_ref(path))?;
+    }
+    Ok(removed)
+}
+
+// Caller owns each path's directory lock before taking the process-local lock.
+fn remove_session_paths_locked(paths: &[PathBuf]) -> std::io::Result<usize> {
     let active = active_captures().lock().expect("active captures lock");
     let mut removed = 0;
     for path in paths {
@@ -784,6 +829,42 @@ mod tests {
         assert!(!lock_path_for(&live).exists());
         assert!(!lock_path_for(&oldest).exists());
         assert!(newest.exists());
+    }
+
+    #[test]
+    fn capture_creation_waits_for_directory_lock_during_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = saved_capture(dir.path(), 1, "A", &[b"old\n"]);
+        let directory_lock = lock_capture_directory(dir.path()).unwrap();
+        // Simulate deletion while retaining the old capture lock. Without
+        // directory coordination, creation can open this inode before unlink
+        // and later protect the replacement with an invisible, stale lock.
+        let capture_lock = try_capture_lock(&path).unwrap();
+        let creator_dir = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let creator = std::thread::spawn(move || {
+            let mut meta = sample_meta();
+            meta.start_wall = DateTime::UNIX_EPOCH + chrono::Duration::seconds(1);
+            meta.identity.serial_number = Some("A".into());
+            let writer = SessionWriter::create(&creator_dir, &meta).unwrap();
+            tx.send(writer.bin_path().to_path_buf()).unwrap();
+            writer
+        });
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(meta_path_for(&path)).unwrap();
+        std::fs::remove_file(lock_path_for(&path)).unwrap();
+        drop(capture_lock);
+        drop(directory_lock);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), path);
+        let _writer = creator.join().unwrap();
+        assert_eq!(
+            try_capture_lock(&path).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
     }
 
     #[test]
@@ -933,6 +1014,32 @@ mod tests {
             .unwrap();
         writer.flush().unwrap();
         assert_eq!(cleanup.lines(&path, &read_meta(&path).unwrap()).unwrap(), 1);
+    }
+
+    #[test]
+    fn cleanup_recounts_closed_captures_changed_by_another_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = saved_capture(dir.path(), 1, "A", &[b"a\nb\nc\n"]);
+        let meta = read_meta(&path).unwrap();
+        let mut cleanup = SessionCleanup::default();
+        assert_eq!(cleanup.lines(&path, &meta).unwrap(), 3);
+        // No local writer registration, as when another process clears and
+        // regrows the raw file past the cached offset between cleanup passes.
+        let mut file = File::options()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(MAGIC).unwrap();
+        file.write_all(&VERSION.to_le_bytes()).unwrap();
+        let bytes = b"one much longer replacement line\n";
+        file.write_all(&1u64.to_le_bytes()).unwrap();
+        file.write_all(&(bytes.len() as u32).to_le_bytes()).unwrap();
+        file.write_all(bytes).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .unwrap();
+        drop(file);
+        assert_eq!(cleanup.lines(&path, &meta).unwrap(), 1);
     }
 
     #[test]
