@@ -158,6 +158,127 @@ actual input while sampling process CPU/RSS, swap and disk activity would
 distinguish those causes. Raw logging is buffered and avoids per-record fsync;
 it has not been implicated by these tests.
 
+### Live Log investigation, 2026-10-13
+
+Investigated the configured `/dev/ttyACM0` connection at 115,200 baud, in Log
+view with a 10,000-line cap, disabled highlight rules, no active search, and no
+plot. The reported sluggishness persists in release builds and with Pin off,
+but disappears when selecting a quiet connection tab.
+
+The ordinary release binary consumed approximately 100–120% process CPU during
+a short baseline, with RSS around 115–125 MiB. A captured interval contained
+6,055 payload bytes and 1,211 newline characters over 6.12 seconds: roughly
+1 KB/s and 200 newlines/s. This is received volume, not the configured baud
+rate or a guarantee of identical traffic throughout every subsequent run.
+
+A temporary source copy added timings around preparation, receive processing,
+derived-index maintenance, workspace drawing, and remaining application work.
+It selected the serial and quiet tabs alternately for four 12-second phases.
+Both connections remained open throughout. Settings and captures were isolated
+under temporary XDG directories using a copy of the user's configuration.
+No transmit commands were issued, and the original release executable was
+restored after building the probe. The final probe used release optimization
+with application link-time optimization disabled; these figures are diagnostic
+comparisons rather than exact timings of the shipped binary.
+
+Two-second reporting windows spanning startup or a tab switch were excluded
+from the following averages. Columns show milliseconds per UI frame; complete
+frame time comes from eframe's previous-frame integration timer, which includes
+rendering and excludes its measured presentation waits. It is an elapsed-time
+measurement, not a separate CPU-counter measurement.
+
+| Backend / selected tab | Frames/s | Receive | Derived indices | Workspace drawing | App UI total | Complete frame |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Vulkan / serial Log | 58.1 | 0.057 | 0.009 | 3.906 | 4.197 | 6.676 |
+| Vulkan / quiet Log | 59.8 | 0.058 | 0.009 | 1.110 | 1.399 | 3.026 |
+| OpenGL / serial Log | 58.3 | 0.054 | 0.015 | 3.741 | 4.024 | 6.033 |
+| OpenGL / quiet Log | 58.9 | 0.057 | 0.010 | 1.140 | 1.434 | 3.063 |
+
+The normal backend selected Intel Iris Xe Vulkan on Mesa 26.0.8, not software
+rendering. The OpenGL override selected the same Intel GPU. Changing backends
+did not substantially change workspace drawing cost. The line store reached
+its cap and evicted old history correctly; receive processing remained small
+across that boundary. RSS stayed approximately 121–127 MiB during the probe
+runs. There were no reported surface errors in those runs.
+
+Short GDB stack samples found visible Log work in `render_row`, `wrapped_text`,
+font shaping/layout, widget creation, and text-accessibility processing, as well
+as normal renderer and event-loop work. These intrusive samples locate work;
+they do not quantify the percentage attributable to each function. Kernel
+performance counters were unavailable under the host's perf policy, which
+was left unchanged.
+
+The measurements identify visible Log drawing as the main additional UI cost
+for this input. Ordinary drawing already virtualizes rows, and the wrap index
+updates incrementally, so replacing a presumed full-history drawing scan is
+not supported by this investigation. Follow-up work should measure and reduce
+repeated per-row layout/widget work while preserving selection, context menus,
+and accessibility, then compare the same live workload again. Disk-retention
+changes should be evaluated independently.
+
+This does not fully explain the reported subjective lag: the warmed comparison
+recorded occasional complete-frame spikes up to about 23 ms but no prolonged
+freeze, and did not measure input-to-paint latency while opening menus or
+dragging the window. Startup had larger transients. A follow-up should include
+those interactions and tail-latency measurements rather than treating average
+frame time as a complete responsiveness result. No performance fix or capture
+retention change was implemented in this investigation.
+
+### Log drawing optimization follow-up
+
+The first optimization pass shared the console style across rows, removed the
+extra text-column UI container from ordinary Log/merged rows, and added a
+single-run path for text without ANSI spans, highlight rules or search matches.
+This produced only a small improvement in the live comparison. Additional
+per-row timings identified timestamp/gutter work as the largest remaining
+component (approximately 23–27 microseconds per row in that probe).
+
+The subsequent pass caches formatted timestamps using egui's frame cache, which
+evicts entries no longer visited. The key includes wall and monotonic time,
+display format, previous-line time and mark. Wall-clock formats are refreshed
+once a second to reflect system timezone changes. Timestamp painting uses a
+single-font galley when it fits, retaining egui's normal label response and
+accessibility; narrow rows retain the previous wrapping path. Text selection,
+its stable row identities, recoloring, clipboard capture and context-menu
+behavior continue through the existing selection painter.
+
+Validation includes the normal application suite, the all-features application
+suite, workspace Clippy and formatting. Existing tests cover offscreen
+selection/copy, wrapped text, caret placement, merged panes, header backdrops,
+search styling and menus during incoming output. A new cache test checks format,
+mark, preceding-line and timestamp changes. During workspace validation, a
+receive-budget test failed under concurrent build load and passed on rerun;
+an updater test failed because `/tmp` had reached its per-user quota and passed
+with `TMPDIR` pointing to the build directory. The remaining core tests passed.
+No capture-retention policy or receive scheduling was changed.
+
+The final temporary probe repeated the live Vulkan comparison with the same
+200-newline/s input and 10,000-line cap. It also included per-row timing calls,
+so the following comparison is conservative but remains host- and run-specific.
+Startup and tab-switch reporting windows were excluded as before.
+
+| Selected tab | Baseline workspace drawing | Optimized workspace drawing | Baseline complete frame | Optimized complete frame |
+| --- | ---: | ---: | ---: | ---: |
+| Serial Log | 3.906 ms | 3.243 ms | 6.676 ms | 6.253 ms |
+| Quiet Log | 1.110 ms | 1.046 ms | 3.026 ms | 2.878 ms |
+
+Serial Log drawing fell approximately 17%; complete-frame time fell about 6%.
+Receive processing remained 0.057 ms and derived indices 0.009 ms per frame.
+The optimized serial view averaged 57.5 frames/s versus 58.1 before, within
+the variation seen between these runs; this is not evidence of higher frame
+rate. Timestamp/gutter work fell to roughly 14–15 microseconds per row. The
+optimized probe still used about one core of process CPU over its full run,
+including startup and both tab selections. The largest sampled warmed serial
+frame was 18.5 ms versus 22.7 ms before; maxima are not comparable latency
+percentiles and do not establish the absence of further stalls.
+
+A native X11 capture of the updated view confirmed the timestamp/text columns,
+header backdrop, footer and retained-line count. The behavior suites continue
+to exercise selection and context menus. These are measured drawing
+optimizations, not a verified resolution of every reported responsiveness
+problem. Interactive input-to-paint latency and remaining rendering/platform
+costs remain worthwhile follow-up measurements if the lag persists.
+
 ### Additional PR review fixes
 
 Clear now discards both the UI's partially consumed batch and output already

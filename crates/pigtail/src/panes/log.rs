@@ -11,6 +11,7 @@ use serialcore::clock::Timestamp;
 use serialcore::config::{TimestampFormat, MAX_CONSOLE_FONT_SIZE, MIN_CONSOLE_FONT_SIZE};
 use serialcore::reader::ConnState;
 use serialcore::store::{LineFlags, LineRef, LineStore, PortId};
+use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, Write};
 
 /// The colour the console draws a session boundary in, shared with the hex
@@ -1261,6 +1262,11 @@ impl App {
                 });
                 return;
             }
+            // Share one console style across the rows. Mutating each child's
+            // inherited Arc<Style> would clone the whole style for every line.
+            let style = ui.style_mut();
+            style.interaction.selectable_labels = false;
+            style.spacing.item_spacing.x = ROW_GAP;
             let active = self.active.min(self.connections.len().saturating_sub(1));
             self.active = active;
 
@@ -3379,7 +3385,11 @@ fn row_slot(
     // Only the explicit text galley participates in console selection.
     // Timestamp, port and marker labels otherwise share egui's global selection
     // and can steal its moving endpoint while rows scroll past the pointer.
-    child.style_mut().interaction.selectable_labels = false;
+    if child.style().interaction.selectable_labels || child.spacing().item_spacing.x != ROW_GAP {
+        let style = child.style_mut();
+        style.interaction.selectable_labels = false;
+        style.spacing.item_spacing.x = ROW_GAP;
+    }
     child.set_clip_rect(rect.intersect(ui.clip_rect()));
     (child, response)
 }
@@ -3388,6 +3398,27 @@ fn row_slot(
 // still need their markers in the header backdrop, just like their text.
 fn paint_row_label(ui: &mut egui::Ui, text: egui::RichText) {
     let (pos, galley, response) = egui::Label::new(text).layout_in_ui(ui);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), galley.text())
+    });
+    ui.painter().galley(pos, galley, ui.visuals().text_color());
+}
+
+/// Timestamp gutters are a single font/color run. Keep egui's label response
+/// and accessibility, but avoid its general RichText and wrapping machinery
+/// when the fixed-width timestamp fits the row.
+fn paint_timestamp(ui: &mut egui::Ui, text: String, font: &egui::FontId) {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text, font.clone(), ui.visuals().weak_text_color());
+    if galley.size().x > ui.available_width() {
+        paint_row_label(
+            ui,
+            egui::RichText::new(galley.text()).font(font.clone()).weak(),
+        );
+        return;
+    }
+    let (pos, galley, response) = egui::Label::new(galley).layout_in_ui(ui);
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), galley.text())
     });
@@ -3417,19 +3448,21 @@ fn render_row(ui: &mut egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> egui:
     // editor. The returned response is the text's, so the right-click menu hangs
     // off the line.
     let (mut cui, _slot) = row_slot(ui, height, egui::Sense::hover(), rctx.row_id);
-    cui.spacing_mut().item_spacing.x = ROW_GAP;
     if let Some((tag, color)) = &rctx.port_tag {
         paint_row_label(
             &mut cui,
             egui::RichText::new(tag).font(m.font.clone()).color(*color),
         );
     }
-    let gutter = format_timestamp(line.meta.ts, rctx.ts_format, rctx.prev_micros, rctx.mark);
+    let gutter = cached_timestamp(
+        &cui,
+        line.meta.ts,
+        rctx.ts_format,
+        rctx.prev_micros,
+        rctx.mark,
+    );
     if !gutter.is_empty() {
-        paint_row_label(
-            &mut cui,
-            egui::RichText::new(gutter).font(m.font.clone()).weak(),
-        );
+        paint_timestamp(&mut cui, gutter, &m.font);
     }
     if line.meta.flags.contains(LineFlags::TX_ECHO) {
         paint_row_label(
@@ -3440,17 +3473,17 @@ fn render_row(ui: &mut egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> egui:
         );
     }
     let job = build_job(&cui, line, rctx);
-    text_ui(&mut cui, m, rctx.row_id, |ui| {
-        wrapped_text(
-            ui,
-            job,
-            m,
-            rctx.rows,
-            height,
-            rctx.row_id,
-            line_caret(line).map(|index| (index, line_color(ui, line))),
-        )
-    })
+    let galley = layout_console_text(&cui, job, m, rctx.rows);
+    // The row already owns a UI and a fixed slot. Position text directly
+    // rather than registering another container widget for every visible line.
+    let row = cui.max_rect();
+    let left = row.left() + m.prefix_w;
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(left, row.top()),
+        egui::vec2((row.right() - left).max(0.0), height.max(galley.size().y)),
+    );
+    let caret = line_caret(line).map(|index| (index, line_color(&cui, line)));
+    paint_console_text(&mut cui, galley, rect, m, rctx.row_id, caret)
 }
 
 /// Run `add_text` in a child `Ui` starting at exactly the text column, which is
@@ -3608,15 +3641,25 @@ fn queue_selection_colors(ui: &egui::Ui, original: &std::sync::Arc<egui::Galley>
 /// arrives while pinned to the bottom.
 fn wrapped_text(
     ui: &mut egui::Ui,
-    mut job: LayoutJob,
+    job: LayoutJob,
     m: &Metrics,
     max_rows: u32,
     height: f32,
     row_id: egui::Id,
     caret: Option<(usize, egui::Color32)>,
 ) -> egui::Response {
-    let fallback = ui.visuals().text_color();
     let avail = ui.available_width();
+    let galley = layout_console_text(ui, job, m, max_rows);
+    let (_auto_id, rect) = ui.allocate_space(egui::vec2(avail, height.max(galley.size().y)));
+    paint_console_text(ui, galley, rect, m, row_id, caret)
+}
+
+fn layout_console_text(
+    ui: &egui::Ui,
+    mut job: LayoutJob,
+    m: &Metrics,
+    max_rows: u32,
+) -> std::sync::Arc<egui::Galley> {
     job.wrap.max_width = m.wrap_width();
     // Break mid-word: a console wraps at the column, like the device's own
     // terminal would, not at whatever word happens to straddle the edge.
@@ -3624,8 +3667,18 @@ fn wrapped_text(
     if m.cols > 0 && max_rows != u32::MAX {
         job.wrap.max_rows = max_rows as usize;
     }
-    let galley = ui.fonts_mut(|f| f.layout_job(job));
-    let (_auto_id, rect) = ui.allocate_space(egui::vec2(avail, height.max(galley.size().y)));
+    ui.fonts_mut(|f| f.layout_job(job))
+}
+
+fn paint_console_text(
+    ui: &mut egui::Ui,
+    galley: std::sync::Arc<egui::Galley>,
+    rect: egui::Rect,
+    m: &Metrics,
+    row_id: egui::Id,
+    caret: Option<(usize, egui::Color32)>,
+) -> egui::Response {
+    let fallback = ui.visuals().text_color();
     let response = ui.interact(rect, row_id.with("text"), egui::Sense::click_and_drag());
     if response.is_pointer_button_down_on() && ui.input(|i| i.pointer.interact_pos().is_some()) {
         let drag = ConsoleDrag {
@@ -3770,6 +3823,20 @@ fn build_job(ui: &egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> LayoutJob 
     let base = line_color(ui, line);
 
     let mut job = LayoutJob::default();
+    if line.meta.spans.is_empty() && rctx.highlight.is_empty() && rctx.search_re.is_none() {
+        // Ordinary output is one run; avoid the range vectors and sorting
+        // needed only when ANSI, highlight rules or search split its styling.
+        job.append(
+            text,
+            0.0,
+            egui::TextFormat {
+                font_id: font,
+                color: base,
+                ..Default::default()
+            },
+        );
+        return job;
+    }
     // Keep every match as a separate text run. Rules remain ordered so that
     // the first rule wins only where matches overlap, rather than tinting the
     // entire line because it matched somewhere.
@@ -3956,6 +4023,65 @@ fn ts_format_label(f: TimestampFormat) -> &'static str {
         TimestampFormat::Mark => "from mark",
         TimestampFormat::None => "none",
     }
+}
+
+#[derive(Clone, Copy)]
+struct TimestampCacheKey {
+    ts: Timestamp,
+    format: TimestampFormat,
+    prev_micros: Option<i64>,
+    mark: Option<i64>,
+    timezone_refresh: u64,
+}
+
+impl Hash for TimestampCacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.ts.wall.hash(state);
+        self.ts.micros.hash(state);
+        (self.format as u8).hash(state);
+        self.prev_micros.hash(state);
+        self.mark.hash(state);
+        self.timezone_refresh.hash(state);
+    }
+}
+
+#[derive(Default)]
+struct TimestampFormatter;
+
+impl egui::cache::ComputerMut<TimestampCacheKey, String> for TimestampFormatter {
+    fn compute(&mut self, key: TimestampCacheKey) -> String {
+        format_timestamp(key.ts, key.format, key.prev_micros, key.mark)
+    }
+}
+
+type TimestampCache = egui::cache::FrameCache<String, TimestampFormatter>;
+
+fn cached_timestamp(
+    ui: &egui::Ui,
+    ts: Timestamp,
+    format: TimestampFormat,
+    prev_micros: Option<i64>,
+    mark: Option<i64>,
+) -> String {
+    if format == TimestampFormat::None {
+        return String::new();
+    }
+    // Reformat wall clocks once a second so a system timezone change remains
+    // visible. egui evicts entries no longer drawn; this cache does not retain
+    // another copy of the connection's full history.
+    let timezone_refresh = if matches!(format, TimestampFormat::Absolute | TimestampFormat::Time) {
+        ui.input(|input| input.time.floor() as u64)
+    } else {
+        0
+    };
+    let key = TimestampCacheKey {
+        ts,
+        format,
+        prev_micros,
+        mark,
+        timezone_refresh,
+    };
+    ui.memory_mut(|memory| memory.caches.cache::<TimestampCache>().get(key).clone())
 }
 
 /// Format a line's timestamp per the display setting (spec §7.3).
@@ -6787,6 +6913,29 @@ mod tests {
             format_timestamp(ts(1), TimestampFormat::Mark, None, None),
             ""
         );
+    }
+
+    #[test]
+    fn cached_timestamps_follow_format_mark_and_previous_line_changes() {
+        let ctx = egui::Context::default();
+        for (format, previous, mark, expected) in [
+            (TimestampFormat::Mark, None, Some(0), "+2.000s"),
+            (TimestampFormat::Mark, None, Some(1_000_000), "+1.000s"),
+            (TimestampFormat::Delta, Some(1_500_000), None, "+500.000ms"),
+            (TimestampFormat::Delta, None, None, " 0.000ms"),
+            (TimestampFormat::None, None, None, ""),
+        ] {
+            let _ = ctx.run_test_ui(egui::RawInput::default(), |ui| {
+                assert_eq!(
+                    cached_timestamp(ui, ts(2_000_000), format, previous, mark),
+                    expected
+                );
+                assert_eq!(
+                    cached_timestamp(ui, ts(3_000_000), TimestampFormat::Mark, None, Some(0)),
+                    "+3.000s"
+                );
+            });
+        }
     }
 
     #[test]
