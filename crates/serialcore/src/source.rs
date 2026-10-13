@@ -34,6 +34,9 @@ pub fn is_debug_echo_path(path: &str) -> bool {
 /// to transition to the `Lost` state and begin reconnecting.
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
+    /// No matching device is currently available. This is a waiting state.
+    #[error("{0}")]
+    DeviceMissing(String),
     /// The device went away (unplugged, reset). Recoverable via reconnect.
     #[error("source disconnected: {0}")]
     Disconnected(String),
@@ -259,7 +262,9 @@ fn map_open_error(path: &str, e: serialport::Error) -> SourceError {
         // A device that isn't there is ENOENT, which serialport maps to
         // `Io(NotFound)` — *not* to `NoDevice`, despite the name. Unplugged
         // adapters land here and nowhere else.
-        ErrorKind::Io(IoKind::NotFound) => SourceError::Open(format!("{path}: device not present")),
+        ErrorKind::Io(IoKind::NotFound) => {
+            SourceError::DeviceMissing(format!("{path}: device not present"))
+        }
         ErrorKind::NoDevice => map_no_device(path),
         _ => SourceError::Open(format!("{path}: {}", e)),
     }
@@ -294,7 +299,7 @@ fn map_no_device(path: &str) -> SourceError {
             permission_hint(path)
         ))
     } else {
-        SourceError::Open(format!("{path}: device not present"))
+        SourceError::DeviceMissing(format!("{path}: device not present"))
     }
 }
 
@@ -564,7 +569,9 @@ mod tests {
             "Le fichier n'existe pas",
         );
         let err = map_open_error("/dev/ttyUSB0", e);
-        assert!(matches!(err, SourceError::Open(msg) if msg.contains("device not present")));
+        assert!(
+            matches!(err, SourceError::DeviceMissing(msg) if msg.contains("device not present"))
+        );
     }
 
     #[test]

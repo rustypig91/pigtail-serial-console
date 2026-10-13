@@ -169,7 +169,7 @@ impl App {
             return;
         }
         let active = self.active.min(self.connections.len() - 1);
-        // The plot is off by default; enable it from the console right-click menu.
+        // The plot is off by default; enable it from the toolbar or shortcut.
         if !self.connections[active].show_plot {
             return;
         }
@@ -191,11 +191,16 @@ impl App {
             if ui.button("Hide").on_hover_text("Hide plot").clicked() {
                 conn.show_plot = false;
             }
+            if ui
+                .button("Plot extraction…")
+                .on_hover_text("Configure rules for extracting plotted values from received text")
+                .clicked()
+            {
+                self.show_extract_win = true;
+            }
             ui.separator();
             if conn.series.is_empty() {
-                ui.weak(
-                    "No series yet — add a plot-extraction rule (right-click > Plot extraction…).",
-                );
+                ui.weak("No series yet — add a rule in Plot extraction…");
             }
             let follow = conn.plot_follow;
             if ui

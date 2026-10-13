@@ -193,7 +193,7 @@ impl App {
         self.reconcile_workspace();
     }
 
-    fn selected_tab_id(&self) -> Option<TabId> {
+    pub(super) fn selected_tab_id(&self) -> Option<TabId> {
         if self.merged_selected {
             self.loaded_merged_tab
                 .and_then(|i| self.merged_tabs.get(i))

@@ -544,6 +544,83 @@ struct MenuTarget<'a> {
     line: Option<u64>,
 }
 
+/// The menu belongs to the view, not a virtualized row. Keep the clicked
+/// target and anchor even after incoming output scrolls or evicts that row.
+#[derive(Clone)]
+struct ConsoleMenuState {
+    position: egui::Pos2,
+    target: Option<OwnedMenuTarget>,
+    has_mark: bool,
+    merged_view: bool,
+}
+
+#[derive(Clone)]
+struct OwnedMenuTarget {
+    port: Option<PortId>,
+    label: Option<String>,
+    line: Option<u64>,
+}
+
+fn queue_console_menu(
+    response: &egui::Response,
+    id: egui::Id,
+    target: Option<MenuTarget<'_>>,
+    has_mark: bool,
+    merged_view: bool,
+) {
+    if response.secondary_clicked() {
+        if let Some(position) = response.ctx.pointer_hover_pos() {
+            let state = ConsoleMenuState {
+                position,
+                target: target.map(|target| OwnedMenuTarget {
+                    port: target.port,
+                    label: target.label.map(str::to_owned),
+                    line: target.line,
+                }),
+                has_mark,
+                merged_view,
+            };
+            response.ctx.data_mut(|data| data.insert_temp(id, state));
+            egui::Popup::open_id(&response.ctx, id);
+        }
+    }
+}
+
+fn show_queued_console_menu(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    menu: &mut MenuAction,
+    ts_format: TimestampFormat,
+) {
+    if !egui::Popup::is_id_open(ui.ctx(), id) {
+        ui.ctx()
+            .data_mut(|data| data.remove::<ConsoleMenuState>(id));
+        return;
+    }
+    let Some(state) = ui.ctx().data(|data| data.get_temp::<ConsoleMenuState>(id)) else {
+        return;
+    };
+    egui::Popup::menu(&ui.response())
+        .id(id)
+        .open_memory(None)
+        .at_position(state.position)
+        .show(|ui| {
+            let target = state.target.as_ref().map(|target| MenuTarget {
+                port: target.port,
+                label: target.label.as_deref(),
+                line: target.line,
+            });
+            console_menu(
+                ui,
+                menu,
+                target,
+                ts_format,
+                state.has_mark,
+                state.merged_view,
+            );
+        });
+}
+
 impl<'a> MenuTarget<'a> {
     /// A menu over the active tab's own console, opened over `line` (or over
     /// the empty space below it).
@@ -817,6 +894,13 @@ fn request_search_selection(ctx: &egui::Context, target: egui::Id) -> bool {
 }
 
 impl App {
+    fn console_menu_id(&self) -> egui::Id {
+        let tab = self.selected_tab_id().map(|tab| match tab {
+            crate::app::TabId::Connection(id) => (false, u64::from(id.0)),
+            crate::app::TabId::Merged(id) => (true, id),
+        });
+        self.pane_widget_id("console_context_menu").with(tab)
+    }
     /// Connection that currently receives keyboard input from the visible
     /// console. The merged pseudo-tab has an explicit device target instead of
     /// falling back to whichever ordinary tab was active last.
@@ -1189,14 +1273,20 @@ impl App {
             let start =
                 ctx.graphics(|graphics| graphics.get(layer).map_or(0, |list| list.next_idx().0));
             if self.merged_selected {
-                self.show_merged_rows(ui, &mut menu);
+                self.show_merged_rows(ui);
             } else if self.connections[active].screen_view {
                 self.show_terminal_screen(ui, active);
             } else if self.connections[active].hex_view {
-                self.show_hex_rows(ui, active, &mut menu);
+                self.show_hex_rows(ui, active);
             } else {
-                self.show_single_rows(ui, active, &mut menu);
+                self.show_single_rows(ui, active);
             }
+            show_queued_console_menu(
+                ui,
+                self.console_menu_id(),
+                &mut menu,
+                self.config.settings.timestamp_format,
+            );
             if let Some(backdrop) = backdrop {
                 let mut shapes = ctx.graphics(|graphics| {
                     graphics
@@ -1653,7 +1743,8 @@ impl App {
         self.maintain_merged_search(false);
     }
 
-    fn show_single_rows(&mut self, ui: &mut egui::Ui, active: usize, menu: &mut MenuAction) {
+    fn show_single_rows(&mut self, ui: &mut egui::Ui, active: usize) {
+        let menu_id = self.console_menu_id();
         let header_height = super::chrome::HeaderBackdrop::current(
             ui.ctx(),
             self.pane_widget_id("header_backdrop"),
@@ -1758,16 +1849,13 @@ impl App {
             ui.id().with("console_bg"),
             egui::Sense::click(),
         );
-        bg.context_menu(|ui| {
-            console_menu(
-                ui,
-                menu,
-                Some(MenuTarget::active(None)),
-                ts_format,
-                has_mark,
-                false,
-            )
-        });
+        queue_console_menu(
+            &bg,
+            menu_id,
+            Some(MenuTarget::active(None)),
+            has_mark,
+            false,
+        );
 
         let row_of_line = |target: u64| -> Option<u64> {
             let entry = if filter_active {
@@ -1904,16 +1992,13 @@ impl App {
                         row_id: egui::Id::new(("console_row", conn.id, abs)),
                     };
                     let resp = render_row(ui, &line, &rctx);
-                    resp.context_menu(|ui| {
-                        console_menu(
-                            ui,
-                            menu,
-                            Some(MenuTarget::active(Some(abs))),
-                            ts_format,
-                            has_mark,
-                            false,
-                        )
-                    });
+                    queue_console_menu(
+                        &resp,
+                        menu_id,
+                        Some(MenuTarget::active(Some(abs))),
+                        has_mark,
+                        false,
+                    );
                     entry += 1;
                 }
                 // The echo row trails the last line, so it is drawn only when
@@ -1950,7 +2035,8 @@ impl App {
         }
     }
 
-    fn show_merged_rows(&mut self, ui: &mut egui::Ui, menu: &mut MenuAction) {
+    fn show_merged_rows(&mut self, ui: &mut egui::Ui) {
+        let menu_id = self.console_menu_id();
         let header_height = super::chrome::HeaderBackdrop::current(
             ui.ctx(),
             self.pane_widget_id("header_backdrop"),
@@ -2079,7 +2165,7 @@ impl App {
         // so the port-specific items are left out here rather than aimed at
         // whichever tab was last active (issue #11). Right-clicking a row
         // offers them, resolved against that row's own port.
-        bg.context_menu(|ui| console_menu(ui, menu, None, ts_format, false, true));
+        queue_console_menu(&bg, menu_id, None, false, true);
         ui.spacing_mut().item_spacing.y = 0.0;
 
         let mut area = egui::ScrollArea::vertical()
@@ -2163,16 +2249,13 @@ impl App {
                     };
                     let resp = render_row(ui, &line, &rctx);
                     let has_mark = conn.mark_micros.is_some();
-                    resp.context_menu(|ui| {
-                        console_menu(
-                            ui,
-                            menu,
-                            Some(MenuTarget::row(port, conn.display_label(), abs)),
-                            ts_format,
-                            has_mark,
-                            true,
-                        )
-                    });
+                    queue_console_menu(
+                        &resp,
+                        menu_id,
+                        Some(MenuTarget::row(port, conn.display_label(), abs)),
+                        has_mark,
+                        true,
+                    );
                 }
             });
         });
@@ -2197,7 +2280,8 @@ impl App {
         }
     }
 
-    fn show_hex_rows(&mut self, ui: &mut egui::Ui, active: usize, menu: &mut MenuAction) {
+    fn show_hex_rows(&mut self, ui: &mut egui::Ui, active: usize) {
+        let menu_id = self.console_menu_id();
         if self.show_search {
             self.connections[active].maintain_hex_search();
         }
@@ -2211,23 +2295,19 @@ impl App {
         });
         let pointer_scroll = !self.workspace.resizing && user_scrolled(ui);
         let (pages, lines) = self.consume_scroll_shortcut(ui.ctx());
-        let ts_format = self.config.settings.timestamp_format;
         let has_mark = self.connections[active].mark_micros.is_some();
         let bg = ui.interact(
             ui.available_rect_before_wrap(),
             ui.id().with("hex_bg"),
             egui::Sense::click(),
         );
-        bg.context_menu(|ui| {
-            console_menu(
-                ui,
-                menu,
-                Some(MenuTarget::active(None)),
-                ts_format,
-                has_mark,
-                false,
-            )
-        });
+        queue_console_menu(
+            &bg,
+            menu_id,
+            Some(MenuTarget::active(None)),
+            has_mark,
+            false,
+        );
 
         let user_scrolled = pages != 0.0 || lines != 0.0 || pointer_scroll;
         if self.connections[active].follow && user_scrolled {
@@ -2353,16 +2433,13 @@ impl App {
                         row_slot(ui, row_height, egui::Sense::hover(), row_id);
                     let resp =
                         wrapped_text(&mut row_ui, job, &m, u32::MAX, row_height, row_id, None);
-                    resp.context_menu(|ui| {
-                        console_menu(
-                            ui,
-                            menu,
-                            Some(MenuTarget::active(None)),
-                            ts_format,
-                            has_mark,
-                            false,
-                        )
-                    });
+                    queue_console_menu(
+                        &resp,
+                        menu_id,
+                        Some(MenuTarget::active(None)),
+                        has_mark,
+                        false,
+                    );
                 }
             },
         );
@@ -4484,9 +4561,9 @@ mod tests {
                         |ui| {
                             egui::CentralPanel::default().show(ui, |ui| {
                                 if merged {
-                                    app.show_merged_rows(ui, &mut MenuAction::default());
+                                    app.show_merged_rows(ui);
                                 } else {
-                                    app.show_single_rows(ui, 0, &mut MenuAction::default());
+                                    app.show_single_rows(ui, 0);
                                 }
                             });
                         },
@@ -4613,6 +4690,165 @@ mod tests {
                     );
                 });
             });
+        }
+    }
+
+    #[test]
+    fn context_menu_survives_incoming_output_and_keeps_its_original_target() {
+        for merged in [false, true] {
+            for evict in [false, true] {
+                let (mut app, _enum_tx) = test_app("live-context-menu");
+                for id in [PortId(0), PortId(1)] {
+                    let mut conn = app.make_connection(
+                        id,
+                        format!("device {}", id.0),
+                        Default::default(),
+                        Default::default(),
+                        inert_handle(id),
+                    );
+                    conn.store = LineStore::new(if evict { 64 } else { 2000 });
+                    app.connections.push(conn);
+                }
+                let target = usize::from(merged);
+                let port = app.connections[target].id;
+                let append = |app: &mut App, start, end| {
+                    for i in start..end {
+                        let abs = app.connections[target].store.append(IncomingLine {
+                            text: format!("live row {i}"),
+                            ts: ts(i),
+                            port,
+                            flags: LineFlags::default(),
+                            spans: Default::default(),
+                            cursor: None,
+                        });
+                        app.merged.push(MergedEntry {
+                            port,
+                            abs,
+                            seq: i as u64,
+                            micros: i,
+                        });
+                    }
+                    if merged && evict {
+                        let first = app.connections[target].store.first_abs_index();
+                        app.merged.retain(|entry| entry.abs >= first);
+                    }
+                    app.merged_generation += 1;
+                };
+                append(&mut app, 0, 64);
+                // A merged row must keep targeting its own device, even though
+                // the active connection is the other one.
+                app.connections[0].store.append(IncomingLine {
+                    text: "other device".into(),
+                    ts: ts(0),
+                    port: PortId(0),
+                    flags: LineFlags::default(),
+                    spans: Default::default(),
+                    cursor: None,
+                });
+                app.merged_selected = merged;
+                app.merged_follow = true;
+                app.config.settings.timestamp_format = TimestampFormat::None;
+                let ctx = egui::Context::default();
+                let draw = |app: &mut App, events| {
+                    ctx.run_test_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(800.0, 500.0),
+                            )),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| app.show_console(ui, false),
+                    )
+                };
+                draw(&mut app, vec![]);
+                draw(&mut app, vec![]);
+                let row = egui::Id::new((
+                    if merged { "merged_row" } else { "console_row" },
+                    port,
+                    63_u64,
+                ))
+                .with("text");
+                let point = ctx
+                    .read_response(row)
+                    .expect("live row is visible")
+                    .rect
+                    .center();
+                let button = |pos, button, pressed| egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                draw(
+                    &mut app,
+                    vec![
+                        egui::Event::PointerMoved(point),
+                        button(point, egui::PointerButton::Secondary, true),
+                    ],
+                );
+                draw(
+                    &mut app,
+                    vec![button(point, egui::PointerButton::Secondary, false)],
+                );
+                let menu_id = app.console_menu_id();
+                assert!(egui::Popup::is_id_open(&ctx, menu_id));
+                let state = ctx
+                    .data(|data| data.get_temp::<ConsoleMenuState>(menu_id))
+                    .unwrap();
+                assert_eq!(state.target.as_ref().unwrap().line, Some(63));
+                assert_eq!(state.target.as_ref().unwrap().port, merged.then_some(port));
+                let mut output = draw(&mut app, vec![]);
+                for start in [64, 164, 264] {
+                    append(&mut app, start, start + 100);
+                    output = draw(&mut app, vec![]);
+                    assert!(
+                        egui::Popup::is_id_open(&ctx, menu_id),
+                        "incoming output closed the menu"
+                    );
+                    assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "Clear console")), "menu is still painted after its original row leaves the viewport");
+                }
+                assert!(
+                    ctx.read_response(row).is_none(),
+                    "the clicked row must no longer be rendered"
+                );
+                assert_eq!(app.connections[target].store.get(63).is_none(), evict);
+                let clear = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| {
+                        if let egui::Shape::Text(text) = &shape.shape {
+                            (text.galley.text() == "Clear console")
+                                .then(|| text.pos + text.galley.size() * 0.5)
+                        } else {
+                            None
+                        }
+                    })
+                    .expect("clear action");
+                draw(
+                    &mut app,
+                    vec![
+                        egui::Event::PointerMoved(clear),
+                        button(clear, egui::PointerButton::Primary, true),
+                    ],
+                );
+                draw(
+                    &mut app,
+                    vec![button(clear, egui::PointerButton::Primary, false)],
+                );
+                assert!(
+                    app.connections[target].store.is_empty(),
+                    "action must target the original device"
+                );
+                if merged {
+                    assert!(!app.connections[0].store.is_empty());
+                }
+                assert!(
+                    !egui::Popup::is_id_open(&ctx, menu_id),
+                    "selecting an action closes the menu"
+                );
+            }
         }
     }
 
@@ -5059,9 +5295,9 @@ mod tests {
                             };
                             scroll_id.set(Some(ui.make_persistent_id(salt)));
                             if merged {
-                                app.show_merged_rows(ui, &mut MenuAction::default());
+                                app.show_merged_rows(ui);
                             } else {
-                                app.show_single_rows(ui, 0, &mut MenuAction::default());
+                                app.show_single_rows(ui, 0);
                             }
                         });
                     },
@@ -6906,7 +7142,7 @@ mod tests {
                         false,
                     )
                     .row_height;
-                    app.show_hex_rows(ui, 0, &mut MenuAction::default());
+                    app.show_hex_rows(ui, 0);
                 });
             },
         );
