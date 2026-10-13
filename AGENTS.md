@@ -311,6 +311,13 @@ Receive-backlog frames use the same pacing. Timer requests compensate for egui's
 predicted frame time so configuration writes and macro deadlines do not busy-loop
 just before they are due.
 
+Log and merged rows share their console style and paint selectable text within
+the existing row container. Plain unstyled lines bypass styling-range allocation.
+Timestamp labels retain their normal accessibility responses; their formatted
+values use a frame cache that discards undrawn entries and refreshes wall-clock
+formats once a second. Mark, previous-line and timestamp changes invalidate the
+cached value. See the live measurements in the receive-load investigation.
+
 Dependencies were checked against the registry and updated to current stable versions
 on 2026-10-11. The GUI uses eframe/egui 0.36.2, egui_plot 0.37.0 and wgpu 30.0.1.
 This includes the upstream fix for DX12 diagnostic hooks being initialized when
