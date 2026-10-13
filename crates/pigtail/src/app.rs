@@ -851,6 +851,14 @@ impl Connection {
             }
             ReaderEvent::Error { scope, msg } => {
                 tracing::warn!(port = self.id.0, "{msg}");
+                // A command dropped during device absence must not erase a
+                // retained failure, including one restored after a link error.
+                if scope == ErrorScope::Session
+                    && msg.ends_with(": dropped, not connected")
+                    && self.last_error.is_some()
+                {
+                    return;
+                }
                 // A dropped-command notice (session-scoped) while the link
                 // itself is down would otherwise clobber the connection
                 // error explaining *why* — and unlike a connection error,
@@ -6182,6 +6190,15 @@ pub(crate) mod tests {
                     "log write: disk full"
                 );
                 assert!(conn.deferred_session_error.is_none());
+                conn.apply_reader_event(ReaderEvent::Error {
+                    scope: ErrorScope::Session,
+                    msg: "transmit: dropped, not connected".into(),
+                });
+                assert_eq!(
+                    conn.last_error.as_ref().unwrap().msg,
+                    "log write: disk full",
+                    "dropped commands must not erase the restored capture failure"
+                );
                 conn.last_error = None;
             }
         }
