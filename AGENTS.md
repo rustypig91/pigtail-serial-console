@@ -234,7 +234,10 @@ also receives settings changes. It counts complete raw records incrementally
 with the log framer, including a final partial line. A capture stays whole while
 any of its lines or its closing marker contributes to the retained Log window;
 when none fits, its `.session.bin` and metadata sidecar are deleted together.
-Active writers are protected, and their raw capture remains complete. Clear
+Active writers are protected by process-local registration and OS locks on
+`.session.lock` sidecars, and their raw capture remains complete. Cleanup defers
+a device while another Pigtail process owns one of its captures; other devices
+continue cleanup. Lock sidecars are removed with discarded captures. Clear
 boundaries discard older saved captures too. Every clear invalidates cached line
 counts, including repeated clears followed by regrowth between cleanup passes.
 Capture creation registers the live writer before cleanup can classify it as

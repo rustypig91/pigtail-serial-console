@@ -52,6 +52,8 @@ pub struct SessionMeta {
 /// per write.
 pub struct SessionWriter {
     file: BufWriter<File>,
+    // Separate from the raw file: Windows file locks also restrict reads.
+    _capture_lock: File,
     bin_path: PathBuf,
     meta_path: PathBuf,
     /// Kept so the sidecar can be rewritten when the log is cleared.
@@ -77,7 +79,7 @@ impl SessionWriter {
         // Publish the sidecar and register its writer under the same lock so
         // cleanup cannot mistake a newly created capture for a closed one.
         let mut active = active_captures().lock().expect("active captures lock");
-        let (file, bin_path, meta_path) = create_unique(dir, &base)?;
+        let (file, capture_lock, bin_path, meta_path) = create_unique(dir, &base)?;
 
         let json = serde_json::to_string_pretty(meta)
             .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
@@ -90,6 +92,7 @@ impl SessionWriter {
         active.insert(bin_path.clone(), 0);
         Ok(SessionWriter {
             file,
+            _capture_lock: capture_lock,
             bin_path,
             meta_path,
             meta: meta.clone(),
@@ -172,7 +175,7 @@ impl Drop for SessionWriter {
 /// Claim an unused `<stem>.session.bin` in `dir`, returning the created file
 /// and the pair of paths. `-1`, `-2`, … disambiguate captures that would
 /// otherwise share a stem.
-fn create_unique(dir: &Path, base: &str) -> std::io::Result<(File, PathBuf, PathBuf)> {
+fn create_unique(dir: &Path, base: &str) -> std::io::Result<(File, File, PathBuf, PathBuf)> {
     for n in 0..1000u32 {
         let stem = if n == 0 {
             base.to_string()
@@ -180,6 +183,13 @@ fn create_unique(dir: &Path, base: &str) -> std::io::Result<(File, PathBuf, Path
             format!("{base}-{n}")
         };
         let bin_path = dir.join(format!("{stem}.session.bin"));
+        // Lock before claiming the raw path, so another process cannot delete
+        // a newly created capture while its metadata is still unpublished.
+        let capture_lock = match try_capture_lock(&bin_path) {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => continue,
+            Err(error) => return Err(error),
+        };
         match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -187,7 +197,7 @@ fn create_unique(dir: &Path, base: &str) -> std::io::Result<(File, PathBuf, Path
         {
             Ok(file) => {
                 let meta_path = dir.join(format!("{stem}.session.meta.json"));
-                return Ok((file, bin_path, meta_path));
+                return Ok((file, capture_lock, bin_path, meta_path));
             }
             Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -304,6 +314,23 @@ fn meta_path_for(bin_path: &Path) -> PathBuf {
     } else {
         bin_path.with_extension("meta.json")
     }
+}
+
+fn lock_path_for(bin_path: &Path) -> PathBuf {
+    bin_path.with_extension("lock")
+}
+
+/// Create a lock sidecar for legacy captures too, so deleting an old path and
+/// reusing it for a new capture coordinate through the same OS lock.
+fn try_capture_lock(bin_path: &Path) -> std::io::Result<File> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path_for(bin_path))?;
+    lock.try_lock()?;
+    Ok(lock)
 }
 
 /// Visit complete records in bounded chunks. A torn final record is ignored.
@@ -551,6 +578,17 @@ impl SessionCleanup {
                 captures.push((path, meta, first));
             }
         }
+        // Another process can clear or grow a capture without updating our
+        // generation counters. Defer cleanup for that device until it closes;
+        // otherwise a concurrent clear could invalidate our deletion budget.
+        let mut foreign_devices = std::collections::HashSet::new();
+        for (path, meta, _) in &captures {
+            let active = active_captures().lock().expect("active captures lock");
+            if !active.contains_key(path) && try_capture_lock(path).is_err() {
+                foreign_devices.insert(meta.identity.clone());
+            }
+        }
+        captures.retain(|(_, meta, _)| !foreign_devices.contains(&meta.identity));
         captures.sort_by_key(|(path, meta, first)| (meta.start_wall, *first, path.clone()));
         let mut budgets: Vec<(PortIdentity, usize, bool)> = Vec::new();
         let mut remove = Vec::new();
@@ -597,12 +635,18 @@ pub fn remove_session_paths(paths: &[PathBuf]) -> std::io::Result<usize> {
         if active.contains_key(path) {
             continue;
         }
+        // Hold the OS lock through deletion, including when cleanup races a
+        // writer in another process, including reuse of a deleted file name.
+        let Ok(_capture_lock) = try_capture_lock(path) else {
+            continue;
+        };
         match std::fs::remove_file(path) {
             Ok(()) => removed += 1,
             Err(error) if error.kind() == ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         }
         let _ = std::fs::remove_file(meta_path_for(path));
+        let _ = std::fs::remove_file(lock_path_for(path));
     }
     Ok(removed)
 }
@@ -654,6 +698,77 @@ mod tests {
             writer.write_record(n as u64, bytes).unwrap();
         }
         writer.bin_path().to_path_buf()
+    }
+
+    #[test]
+    fn foreign_capture_writer() {
+        let Some(dir) = std::env::var_os("PIGTAIL_TEST_FOREIGN_CAPTURE_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let mut meta = sample_meta();
+        meta.start_wall = DateTime::UNIX_EPOCH + chrono::Duration::seconds(2);
+        meta.identity.serial_number = Some("A".into());
+        let mut writer = SessionWriter::create(&dir, &meta).unwrap();
+        writer.write_record(0, b"live\n").unwrap();
+        writer.flush().unwrap();
+        crate::fs::atomic_write(&dir.join("ready"), writer.bin_path().to_str().unwrap()).unwrap();
+        // Parent closes stdin to end this writer; the OS also releases the
+        // lock if the child crashes or is killed.
+        let mut byte = [0];
+        let _ = std::io::stdin().read(&mut byte).unwrap();
+    }
+
+    #[test]
+    fn cleanup_protects_writers_in_another_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let oldest = saved_capture(dir.path(), 1, "A", &[b"old\n"]);
+        let newest = saved_capture(dir.path(), 3, "A", &[b"new\n"]);
+        let other_old = saved_capture(dir.path(), 1, "B", &[b"old\n"]);
+        let other_new = saved_capture(dir.path(), 3, "B", &[b"new\n"]);
+        // Captures from older versions have no lock sidecar.
+        std::fs::remove_file(lock_path_for(&other_old)).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "session::tests::foreign_capture_writer"])
+            .env("PIGTAIL_TEST_FOREIGN_CAPTURE_DIR", dir.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let ready = dir.path().join("ready");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            if Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("foreign capture writer did not become ready");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let live = PathBuf::from(std::fs::read_to_string(ready).unwrap());
+        assert!(!active_captures().lock().unwrap().contains_key(&live));
+        let mut cleanup = SessionCleanup::default();
+        // A's live capture lies outside this window. Neither it nor older A
+        // captures may be deleted, but B's closed captures still get cleaned.
+        assert_eq!(cleanup.cleanup(dir.path(), 2).unwrap(), 1);
+        assert!(oldest.exists());
+        assert!(live.exists());
+        assert!(newest.exists());
+        assert!(!other_old.exists());
+        assert!(other_new.exists());
+        assert_eq!(
+            remove_session_paths(std::slice::from_ref(&live)).unwrap(),
+            0
+        );
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        assert_eq!(cleanup.cleanup(dir.path(), 2).unwrap(), 2);
+        assert!(!oldest.exists());
+        assert!(!live.exists());
+        assert!(!meta_path_for(&live).exists());
+        assert!(!lock_path_for(&live).exists());
+        assert!(!lock_path_for(&oldest).exists());
+        assert!(newest.exists());
     }
 
     #[test]
