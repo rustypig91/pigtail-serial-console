@@ -2655,7 +2655,7 @@ dependencies = [
 
 [[package]]
 name = "pigtail"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3279,7 +3279,7 @@ dependencies = [
 
 [[package]]
 name = "serialcore"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "crossbeam-channel",
