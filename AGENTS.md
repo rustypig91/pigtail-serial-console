@@ -172,7 +172,7 @@ application.
   finishes, rebuilding from retained receive data. ANSI/VT history is restored
   across app restarts by replaying the same saved raw
   session captures used by Log and Hex. Prior captures are separated by session
-  markers; the existing history restore budget and clear-history boundaries apply.
+  markers; the log line limit and clear-history boundaries apply.
   The VT grid retains the configured number of scrolled rows, while the full raw capture
   remains on disk. Use the mouse wheel or scrollbar to review it;
   **Pin** or typing returns to live output. New output preserves your scroll position.
@@ -220,6 +220,24 @@ application.
 - Export the current (filtered) view to `.txt` or `.csv`
 - Startup notice when a newer release is published, with "skip this version" and
   one-click download and update. Startup checks can be switched off in Settings.
+
+### Saved session history
+
+Saved captures have no age limit. **Settings → Max log lines** controls restored
+Log history and saved captures per device identity. Restore walks newest-first
+by framed log lines, including closing session markers, with no raw-byte restore
+budget; selected captures replay in bounded chunks. It honors each capture's framing mode and existing clear boundaries.
+Raw capture remains independent of search filters and the selected view.
+
+Background cleanup starts after history restore, runs every five seconds and
+also receives settings changes. It counts complete raw records incrementally
+with the log framer, including a final partial line. A capture stays whole while
+any of its lines or its closing marker contributes to the retained Log window;
+when none fits, its `.session.bin` and metadata sidecar are deleted together.
+Active writers are protected, and their raw capture remains complete. Clear
+boundaries discard older saved captures too. Unreadable captures are preserved.
+The obsolete `session_retention_days` setting is ignored and omitted on save;
+there is no age retention control or cleanup confirmation in Settings.
 
 ### Keyboard shortcuts and appearance
 

@@ -23,6 +23,14 @@ const MAGIC: &[u8; 4] = b"SMON";
 const VERSION: u16 = 1;
 const HEADER_LEN: u64 = 6;
 
+// Cleanup must never unlink a capture owned by a live reader, including when
+// multiple readers happen to share the same device identity.
+fn active_captures() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    static ACTIVE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    ACTIVE.get_or_init(Default::default)
+}
+
 /// Sidecar metadata written as JSON.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionMeta {
@@ -76,6 +84,10 @@ impl SessionWriter {
         file.write_all(MAGIC)?;
         file.write_all(&VERSION.to_le_bytes())?;
 
+        active_captures()
+            .lock()
+            .expect("active captures lock")
+            .insert(bin_path.clone());
         Ok(SessionWriter {
             file,
             bin_path,
@@ -144,6 +156,10 @@ impl SessionWriter {
 impl Drop for SessionWriter {
     fn drop(&mut self) {
         let _ = self.file.flush();
+        active_captures()
+            .lock()
+            .expect("active captures lock")
+            .remove(&self.bin_path);
     }
 }
 
@@ -284,54 +300,279 @@ fn meta_path_for(bin_path: &Path) -> PathBuf {
     }
 }
 
-/// Return session captures whose modified time is older than `days`.
-///
-/// This lets callers ask for confirmation before invoking
-/// [`cleanup_old_sessions`]. Metadata failures are ignored just as they are by
-/// cleanup: a capture with an unavailable modification time is retained.
-pub fn old_session_paths(dir: &Path, days: u32) -> std::io::Result<Vec<PathBuf>> {
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let cutoff = std::time::SystemTime::now()
-        .checked_sub(Duration::from_secs(days as u64 * 86_400))
-        .unwrap_or(std::time::UNIX_EPOCH);
-    let mut old = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if !name.ends_with(".session.bin") {
-            continue;
+/// Visit complete records in bounded chunks. A torn final record is ignored.
+fn scan_records(
+    path: &Path,
+    start: u64,
+    end: Option<u64>,
+    mut visit: impl FnMut(u64, u64, &[u8]),
+) -> std::io::Result<u64> {
+    let file = File::open(path)?;
+    let len = file.metadata()?.len().min(end.unwrap_or(u64::MAX));
+    let mut reader = BufReader::new(file);
+    let mut header = [0; HEADER_LEN as usize];
+    reader.read_exact(&mut header)?;
+    check_header(&header)?;
+    reader.seek(SeekFrom::Start(start))?;
+    let mut pos = start;
+    let mut buffer = [0; 64 * 1024];
+    while len.saturating_sub(pos) >= 12 {
+        let mut rh = [0; 12];
+        reader.read_exact(&mut rh)?;
+        let count = u64::from(u32::from_le_bytes(rh[8..].try_into().unwrap()));
+        if count > len.saturating_sub(pos + 12) {
+            break;
         }
-        let modified = entry.metadata().and_then(|m| m.modified());
-        if let Ok(modified) = modified {
-            if modified < cutoff {
-                old.push(path);
-            }
+        let mut remaining = count;
+        while remaining > 0 {
+            let n = remaining.min(buffer.len() as u64) as usize;
+            reader.read_exact(&mut buffer[..n])?;
+            visit(
+                pos,
+                u64::from_le_bytes(rh[..8].try_into().unwrap()),
+                &buffer[..n],
+            );
+            remaining -= n as u64;
         }
+        pos += 12 + count;
     }
-    Ok(old)
+    Ok(pos)
 }
 
-/// Delete session files (`.session.bin` and their `.meta.json`) whose modified
-/// time is older than `days` (spec §7.5). Returns the number of bin files
-/// removed.
-pub fn cleanup_old_sessions(dir: &Path, days: u32) -> std::io::Result<usize> {
-    let old = old_session_paths(dir, days)?;
-    remove_session_paths(&old)
+/// Raw records in capture order, with their original microsecond timestamps.
+pub type SessionRecords = Vec<(u64, Vec<u8>)>;
+
+/// Restore by log lines, preserving complete records and the first byte of a
+/// line spanning records. Record boundaries can include extra leading lines;
+/// the caller's line store evicts those. No age or byte budget gates restore.
+#[derive(Clone, Copy)]
+pub struct LineTail {
+    start: u64,
+    end: u64,
+    pub lines: usize,
+}
+
+impl LineTail {
+    pub fn has_records(&self) -> bool {
+        self.end > self.start
+    }
+}
+
+/// Locate the raw records covering the requested log tail without loading them.
+pub fn line_tail(
+    path: &Path,
+    max_lines: usize,
+    mode: crate::config::TerminalMode,
+) -> std::io::Result<LineTail> {
+    use std::collections::VecDeque;
+    let mut framer = crate::framer::Framer::with_mode(mode);
+    let mut lines = Vec::new();
+    let mut starts = VecDeque::new();
+    let mut total = 0usize;
+    let mut origin = HEADER_LEN;
+    let mut collect = |lines: &mut Vec<crate::framer::FramedLine>, origin: &mut u64, pos: u64| {
+        for line in lines.drain(..) {
+            total = total.saturating_add(1);
+            starts.push_back((*origin).min(line.ts.micros as u64));
+            *origin = pos;
+            if starts.len() > max_lines.max(1) {
+                starts.pop_front();
+            }
+        }
+    };
+    let end = scan_records(path, HEADER_LEN, None, |pos, _, bytes| {
+        if !framer.has_pending_input() {
+            origin = pos;
+        }
+        framer.push(
+            bytes,
+            crate::clock::Timestamp {
+                wall: DateTime::UNIX_EPOCH,
+                micros: pos as i64,
+            },
+            &mut lines,
+        );
+        collect(&mut lines, &mut origin, pos);
+    })?;
+    framer.flush_final(&mut lines);
+    collect(&mut lines, &mut origin, end);
+    // Control-only captures remain available to Hex and ANSI/VT.
+    let start = starts.front().copied().unwrap_or(HEADER_LEN);
+    Ok(LineTail {
+        start,
+        end,
+        lines: total,
+    })
+}
+
+/// Replay selected records in bounded chunks, preserving their timestamps.
+pub fn visit_line_tail(
+    path: &Path,
+    tail: LineTail,
+    mut visit: impl FnMut(u64, &[u8]),
+) -> std::io::Result<()> {
+    scan_records(path, tail.start, Some(tail.end), |_, micros, bytes| {
+        visit(micros, bytes)
+    })?;
+    Ok(())
+}
+
+/// Read the selected tail, for callers that need owned raw records.
+pub fn read_tail_records_by_lines(
+    path: &Path,
+    max_lines: usize,
+    mode: crate::config::TerminalMode,
+) -> std::io::Result<(SessionRecords, usize)> {
+    let tail = line_tail(path, max_lines, mode)?;
+    let start = tail.start;
+    let end = tail.end;
+    let mut reader = BufReader::new(File::open(path)?);
+    reader.seek(SeekFrom::Start(start))?;
+    let mut pos = start;
+    let mut records = Vec::new();
+    while pos < end {
+        let mut rh = [0; 12];
+        reader.read_exact(&mut rh)?;
+        let count = u32::from_le_bytes(rh[8..].try_into().unwrap()) as usize;
+        let mut bytes = vec![0; count];
+        reader.read_exact(&mut bytes)?;
+        records.push((u64::from_le_bytes(rh[..8].try_into().unwrap()), bytes));
+        pos += 12 + count as u64;
+    }
+    Ok((records, tail.lines))
+}
+
+struct CaptureLines {
+    pos: u64,
+    framer: crate::framer::Framer,
+    completed: usize,
+    mode: crate::config::TerminalMode,
+    cleared: bool,
+}
+
+/// Incremental line-based cleanup. Files still contributing to a device's log
+/// are kept whole, including a partially visible oldest capture. The newest
+/// active captures are protected while their reader is writing them.
+#[derive(Default)]
+pub struct SessionCleanup {
+    counts: std::collections::HashMap<PathBuf, CaptureLines>,
+}
+
+impl SessionCleanup {
+    fn lines(&mut self, path: &Path, meta: &SessionMeta) -> std::io::Result<usize> {
+        let len = std::fs::metadata(path)?.len();
+        let state = self
+            .counts
+            .entry(path.to_path_buf())
+            .or_insert_with(|| CaptureLines {
+                pos: HEADER_LEN,
+                framer: crate::framer::Framer::with_mode(meta.config.terminal),
+                completed: 0,
+                mode: meta.config.terminal,
+                cleared: meta.cleared,
+            });
+        if len < state.pos || state.mode != meta.config.terminal || state.cleared != meta.cleared {
+            *state = CaptureLines {
+                pos: HEADER_LEN,
+                framer: crate::framer::Framer::with_mode(meta.config.terminal),
+                completed: 0,
+                mode: meta.config.terminal,
+                cleared: meta.cleared,
+            };
+        }
+        let mut framed = Vec::new();
+        let mut framer = state.framer.clone();
+        let mut completed = state.completed;
+        let pos = scan_records(path, state.pos, None, |_, _, bytes| {
+            framer.push(
+                bytes,
+                crate::clock::Timestamp {
+                    wall: meta.start_wall,
+                    micros: 0,
+                },
+                &mut framed,
+            );
+            completed = completed.saturating_add(framed.len());
+            framed.clear();
+        })?;
+        state.pos = pos;
+        state.framer = framer;
+        state.completed = completed;
+        let mut tail = state.framer.clone();
+        tail.flush_final(&mut framed);
+        Ok(state.completed.saturating_add(framed.len()))
+    }
+
+    /// Apply the same line limit independently to each saved device identity.
+    /// Invalid/unreadable captures are retained, never grounds for deleting
+    /// older history. Sidecars are removed together with their raw captures.
+    pub fn cleanup(&mut self, dir: &Path, max_lines: usize) -> std::io::Result<usize> {
+        if !dir.exists() {
+            return Ok(0);
+        }
+        let mut captures = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if !path.to_string_lossy().ends_with(".session.bin") {
+                continue;
+            }
+            if let Ok(meta) = read_meta(&path) {
+                let first = read_first_micros(&path).ok().flatten().unwrap_or(u64::MAX);
+                captures.push((path, meta, first));
+            }
+        }
+        captures.sort_by_key(|(path, meta, first)| (meta.start_wall, *first, path.clone()));
+        let mut budgets: Vec<(PortIdentity, usize, bool)> = Vec::new();
+        let mut remove = Vec::new();
+        for (path, meta, _) in captures.iter().rev() {
+            let newest = !budgets.iter().any(|(id, _, _)| id == &meta.identity);
+            if newest {
+                budgets.push((meta.identity.clone(), max_lines.max(1), false));
+            }
+            let (_, remaining, cleared) = budgets
+                .iter_mut()
+                .find(|(id, _, _)| id == &meta.identity)
+                .unwrap();
+            let active = active_captures()
+                .lock()
+                .expect("active captures lock")
+                .contains(path);
+            if !active && (*remaining == 0 || *cleared) {
+                remove.push(path.clone());
+                continue;
+            }
+            if let Ok(lines) = self.lines(path, meta) {
+                // Restored nonempty logs have one closing session marker;
+                // live output does not have that marker yet.
+                *remaining = remaining
+                    .saturating_sub(lines.saturating_add(usize::from(!active && lines > 0)));
+            }
+            *cleared |= meta.cleared;
+        }
+        let removed = remove_session_paths(&remove)?;
+        self.counts.retain(|path, _| path.exists());
+        Ok(removed)
+    }
 }
 
 /// Delete exactly the session captures in `paths`, along with their metadata.
 ///
-/// Callers that displayed a cleanup preview can pass the previewed paths here
-/// so files that become old while awaiting confirmation are not removed too.
+/// Only captures outside the retained history should be passed here.
 pub fn remove_session_paths(paths: &[PathBuf]) -> std::io::Result<usize> {
+    let active = active_captures().lock().expect("active captures lock");
+    let mut removed = 0;
     for path in paths {
-        std::fs::remove_file(path)?;
+        if active.contains(path) {
+            continue;
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
         let _ = std::fs::remove_file(meta_path_for(path));
     }
-    Ok(paths.len())
+    Ok(removed)
 }
 
 fn sanitize_label(label: &str) -> String {
@@ -370,6 +611,188 @@ mod tests {
             port_label: "Nucleo/1".into(),
             cleared: false,
         }
+    }
+
+    fn saved_capture(dir: &Path, sequence: i64, device: &str, records: &[&[u8]]) -> PathBuf {
+        let mut meta = sample_meta();
+        meta.start_wall = DateTime::UNIX_EPOCH + chrono::Duration::seconds(sequence);
+        meta.identity.serial_number = Some(device.into());
+        let mut writer = SessionWriter::create(dir, &meta).unwrap();
+        for (n, bytes) in records.iter().enumerate() {
+            writer.write_record(n as u64, bytes).unwrap();
+        }
+        writer.bin_path().to_path_buf()
+    }
+
+    #[test]
+    fn cleanup_keeps_partly_visible_captures_regardless_of_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let oldest = saved_capture(dir.path(), 1, "A", &[b"old\n"]);
+        let partial = saved_capture(dir.path(), 2, "A", &[b"one\ntwo\nthree\n"]);
+        let newest = saved_capture(dir.path(), 3, "A", &[b"new\n"]);
+        let other = saved_capture(dir.path(), 4, "B", &[b"other\n"]);
+        let ancient = std::time::UNIX_EPOCH + Duration::from_secs(1);
+        File::options()
+            .write(true)
+            .open(&partial)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(ancient))
+            .unwrap();
+        let mut cleanup = SessionCleanup::default();
+        // Two lines from newest (text + marker), three remaining: partial
+        // still contributes and is retained in full, oldest contributes none.
+        assert_eq!(cleanup.cleanup(dir.path(), 5).unwrap(), 1);
+        assert!(!oldest.exists());
+        assert!(!meta_path_for(&oldest).exists());
+        assert!(partial.exists());
+        assert!(newest.exists());
+        assert!(other.exists());
+        assert_eq!(
+            read_tail_records(&partial, usize::MAX).unwrap()[0].1,
+            b"one\ntwo\nthree\n"
+        );
+        assert_eq!(cleanup.cleanup(dir.path(), 2).unwrap(), 1);
+        assert!(!partial.exists());
+        assert!(newest.exists());
+        assert!(other.exists());
+    }
+
+    #[test]
+    fn growing_active_capture_evicts_old_files_without_deleting_live_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = saved_capture(dir.path(), 1, "A", &[b"old\n"]);
+        let mut meta = sample_meta();
+        meta.identity.serial_number = Some("A".into());
+        let mut writer = SessionWriter::create(dir.path(), &meta).unwrap();
+        let live = writer.bin_path().to_path_buf();
+        let mut cleanup = SessionCleanup::default();
+        writer.write_record(0, b"par").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(cleanup.cleanup(dir.path(), 3).unwrap(), 0);
+        writer.write_record(1, b"tial\nsecond\nthird\n").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(cleanup.cleanup(dir.path(), 3).unwrap(), 1);
+        assert!(!old.exists());
+        assert!(live.exists());
+        assert_eq!(cleanup.lines(&live, &meta).unwrap(), 3);
+        assert_eq!(
+            remove_session_paths(std::slice::from_ref(&live)).unwrap(),
+            0
+        );
+        writer.truncate().unwrap();
+        writer.write_record(2, b"after clear\n").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(cleanup.lines(&live, &read_meta(&live).unwrap()).unwrap(), 1);
+    }
+
+    #[test]
+    fn cleanup_respects_clear_boundaries_and_preserves_invalid_captures() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = saved_capture(dir.path(), 1, "A", &[b"discarded\n"]);
+        let mut meta = sample_meta();
+        meta.identity.serial_number = Some("A".into());
+        let mut writer = SessionWriter::create(dir.path(), &meta).unwrap();
+        writer.truncate().unwrap();
+        writer.flush().unwrap();
+        let live = writer.bin_path().to_path_buf();
+        let invalid = dir.path().join("invalid.session.bin");
+        std::fs::write(&invalid, b"invalid").unwrap();
+        assert_eq!(
+            SessionCleanup::default().cleanup(dir.path(), 100).unwrap(),
+            1
+        );
+        assert!(!old.exists());
+        assert!(live.exists());
+        assert!(invalid.exists());
+    }
+
+    #[test]
+    fn line_tail_keeps_a_line_spanning_records_and_ignores_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = saved_capture(
+            dir.path(),
+            1,
+            "A",
+            &[b"old\n", b"start ", b"middle ", b"end\n", b"last"],
+        );
+        let (records, total) =
+            read_tail_records_by_lines(&path, 2, crate::config::TerminalMode::Classic).unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(
+            records
+                .into_iter()
+                .flat_map(|(_, bytes)| bytes)
+                .collect::<Vec<_>>(),
+            b"start middle end\nlast"
+        );
+        let mut file = File::options().append(true).open(&path).unwrap();
+        file.write_all(&0u64.to_le_bytes()).unwrap();
+        file.write_all(&100u32.to_le_bytes()).unwrap();
+        file.write_all(b"torn").unwrap();
+        assert_eq!(
+            read_tail_records_by_lines(&path, 1, crate::config::TerminalMode::Classic).unwrap(),
+            (vec![(4, b"last".to_vec())], 3)
+        );
+    }
+
+    #[test]
+    fn line_tail_preserves_escape_sequences_split_before_visible_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = saved_capture(dir.path(), 1, "A", &[b"old\n", b"\x1b[", b"31", b"mred\n"]);
+        let (records, lines) =
+            read_tail_records_by_lines(&path, 1, crate::config::TerminalMode::Vt100).unwrap();
+        assert_eq!(lines, 2);
+        assert_eq!(
+            records
+                .into_iter()
+                .flat_map(|(_, bytes)| bytes)
+                .collect::<Vec<_>>(),
+            b"\x1b[31mred\n"
+        );
+    }
+
+    #[test]
+    fn streaming_restore_bounds_chunks_and_preserves_record_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = vec![b'x'; crate::framer::MAX_LINE_LEN * 3 + 1];
+        let path = saved_capture(dir.path(), 1, "A", &[&bytes, b"\nlast\n"]);
+        let tail = line_tail(&path, 100, crate::config::TerminalMode::Classic).unwrap();
+        let mut output = Vec::new();
+        let mut stamps = Vec::new();
+        visit_line_tail(&path, tail, |micros, chunk| {
+            assert!(chunk.len() <= 64 * 1024);
+            output.extend_from_slice(chunk);
+            stamps.push(micros);
+        })
+        .unwrap();
+        assert_eq!(output, [bytes.as_slice(), b"\nlast\n"].concat());
+        assert_eq!(stamps, [0, 0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn line_count_uses_terminal_framing_and_forced_long_line_breaks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = saved_capture(dir.path(), 1, "A", &[b"a\rb\rc\n"]);
+        assert_eq!(
+            read_tail_records_by_lines(&path, 100, crate::config::TerminalMode::Classic)
+                .unwrap()
+                .1,
+            3
+        );
+        assert_eq!(
+            read_tail_records_by_lines(&path, 100, crate::config::TerminalMode::Vt100)
+                .unwrap()
+                .1,
+            1
+        );
+        let long = vec![b'x'; crate::framer::MAX_LINE_LEN * 3 + 1];
+        let path = saved_capture(dir.path(), 2, "A", &[&long]);
+        assert_eq!(
+            read_tail_records_by_lines(&path, 100, crate::config::TerminalMode::Classic)
+                .unwrap()
+                .1,
+            4
+        );
     }
 
     #[test]
@@ -532,34 +955,6 @@ mod tests {
             read_meta(&bin).unwrap().cleared,
             "restoring history must stop at a capture the user cleared"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn old_sessions_can_be_previewed_before_cleanup() {
-        let dir = std::env::temp_dir().join(format!("smon-cleanup-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        let mut writer = SessionWriter::create(&dir, &sample_meta()).unwrap();
-        writer.write_record(0, b"old\n").unwrap();
-        writer.flush().unwrap();
-        let bin = writer.bin_path().to_path_buf();
-        let sidecar = writer.meta_path().to_path_buf();
-        drop(writer);
-
-        let old = std::time::SystemTime::now() - Duration::from_secs(2 * 86_400);
-        // Windows requires write access to update a file's timestamps.
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&bin)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(old))
-            .unwrap();
-
-        assert_eq!(old_session_paths(&dir, 1).unwrap(), vec![bin.clone()]);
-        assert_eq!(cleanup_old_sessions(&dir, 1).unwrap(), 1);
-        assert!(!bin.exists());
-        assert!(!sidecar.exists());
 
         std::fs::remove_dir_all(&dir).ok();
     }

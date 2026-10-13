@@ -402,11 +402,6 @@ pub struct Settings {
     pub wrap_lines: bool,
     #[serde(default, skip_serializing_if = "is_default")]
     pub timestamp_format: TimestampFormat,
-    #[serde(
-        default = "default_retention",
-        skip_serializing_if = "is_default_retention"
-    )]
-    pub session_retention_days: u32,
     #[serde(default = "default_theme", skip_serializing_if = "is_default_theme")]
     pub theme: String,
     #[serde(default, skip_serializing_if = "is_default")]
@@ -461,10 +456,6 @@ fn is_default_header_opacity(value: &u8) -> bool {
     *value == default_header_opacity()
 }
 
-fn is_default_retention(value: &u32) -> bool {
-    *value == default_retention()
-}
-
 fn is_default_theme(value: &String) -> bool {
     *value == default_theme()
 }
@@ -483,7 +474,6 @@ impl Default for Settings {
             header_opacity: default_header_opacity(),
             wrap_lines: true,
             timestamp_format: TimestampFormat::default(),
-            session_retention_days: default_retention(),
             theme: default_theme(),
             dark_base_color: BaseColor::default(),
             light_base_color: BaseColor::default(),
@@ -851,9 +841,6 @@ fn default_header_opacity() -> u8 {
 fn default_console_font_size() -> u8 {
     12
 }
-fn default_retention() -> u32 {
-    30
-}
 fn default_theme() -> String {
     "dark".to_string()
 }
@@ -972,6 +959,18 @@ enabled = true
     }
 
     #[test]
+    fn obsolete_session_retention_is_ignored_and_removed_on_save() {
+        for value in ["1", "3650", "-1", "'invalid'"] {
+            let config = Config::from_toml(&format!(
+                "[settings]\nsession_retention_days = {value}\nmax_lines = 12345\n"
+            ))
+            .unwrap();
+            assert_eq!(config.settings.max_lines, 12345);
+            assert!(!config.to_toml().unwrap().contains("session_retention_days"));
+        }
+    }
+
+    #[test]
     fn obsolete_global_send_delay_is_ignored_and_removed_on_save() {
         for value in ["25", "-1", "\"invalid\""] {
             let config =
@@ -1086,7 +1085,6 @@ enabled = true
             header_opacity = 0
             wrap_lines = false
             timestamp_format = "none"
-            session_retention_days = 123
             theme = "light"
             check_updates = false
             skipped_version = "2.0.0"
@@ -1129,7 +1127,6 @@ enabled = true
             header_opacity,
             wrap_lines,
             timestamp_format,
-            session_retention_days,
             theme,
             check_updates
         );
@@ -1216,7 +1213,6 @@ enabled = true
 [settings]
 max_lines = 1000000
 timestamp_format = "delta"
-session_retention_days = 30
 theme = "dark"
 
 [[preset]]

@@ -34,20 +34,12 @@ fn main() -> anyhow::Result<()> {
     install_panic_hook(dirs.crash_log.clone());
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting Pigtail");
 
-    // Best-effort retention cleanup at startup (spec §7.5).
+    // Load configuration before creating the UI.
     let cfg = if cfg!(feature = "demo") {
         serialcore::config::Config::default()
     } else {
         app::load_config(&dirs)
     };
-    if !cfg!(feature = "demo") {
-        if let Err(e) = serialcore::session::cleanup_old_sessions(
-            &dirs.sessions,
-            cfg.settings.session_retention_days,
-        ) {
-            tracing::warn!("session cleanup failed: {e}");
-        }
-    }
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size(if cfg!(feature = "demo") {

@@ -44,7 +44,7 @@ fn series_point_capacity(requested: usize, count: usize) -> usize {
 
 /// Retention limits derived from the single user-facing memory setting.
 ///
-/// The ratios preserve the old preload and plot defaults at one million lines,
+/// The ratios preserve the raw and plot defaults at one million lines,
 /// while giving raw bytes enough room to represent ordinary console lines. The
 /// byte caps keep a manually edited, extreme `max_lines` value from turning one
 /// connection into an unbounded allocation; every value offered by Settings
@@ -53,17 +53,13 @@ fn series_point_capacity(requested: usize, count: usize) -> usize {
 pub(crate) struct HistoryLimits {
     pub max_lines: usize,
     pub raw_bytes: usize,
-    pub preload_bytes: usize,
     pub series_points: usize,
 }
 
 const MIN_RAW_BYTES: usize = 1 << 20;
 const MAX_RAW_BYTES: usize = 640 * 1024 * 1024;
-const MIN_PRELOAD_BYTES: usize = 1 << 20;
-const MAX_PRELOAD_BYTES: usize = 80 * 1024 * 1024;
 const DEFAULT_HISTORY_LINES: usize = 1_000_000;
 const DEFAULT_RAW_BYTES: usize = 64 * 1024 * 1024;
-const DEFAULT_PRELOAD_BYTES: usize = 8 * 1024 * 1024;
 
 fn scale_from_default(max_lines: usize, default: usize) -> usize {
     ((max_lines as u128 * default as u128) / DEFAULT_HISTORY_LINES as u128).min(usize::MAX as u128)
@@ -76,8 +72,6 @@ pub(crate) fn history_limits(max_lines: usize) -> HistoryLimits {
         max_lines,
         raw_bytes: scale_from_default(max_lines, DEFAULT_RAW_BYTES)
             .clamp(MIN_RAW_BYTES, MAX_RAW_BYTES),
-        preload_bytes: scale_from_default(max_lines, DEFAULT_PRELOAD_BYTES)
-            .clamp(MIN_PRELOAD_BYTES, MAX_PRELOAD_BYTES),
         series_points: (max_lines.saturating_add(9) / 10).max(2),
     }
 }
@@ -237,16 +231,16 @@ fn captures_for<'a>(
             (path, m, first)
         })
         .collect();
-    mine.sort_by_key(|(_, m, first)| (m.start_wall, *first));
+    mine.sort_by(|(a, ma, fa), (b, mb, fb)| (ma.start_wall, fa, a).cmp(&(mb.start_wall, fb, b)));
     mine.into_iter().map(|(p, m, _)| (p, m)).collect()
 }
 
 /// Stored history ready to replay: one entry per capture, oldest first, each
 /// pairing the capture's metadata with the tail of its raw records.
-type RestoredHistory<'a> = Vec<(&'a SessionMeta, Vec<(u64, Vec<u8>)>)>;
+type RestoredHistory<'a> = Vec<(&'a PathBuf, &'a SessionMeta, session::LineTail)>;
 
 /// Collect this device's stored history, walking back from the newest capture
-/// until `budget` bytes of raw records are covered. Returns the captures
+/// until `budget` log lines (including session markers) are covered. Returns the captures
 /// oldest-first, each with the tail of its records, ready to replay.
 fn gather_history<'a>(
     captures: &'a [(PathBuf, SessionMeta)],
@@ -259,11 +253,11 @@ fn gather_history<'a>(
         if budget == 0 {
             break;
         }
-        if let Ok(records) = session::read_tail_records(path, budget) {
-            let used: usize = records.iter().map(|(_, b)| b.len()).sum();
+        if let Ok(tail) = session::line_tail(path, budget.saturating_sub(1), meta.config.terminal) {
+            let used = tail.lines.saturating_add(usize::from(tail.lines > 0));
             budget = budget.saturating_sub(used);
-            if !records.is_empty() {
-                restored.push((*meta, records));
+            if tail.has_records() {
+                restored.push((*path, *meta, tail));
             }
         }
         // A capture the user cleared mid-session holds only what arrived after
@@ -281,8 +275,8 @@ fn gather_history<'a>(
 /// a boundary marker, so a reopened tab shows the output it had before the app
 /// was last closed with new live output continuing below the last marker.
 ///
-/// History is gathered from the newest capture backwards until `preload_bytes`
-/// is filled, rather than from the newest one alone. A
+/// History is gathered from the newest capture backwards up to the log line
+/// limit, rather than from the newest one alone. A
 /// single run can leave several captures behind — applying new port options
 /// respawns the reader onto a fresh one — and what the console showed at exit
 /// was itself part restored, part live, so stopping at the newest capture
@@ -292,89 +286,79 @@ fn preload_last_session(
     captures: &[(PathBuf, SessionMeta)],
     identity: &PortIdentity,
     clock: &SessionClock,
-    preload_bytes: usize,
+    max_lines: usize,
 ) {
-    let restored = gather_history(captures, identity, preload_bytes);
+    let restored = gather_history(captures, identity, max_lines);
 
     // Re-frame the raw bytes exactly as the reader did, stamping each line with
     // the *original* wall-clock time (start of that capture plus its offset) so
     // absolute timestamps read as when the data actually arrived. Each capture
     // is framed on its own: they are separate streams, and the last line of one
     // must not swallow the first line of the next.
-    for (meta, records) in &restored {
-        let mut framer = Framer::with_mode(conn.port_config.terminal);
+    for (path, meta, tail) in &restored {
+        let mut framer = Framer::with_mode(meta.config.terminal);
         let mut framed = Vec::new();
-        for (micros, bytes) in records {
-            // Checked: the offset comes off disk, and a capture torn by a
-            // crash (or an older one damaged since) can name one that runs
-            // the date past what chrono represents — which `+` answers with
-            // a panic, before the window has even opened.
-            let wall = meta
-                .start_wall
-                .checked_add_signed(chrono::Duration::microseconds(*micros as i64))
-                .unwrap_or(meta.start_wall);
-            // Not the offset off disk: that counts from *that* run's start, and
-            // this line is about to share a store — and every interval drawn
-            // from it — with output stamped against this run's clock. Projected
-            // through the wall clock instead, the only reference the two runs
-            // share, which puts it on the negative side of the axis where a
-            // line recorded before this run began belongs.
-            let ts = Timestamp {
-                wall,
-                micros: clock.micros_at(wall),
-            };
-            framer.push(bytes, ts, &mut framed);
-        }
-        framer.flush_final(&mut framed);
-        let last_ts = framed.last().map(|line| line.ts);
-        // The console's marker text, shared with the hex view's boundary so the
-        // two views name the same capture the same way.
+        let mut last_ts = None;
         let label = format!(
             "previous session · {}",
-            // Local time, like every other wall-clock stamp on screen; only
-            // storage is UTC.
             meta.start_wall
                 .with_timezone(&chrono::Local)
                 .format("%Y-%m-%d %H:%M")
         );
-        // The same records, as the bytes they were on the wire. Pushed as one
-        // run so the hex view numbers them from this capture's start.
         let raw_start = conn.raw_next();
-        for (_, bytes) in records {
+        let result = session::visit_line_tail(path, *tail, |micros, bytes| {
+            let wall = meta
+                .start_wall
+                .checked_add_signed(chrono::Duration::microseconds(micros as i64))
+                .unwrap_or(meta.start_wall);
+            let ts = Timestamp {
+                wall,
+                micros: clock.micros_at(wall),
+            };
             conn.push_raw_bytes(bytes);
+            framer.push(bytes, ts, &mut framed);
+            for line in framed.drain(..) {
+                last_ts = Some(line.ts);
+                append_restored_line(conn, line);
+            }
+        });
+        if let Err(error) = result {
+            tracing::warn!(%error, path = %path.display(), "could not finish restoring session capture");
+        }
+        framer.flush_final(&mut framed);
+        for line in framed.drain(..) {
+            last_ts = Some(line.ts);
+            append_restored_line(conn, line);
         }
         conn.finish_terminal_capture(&label);
         conn.raw_sessions.push(RawSession {
             start: raw_start,
             label: Some(label.clone()),
         });
-        // Control-only captures still belong in raw/VT replay even if the
-        // line-oriented framer produced no log text.
-        let Some(last_ts) = last_ts else {
-            continue;
-        };
-        for line in framed {
-            let styled = serialcore::ansi::parse_line(&line.text, line.cursor);
+        // Control-only captures still belong in raw/VT replay.
+        if let Some(ts) = last_ts {
             conn.store.append(IncomingLine {
-                text: styled.text,
-                ts: line.ts,
+                text: label,
+                ts,
                 port: conn.id,
-                flags: line.flags,
-                spans: styled.spans,
-                cursor: styled.cursor.map(|c| c as u32),
+                flags: LineFlags::RECONNECT_MARKER,
+                spans: Default::default(),
+                cursor: None,
             });
         }
-        // Boundary closing this capture. Below it is either the next restored
-        // session or, after the last one, the live output.
-        conn.store.append(IncomingLine {
-            text: label,
-            ts: last_ts,
-            port: conn.id,
-            flags: LineFlags::RECONNECT_MARKER,
-            spans: Default::default(),
-            cursor: None,
-        });
     }
+}
+
+fn append_restored_line(conn: &mut Connection, line: serialcore::framer::FramedLine) {
+    let styled = serialcore::ansi::parse_line(&line.text, line.cursor);
+    conn.store.append(IncomingLine {
+        text: styled.text,
+        ts: line.ts,
+        port: conn.id,
+        flags: line.flags,
+        spans: styled.spans,
+        cursor: styled.cursor.map(|c| c as u32),
+    });
 }
 
 /// Append `bytes` to a raw ring holding at most `cap`, evicting from the front,
@@ -1492,12 +1476,6 @@ pub(crate) struct MacroEditor {
     pub(crate) step_selection: Option<usize>,
 }
 
-/// A retention edit that would immediately discard existing captures.
-pub(crate) struct RetentionCleanupConfirmation {
-    pub(crate) days: u32,
-    pub(crate) paths: Vec<PathBuf>,
-}
-
 /// State parked while another merged tab is displayed. The loaded tab keeps
 /// its state on App so the console can borrow connections and caches separately.
 pub struct MergedTab {
@@ -1788,11 +1766,8 @@ pub struct App {
     pub(crate) macro_running_edit_confirmation: Option<usize>,
     /// Target macro, requested digit, and the macro currently owning it.
     pub(crate) macro_shortcut_conflict: Option<(usize, u8, usize)>,
-    /// Retention edit waiting for the user to approve deletion of old captures.
-    pub(crate) retention_cleanup_confirmation: Option<RetentionCleanupConfirmation>,
-    /// Value being edited in Settings. It is kept separate from the saved
-    /// configuration until the number box loses focus.
-    pub(crate) session_retention_draft: Option<u32>,
+    session_cleanup_tx: Option<crossbeam_channel::Sender<usize>>,
+    session_cleanup_limit: Option<usize>,
     pub show_highlight_win: bool,
     pub show_extract_win: bool,
     /// `Some(port_id)` while the popup showing that connection's `last_error`
@@ -1905,8 +1880,8 @@ impl App {
             macro_editor: None,
             macro_running_edit_confirmation: None,
             macro_shortcut_conflict: None,
-            retention_cleanup_confirmation: None,
-            session_retention_draft: None,
+            session_cleanup_tx: None,
+            session_cleanup_limit: None,
             show_highlight_win: false,
             show_extract_win: false,
             show_error_win: None,
@@ -1923,6 +1898,58 @@ impl App {
             macro_runs: Vec::new(),
             connect_errors: VecDeque::new(),
             folder_open_results: Vec::new(),
+        }
+    }
+
+    fn start_session_cleanup(&mut self) {
+        if cfg!(feature = "demo") {
+            return;
+        }
+        let dir = self.paths.sessions.clone();
+        let mut max_lines = self.config.settings.max_lines;
+        let (tx, rx) = crossbeam_channel::unbounded();
+        match std::thread::Builder::new()
+            .name("session-cleanup".into())
+            .spawn(move || {
+                let mut cleanup = session::SessionCleanup::default();
+                loop {
+                    match cleanup.cleanup(&dir, max_lines) {
+                        Ok(0) => {}
+                        Ok(removed) => tracing::info!(
+                            removed,
+                            "removed session captures outside the log line limit"
+                        ),
+                        Err(error) => tracing::warn!(%error, "session cleanup failed"),
+                    }
+                    match rx.recv_timeout(Duration::from_secs(5)) {
+                        Ok(limit) => {
+                            max_lines = limit;
+                            for limit in rx.try_iter() {
+                                max_lines = limit;
+                            }
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            }) {
+            Ok(_) => {
+                self.session_cleanup_tx = Some(tx);
+                self.session_cleanup_limit = Some(self.config.settings.max_lines);
+            }
+            Err(error) => tracing::warn!(%error, "could not start session cleanup"),
+        }
+    }
+
+    pub(crate) fn request_session_cleanup(&mut self) {
+        let limit = self.config.settings.max_lines;
+        if self.session_cleanup_limit == Some(limit) {
+            return;
+        }
+        if let Some(tx) = &self.session_cleanup_tx {
+            if tx.send(limit).is_ok() {
+                self.session_cleanup_limit = Some(limit);
+            }
         }
     }
 
@@ -1993,12 +2020,13 @@ impl App {
                     &prior_captures,
                     &saved.identity,
                     &clock,
-                    history_limits(app.config.settings.max_lines).preload_bytes,
+                    app.config.settings.max_lines,
                 );
             }
         }
         app.active = 0;
         app.merged_selected = false;
+        app.start_session_cleanup();
         app.restore_merged_views();
         app.restore_workspace();
 
@@ -3780,7 +3808,6 @@ impl App {
             || self.macro_editor.is_some()
             || self.macro_running_edit_confirmation.is_some()
             || self.macro_shortcut_conflict.is_some()
-            || self.retention_cleanup_confirmation.is_some()
             || self.tab_close_confirmation.is_some()
             || self.show_highlight_win
             || self.show_extract_win
@@ -4040,11 +4067,14 @@ pub(crate) mod tests {
     }
 
     fn texts(restored: &RestoredHistory<'_>) -> Vec<String> {
-        restored
-            .iter()
-            .flat_map(|(_, records)| records.iter())
-            .map(|(_, bytes)| String::from_utf8_lossy(bytes).to_string())
-            .collect()
+        let mut texts = Vec::new();
+        for (path, _, tail) in restored {
+            session::visit_line_tail(path, *tail, |_, bytes| {
+                texts.push(String::from_utf8_lossy(bytes).into_owned())
+            })
+            .unwrap();
+        }
+        texts
     }
 
     #[test]
@@ -4203,7 +4233,70 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn history_is_bounded_by_the_byte_budget() {
+    fn restore_keeps_the_configured_line_window_including_session_markers() {
+        let (mut app, _enum_tx) = test_app("line-window-restore");
+        let dev = identity("line-window");
+        let run = chrono::Utc::now();
+        capture(&app.paths.sessions, &dev, run, &[(1, b"outside\n")]);
+        capture(&app.paths.sessions, &dev, run, &[(2, b"one\ntwo\nthree\n")]);
+        capture(&app.paths.sessions, &dev, run, &[(3, b"new\n")]);
+        app.config.settings.max_lines = 4;
+        let mut conn = app.make_connection(
+            PortId(0),
+            "probe".into(),
+            dev.clone(),
+            Default::default(),
+            inert_handle(PortId(0)),
+        );
+        preload_last_session(
+            &mut conn,
+            &snapshot_captures(&app.paths.sessions),
+            &dev,
+            &app.clock,
+            4,
+        );
+        assert_eq!(conn.store.len(), 4);
+        let first = conn.store.first_abs_index();
+        assert_eq!(conn.store.get(first).unwrap().text, "three");
+        assert!(conn
+            .store
+            .get(first + 1)
+            .unwrap()
+            .meta
+            .flags
+            .contains(LineFlags::RECONNECT_MARKER));
+        assert_eq!(conn.store.get(first + 2).unwrap().text, "new");
+        assert!(conn
+            .store
+            .get(first + 3)
+            .unwrap()
+            .meta
+            .flags
+            .contains(LineFlags::RECONNECT_MARKER));
+        std::fs::remove_dir_all(app.paths.sessions.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn restore_is_not_gated_by_the_previous_raw_byte_budget() {
+        let dir = scratch("restore-long-lines");
+        let dev = identity("long-lines");
+        let mut bytes = Vec::new();
+        for _ in 0..20 {
+            bytes.extend(std::iter::repeat_n(b'x', 60_000));
+            bytes.push(b'\n');
+        }
+        let saved = capture(&dir, &dev, chrono::Utc::now(), &[(0, &bytes)]);
+        let captures = [saved];
+        let restored = gather_history(&captures, &dev, 21);
+        assert_eq!(
+            texts(&restored).iter().map(String::len).sum::<usize>(),
+            bytes.len()
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn history_is_bounded_by_the_line_budget() {
         let dir = scratch("budget");
         let dev = identity("A1");
         let run = chrono::Utc::now();
@@ -4211,7 +4304,7 @@ pub(crate) mod tests {
         let newer = capture(&dir, &dev, run, &[(9_000, b"0123456789")]);
 
         let captures = vec![older, newer];
-        let restored = gather_history(&captures, &dev, 10);
+        let restored = gather_history(&captures, &dev, 2);
         assert_eq!(
             texts(&restored).len(),
             1,
@@ -4390,17 +4483,15 @@ pub(crate) mod tests {
             HistoryLimits {
                 max_lines: 1_000_000,
                 raw_bytes: 64 * 1024 * 1024,
-                preload_bytes: 8 * 1024 * 1024,
                 series_points: 100_000,
             },
-            "the default retains the established preload and plot limits"
+            "the default retains the established raw and plot limits"
         );
         assert_eq!(
             history_limits(10_000),
             HistoryLimits {
                 max_lines: 10_000,
                 raw_bytes: MIN_RAW_BYTES,
-                preload_bytes: MIN_PRELOAD_BYTES,
                 series_points: 1_000,
             },
         );
@@ -4409,7 +4500,6 @@ pub(crate) mod tests {
             HistoryLimits {
                 max_lines: 10_000_000,
                 raw_bytes: MAX_RAW_BYTES,
-                preload_bytes: MAX_PRELOAD_BYTES,
                 series_points: 1_000_000,
             },
             "the full Settings range scales all three derived limits"

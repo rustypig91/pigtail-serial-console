@@ -100,10 +100,6 @@ impl App {
             ("Close tab?", self.tab_close_confirmation.is_some()),
             ("error_window", self.show_error_win.is_some()),
             (
-                "Remove expired session captures?",
-                self.retention_cleanup_confirmation.is_some(),
-            ),
-            (
                 "Macro is running",
                 self.macro_running_edit_confirmation.is_some(),
             ),
@@ -172,12 +168,6 @@ impl App {
             closed = true;
         } else if self.show_error_win.is_some() && is_window("error_window") {
             self.show_error_win = None;
-            closed = true;
-        } else if self.retention_cleanup_confirmation.is_some()
-            && is_window("Remove expired session captures?")
-        {
-            self.retention_cleanup_confirmation = None;
-            self.session_retention_draft = None;
             closed = true;
         } else if self.macro_running_edit_confirmation.is_some() && is_window("Macro is running") {
             self.macro_running_edit_confirmation = None;
