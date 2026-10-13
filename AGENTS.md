@@ -151,7 +151,10 @@ application.
   suppression. There is no separate Error tag. Device absence clears obsolete
   link errors without clearing
   unrelated session failures, which remain visible until dismissed. Successful
-  reconnection clears link errors. Error details remain available in the
+  reconnection clears link errors. A link error temporarily takes priority over
+  a session failure; clearing it restores that failure, including failures
+  reported during the outage. Dropped-command warnings do not replace a
+  deferred session failure. Error details remain available in the
   overflow menu.
 - Optional **ANSI/VT** screen for interactive shells and device menus: cursor
   positioning, erase and redraw operations, scrolling regions, styled/colored
