@@ -521,6 +521,8 @@ pub struct Connection {
     /// successful (re)connect retires a [`ErrorScope::Connection`] error but
     /// says nothing about a [`ErrorScope::Session`] one, which outlives it.
     pub last_error: Option<TabError>,
+    /// Session failure temporarily hidden by a higher-priority link error.
+    deferred_session_error: Option<TabError>,
     /// Present only while this reader is sending a dropped file. Completion,
     /// cancellation, disconnect, and failure all remove it silently.
     pub transfer_progress: Option<TransferProgress>,
@@ -843,7 +845,7 @@ impl Connection {
                     // Session-scoped errors (a capture file that couldn't
                     // be opened, say) are untouched by reconnecting, so
                     // they survive it.
-                    self.last_error = None;
+                    self.last_error = self.deferred_session_error.take();
                 }
                 self.set_state(s);
             }
@@ -864,7 +866,21 @@ impl Connection {
                             ..
                         })
                     );
-                if !hides_connection_error {
+                if hides_connection_error {
+                    // Dropped commands add nothing to a link failure, but a
+                    // capture/control failure must survive the outage.
+                    if !msg.ends_with(": dropped, not connected") {
+                        self.deferred_session_error = Some(TabError { scope, msg });
+                    }
+                } else {
+                    if scope == ErrorScope::Connection
+                        && self
+                            .last_error
+                            .as_ref()
+                            .is_some_and(|error| error.scope == ErrorScope::Session)
+                    {
+                        self.deferred_session_error = self.last_error.take();
+                    }
                     self.last_error = Some(TabError { scope, msg });
                 }
             }
@@ -2286,6 +2302,7 @@ impl App {
             conn.dtr = dtr;
             conn.rts = rts;
             conn.last_error = None;
+            conn.deferred_session_error = None;
             // Console (store, raw_ring, filters, search, plot series, marks,
             // selection, scroll position) is intentionally left untouched —
             // except for closing any line the old reader left open, since the
@@ -2630,6 +2647,7 @@ impl App {
             raw_contiguous_start: 0,
             raw_sessions: Vec::new(),
             last_error: None,
+            deferred_session_error: None,
             transfer_progress: None,
             mark_micros: None,
             hex_view: false,
@@ -6027,8 +6045,8 @@ pub(crate) mod tests {
     }
 
     /// Regression test for the PR #6 fix: a command dropped while
-    /// reconnecting is reported as a session-scoped error, but the tab only
-    /// has room for one `last_error`. It must not clobber a connection error
+    /// reconnecting is reported as a session-scoped error. It must not
+    /// clobber a connection error
     /// already explaining *why* the link is down — that message is more
     /// useful, and unlike a connection error, nothing later clears a session
     /// error, so overwriting it would hide the real cause for the rest of
@@ -6120,6 +6138,52 @@ pub(crate) mod tests {
                 conn.last_error.as_ref().unwrap().msg,
                 "log write: disk full"
             );
+        }
+    }
+
+    #[test]
+    fn capture_failure_survives_intervening_link_errors() {
+        let (app, _enum_tx) = test_app("capture-failure-through-outage");
+        let mut conn = app.make_connection(
+            PortId(0),
+            "probe".into(),
+            identity("A1"),
+            PortConfig::default(),
+            inert_handle(PortId(0)),
+        );
+        for capture_first in [true, false] {
+            for recovered_state in [ConnState::DeviceMissing, ConnState::Connected] {
+                let capture = ReaderEvent::Error {
+                    scope: ErrorScope::Session,
+                    msg: "log write: disk full".into(),
+                };
+                let link = ReaderEvent::Error {
+                    scope: ErrorScope::Connection,
+                    msg: "device disconnected".into(),
+                };
+                let events = if capture_first {
+                    [capture, link]
+                } else {
+                    [link, capture]
+                };
+                for event in events {
+                    conn.apply_reader_event(event);
+                }
+                conn.apply_reader_event(ReaderEvent::State(ConnState::Lost));
+                assert_eq!(conn.last_error.as_ref().unwrap().msg, "device disconnected");
+                conn.apply_reader_event(ReaderEvent::Error {
+                    scope: ErrorScope::Session,
+                    msg: "transmit: dropped, not connected".into(),
+                });
+                conn.apply_reader_event(ReaderEvent::State(recovered_state));
+                assert_eq!(conn.last_error.as_ref().unwrap().scope, ErrorScope::Session);
+                assert_eq!(
+                    conn.last_error.as_ref().unwrap().msg,
+                    "log write: disk full"
+                );
+                assert!(conn.deferred_session_error.is_none());
+                conn.last_error = None;
+            }
         }
     }
 
