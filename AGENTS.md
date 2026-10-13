@@ -223,6 +223,11 @@ application.
 
 ### Saved session history
 
+Captures sharing an app clock anchor are ordered by their first raw record.
+Empty captures use the raw file's modification time (creation or latest clear),
+so a cleared empty capture stops older history without hiding or deleting output
+from subsequent reconnects in the same run.
+
 Saved captures have no age limit. **Settings → Max log lines** controls restored
 Log history and saved captures per device identity. Restore walks newest-first
 by framed log lines, including closing session markers, with no raw-byte restore

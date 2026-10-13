@@ -288,6 +288,21 @@ pub fn read_first_micros(bin_path: &Path) -> std::io::Result<Option<u64>> {
     }
 }
 
+/// Order captures sharing an app clock anchor, including empty captures.
+/// An empty file's modification time records its creation or most recent clear;
+/// treating it as infinitely new would hide output from subsequent reconnects.
+pub fn capture_order_micros(path: &Path, meta: &SessionMeta) -> std::io::Result<u64> {
+    if let Some(first) = read_first_micros(path)? {
+        return Ok(first);
+    }
+    let modified: DateTime<Utc> = std::fs::metadata(path)?.modified()?.into();
+    Ok(modified
+        .signed_duration_since(meta.start_wall)
+        .num_microseconds()
+        .unwrap_or(i64::MAX)
+        .max(0) as u64)
+}
+
 fn check_header(hdr: &[u8; HEADER_LEN as usize]) -> std::io::Result<()> {
     if &hdr[..4] != MAGIC {
         return Err(std::io::Error::new(
@@ -574,7 +589,7 @@ impl SessionCleanup {
                 continue;
             }
             if let Ok(meta) = read_meta(&path) {
-                let first = read_first_micros(&path).ok().flatten().unwrap_or(u64::MAX);
+                let first = capture_order_micros(&path, &meta).unwrap_or(u64::MAX);
                 captures.push((path, meta, first));
             }
         }
@@ -768,6 +783,41 @@ mod tests {
         assert!(!meta_path_for(&live).exists());
         assert!(!lock_path_for(&live).exists());
         assert!(!lock_path_for(&oldest).exists());
+        assert!(newest.exists());
+    }
+
+    #[test]
+    fn empty_clear_does_not_delete_later_captures_in_the_same_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = sample_meta();
+        meta.start_wall = DateTime::UNIX_EPOCH;
+        let mut old = SessionWriter::create(dir.path(), &meta).unwrap();
+        old.write_record(1000, b"old\n").unwrap();
+        let oldest = old.bin_path().to_path_buf();
+        drop(old);
+        let mut cleared = SessionWriter::create(dir.path(), &meta).unwrap();
+        cleared.truncate().unwrap();
+        let empty = cleared.bin_path().to_path_buf();
+        drop(cleared);
+        File::options()
+            .write(true)
+            .open(&empty)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_micros(2000)),
+            )
+            .unwrap();
+        let mut new = SessionWriter::create(dir.path(), &meta).unwrap();
+        new.write_record(3000, b"after reconnect\n").unwrap();
+        let newest = new.bin_path().to_path_buf();
+        drop(new);
+        assert_eq!(
+            SessionCleanup::default().cleanup(dir.path(), 100).unwrap(),
+            1
+        );
+        assert!(!oldest.exists());
+        assert!(empty.exists());
         assert!(newest.exists());
     }
 
