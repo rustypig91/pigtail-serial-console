@@ -1,8 +1,7 @@
-//! Settings window (spec §7.14, §5 M5): max lines, retention, theme, updates.
+//! Settings window (spec §7.14, §5 M5): max lines, theme, updates.
 
-use crate::app::{history_limits, App, RetentionCleanupConfirmation};
+use crate::app::{history_limits, App};
 use serialcore::config::{MAX_CONSOLE_FONT_SIZE, MIN_CONSOLE_FONT_SIZE};
-use std::path::PathBuf;
 
 impl App {
     pub(crate) fn show_settings_window(&mut self, ctx: &egui::Context) {
@@ -11,6 +10,7 @@ impl App {
         let mut changed = false;
         let mut history_limit_changed = false;
         let mut history_limit_dragged = false;
+        let mut history_limit_editing = false;
         let mut vt_limit_editing = false;
         let mut folder_to_open = None;
         if open {
@@ -110,7 +110,7 @@ impl App {
                         });
                         ui.add_space(10.0);
                         settings_section(ui, "History", "Manage retained console history and session captures.", |ui| {
-                        let history_reset = reset_setting(ui, "Max lines in memory", "Limit retained console history and the related Hex and plot memory budgets. Older data leaves the live view, while full session captures remain on disk.", &mut self.config.settings.max_lines, defaults.max_lines);
+                        let history_reset = reset_setting(ui, "Max log lines", "Limit retained console history and the related Hex and plot memory budgets. Stored captures are deleted once all their lines fall outside this limit.", &mut self.config.settings.max_lines, defaults.max_lines);
                         changed |= history_reset;
                         let response = ui.add(
                             egui::DragValue::new(&mut self.config.settings.max_lines)
@@ -119,14 +119,13 @@ impl App {
                         );
                         let limits = history_limits(self.config.settings.max_lines);
                         history_limit_dragged = response.dragged();
+                        history_limit_editing = response.dragged() || response.has_focus();
                         history_limit_changed = history_reset || response
                             .on_hover_text(format!(
                                 "Also keeps up to {} of raw bytes in Hex, {} points per plotted \
-                                 series, and preloads up to {} when reopening a tab. Full capture \
-                                 always remains on disk.",
+                                 series. Stored captures follow the log line limit.",
                                 format_bytes(limits.raw_bytes),
                                 limits.series_points,
-                                format_bytes(limits.preload_bytes),
                             ))
                             .changed();
                         changed |= history_limit_changed;
@@ -137,32 +136,11 @@ impl App {
                             egui::DragValue::new(&mut self.config.settings.vt_scrollback_rows)
                                 .speed(100)
                                 .range(0..=serialcore::config::MAX_VT_SCROLLBACK_ROWS),
-                        ).on_hover_text("Rows of VT history kept per connection (0 disables scrollback). Applies when editing finishes, rebuilding from retained received bytes. Full capture stays on disk.");
+                        ).on_hover_text("Rows of VT history kept per connection (0 disables scrollback). Applies when editing finishes, rebuilding from retained received bytes. Captures follow the log line limit.");
                         vt_limit_editing = response.dragged() || response.has_focus();
                         changed |= response.changed();
                         ui.end_row();
 
-                        if setting_label(ui, "Session retention (days)", "Choose how long stored session captures are kept. Changing this setting checks for expired captures and asks before deleting any.", self.config.settings.session_retention_days != defaults.session_retention_days && self.retention_cleanup_confirmation.is_none()) {
-                            self.session_retention_draft = None;
-                            self.request_session_retention_change(defaults.session_retention_days);
-                        }
-                        let saved_retention = self.config.settings.session_retention_days;
-                        let draft = self.session_retention_draft.get_or_insert(saved_retention);
-                        let response = ui.add_enabled(
-                            self.retention_cleanup_confirmation.is_none(),
-                            egui::DragValue::new(draft).range(1..=3650),
-                        );
-                        let days = *draft;
-                        // Typing produces an edit event for every character.
-                        // Wait until the user leaves the field before previewing
-                        // deletion, so e.g. entering 20 never prompts at 2.
-                        if days != saved_retention
-                            && (response.lost_focus()
-                                || (response.changed() && !response.has_focus()))
-                        {
-                            self.request_session_retention_change(days);
-                        }
-                        ui.end_row();
                         });
                         ui.add_space(10.0);
                         settings_section(ui, "Updates", "Keep the application up to date.", |ui| {
@@ -208,20 +186,21 @@ impl App {
                             env!("CARGO_PKG_VERSION")
                         ));
                         ui.add_space(12.0);
-                        if ui.add_enabled(self.retention_cleanup_confirmation.is_none(), egui::Button::new("Reset all"))
-                            .on_hover_text("Restore all settings to their defaults, including both color palettes and update preferences. Any capture deletion still requires confirmation.")
+                        if ui.button("Reset all")
+                            .on_hover_text("Restore all settings to their defaults, including both color palettes and update preferences.")
                             .clicked()
                         {
                             self.reset_all_settings();
                             super::chrome::apply_settings_visuals(ctx, &self.config.settings);
                             history_limit_changed = true;
                             history_limit_dragged = false;
+                            history_limit_editing = false;
                             vt_limit_editing = false;
                             changed = true;
                         }
                     });
             });
-            if self.retention_cleanup_confirmation.is_none() && response.should_close() {
+            if response.should_close() {
                 open = false;
             }
         }
@@ -251,89 +230,19 @@ impl App {
             // the one follow-up frame that consumes the settled state.
             ctx.request_repaint();
         }
+        // Commit deletion only after the line-limit edit finishes, avoiding
+        // intermediate values while typing or dragging.
+        if !history_limit_editing || !open {
+            self.request_session_cleanup();
+        }
         if changed {
             ctx.request_repaint();
             self.write_config();
         }
-        self.show_retention_cleanup_confirmation(ctx);
     }
 
     fn reset_all_settings(&mut self) {
-        let saved_retention = self.config.settings.session_retention_days;
         self.config.settings = serialcore::config::Settings::default();
-        let default_retention = self.config.settings.session_retention_days;
-        // Keep the saved retention until its existing cleanup flow succeeds
-        // or the user approves any capture deletion.
-        self.config.settings.session_retention_days = saved_retention;
-        self.session_retention_draft = None;
-        if saved_retention != default_retention {
-            self.request_session_retention_change(default_retention);
-        }
-    }
-
-    fn apply_session_retention(&mut self, days: u32, paths: &[PathBuf]) {
-        self.config.settings.session_retention_days = days;
-        self.session_retention_draft = None;
-        match serialcore::session::remove_session_paths(paths) {
-            Ok(removed) => tracing::info!("removed {removed} expired session capture(s)"),
-            Err(error) => tracing::warn!("session cleanup failed: {error}"),
-        }
-        self.write_config();
-    }
-
-    fn request_session_retention_change(&mut self, days: u32) {
-        match serialcore::session::old_session_paths(&self.paths.sessions, days) {
-            Ok(old) if old.is_empty() => self.apply_session_retention(days, &old),
-            Ok(old) => {
-                self.retention_cleanup_confirmation =
-                    Some(RetentionCleanupConfirmation { days, paths: old });
-            }
-            Err(error) => {
-                tracing::warn!("couldn't preview session cleanup: {error}");
-                // A preview is the user's chance to approve a destructive
-                // change. Do not retry it as cleanup here: a transient error
-                // could make that second scan succeed and delete captures the
-                // user never saw or approved.
-                self.session_retention_draft = None;
-            }
-        }
-    }
-
-    fn show_retention_cleanup_confirmation(&mut self, ctx: &egui::Context) {
-        let Some(pending) = &self.retention_cleanup_confirmation else {
-            return;
-        };
-        let days = pending.days;
-        let captures = pending.paths.len();
-        let paths = pending.paths.clone();
-        let mut open = true;
-        let mut confirm = false;
-        let mut cancel = false;
-        let response = super::chrome::app_modal(ctx, "retention_confirmation").show(ctx, |ui| {
-            super::chrome::modal_header(ui, "Remove expired session captures?", &mut open);
-            ui.label(format!(
-                "Changing retention to {days} days will delete {captures} stored session {}.",
-                if captures == 1 { "capture" } else { "captures" },
-            ));
-            ui.label("This cannot be undone.");
-            ui.horizontal(|ui| {
-                confirm = ui.button("Remove captures").clicked();
-                if ui.button("Cancel").clicked() {
-                    cancel = true;
-                }
-            });
-        });
-
-        if response.should_close() {
-            cancel = true;
-        }
-        if confirm {
-            self.retention_cleanup_confirmation = None;
-            self.apply_session_retention(days, &paths);
-        } else if cancel || !open {
-            self.retention_cleanup_confirmation = None;
-            self.session_retention_draft = None;
-        }
     }
 }
 
@@ -476,42 +385,12 @@ mod tests {
     use crate::app::tests::test_app;
 
     #[test]
-    fn reset_all_restores_settings_but_keeps_retention_when_preview_fails() {
-        let (mut app, _enum_tx) = test_app("reset-all-preview-failure");
-        let defaults = serialcore::config::Settings::default();
+    fn reset_all_restores_settings() {
+        let (mut app, _enum_tx) = test_app("reset-all");
         app.config.settings.theme = "light".into();
-        app.config.settings.dark_base_color = serialcore::config::BaseColor::Red;
         app.config.settings.max_lines = 50_000;
         app.config.settings.check_updates = false;
-        app.config.settings.skipped_version = Some("9.0.0".into());
-        let retained_days = defaults.session_retention_days + 1;
-        app.config.settings.session_retention_days = retained_days;
-        std::fs::create_dir_all(app.paths.sessions.parent().unwrap()).unwrap();
-        std::fs::write(&app.paths.sessions, b"not a directory").unwrap();
-
         app.reset_all_settings();
-
-        let expected = serialcore::config::Settings {
-            session_retention_days: retained_days,
-            ..defaults
-        };
-        assert_eq!(app.config.settings, expected);
-        assert!(app.session_retention_draft.is_none());
-        std::fs::remove_dir_all(app.paths.sessions.parent().unwrap()).ok();
-    }
-
-    #[test]
-    fn failed_retention_preview_keeps_the_saved_setting() {
-        let (mut app, _enum_tx) = test_app("retention-preview-failure");
-        let saved = app.config.settings.session_retention_days;
-        std::fs::create_dir_all(app.paths.sessions.parent().unwrap()).unwrap();
-        std::fs::write(&app.paths.sessions, b"not a directory").unwrap();
-        app.session_retention_draft = Some(1);
-
-        app.request_session_retention_change(1);
-
-        assert_eq!(app.config.settings.session_retention_days, saved);
-        assert!(app.session_retention_draft.is_none());
-        std::fs::remove_dir_all(app.paths.sessions.parent().unwrap()).ok();
+        assert_eq!(app.config.settings, serialcore::config::Settings::default());
     }
 }

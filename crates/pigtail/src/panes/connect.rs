@@ -54,7 +54,6 @@ impl App {
     /// when a text field is focused or no connection is open.
     pub(crate) fn consume_app_shortcuts(&mut self, ctx: &egui::Context) {
         if self.tab_close_confirmation.is_some()
-            || self.retention_cleanup_confirmation.is_some()
             || self.show_keyboard_shortcuts
             || self.update_dialog.is_some()
             || !self.connect_errors.is_empty()

@@ -66,6 +66,7 @@ enum EscState {
 }
 
 /// Stateful line framer. One per port.
+#[derive(Clone)]
 pub struct Framer {
     mode: TerminalMode,
     tail: Vec<u8>,
@@ -134,6 +135,12 @@ impl Framer {
     /// resurrect text the user just deleted.
     pub fn reset(&mut self) {
         *self = Framer::with_mode(self.mode);
+    }
+
+    /// Whether a later chunk can still complete the current line or control
+    /// sequence. Session restore uses this to preserve its first raw record.
+    pub fn has_pending_input(&self) -> bool {
+        !self.tail.is_empty() || self.pending_cr || self.esc != EscState::None
     }
 
     /// Feed a chunk stamped at arrival. Completed lines are pushed onto `out`.
