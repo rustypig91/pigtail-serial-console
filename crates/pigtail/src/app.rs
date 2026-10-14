@@ -1672,7 +1672,6 @@ pub struct App {
     pub enum_rx: Receiver<EnumEvent>,
     pub available: Vec<DiscoveredPort>,
     pub connections: Vec<Connection>,
-    pub(crate) selection_rows: Option<(egui::Id, u64, u64)>,
     /// Active connection index, retained while a merged tab is selected.
     pub active: usize,
     pub(crate) workspace: crate::panes::Workspace,
@@ -1823,7 +1822,6 @@ impl App {
             enum_rx,
             available: Vec::new(),
             connections: Vec::new(),
-            selection_rows: None,
             active: 0,
             workspace: crate::panes::Workspace::default(),
             search_history: Default::default(),

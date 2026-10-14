@@ -3,6 +3,7 @@
 //! device (see `transmit`) — with an optional search bar and a right-click menu
 //! that toggles everything else so the main view stays clean.
 
+use super::log_selection::{self, Row as SelectionRow};
 use crate::app::{compile_search, App, CompiledHighlight, Connection, MergedEntry, RawSession};
 use crate::search_history::{SearchBrowse, SearchEntry, SearchHistory};
 use crate::wrap::{rows_for, WrapIndex};
@@ -850,6 +851,13 @@ fn selection_menu_id() -> egui::Id {
     egui::Id::new("console_selection_menu")
 }
 
+pub(super) fn mark_selection_menu_hit(ctx: &egui::Context) {
+    ctx.data_mut(|data| {
+        data.get_temp_mut_or_default::<SelectionMenu>(selection_menu_id())
+            .hit = true;
+    });
+}
+
 // Set the cursor before TextEdit processes input so even typing on the first
 // frame the prefilled query appears replaces it. Count Unicode characters,
 // matching egui's cursor indices rather than UTF-8 byte offsets.
@@ -871,10 +879,7 @@ fn search_selection_id(ctx: &egui::Context) -> egui::Id {
 
 fn request_search_selection(ctx: &egui::Context, target: egui::Id) -> bool {
     if ctx.memory(|m| m.focused().is_some())
-        || !ctx
-            .plugin::<egui::text_selection::LabelSelectionState>()
-            .lock()
-            .has_selection()
+        || !log_selection::has_selection(ctx)
         || ctx.input(|i| {
             i.events
                 .iter()
@@ -1786,7 +1791,6 @@ impl App {
             connections,
             highlight_cache,
             highlights_visible,
-            selection_rows,
             ..
         } = self;
         let highlights = if *highlights_visible {
@@ -1832,6 +1836,21 @@ impl App {
                 first_abs + i as u64
             }
         };
+        let selection_view = egui::Id::new(("console_selection", conn.id));
+        log_selection::begin_view(
+            ui.ctx(),
+            selection_view,
+            ui.available_rect_before_wrap().intersect(ui.clip_rect()),
+            |row| {
+                let entry = if filter_active {
+                    matching.binary_search(&row.abs).ok()?
+                } else {
+                    usize::try_from(row.abs.checked_sub(first_abs)?).ok()?
+                };
+                (entry < entries && conn.store.get(row.abs).is_some())
+                    .then_some(SelectionRow { entry, ..row })
+            },
+        );
         // With local echo on, the in-progress input line is shown as a trailing
         // row (for devices that don't echo). Otherwise the device's own echo is
         // the only thing on screen.
@@ -1955,14 +1974,7 @@ impl App {
             while last_entry < entries && conn.wrap_index.start_row(last_entry) < last_row {
                 last_entry += 1;
             }
-            let retained = selection_entries(
-                ui.ctx(),
-                selection_rows,
-                egui::Id::new(("console_selection", conn.id)),
-                first_entry..last_entry,
-                entries,
-                abs_of,
-            );
+            let retained = first_entry..last_entry;
             rect.min.y =
                 ui.max_rect().top() + conn.wrap_index.start_row(retained.start) as f32 * row_height;
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
@@ -1997,7 +2009,18 @@ impl App {
                         port_tag: None,
                         row_id: egui::Id::new(("console_row", conn.id, abs)),
                     };
-                    let resp = render_row(ui, &line, &rctx);
+                    let resp = render_row(
+                        ui,
+                        &line,
+                        &rctx,
+                        selection_view,
+                        SelectionRow {
+                            port: conn.id,
+                            abs,
+                            micros: line.meta.ts.micros,
+                            entry,
+                        },
+                    );
                     queue_console_menu(
                         &resp,
                         menu_id,
@@ -2020,6 +2043,12 @@ impl App {
                     );
                 }
             });
+        });
+
+        log_selection::copy(ui.ctx(), selection_view, |entry| {
+            conn.store.get(abs_of(entry)).and_then(|line| {
+                (!line.meta.flags.contains(LineFlags::RECONNECT_MARKER)).then_some(line.text)
+            })
         });
 
         rearm_follow_at_bottom(&mut conn.follow, user_scrolled, &output, row_height);
@@ -2090,7 +2119,6 @@ impl App {
             connections,
             highlight_cache,
             highlights_visible,
-            selection_rows,
             merged,
             merged_filtered,
             merged_wrap,
@@ -2109,6 +2137,25 @@ impl App {
         let row_height = m.row_height;
         let index_of = |id: PortId| connections.iter().position(|c| c.id == id);
         let entries = view.len();
+        let selection_view = egui::Id::new(("merged_selection", merged_tab_id));
+        log_selection::begin_view(
+            ui.ctx(),
+            selection_view,
+            ui.available_rect_before_wrap().intersect(ui.clip_rect()),
+            |row| {
+                let same = |entry: &MergedEntry| entry.port == row.port && entry.abs == row.abs;
+                let entry = if view.get(row.entry).is_some_and(same) {
+                    row.entry
+                } else {
+                    // Search only tied timestamps when eviction or late data has
+                    // moved an endpoint. Sequence numbers may have been reassigned.
+                    let start = view.partition_point(|entry| entry.micros < row.micros);
+                    let end = view.partition_point(|entry| entry.micros <= row.micros);
+                    start + view[start..end].iter().position(same)?
+                };
+                Some(SelectionRow { entry, ..row })
+            },
+        );
         // The merged view carries no mark of its own — a mark belongs to one
         // port's console — so "from mark" counts from this run's start here,
         // the same zero a single tab falls back to.
@@ -2204,25 +2251,19 @@ impl App {
             while last_entry < entries && merged_wrap.start_row(last_entry) < last_row {
                 last_entry += 1;
             }
-            let retained = selection_entries(
-                ui.ctx(),
-                selection_rows,
-                egui::Id::new(("merged_selection", merged_tab_id)),
-                first_entry..last_entry,
-                entries,
-                // Sequence numbers are reassigned when late data interleaves
-                // with existing rows. Timestamps stay stable and sorted; the
-                // sign-bit flip preserves their signed order as u64 keys.
-                // Equal timestamps conservatively retain all tied rows.
-                |i| (view[i].micros as u64) ^ (1_u64 << 63),
-            );
+            let retained = first_entry..last_entry;
             rect.min.y =
                 ui.max_rect().top() + merged_wrap.start_row(retained.start) as f32 * row_height;
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 let mut entry = retained.start;
                 while entry < retained.end {
-                    let MergedEntry { port, abs, seq, .. } = view[entry];
+                    let MergedEntry {
+                        port,
+                        abs,
+                        seq,
+                        micros,
+                    } = view[entry];
                     let rows = merged_wrap.rows(entry);
                     entry += 1;
                     // A row that can't be resolved still holds its space, or
@@ -2253,7 +2294,18 @@ impl App {
                         port_tag: Some((short_tag(conn.merged_label(), tag_chars), color)),
                         row_id: egui::Id::new(("merged_row", port, abs)),
                     };
-                    let resp = render_row(ui, &line, &rctx);
+                    let resp = render_row(
+                        ui,
+                        &line,
+                        &rctx,
+                        selection_view,
+                        SelectionRow {
+                            port,
+                            abs,
+                            micros,
+                            entry: entry - 1,
+                        },
+                    );
                     let has_mark = conn.mark_micros.is_some();
                     queue_console_menu(
                         &resp,
@@ -2264,6 +2316,13 @@ impl App {
                     );
                 }
             });
+        });
+        log_selection::copy(ui.ctx(), selection_view, |entry| {
+            let entry = view.get(entry)?;
+            let conn = &connections[index_of(entry.port)?];
+            conn.store.get(entry.abs).and_then(|line| {
+                (!line.meta.flags.contains(LineFlags::RECONNECT_MARKER)).then_some(line.text)
+            })
         });
         rearm_follow_at_bottom(&mut self.merged_follow, user_scrolled, &output, row_height);
         if self.merged_follow {
@@ -3123,12 +3182,15 @@ fn console_drag(ctx: &egui::Context) -> Option<ConsoleDrag> {
         ctx.data_mut(|data| data.remove::<ConsoleDrag>(console_drag_id()));
         return None;
     }
-    let drag = ctx.data(|data| data.get_temp::<ConsoleDrag>(console_drag_id()))?;
-    (ctx.dragged_id() == Some(drag.widget)
-        && ctx
-            .plugin::<egui::text_selection::LabelSelectionState>()
-            .lock()
-            .has_selection())
+    let mut drag = ctx.data(|data| data.get_temp::<ConsoleDrag>(console_drag_id()))?;
+    if log_selection::is_dragging(ctx) && ctx.input(|i| i.pointer.interact_pos().is_some()) {
+        // The widget where the drag started can now be off screen. Preserve
+        // the latest native pointer before PointerGone, independently of it.
+        drag.pointer = ctx.input(|i| i.pointer.clone());
+        ctx.data_mut(|data| data.insert_temp(console_drag_id(), drag.clone()));
+    }
+    ((ctx.dragged_id() == Some(drag.widget) || log_selection::is_dragging(ctx))
+        && log_selection::has_selection(ctx))
     .then_some(drag)
 }
 
@@ -3237,57 +3299,6 @@ pub fn wrap_len(store: &LineStore, abs: u64) -> u32 {
         Some(line) => line.meta.len,
         None => 0,
     }
-}
-
-// egui clears label selection unless both endpoints are visited each frame,
-// and builds clipboard text from the labels visited in content order. Retain
-// the visited span during a selection so scrolling preserves both endpoints
-// and all intervening text. Stable keys survive scrollback eviction; ordinary
-// rendering returns to just the viewport as soon as selection is cleared.
-fn selection_entries(
-    ctx: &egui::Context,
-    saved: &mut Option<(egui::Id, u64, u64)>,
-    view: egui::Id,
-    visible: std::ops::Range<usize>,
-    entries: usize,
-    key: impl Fn(usize) -> u64,
-) -> std::ops::Range<usize> {
-    if entries == 0 {
-        *saved = None;
-        return 0..0;
-    }
-    let mut range = visible;
-    if ctx
-        .plugin::<egui::text_selection::LabelSelectionState>()
-        .lock()
-        .has_selection()
-    {
-        if let Some((previous_view, first, last)) = *saved {
-            if previous_view == view {
-                // Find the surviving portion of the retained span in this view.
-                let lower_bound = |target, inclusive| {
-                    let (mut lo, mut hi) = (0, entries);
-                    while lo < hi {
-                        let mid = lo + (hi - lo) / 2;
-                        if key(mid) < target || (inclusive && key(mid) == target) {
-                            lo = mid + 1;
-                        } else {
-                            hi = mid;
-                        }
-                    }
-                    lo
-                };
-                range.start = range.start.min(lower_bound(first, false));
-                range.end = range.end.max(lower_bound(last, true));
-            }
-        }
-    }
-    *saved = if range.is_empty() {
-        None
-    } else {
-        Some((view, key(range.start), key(range.end - 1)))
-    };
-    range
 }
 
 /// The first entry the viewport touches, and the rect its row starts at. Mirrors
@@ -3425,7 +3436,13 @@ fn paint_timestamp(ui: &mut egui::Ui, text: String, font: &egui::FontId) {
     ui.painter().galley(pos, galley, ui.visuals().text_color());
 }
 
-fn render_row(ui: &mut egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> egui::Response {
+fn render_row(
+    ui: &mut egui::Ui,
+    line: &LineRef<'_>,
+    rctx: &RowCtx<'_>,
+    view: egui::Id,
+    selection_row: SelectionRow,
+) -> egui::Response {
     let m = rctx.m;
     let height = rctx.rows as f32 * m.row_height;
     if line.meta.flags.contains(LineFlags::RECONNECT_MARKER) {
@@ -3472,8 +3489,7 @@ fn render_row(ui: &mut egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> egui:
                 .color(egui::Color32::from_rgb(0x66, 0xaa, 0xff)),
         );
     }
-    let job = build_job(&cui, line, rctx);
-    let galley = layout_console_text(&cui, job, m, rctx.rows);
+    let galley = cached_console_layout(&cui, line, rctx);
     // The row already owns a UI and a fixed slot. Position text directly
     // rather than registering another container widget for every visible line.
     let row = cui.max_rect();
@@ -3483,7 +3499,15 @@ fn render_row(ui: &mut egui::Ui, line: &LineRef<'_>, rctx: &RowCtx<'_>) -> egui:
         egui::vec2((row.right() - left).max(0.0), height.max(galley.size().y)),
     );
     let caret = line_caret(line).map(|index| (index, line_color(&cui, line)));
-    paint_console_text(&mut cui, galley, rect, m, rctx.row_id, caret)
+    paint_console_text_impl(
+        &mut cui,
+        galley,
+        rect,
+        m,
+        rctx.row_id,
+        caret,
+        Some((view, selection_row)),
+    )
 }
 
 /// Run `add_text` in a child `Ui` starting at exactly the text column, which is
@@ -3670,6 +3694,127 @@ fn layout_console_text(
     ui.fonts_mut(|f| f.layout_job(job))
 }
 
+#[derive(Clone)]
+struct CachedConsoleLayout {
+    signature: u64,
+    pass: u64,
+    galley: std::sync::Arc<egui::Galley>,
+}
+
+#[derive(Clone, Default)]
+struct ConsoleLayoutCache {
+    pass: u64,
+    font_epoch: Option<std::sync::Arc<egui::Galley>>,
+    entries: std::collections::HashMap<egui::Id, CachedConsoleLayout>,
+}
+
+fn cached_console_layout(
+    ui: &egui::Ui,
+    line: &LineRef<'_>,
+    rctx: &RowCtx<'_>,
+) -> std::sync::Arc<egui::Galley> {
+    if rctx.highlight.is_empty() && rctx.search_re.is_none() {
+        // Plain and ANSI-only output already use egui's efficient job cache.
+        // Reserve the extra fingerprint/cache for expensive rule/search styling.
+        return layout_console_text(ui, build_job(ui, line, rctx), rctx.m, rctx.rows);
+    }
+    // Hash borrowed content rather than copying it into a new LayoutJob and
+    // recomputing styling ranges on every redraw. Mutable tails and every
+    // rendering input participate, including DPI, wrapping and search mode.
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    line.text.hash(&mut hash);
+    line.meta.flags.0.hash(&mut hash);
+    line_color(ui, line).hash(&mut hash);
+    line.meta.spans.len().hash(&mut hash);
+    for span in &line.meta.spans {
+        (span.start, span.len, span.rgb, span.bg, span.bold).hash(&mut hash);
+    }
+    rctx.highlight.len().hash(&mut hash);
+    for rule in rctx.highlight {
+        (rule.re.as_str(), rule.color).hash(&mut hash);
+    }
+    rctx.search_re.map(regex::Regex::as_str).hash(&mut hash);
+    rctx.is_search_current.hash(&mut hash);
+    rctx.m.font.hash(&mut hash);
+    rctx.m.wrap_width().to_bits().hash(&mut hash);
+    rctx.m.cols.hash(&mut hash);
+    rctx.rows.hash(&mut hash);
+    ui.pixels_per_point().to_bits().hash(&mut hash);
+    let signature = hash.finish();
+    let pass = ui.ctx().cumulative_pass_nr();
+    let id = egui::Id::new(("console_layout_cache", ui.ctx().viewport_id()));
+    let (new_pass, mut cached) = ui.ctx().data_mut(|data| {
+        let cache = data.get_temp_mut_or_default::<ConsoleLayoutCache>(id);
+        if cache.pass != pass || cache.font_epoch.is_none() {
+            return (true, None);
+        }
+        (
+            false,
+            cache
+                .entries
+                .get_mut(&rctx.row_id)
+                .filter(|entry| entry.signature == signature)
+                .map(|entry| {
+                    entry.pass = pass;
+                    entry.galley.clone()
+                }),
+        )
+    });
+    if new_pass {
+        // Keep a tiny galley alive in egui's own font cache every pass. Its
+        // identity changes whenever fonts/options/DPI or an overflowing atlas
+        // recreate that cache. Old galleys contain atlas coordinates and must
+        // never survive such a reset, even when their text hasn't changed.
+        let epoch = ui.fonts_mut(|fonts| {
+            fonts.layout_no_wrap(
+                "0".into(),
+                egui::FontId::monospace(1.0),
+                egui::Color32::TRANSPARENT,
+            )
+        });
+        cached = ui.ctx().data_mut(|data| {
+            let cache = data.get_temp_mut_or_default::<ConsoleLayoutCache>(id);
+            if !cache
+                .font_epoch
+                .as_ref()
+                .is_some_and(|previous| std::sync::Arc::ptr_eq(previous, &epoch))
+            {
+                cache.entries.clear();
+            }
+            // Keep only rows visited in the preceding pass. Cache memory stays
+            // proportional to the viewports, never to accumulated scrollback.
+            cache.entries.retain(|_, entry| entry.pass + 1 >= pass);
+            cache.pass = pass;
+            cache.font_epoch = Some(epoch);
+            cache
+                .entries
+                .get_mut(&rctx.row_id)
+                .filter(|entry| entry.signature == signature)
+                .map(|entry| {
+                    entry.pass = pass;
+                    entry.galley.clone()
+                })
+        });
+    }
+    if let Some(galley) = cached {
+        return galley;
+    }
+    let galley = layout_console_text(ui, build_job(ui, line, rctx), rctx.m, rctx.rows);
+    ui.ctx().data_mut(|data| {
+        data.get_temp_mut_or_default::<ConsoleLayoutCache>(id)
+            .entries
+            .insert(
+                rctx.row_id,
+                CachedConsoleLayout {
+                    signature,
+                    pass,
+                    galley: galley.clone(),
+                },
+            );
+    });
+    galley
+}
+
 fn paint_console_text(
     ui: &mut egui::Ui,
     galley: std::sync::Arc<egui::Galley>,
@@ -3677,6 +3822,18 @@ fn paint_console_text(
     m: &Metrics,
     row_id: egui::Id,
     caret: Option<(usize, egui::Color32)>,
+) -> egui::Response {
+    paint_console_text_impl(ui, galley, rect, m, row_id, caret, None)
+}
+
+fn paint_console_text_impl(
+    ui: &mut egui::Ui,
+    galley: std::sync::Arc<egui::Galley>,
+    rect: egui::Rect,
+    m: &Metrics,
+    row_id: egui::Id,
+    caret: Option<(usize, egui::Color32)>,
+    document: Option<(egui::Id, SelectionRow)>,
 ) -> egui::Response {
     let fallback = ui.visuals().text_color();
     let response = ui.interact(rect, row_id.with("text"), egui::Sense::click_and_drag());
@@ -3717,7 +3874,9 @@ fn paint_console_text(
     if !ui.input(|i| i.pointer.primary_down() || i.pointer.primary_pressed()) {
         selection_response.sense = egui::Sense::click();
     }
-    if m.selectable {
+    if let Some((view, row)) = document.filter(|_| m.selectable) {
+        log_selection::paint(ui, &selection_response, rect, galley.clone(), view, row);
+    } else if m.selectable {
         egui::text_selection::LabelSelectionState::label_text_selection(
             ui,
             &selection_response,
@@ -3735,7 +3894,7 @@ fn paint_console_text(
     // egui keeps selection ranges private. Its selection painter appends
     // four rectangle vertices per selected row; compare with the original
     // galley so search/highlight backgrounds cannot count as selected text.
-    if response.secondary_clicked() {
+    if document.is_none() && response.secondary_clicked() {
         if let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) {
             let hit = ui.ctx().graphics(|graphics| {
                 graphics
@@ -5293,9 +5452,7 @@ mod tests {
                 range.sorted_cursors()[0].index..range.sorted_cursors()[1].index,
                 egui::text::CharIndex::from(0)..text.chars().count().into()
             );
-            ctx.plugin::<egui::text_selection::LabelSelectionState>()
-                .lock()
-                .clear_selection();
+            log_selection::clear_selection(&ctx);
             let _ = draw(&mut app, vec![shortcut()]);
             let _ = draw(&mut app, vec![]);
             assert!(
@@ -5466,10 +5623,7 @@ mod tests {
                 "gutter drag selected UI text: {}",
                 crate::panes::log::copied_text(&output.platform_output)
             );
-            assert!(!ctx
-                .plugin::<egui::text_selection::LabelSelectionState>()
-                .lock()
-                .has_selection());
+            assert!(!log_selection::has_selection(&ctx));
             let _ = draw(
                 &mut app,
                 vec![egui::Event::PointerMoved(start), button(start, true)],
@@ -5547,10 +5701,7 @@ mod tests {
             } else {
                 let _ = draw(&mut app, vec![button(end, false)]);
             }
-            assert!(ctx
-                .plugin::<egui::text_selection::LabelSelectionState>()
-                .lock()
-                .has_selection());
+            assert!(log_selection::has_selection(&ctx));
             if late_data {
                 // A late batch from another reader is sorted before existing
                 // rows, then maintain_merged renumbers every sequence key.
@@ -5615,15 +5766,374 @@ mod tests {
                 assert!(copied.contains("row 030 selection text"));
                 assert!(!copied.contains("row 060"));
             }
-            ctx.plugin::<egui::text_selection::LabelSelectionState>()
-                .lock()
-                .clear_selection();
+            log_selection::clear_selection(&ctx);
             let _ = draw(&mut app, vec![]);
-            let (_, first, last) = app.selection_rows.unwrap();
-            assert!(
-                last - first < 20,
-                "clearing selection restores virtualization"
+            assert!(!log_selection::has_selection(&ctx));
+        }
+    }
+
+    #[test]
+    fn console_layout_cache_reuses_text_and_invalidates_rendering_changes() {
+        let ctx = egui::Context::default();
+        let port = PortId(1);
+        let mut store = LineStore::new(100);
+        store.append(IncomingLine {
+            text: "temperature=23 café".into(),
+            ts: ts(0),
+            port,
+            flags: LineFlags::PROVISIONAL,
+            spans: vec![serialcore::store::ColorSpan {
+                start: 0,
+                len: 9,
+                rgb: 0x88bbff,
+                bg: serialcore::store::ColorSpan::NO_COLOR,
+                bold: false,
+            }]
+            .into(),
+            cursor: None,
+        });
+        let draw = |store: &LineStore, search: Option<&regex::Regex>, current, font_size| {
+            let mut result = None;
+            let _ = ctx.run_test_ui(Default::default(), |ui| {
+                let metrics = Metrics::new(
+                    ui,
+                    egui::FontId::monospace(font_size),
+                    TimestampFormat::None,
+                    true,
+                    0,
+                    false,
+                );
+                let row = RowCtx {
+                    ts_format: TimestampFormat::None,
+                    m: &metrics,
+                    rows: 1,
+                    prev_micros: None,
+                    mark: None,
+                    highlight: &[],
+                    search_re: search,
+                    is_search_current: current,
+                    port_tag: None,
+                    row_id: egui::Id::new("cached-provisional-line"),
+                };
+                result = Some(cached_console_layout(ui, &store.get(0).unwrap(), &row));
+            });
+            result.unwrap()
+        };
+        let initial = draw(&store, None, false, 14.0);
+        let reused = draw(&store, None, false, 14.0);
+        assert!(std::sync::Arc::ptr_eq(&initial, &reused));
+        let search = regex::Regex::new("23").unwrap();
+        let highlighted = draw(&store, Some(&search), false, 14.0);
+        assert!(highlighted
+            .job
+            .sections
+            .iter()
+            .any(|section| section.format.background != egui::Color32::TRANSPARENT));
+        let current = draw(&store, Some(&search), true, 14.0);
+        assert!(current
+            .job
+            .sections
+            .iter()
+            .any(|section| section.format.background == egui::Color32::from_rgb(0xff, 0xd5, 0x4a)));
+        let cleared = draw(&store, None, false, 14.0);
+        assert!(cleared
+            .job
+            .sections
+            .iter()
+            .all(|section| section.format.background == egui::Color32::TRANSPARENT));
+        store.append(IncomingLine {
+            text: "temperature=24 café".into(),
+            ts: ts(1),
+            port,
+            flags: LineFlags::PROVISIONAL | LineFlags::CONTINUATION,
+            spans: vec![serialcore::store::ColorSpan {
+                start: 0,
+                len: 9,
+                rgb: 0x88bbff,
+                bg: serialcore::store::ColorSpan::NO_COLOR,
+                bold: false,
+            }]
+            .into(),
+            cursor: None,
+        });
+        let changed = draw(&store, None, false, 14.0);
+        assert_eq!(changed.text(), "temperature=24 café");
+        assert!(!std::sync::Arc::ptr_eq(&changed, &cleared));
+        let bigger = draw(&store, Some(&search), false, 18.0);
+        assert!(bigger.size().y > changed.size().y);
+        let old_fonts = draw(&store, Some(&search), false, 18.0);
+        let mut definitions = egui::FontDefinitions::default();
+        definitions
+            .families
+            .get_mut(&egui::FontFamily::Monospace)
+            .unwrap()
+            .reverse();
+        ctx.set_fonts(definitions);
+        let new_fonts = draw(&store, Some(&search), false, 18.0);
+        assert!(
+            !std::sync::Arc::ptr_eq(&old_fonts, &new_fonts),
+            "cached atlas coordinates must not survive a font reset"
+        );
+        ctx.set_pixels_per_point(1.5);
+        let scaled = draw(&store, Some(&search), false, 18.0);
+        assert!(!std::sync::Arc::ptr_eq(&new_fonts, &scaled));
+    }
+
+    #[test]
+    fn full_log_selection_and_single_clicks_keep_scrolling_virtualized() {
+        for (merged, dragging) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (mut app, _tx) = test_app("full-log-selection");
+            let port = PortId(0);
+            app.config.settings.max_lines = 10_000;
+            app.config.settings.timestamp_format = TimestampFormat::None;
+            let mut conn = app.make_connection(
+                port,
+                "probe".into(),
+                Default::default(),
+                Default::default(),
+                inert_handle(port),
             );
+            conn.follow = false;
+            conn.search_query = "café".into();
+            conn.search_filter_suspended = false;
+            for i in 0..10_000 {
+                let abs = conn.store.append(IncomingLine {
+                    text: format!("row {i:05} café 東京"),
+                    ts: ts(i),
+                    port,
+                    flags: LineFlags::default(),
+                    spans: vec![serialcore::store::ColorSpan {
+                        start: 0,
+                        len: 9,
+                        rgb: 0x88bbff,
+                        bg: serialcore::store::ColorSpan::NO_COLOR,
+                        bold: false,
+                    }]
+                    .into(),
+                    cursor: None,
+                });
+                app.merged.push(MergedEntry {
+                    port,
+                    abs,
+                    seq: i as u64,
+                    micros: i,
+                });
+            }
+            app.connections.push(conn);
+            app.merged_follow = false;
+            app.merged_search_query = "café".into();
+            app.merged_search_filter_suspended = false;
+            let ctx = egui::Context::default();
+            let draw = |app: &mut App, events| {
+                ctx.run_test_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(800.0, 400.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        if merged {
+                            app.show_merged_rows(ui);
+                        } else {
+                            app.show_single_rows(ui, 0);
+                        }
+                    },
+                )
+            };
+            let _ = draw(&mut app, vec![]);
+            let _ = draw(&mut app, vec![]);
+            let id = egui::Id::new((
+                if merged { "merged_row" } else { "console_row" },
+                port,
+                1_u64,
+            ))
+            .with("text");
+            let start = ctx.read_response(id).unwrap().rect.left_center() + egui::vec2(4.0, 0.0);
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let _ = draw(
+                &mut app,
+                vec![egui::Event::PointerMoved(start), button(start, true)],
+            );
+            if !dragging {
+                // A plain click leaves a zero-width selection. The old label
+                // selection path expanded its rendered span even in this case,
+                // with no visible selected text to explain the slowdown.
+                let _ = draw(&mut app, vec![button(start, false)]);
+            }
+            if merged {
+                app.merged_scroll_to = Some(app.merged[9_950]);
+            } else {
+                app.connections[0].scroll_to = Some(9_950);
+            }
+            let end = egui::pos2(start.x + 120.0, 300.0);
+            let _ = draw(&mut app, vec![egui::Event::PointerMoved(end)]);
+            let _ = draw(&mut app, vec![button(end, false)]);
+            for _ in 0..3 {
+                let output = draw(&mut app, vec![]);
+                assert!(
+                    output.shapes.len() < 300,
+                    "selected history was rendered: {} shapes",
+                    output.shapes.len()
+                );
+            }
+            let output = draw(&mut app, vec![egui::Event::Copy]);
+            let text = copied_text(&output.platform_output);
+            if dragging {
+                assert!(
+                    text.contains("row 05000 café 東京"),
+                    "Copy must include off-screen selected history"
+                );
+                assert!(text.contains("row 09950 café 東京"));
+            } else {
+                assert!(
+                    text.is_empty(),
+                    "an invisible zero-width selection must not copy history"
+                );
+            }
+            assert!(!text.contains("row 00000"));
+            assert!(
+                output.shapes.len() < 300,
+                "Copy must not lay out off-screen text"
+            );
+            let id = egui::Id::new(("console_layout_cache", ctx.viewport_id()));
+            let cached = ctx
+                .data(|data| data.get_temp::<ConsoleLayoutCache>(id))
+                .unwrap();
+            assert!(
+                cached.entries.len() < 100,
+                "layout cache must remain bounded by visible rows"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode scrolling and receive drawing diagnostic"]
+    fn log_scroll_diagnostic() {
+        for (count, styled) in [(1_000, false), (10_000, false), (10_000, true)] {
+            let (mut app, _tx) = test_app("log-scroll-diagnostic");
+            let port = PortId(0);
+            app.config.settings.max_lines = count;
+            app.connections.push(app.make_connection(
+                port,
+                "probe".into(),
+                Default::default(),
+                Default::default(),
+                inert_handle(port),
+            ));
+            for i in 0..count {
+                app.connections[0]
+                    .store
+                    .append(serialcore::store::IncomingLine {
+                        text: format!(
+                            "row {i:05}: temperature=23.5 humidity=47.2 ordinary serial output"
+                        ),
+                        ts: ts(i as i64),
+                        port,
+                        flags: LineFlags::default(),
+                        spans: if styled {
+                            vec![serialcore::store::ColorSpan {
+                                start: 0,
+                                len: 12,
+                                rgb: 0x88bbff,
+                                bg: serialcore::store::ColorSpan::NO_COLOR,
+                                bold: false,
+                            }]
+                            .into()
+                        } else {
+                            Default::default()
+                        },
+                        cursor: None,
+                    });
+            }
+            app.connections[0].follow = false;
+            let ctx = egui::Context::default();
+            let draw = |app: &mut App, events| {
+                ctx.run_test_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1280.0, 900.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.show_single_rows(ui, 0),
+                )
+            };
+            for _ in 0..5 {
+                let _ = draw(&mut app, vec![]);
+            }
+            for phase in ["scroll", "selected-scroll", "incoming"] {
+                if phase == "selected-scroll" {
+                    app.connections[0].scroll_to = Some(5);
+                    let _ = draw(&mut app, vec![]);
+                    let rect = ctx
+                        .read_response(egui::Id::new(("console_row", port, 5_u64)).with("text"))
+                        .unwrap()
+                        .rect;
+                    let pos = rect.left_center() + egui::vec2(4.0, 0.0);
+                    let button = |pos, pressed| egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    };
+                    let _ = draw(
+                        &mut app,
+                        vec![egui::Event::PointerMoved(pos), button(pos, true)],
+                    );
+                    let end = pos + egui::vec2(80.0, 20.0);
+                    let _ = draw(&mut app, vec![egui::Event::PointerMoved(end)]);
+                    let _ = draw(&mut app, vec![button(end, false)]);
+                }
+                if phase == "incoming" {
+                    log_selection::clear_selection(&ctx);
+                    app.connections[0].follow = true;
+                }
+                let mut samples = Vec::new();
+                let mut shapes = 0;
+                for frame in 0..120 {
+                    if phase == "incoming" {
+                        app.connections[0]
+                            .store
+                            .append(serialcore::store::IncomingLine {
+                                text: format!("new row {frame}: temperature=24.1 humidity=48.0"),
+                                ts: ts((count + frame) as i64),
+                                port,
+                                flags: LineFlags::default(),
+                                spans: if styled {
+                                    vec![serialcore::store::ColorSpan {
+                                        start: 0,
+                                        len: 12,
+                                        rgb: 0x88bbff,
+                                        bg: serialcore::store::ColorSpan::NO_COLOR,
+                                        bold: false,
+                                    }]
+                                    .into()
+                                } else {
+                                    Default::default()
+                                },
+                                cursor: None,
+                            });
+                    } else {
+                        app.connections[0].scroll_to = Some((frame * (count - 100) / 119) as u64);
+                    }
+                    let start = std::time::Instant::now();
+                    let output = draw(&mut app, vec![]);
+                    samples.push(start.elapsed().as_secs_f64() * 1000.0);
+                    shapes = shapes.max(output.shapes.len());
+                }
+                samples.sort_by(f64::total_cmp);
+                eprintln!("{count} lines styled={styled} {phase}: median={:.3}ms p95={:.3}ms max={:.3}ms max_shapes={shapes}", samples[60], samples[114], samples[119]);
+            }
         }
     }
 

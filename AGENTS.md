@@ -353,6 +353,21 @@ values use a frame cache that discards undrawn entries and refreshes wall-clock
 formats once a second. Mark, previous-line and timestamp changes invalidate the
 cached value. See the live measurements in the receive-load investigation.
 
+Log and merged-view selection uses stored-line endpoints in
+`crates/pigtail/src/panes/log_selection.rs`, independently of the virtualized
+row widgets. A plain click or a retained selection never expands the rendered
+range beyond the viewport. Copy reads the selected displayed lines directly, including empty
+lines and Unicode text; timestamps and source labels are excluded. Endpoints
+follow stable connection/line identities across scrolling and late merged data,
+and selection clears if an endpoint is evicted, cleared or filtered out.
+Word/line clicks, Shift-click, drag reversal, selection edge scrolling (including
+PointerGone), selection colors, search-selection capture, context menus and
+text accessibility remain supported. Search/highlight text layouts are cached
+for recently visible rows only, with invalidation for text, styling, wrapping,
+font size, DPI and font-atlas resets. Plain and ANSI-only jobs use egui's cache
+directly. The 2026-10-14 measurements and validation are recorded in the
+receive-load investigation.
+
 Dependencies were checked against the registry and updated to current stable versions
 on 2026-10-11. The GUI uses eframe/egui 0.36.2, egui_plot 0.37.0 and wgpu 30.0.1.
 This includes the upstream fix for DX12 diagnostic hooks being initialized when

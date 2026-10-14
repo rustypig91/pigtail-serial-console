@@ -7,6 +7,7 @@ pub(crate) use chrome::app_visuals;
 pub(crate) use chrome::apply_settings_visuals;
 mod connect;
 mod log;
+pub(crate) mod log_selection;
 pub use log::wrap_len;
 pub(crate) use log::HexSearch;
 

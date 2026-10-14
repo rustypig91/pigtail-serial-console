@@ -15,7 +15,6 @@ struct Pane {
     selected: Option<TabId>,
     show_search: bool,
     search_focus_request: bool,
-    selection_rows: Option<(egui::Id, u64, u64)>,
 }
 
 #[derive(Clone, Copy)]
@@ -229,7 +228,6 @@ impl App {
         }
         pane.show_search = self.show_search;
         pane.search_focus_request = self.search_focus_request;
-        pane.selection_rows = self.selection_rows;
     }
 
     fn load_pane(&mut self, index: usize) {
@@ -239,7 +237,6 @@ impl App {
         let pane = &self.workspace.panes[index];
         self.show_search = pane.show_search;
         self.search_focus_request = pane.search_focus_request;
-        self.selection_rows = pane.selection_rows;
     }
 
     /// Reconcile stable identities after connection creation/closure, including
@@ -294,9 +291,7 @@ impl App {
         }
         self.save_pane(self.workspace.focused);
         self.workspace.panes[self.workspace.focused].search_focus_request = false;
-        ctx.plugin::<egui::text_selection::LabelSelectionState>()
-            .lock()
-            .clear_selection();
+        super::log_selection::clear_selection(ctx);
         self.workspace.focused = index;
         self.load_pane(index);
         // A search field in the old pane must not retain input.

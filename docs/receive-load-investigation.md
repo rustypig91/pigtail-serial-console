@@ -292,3 +292,93 @@ of temporarily restoring the uncapped per-series setting.
 Three regression tests reproduced these failures before the fixes and pass
 with them. The full workspace suite passes with 422 tests and two ignored
 manual diagnostics; workspace Clippy and changed-file formatting also pass.
+
+## Document selection and scrolling, 2026-10-14
+
+The retained-row selection workaround defeated virtualization after interacting
+with the log. egui requires both label-selection endpoints to be visited each
+frame, so `selection_entries` kept the union of previously visited rows and the
+current viewport. Scrolling or following incoming output could therefore grow
+the work toward the entire retained history. This also applied after a **single
+click**: egui reports a zero-width selection as active, although no selected text
+is visible. It explains a way for modest-rate output to become expensive as
+history accumulates, without an apparent selection on screen.
+
+Log and merged views now retain document endpoints by connection and absolute
+line identity. Rendering remains limited to the viewport, including during
+selection drags and after a single click. Only copying reads the selected
+displayed history; it does not create off-screen widgets or text layouts.
+Endpoint lookup accounts for filtering, eviction and late merged data; missing
+endpoints clear selection instead of targeting replacement text. Hex keeps its
+existing selection mechanism. Search and highlight styling has a bounded cache
+of recently visible layouts; font/DPI/atlas resets invalidate cached galleys.
+Plain and ANSI-only text delegates to egui's existing layout cache, avoiding the
+extra fingerprint cost for those inexpensive jobs.
+
+### Reproduce and measurements
+
+```sh
+cargo +stable test -p pigtail --release --locked --offline \
+    log_scroll_diagnostic -- --ignored --nocapture
+```
+
+The probe creates 1,000- and 10,000-line histories in a 1280 × 900 headless
+viewport. It measures 120 frames each of navigation across history, navigation
+with a retained selection, and pinned output with one appended line per frame.
+The 10,000-line case also runs with ANSI colour spans. Scrolling uses explicit
+line navigation, rather than wheel events; it exercises newly visible row
+layout and selection maintenance. The smaller history has more viewport overlap
+between navigation targets, so it is not a controlled history-size comparison.
+
+The baseline is the prior source with the identical diagnostic added in an
+isolated temporary copy. Both executables use stable Rust 1.98 and release
+optimization. Three alternating baseline/updated runs were made after builds
+finished and the native demo was closed. Each timing below is the mean of the
+three per-run medians or 95th percentiles, in milliseconds. Shapes are the
+maximum observed drawing-shape count.
+
+| 10,000-line workload | Before median | After median | Before p95 | After p95 | Shapes before / after |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Plain scrolling | 0.722 | 0.725 | 0.778 | 0.829 | 139 / 139 |
+| Plain scrolling with selection | 12.261 | 0.740 | 24.021 | 0.767 | 19,873 / 139 |
+| ANSI scrolling | 0.883 | 0.886 | 0.972 | 0.955 | 139 / 139 |
+| ANSI scrolling with selection | 13.421 | 0.905 | 27.020 | 1.175 | 19,873 / 139 |
+| Plain incoming output | 0.152 | 0.137 | 0.211 | 0.170 | 134 / 134 |
+| ANSI incoming output | 0.168 | 0.157 | 0.219 | 0.191 | 134 / 134 |
+
+The selection-dependent increase in rendering work is removed. Ordinary
+scrolling is essentially unchanged in these runs; incoming drawing improves
+modestly. These are headless UI/CPU-tessellation measurements, not native GPU
+frame times or input-to-paint latency. Appending happens before the timed frame,
+so the probe does not measure store append/compaction, capture writes, receive
+parsing, plot extraction or the complete application UI. The incoming phase
+follows selection removal, so its maximum also includes that transition.
+Search/highlight cache correctness is tested separately; the table does not
+measure its performance. Actual hardware traffic and native interaction latency
+remain necessary to establish whether every reported source of lag is resolved.
+
+### Validation
+
+Regression tests cover a single click and a nearly full-history selection at
+10,000 lines in both single and merged views, with bounded drawing shapes and
+layout-cache size. The single-click test fails against the previous source,
+producing 9,971 shapes in its first case; it passes with the updated viewer.
+Copy includes off-screen selected Unicode and empty lines without rendering
+them. Existing suites still cover selection reversal, scrolling beyond the
+native window, PointerGone, late merged rows, clipboard preservation during
+search seeding, context menus and split-pane input ownership. Additional tests
+cover wrapped Unicode word/line clicks, Escape, invalidated endpoints,
+provisional text changes, search styling, font size, font resets and DPI changes.
+
+Formatting, workspace/all-target Clippy and the demo feature check pass on
+stable Rust. The full workspace suite with all features passes in release mode
+with `-- --test-threads=1`. Default and all-feature debug workspace suites also
+passed during validation, but repeated debug runs were intermittent: the core
+throughput check sometimes exceeded its 50 ms wall-clock budget, including
+during a concurrent release build, and a saved-session cleanup test failed once
+in the parallel suite and passed individually. `serialcore` was not changed by
+this work; the release run passes both checks. A native X11 demo capture
+verified timestamps, coloured rows, header backdrop, footer and
+plot layout. Demo settings/captures remained isolated, and the test window was
+closed afterward. Capture retention, raw bytes and the configured line cap are
+unchanged.
