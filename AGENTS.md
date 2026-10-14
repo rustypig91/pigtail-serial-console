@@ -363,7 +363,8 @@ and selection clears if an endpoint is evicted, cleared or filtered out.
 Word/line clicks, Shift-click, drag reversal, selection edge scrolling (including
 PointerGone), selection colors, search-selection capture, context menus and
 text accessibility remain supported. Search/highlight text layouts are cached
-for recently visible rows only, with invalidation for text, styling, wrapping,
+for recently visible rows only, with invalidation for text, styling (including
+search and highlight case sensitivity), wrapping,
 font size, DPI and font-atlas resets. Plain and ANSI-only jobs use egui's cache
 directly. The 2026-10-14 measurements and validation are recorded in the
 receive-load investigation.

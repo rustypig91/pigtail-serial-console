@@ -104,6 +104,7 @@ pub const SERIES_PALETTE: [egui::Color32; 8] = [
 /// no longer offered in the Highlight rules window either (issue #45).
 pub struct CompiledHighlight {
     pub re: regex::Regex,
+    pub case_sensitive: bool,
     pub color: egui::Color32,
 }
 
@@ -3014,6 +3015,7 @@ impl App {
             };
             self.highlight_cache.push(CompiledHighlight {
                 re,
+                case_sensitive: rule.case_sensitive,
                 color: parse_hex_color(&rule.color)
                     .unwrap_or(egui::Color32::from_rgb(0xff, 0x55, 0x55)),
             });

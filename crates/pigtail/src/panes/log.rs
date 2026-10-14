@@ -772,6 +772,7 @@ struct RowCtx<'a> {
     mark: Option<i64>,
     highlight: &'a [CompiledHighlight],
     search_re: Option<&'a regex::Regex>,
+    search_case_sensitive: bool,
     is_search_current: bool,
     port_tag: Option<(String, egui::Color32)>,
     /// Stable identity for this line, independent of where it lands in the
@@ -2005,6 +2006,7 @@ impl App {
                         } else {
                             None
                         },
+                        search_case_sensitive: conn.search_case_sensitive,
                         is_search_current: cur_match_abs == Some(abs),
                         port_tag: None,
                         row_id: egui::Id::new(("console_row", conn.id, abs)),
@@ -2290,6 +2292,7 @@ impl App {
                         } else {
                             None
                         },
+                        search_case_sensitive: self.merged_search_case_sensitive,
                         is_search_current: cur_match_seq == Some(seq),
                         port_tag: Some((short_tag(conn.merged_label(), tag_chars), color)),
                         row_id: egui::Id::new(("merged_row", port, abs)),
@@ -3731,9 +3734,10 @@ fn cached_console_layout(
     }
     rctx.highlight.len().hash(&mut hash);
     for rule in rctx.highlight {
-        (rule.re.as_str(), rule.color).hash(&mut hash);
+        (rule.re.as_str(), rule.case_sensitive, rule.color).hash(&mut hash);
     }
     rctx.search_re.map(regex::Regex::as_str).hash(&mut hash);
+    rctx.search_case_sensitive.hash(&mut hash);
     rctx.is_search_current.hash(&mut hash);
     rctx.m.font.hash(&mut hash);
     rctx.m.wrap_width().to_bits().hash(&mut hash);
@@ -5811,6 +5815,7 @@ mod tests {
                     mark: None,
                     highlight: &[],
                     search_re: search,
+                    search_case_sensitive: true,
                     is_search_current: current,
                     port_tag: None,
                     row_id: egui::Id::new("cached-provisional-line"),
@@ -5877,6 +5882,79 @@ mod tests {
         ctx.set_pixels_per_point(1.5);
         let scaled = draw(&store, Some(&search), false, 18.0);
         assert!(!std::sync::Arc::ptr_eq(&new_fonts, &scaled));
+    }
+
+    #[test]
+    fn console_layout_cache_invalidates_search_and_highlight_case_sensitivity() {
+        for search in [true, false] {
+            let ctx = egui::Context::default();
+            let mut store = LineStore::new(100);
+            store.append(IncomingLine {
+                text: "HIT hit".into(),
+                ts: ts(0),
+                port: PortId(1),
+                flags: LineFlags::default(),
+                spans: Default::default(),
+                cursor: None,
+            });
+            let draw = |case_sensitive| {
+                let re = compile_search("HIT", case_sensitive, true).unwrap();
+                let highlights = [CompiledHighlight {
+                    re: re.clone(),
+                    case_sensitive,
+                    color: egui::Color32::RED,
+                }];
+                let mut result = None;
+                let _ = ctx.run_test_ui(Default::default(), |ui| {
+                    let metrics = Metrics::new(
+                        ui,
+                        egui::FontId::monospace(14.0),
+                        TimestampFormat::None,
+                        true,
+                        0,
+                        false,
+                    );
+                    let row = RowCtx {
+                        ts_format: TimestampFormat::None,
+                        m: &metrics,
+                        rows: 1,
+                        prev_micros: None,
+                        mark: None,
+                        highlight: if search { &[] } else { &highlights },
+                        search_re: search.then_some(&re),
+                        search_case_sensitive: case_sensitive,
+                        is_search_current: true,
+                        port_tag: None,
+                        row_id: egui::Id::new("case-sensitive-cache"),
+                    };
+                    result = Some(cached_console_layout(ui, &store.get(0).unwrap(), &row));
+                });
+                result.unwrap()
+            };
+            let styled_text = |galley: &egui::Galley| {
+                galley
+                    .job
+                    .sections
+                    .iter()
+                    .filter_map(|section| {
+                        let styled = if search {
+                            section.format.background != egui::Color32::TRANSPARENT
+                        } else {
+                            section.format.color == egui::Color32::RED
+                        };
+                        styled.then(|| {
+                            &galley.job.text[section.byte_range.start.0..section.byte_range.end.0]
+                        })
+                    })
+                    .collect::<String>()
+            };
+            let insensitive = draw(false);
+            assert_eq!(styled_text(&insensitive), "HIThit");
+            let sensitive = draw(true);
+            assert_eq!(styled_text(&sensitive), "HIT");
+            let insensitive_again = draw(false);
+            assert_eq!(styled_text(&insensitive_again), "HIThit");
+        }
     }
 
     #[test]
@@ -6375,6 +6453,7 @@ mod tests {
                             mark: None,
                             highlight: &[],
                             search_re: None,
+                            search_case_sensitive: true,
                             is_search_current: false,
                             port_tag: None,
                             row_id: egui::Id::new("caret-test"),
@@ -6478,6 +6557,7 @@ mod tests {
             mark: None,
             highlight: &[],
             search_re: Some(&search),
+            search_case_sensitive: true,
             is_search_current: true,
             port_tag: None,
             row_id: egui::Id::new("background-search-test"),
@@ -6545,6 +6625,7 @@ mod tests {
         let highlight_color = egui::Color32::from_rgb(0xff, 0x55, 0x55);
         let highlights = [CompiledHighlight {
             re: regex::Regex::new("HIT").unwrap(),
+            case_sensitive: true,
             color: highlight_color,
         }];
         let metrics = Metrics {
@@ -6563,6 +6644,7 @@ mod tests {
             mark: None,
             highlight: &highlights,
             search_re: None,
+            search_case_sensitive: true,
             is_search_current: false,
             port_tag: None,
             row_id: egui::Id::new("rule-highlight-device-color-test"),
@@ -6601,6 +6683,7 @@ mod tests {
         let highlight_color = egui::Color32::from_rgb(0xff, 0x55, 0x55);
         let highlights = [CompiledHighlight {
             re: regex::Regex::new("HIT").unwrap(),
+            case_sensitive: true,
             color: highlight_color,
         }];
         let metrics = Metrics {
@@ -6646,6 +6729,7 @@ mod tests {
                 mark: None,
                 highlight: &highlights,
                 search_re: None,
+                search_case_sensitive: true,
                 is_search_current: false,
                 port_tag: None,
                 row_id: egui::Id::new(("rule-highlight-semantic-color-test", case)),
