@@ -678,6 +678,11 @@ impl Metrics {
     ) -> Metrics {
         let (row_height, advance) =
             ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0')));
+        // epaint rounds every laid-out text row to device pixels. Match that
+        // pitch in the virtual index and scroll offsets, or incoming lines
+        // change the fractional baseline phase and make the text shimmer.
+        let ppp = ui.pixels_per_point();
+        let row_height = (row_height * ppp).round() / ppp;
         // Shaped text retains fractional advances. Use that same width for
         // virtual rows rather than rounding each character to a device pixel.
         let char_w = advance;
@@ -1889,8 +1894,16 @@ impl App {
             } else {
                 target.checked_sub(first_abs)? as usize
             };
-            Some(conn.wrap_index.start_row(entry))
+            (entry < entries).then(|| conn.wrap_index.start_row(entry))
         };
+        restore_log_anchor(
+            ui,
+            "scroll_area",
+            conn.follow,
+            |row| row_of_line(row.abs),
+            row_height,
+            n_rows as f32 * row_height,
+        );
         let goto = conn.scroll_to.take();
         let scroll_offset = keyboard_scroll_offset(
             ui,
@@ -2058,6 +2071,18 @@ impl App {
         // Remember what is at the top, so a relayout can put it back there.
         let top_row = (output.state.offset.y / row_height).floor().max(0.0) as u64;
         conn.top_line = (entries > 0).then(|| abs_of(conn.wrap_index.entry_at_row(top_row)));
+        remember_log_anchor(
+            ui,
+            &output,
+            &conn.wrap_index,
+            |entry| SelectionRow {
+                port: conn.id,
+                abs: abs_of(entry),
+                micros: 0,
+                entry,
+            },
+            row_height,
+        );
 
         if !conn.search_filter_suspended
             && conn.search_filter == crate::app::SearchFilter::Highlight
@@ -2180,6 +2205,26 @@ impl App {
             },
         );
         let n_rows = merged_wrap.total_rows();
+        restore_log_anchor(
+            ui,
+            ("merged_scroll", merged_tab_id),
+            self.merged_follow,
+            |row| {
+                // Timestamp ties are common; identify the original connection
+                // and line rather than a sequence key reassigned by a rebuild.
+                let same = |entry: &MergedEntry| entry.port == row.port && entry.abs == row.abs;
+                let entry = if view.get(row.entry).is_some_and(same) {
+                    row.entry
+                } else {
+                    let start = view.partition_point(|entry| entry.micros < row.micros);
+                    let end = view.partition_point(|entry| entry.micros <= row.micros);
+                    start + view[start..end].iter().position(same)?
+                };
+                Some(merged_wrap.start_row(entry))
+            },
+            row_height,
+            n_rows as f32 * row_height,
+        );
         let scroll_offset = keyboard_scroll_offset(
             ui,
             ("merged_scroll", merged_tab_id),
@@ -2332,6 +2377,18 @@ impl App {
             self.merged_new_since_scroll = 0;
         }
         self.merged_pin_view_h = output.inner_rect.height();
+        remember_log_anchor(
+            ui,
+            &output,
+            merged_wrap,
+            |entry| SelectionRow {
+                port: view[entry].port,
+                abs: view[entry].abs,
+                micros: view[entry].micros,
+                entry,
+            },
+            row_height,
+        );
         if !self.merged_search_filter_suspended && highlight_all_matches {
             draw_search_ticks(
                 ui,
@@ -3144,6 +3201,71 @@ fn export_menu(ui: &mut egui::Ui, menu: &mut MenuAction) {
             ui.close();
         }
     });
+}
+
+// Store anchors with the scroll area's UI state, so connections, merged tabs
+// and split panes each keep their own place without persisting it across runs.
+#[derive(Clone)]
+struct LogScrollAnchor {
+    start_row: u64,
+    top: SelectionRow,
+    within_line: f32,
+}
+
+fn restore_log_anchor(
+    ui: &egui::Ui,
+    salt: impl egui::AsId,
+    follow: bool,
+    row_of: impl FnOnce(SelectionRow) -> Option<u64>,
+    row_height: f32,
+    content_height: f32,
+) {
+    if follow {
+        return;
+    }
+    let id = ui.make_persistent_id(egui::IdSalt::new(salt));
+    let Some(anchor) = ui
+        .ctx()
+        .data(|data| data.get_temp::<LogScrollAnchor>(id.with("line_anchor")))
+    else {
+        return;
+    };
+    let row = row_of(anchor.top);
+    if row == Some(anchor.start_row) {
+        return;
+    }
+    if let Some(mut state) = egui::scroll_area::State::load(ui.ctx(), id) {
+        // Preserve even a partially visible wrapped row. When the anchor itself
+        // has gone, stay at the oldest remaining line as eviction continues.
+        state.offset.y = row
+            .map_or(0.0, |row| (row as f32 + anchor.within_line) * row_height)
+            .clamp(0.0, (content_height - ui.available_height()).max(0.0));
+        // Update before keyboard/selection scrolling so input applies to the
+        // corrected position; wheel and scrollbar handling still belong to egui.
+        state.store(ui.ctx(), id);
+    }
+}
+
+fn remember_log_anchor(
+    ui: &egui::Ui,
+    output: &egui::scroll_area::ScrollAreaOutput<()>,
+    wrap: &crate::wrap::WrapIndex,
+    row_at: impl Fn(usize) -> SelectionRow,
+    row_height: f32,
+) {
+    let id = output.id.with("line_anchor");
+    if wrap.len() == 0 {
+        ui.ctx().data_mut(|data| data.remove::<LogScrollAnchor>(id));
+        return;
+    }
+    let top_row = output.state.offset.y / row_height;
+    let entry = wrap.entry_at_row(top_row.floor().max(0.0) as u64);
+    let anchor = LogScrollAnchor {
+        start_row: wrap.start_row(entry),
+        top: row_at(entry),
+        within_line: top_row - wrap.start_row(entry) as f32,
+    };
+    ui.ctx().data_mut(|data| data.insert_temp(id, anchor));
 }
 
 /// Use the last rendered offset so paging works without hovering the console.
@@ -4801,6 +4923,441 @@ mod tests {
                 crate::panes::log::copied_text(&output.platform_output).trim(),
                 "console text"
             );
+        }
+    }
+
+    #[test]
+    fn incoming_log_rows_keep_the_same_pixel_spacing() {
+        for merged in [false, true] {
+            for ppp in [1.0, 1.25, 1.5, 2.0] {
+                for size in [12, 17] {
+                    for wrapped in [false, true] {
+                        let (mut app, _enum_tx) = test_app("receive-row-spacing");
+                        let port = PortId(0);
+                        let mut conn = app.make_connection(
+                            port,
+                            "probe".into(),
+                            Default::default(),
+                            Default::default(),
+                            inert_handle(port),
+                        );
+                        let history = if ppp == 1.25 && size == 17 {
+                            100_000
+                        } else {
+                            128
+                        };
+                        conn.store = LineStore::new(history as usize + 128);
+                        app.connections.push(conn);
+                        app.config.settings.timestamp_format = TimestampFormat::None;
+                        app.config.settings.console_font_size = size;
+                        app.config.settings.wrap_lines = wrapped;
+                        let append = |app: &mut App, start, end| {
+                            for i in start..end {
+                                let abs = app.connections[0].store.append(IncomingLine {
+                                    text: format!(
+                                        "jitter line {i:04} {}",
+                                        if wrapped {
+                                            "x".repeat(100)
+                                        } else {
+                                            String::new()
+                                        }
+                                    ),
+                                    ts: ts(i),
+                                    port,
+                                    flags: LineFlags::default(),
+                                    spans: Default::default(),
+                                    cursor: None,
+                                });
+                                app.merged.push(MergedEntry {
+                                    port,
+                                    abs,
+                                    seq: i as u64,
+                                    micros: i,
+                                });
+                            }
+                            let first = app.connections[0].store.first_abs_index();
+                            app.merged.retain(|entry| entry.abs >= first);
+                            app.merged_generation += 1;
+                        };
+                        append(&mut app, 0, history);
+                        let ctx = egui::Context::default();
+                        ctx.set_pixels_per_point(ppp);
+                        let draw = |app: &mut App| {
+                            let output = ctx.run_test_ui(
+                                egui::RawInput {
+                                    screen_rect: Some(egui::Rect::from_min_size(
+                                        egui::Pos2::ZERO,
+                                        egui::vec2(600.0, 300.0),
+                                    )),
+                                    ..Default::default()
+                                },
+                                |ui| {
+                                    egui::CentralPanel::default().show(ui, |ui| {
+                                        if merged {
+                                            app.show_merged_rows(ui);
+                                        } else {
+                                            app.show_single_rows(ui, 0);
+                                        }
+                                    });
+                                },
+                            );
+                            let mut positions: Vec<_> = output
+                                .shapes
+                                .iter()
+                                .flat_map(|shape| {
+                                    let egui::Shape::Text(text) = &shape.shape else {
+                                        return Vec::new();
+                                    };
+                                    if !text.galley.text().starts_with("jitter line") {
+                                        return Vec::new();
+                                    }
+                                    text.galley
+                                        .rows
+                                        .iter()
+                                        .filter_map(|row| {
+                                            let y = text.pos.y + row.pos.y;
+                                            (40.0..290.0).contains(&y).then_some(y * ppp)
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .collect();
+                            positions.sort_by(f32::total_cmp);
+                            positions.split_off(positions.len().saturating_sub(6))
+                        };
+                        for _ in 0..3 {
+                            draw(&mut app);
+                        }
+                        let baseline = draw(&mut app);
+                        assert_eq!(baseline.len(), 6);
+                        for pair in baseline.windows(2) {
+                            let pitch = pair[1] - pair[0];
+                            assert!((pitch - pitch.round()).abs() < 0.05,
+                                "line pitch must agree with the text's device pixel grid: {baseline:?}");
+                        }
+                        let mut next = history;
+                        for burst in [1, 1, 3, 31, 128, 1] {
+                            append(&mut app, next, next + burst);
+                            next += burst;
+                            let positions = draw(&mut app);
+                            assert_eq!(positions.len(), baseline.len());
+                            for (before, after) in baseline.iter().zip(&positions) {
+                                assert!((before - after).abs() < 0.05,
+                                    "row jitter: merged={merged}, ppp={ppp}, size={size}, wrapped={wrapped}, burst={burst}, before={baseline:?}, after={positions:?}");
+                            }
+                        }
+                        // Unpin at the bottom, then keep a surviving line at
+                        // exactly the same baseline as eviction advances.
+                        app.connections[0].follow = false;
+                        app.merged_follow = false;
+                        draw(&mut app);
+                        let target = egui::Id::new((
+                            if merged { "merged_row" } else { "console_row" },
+                            port,
+                            next as u64 - 4,
+                        ))
+                        .with("text");
+                        let before = ctx.read_response(target).unwrap().rect.top() * ppp;
+                        for burst in [1, 3, 17] {
+                            append(&mut app, next, next + burst);
+                            next += burst;
+                            draw(&mut app);
+                            let after = ctx.read_response(target).unwrap().rect.top() * ppp;
+                            assert!((after - before).abs() < 0.05,
+                                "unpinned row jitter: merged={merged}, ppp={ppp}, size={size}, wrapped={wrapped}, before={before}, after={after}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scrollbar_drags_do_not_select_console_text() {
+        for merged in [false, true] {
+            let (mut app, _enum_tx) = test_app("scrollbar-selection");
+            let port = PortId(0);
+            let mut conn = app.make_connection(
+                port,
+                "probe".into(),
+                Default::default(),
+                Default::default(),
+                inert_handle(port),
+            );
+            conn.follow = false;
+            for i in 0..100 {
+                let abs = conn.store.append(IncomingLine {
+                    text: format!("line {i} {}", "x".repeat(100)),
+                    ts: ts(i),
+                    port,
+                    flags: LineFlags::default(),
+                    spans: Default::default(),
+                    cursor: None,
+                });
+                app.merged.push(MergedEntry {
+                    port,
+                    abs,
+                    seq: i as u64,
+                    micros: i,
+                });
+            }
+            app.connections.push(conn);
+            app.merged_follow = false;
+            app.config.settings.timestamp_format = TimestampFormat::None;
+            let ctx = egui::Context::default();
+            ctx.all_styles_mut(|style| style.spacing.scroll.floating = true);
+            let scroll_id = std::cell::Cell::new(egui::Id::NULL);
+            let draw = |app: &mut App, events| {
+                ctx.run_test_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(500.0, 250.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            let salt = if merged {
+                                egui::IdSalt::new(("merged_scroll", Option::<u64>::None))
+                            } else {
+                                egui::IdSalt::new("scroll_area")
+                            };
+                            scroll_id.set(ui.make_persistent_id(salt));
+                            if merged {
+                                app.show_merged_rows(ui);
+                            } else {
+                                app.show_single_rows(ui, 0);
+                            }
+                        });
+                    },
+                )
+            };
+            let _ = draw(&mut app, vec![]);
+            let _ = draw(&mut app, vec![]);
+            let bar = ctx
+                .read_response(scroll_id.get().with(1_usize))
+                .unwrap()
+                .rect;
+            let start = egui::pos2(bar.center().x, bar.top() + 10.0);
+            let end = egui::pos2(start.x, bar.center().y);
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let _ = draw(
+                &mut app,
+                vec![egui::Event::PointerMoved(start), button(start, true)],
+            );
+            assert!(
+                !log_selection::is_dragging(&ctx),
+                "scrollbar started text selection: merged={merged}"
+            );
+            let _ = draw(&mut app, vec![egui::Event::PointerMoved(end)]);
+            assert!(
+                egui::scroll_area::State::load(&ctx, scroll_id.get())
+                    .unwrap()
+                    .offset
+                    .y
+                    > 0.0
+            );
+            assert!(
+                !log_selection::has_selection(&ctx),
+                "scrollbar selected text: merged={merged}"
+            );
+            // Moving a held scrollbar drag into the text still belongs to the scrollbar.
+            let inside = egui::pos2(200.0, end.y);
+            let _ = draw(&mut app, vec![egui::Event::PointerMoved(inside)]);
+            let output = draw(&mut app, vec![button(inside, false), egui::Event::Copy]);
+            assert!(copied_text(&output.platform_output).is_empty());
+            assert!(!log_selection::has_selection(&ctx));
+            // A subsequent drag starting on text must continue to select normally.
+            let _ = draw(
+                &mut app,
+                vec![egui::Event::PointerMoved(inside), button(inside, true)],
+            );
+            let text_end = inside + egui::vec2(60.0, 35.0);
+            let _ = draw(&mut app, vec![egui::Event::PointerMoved(text_end)]);
+            let output = draw(&mut app, vec![button(text_end, false), egui::Event::Copy]);
+            assert!(!copied_text(&output.platform_output).is_empty());
+        }
+    }
+
+    #[test]
+    fn unpinned_log_keeps_its_place_during_history_eviction() {
+        for merged in [false, true] {
+            for wrapped in [false, true] {
+                for filtered in [false, true] {
+                    let (mut app, _enum_tx) = test_app("eviction-scroll-anchor");
+                    let port = PortId(0);
+                    let mut conn = app.make_connection(
+                        port,
+                        "probe".into(),
+                        Default::default(),
+                        Default::default(),
+                        inert_handle(port),
+                    );
+                    conn.store = LineStore::new(64);
+                    conn.follow = false;
+                    app.connections.push(conn);
+                    if merged {
+                        // A quiet connection keeps the merged first row alive
+                        // while another connection evicts rows before the viewport.
+                        let other_port = PortId(1);
+                        let mut other = app.make_connection(
+                            other_port,
+                            "quiet".into(),
+                            Default::default(),
+                            Default::default(),
+                            inert_handle(other_port),
+                        );
+                        let abs = other.store.append(IncomingLine {
+                            text: "line from quiet connection".into(),
+                            ts: ts(-1),
+                            port: other_port,
+                            flags: LineFlags::default(),
+                            spans: Default::default(),
+                            cursor: None,
+                        });
+                        app.merged.push(MergedEntry {
+                            port: other_port,
+                            abs,
+                            seq: 0,
+                            micros: -1,
+                        });
+                        app.connections.push(other);
+                    }
+                    app.merged_selected = merged;
+                    app.merged_follow = false;
+                    app.config.settings.wrap_lines = wrapped;
+                    app.config.settings.timestamp_format = TimestampFormat::None;
+                    if filtered {
+                        app.connections[0].search_query = "line".into();
+                        app.connections[0].search_filter = crate::app::SearchFilter::OnlyMatches;
+                        app.connections[0].search_filter_suspended = false;
+                        app.merged_search_query = "line".into();
+                        app.merged_search_filter = crate::app::SearchFilter::OnlyMatches;
+                        app.merged_search_filter_suspended = false;
+                        app.merged_filter_dirty = true;
+                    }
+                    let append = |app: &mut App, start, end| {
+                        for i in start..end {
+                            let text = if i % 3 == 0 { "skip" } else { "line" };
+                            let abs = app.connections[0].store.append(IncomingLine {
+                                text: format!("{text} {i} {}", "x".repeat((i as usize % 4) * 80)),
+                                ts: ts(i),
+                                port,
+                                flags: LineFlags::default(),
+                                spans: Default::default(),
+                                cursor: None,
+                            });
+                            app.merged.push(MergedEntry {
+                                port,
+                                abs,
+                                seq: i as u64 + 1,
+                                micros: i,
+                            });
+                        }
+                        let first = app.connections[0].store.first_abs_index();
+                        app.merged
+                            .retain(|entry| entry.port != port || entry.abs >= first);
+                        app.merged_generation += 1;
+                        app.maintain_filters();
+                        app.maintain_merged_filter(true);
+                    };
+                    append(&mut app, 0, 64);
+                    let ctx = egui::Context::default();
+                    let top_abs = std::cell::Cell::new(0);
+                    let draw = |app: &mut App, initial_offset: Option<f32>| {
+                        let mut offset = 0.0;
+                        let _ = ctx.run_test_ui(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(600.0, 300.0),
+                                )),
+                                ..Default::default()
+                            },
+                            |ui| {
+                                egui::CentralPanel::default().show(ui, |ui| {
+                                    let id = if merged {
+                                        ui.make_persistent_id(egui::IdSalt::new((
+                                            "merged_scroll",
+                                            Option::<u64>::None,
+                                        )))
+                                    } else {
+                                        ui.make_persistent_id(egui::IdSalt::new("scroll_area"))
+                                    };
+                                    if let Some(offset) = initial_offset {
+                                        // Replace the anchor when simulating a user scroll.
+                                        ctx.data_mut(|data| {
+                                            data.remove::<LogScrollAnchor>(id.with("line_anchor"))
+                                        });
+                                        let mut state = egui::scroll_area::State::load(&ctx, id)
+                                            .unwrap_or_default();
+                                        state.offset.y = offset;
+                                        state.store(&ctx, id);
+                                    }
+                                    if merged {
+                                        app.show_merged_rows(ui);
+                                    } else {
+                                        app.show_single_rows(ui, 0);
+                                    }
+                                    offset =
+                                        egui::scroll_area::State::load(&ctx, id).unwrap().offset.y;
+                                    top_abs.set(
+                                        ctx.data(|data| {
+                                            data.get_temp::<LogScrollAnchor>(id.with("line_anchor"))
+                                        })
+                                        .unwrap()
+                                        .top
+                                        .abs,
+                                    );
+                                });
+                            },
+                        );
+                        offset
+                    };
+                    draw(&mut app, None);
+                    draw(&mut app, None);
+                    // Include a fractional offset and multiple wrapped rows.
+                    let before_offset = draw(&mut app, Some(250.5));
+                    assert!((before_offset - 250.5).abs() < 0.01);
+                    let target = if merged { "merged_row" } else { "console_row" };
+                    let visible = (top_abs.get()..64)
+                        .find_map(|abs| {
+                            let id = egui::Id::new((target, port, abs)).with("text");
+                            ctx.read_response(id)
+                                .filter(|r| r.rect.top() > 40.0 && r.rect.top() < 150.0)
+                                .map(|r| (id, r.rect.top()))
+                        })
+                        .unwrap();
+                    append(&mut app, 64, 67);
+                    let after_offset = draw(&mut app, None);
+                    assert!(after_offset < before_offset);
+                    let after_top = ctx.read_response(visible.0).unwrap_or_else(|| panic!("missing anchored row: merged={merged}, wrapped={wrapped}, filtered={filtered}")).rect.top();
+                    assert!((after_top - visible.1).abs() < 0.01,
+                        "reader moved: merged={merged}, wrapped={wrapped}, filtered={filtered}, before={}, after={after_top}", visible.1);
+                    assert!(!app.connections[0].follow && !app.merged_follow);
+                    // Evict the anchor itself, then continue eviction at the top.
+                    append(&mut app, 67, 131);
+                    assert_eq!(draw(&mut app, None), 0.0);
+                    append(&mut app, 131, 134);
+                    assert_eq!(draw(&mut app, None), 0.0);
+                    assert!(!app.connections[0].follow && !app.merged_follow);
+                    // Pin still returns to live output and follows further eviction.
+                    if merged {
+                        app.merged_follow = true;
+                    } else {
+                        app.connections[0].follow = true;
+                    }
+                    assert!(draw(&mut app, None) > 0.0);
+                    append(&mut app, 134, 137);
+                    assert!(draw(&mut app, None) > 0.0);
+                }
+            }
         }
     }
 

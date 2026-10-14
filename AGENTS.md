@@ -139,7 +139,16 @@ application.
   ANSI/VT sits beside Hex; highlights are in the overflow menu. A thin footer shows
   one combined connection/error status at the bottom left, line counts and port
   settings, with a clickable pin icon for autoscroll. History eviction does not add a
-  “History limited” indicator to the footer. The header tint blends subtly
+  “History limited” indicator to the footer. Unpinned Log and merged views
+  retain the same top visible line and its wrapped-row/fractional position when
+  older displayed lines are evicted. Once that line is evicted, the view stays
+  at the top of the remaining history as further lines are discarded. Eviction
+  alone never re-enables Pin. At the configured line limit, each new Log
+  line discards only the oldest excess line; retention no longer drops 10% in
+  one batch. Metadata uses a deque and discarded text is compacted periodically,
+  independently of logical eviction. Separate text/metadata memory limits may
+  discard additional oldest lines when unusually large output exceeds those
+  budgets. Raw capture remains complete. The header tint blends subtly
   with scrolling terminal history and its timestamps underneath it.
   The combined status shows green **Connected**, yellow **Device missing** when
   no device is available, and yellow **Reconnecting** after discovery while
@@ -346,6 +355,13 @@ Receive-backlog frames use the same pacing. Timer requests compensate for egui's
 predicted frame time so configuration writes and macro deadlines do not busy-loop
 just before they are due.
 
+Console row pitch is rounded to device pixels, matching egui's text layout.
+Log, merged and Hex virtualization and scroll offsets use that same pitch so
+incoming bursts do not change fractional baseline positions or line spacing.
+Rendering regression frames cover pinned growth, unpinned eviction, wrapped
+and merged logs, 1×/1.25×/1.5×/2× display scales, multiple font sizes and a
+100,000-line history.
+
 Log and merged rows share their console style and paint selectable text within
 the existing row container. Plain unstyled lines bypass styling-range allocation.
 Timestamp labels retain their normal accessibility responses; their formatted
@@ -362,12 +378,23 @@ follow stable connection/line identities across scrolling and late merged data,
 and selection clears if an endpoint is evicted, cleared or filtered out.
 Word/line clicks, Shift-click, drag reversal, selection edge scrolling (including
 PointerGone), selection colors, search-selection capture, context menus and
-text accessibility remain supported. Search/highlight text layouts are cached
-for recently visible rows only, with invalidation for text, styling (including
+text accessibility remain supported. Scrollbar presses and drags never start
+text selection, including when a floating scrollbar overlaps a text row or the
+held pointer moves from the scrollbar into the console. Search/highlight text
+layouts are cached for recently visible rows only, with invalidation for text, styling (including
 search and highlight case sensitivity), wrapping,
 font size, DPI and font-atlas resets. Plain and ANSI-only jobs use egui's cache
 directly. The 2026-10-14 measurements and validation are recorded in the
 receive-load investigation.
+
+The 2026-10-14 line-retention change was checked with exact-cap, stable-index,
+Unicode, continuation, color-span, clear, shrink and memory-budget tests. The
+throughput test now feeds 75,000 lines through a 20,000-line store so it exercises
+sustained eviction. A storage-only optimized probe compared the prior batched
+store with the deque store: after filling each cap, 500,000 appends of a 48-byte
+line took median 35.3/33.2 ms at 1,000 lines, 51.1/46.9 ms at 10,000 lines and
+76.1/55.6 ms at 100,000 lines (before/after, five alternating trials, Rust 1.98).
+These synthetic timings exclude framing, filtering, rendering and real serial I/O.
 
 Dependencies were checked against the registry and updated to current stable versions
 on 2026-10-11. The GUI uses eframe/egui 0.36.2, egui_plot 0.37.0 and wgpu 30.0.1.
