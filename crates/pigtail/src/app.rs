@@ -104,6 +104,7 @@ pub const SERIES_PALETTE: [egui::Color32; 8] = [
 /// no longer offered in the Highlight rules window either (issue #45).
 pub struct CompiledHighlight {
     pub re: regex::Regex,
+    pub case_sensitive: bool,
     pub color: egui::Color32,
 }
 
@@ -1672,7 +1673,6 @@ pub struct App {
     pub enum_rx: Receiver<EnumEvent>,
     pub available: Vec<DiscoveredPort>,
     pub connections: Vec<Connection>,
-    pub(crate) selection_rows: Option<(egui::Id, u64, u64)>,
     /// Active connection index, retained while a merged tab is selected.
     pub active: usize,
     pub(crate) workspace: crate::panes::Workspace,
@@ -1823,7 +1823,6 @@ impl App {
             enum_rx,
             available: Vec::new(),
             connections: Vec::new(),
-            selection_rows: None,
             active: 0,
             workspace: crate::panes::Workspace::default(),
             search_history: Default::default(),
@@ -3016,6 +3015,7 @@ impl App {
             };
             self.highlight_cache.push(CompiledHighlight {
                 re,
+                case_sensitive: rule.case_sensitive,
                 color: parse_hex_color(&rule.color)
                     .unwrap_or(egui::Color32::from_rgb(0xff, 0x55, 0x55)),
             });
