@@ -940,8 +940,9 @@ fn request_search_selection(ctx: &egui::Context, target: egui::Id) -> bool {
 impl App {
     fn console_menu_id(&self) -> egui::Id {
         let tab = self.selected_tab_id().map(|tab| match tab {
-            crate::app::TabId::Connection(id) => (false, u64::from(id.0)),
-            crate::app::TabId::Merged(id) => (true, id),
+            crate::app::TabId::Connection(id) => (0, u64::from(id.0)),
+            crate::app::TabId::Merged(id) => (1, id),
+            crate::app::TabId::Plot(id) => (2, id),
         });
         self.pane_widget_id("console_context_menu").with(tab)
     }
@@ -1196,15 +1197,16 @@ impl App {
             conn.scroll_to = None;
             conn.screen_search.scroll_to = None;
         }
-        if plot {
-            conn.show_plot = !conn.show_plot;
-        }
+
         if let Some((screen, hex)) = view {
             if (conn.screen_view, conn.hex_view) != (screen, hex) {
                 conn.screen_view = screen;
                 conn.hex_view = hex;
                 self.save_session();
             }
+        }
+        if plot {
+            self.plot_shortcut();
         }
     }
 
@@ -1298,6 +1300,9 @@ impl App {
         console_tab_claimed: bool,
         parent: &mut egui::Ui,
     ) {
+        if self.active_plot.is_some() {
+            return;
+        }
         let input_enabled = self.pane_input_enabled();
         if input_enabled && !self.show_search {
             // Selection context menus also consume captured text, even when
@@ -2778,7 +2783,7 @@ impl App {
             self.show_highlight_win = !self.show_highlight_win;
         }
         if menu.open_extract {
-            self.show_extract_win = !self.show_extract_win;
+            self.open_new_plot();
         }
         if menu.toggle_search {
             self.set_search_visible(!self.show_search);
@@ -3217,7 +3222,7 @@ fn console_menu(
         menu.open_highlight = true;
         ui.close();
     }
-    if own_console && ui.button("Plot extraction…").clicked() {
+    if own_console && ui.button("New plot…").clicked() {
         menu.open_extract = true;
         ui.close();
     }
@@ -7039,33 +7044,29 @@ mod tests {
         assert_eq!(press(&mut app, egui::Key::W, egui::Modifiers::CTRL), 1);
         assert!(!app.connections[0].hex_view);
 
-        let initial_plot = app.connections[0].show_plot;
         assert_eq!(press(&mut app, egui::Key::P, modifiers), 0);
-        assert_eq!(app.connections[0].show_plot, !initial_plot);
-        assert_eq!(press(&mut app, egui::Key::P, modifiers), 0);
-        assert_eq!(app.connections[0].show_plot, initial_plot);
+        assert!(app.plot_draft.is_some());
+        app.plot_draft = None;
         assert_eq!(press(&mut app, egui::Key::P, egui::Modifiers::CTRL), 1);
-        assert_eq!(app.connections[0].show_plot, initial_plot);
-
+        assert!(app.plot_draft.is_none());
         app.show_settings = true;
         assert_eq!(press(&mut app, egui::Key::P, modifiers), 1);
-        assert_eq!(app.connections[0].show_plot, initial_plot);
+        assert!(app.plot_draft.is_none());
         assert_eq!(press(&mut app, egui::Key::E, modifiers), 1);
         assert!(!app.connections[0].screen_view);
         app.show_settings = false;
         ctx.memory_mut(|m| m.request_focus(egui::Id::new("text-input")));
         assert_eq!(press(&mut app, egui::Key::P, modifiers), 1);
-        assert_eq!(app.connections[0].show_plot, initial_plot);
+        assert!(app.plot_draft.is_none());
         ctx.memory_mut(|m| m.request_focus(egui::Id::new("text-input")));
         assert_eq!(press(&mut app, egui::Key::W, modifiers), 1);
         assert!(!app.connections[0].hex_view);
         ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("text-input")));
-
         app.merged_selected = true;
         app.merged_follow = false;
         app.merged_new_since_scroll = 12;
         assert_eq!(press(&mut app, egui::Key::P, modifiers), 0);
-        assert_eq!(app.connections[0].show_plot, initial_plot);
+        assert!(app.plot_draft.is_none());
         assert_eq!(press(&mut app, egui::Key::Space, modifiers), 0);
         assert!(app.merged_follow);
         assert_eq!(app.merged_new_since_scroll, 0);

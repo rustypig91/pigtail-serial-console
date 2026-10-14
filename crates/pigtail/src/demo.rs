@@ -1,6 +1,6 @@
 //! Fixed demonstration data, compiled only into demo builds.
 use super::*;
-use serialcore::config::{ExtractMode, TimestampFormat};
+use serialcore::config::{ExtractMode, ExtractRule, TimestampFormat};
 
 impl App {
     pub(super) fn seed_demo(&mut self) -> std::io::Result<()> {
@@ -44,7 +44,7 @@ impl App {
         samples.extend(tail);
         samples.push("[info] Capture complete: 6 samples; total: 90".into());
         samples.push("\x1b[96mdevice 1>\x1b[0m ".into());
-        self.add_demo_console("device 1", samples, true)?;
+        self.add_demo_console("device 1", samples)?;
 
         self.add_demo_console(
             "device 2",
@@ -74,19 +74,52 @@ impl App {
             .into_iter()
             .map(str::to_owned)
             .collect(),
-            false,
         )?;
+        // Two independent charts, comparing both simulated sources.
+        let sources: Vec<_> = self
+            .connections
+            .iter()
+            .map(crate::plots::source_of)
+            .collect();
+        let charts = ["temperature", "humidity"]
+            .into_iter()
+            .map(|name| serialcore::config::SavedPlotChart {
+                id: crate::plots::new_id(),
+                title: name.to_owned(),
+                rules: sources
+                    .iter()
+                    .map(|source| serialcore::config::DeviceExtractRule {
+                        id: crate::plots::new_id(),
+                        source: Some(source.clone()),
+                        extraction: ExtractRule {
+                            mode: ExtractMode::Regex,
+                            prefix: Some("sensor:".into()),
+                            pattern: Some(format!("{name}=(?P<{name}>[\\d.]+)")),
+                            kv_separators: None,
+                        },
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .collect();
+        let saved = serialcore::config::SavedPlotTab {
+            id: crate::plots::new_id(),
+            name: "Environment".into(),
+            charts,
+            follow: false,
+            ..Default::default()
+        };
+        self.plot_tabs.push(crate::plots::PlotTab::new(saved));
+        self.plot_routes_dirty = true;
+        self.resize_plot_history();
+        while self.maintain_plots(Duration::from_secs(1)) {}
         self.active = 0;
         self.next_port_id = 2;
+        self.split_demo_plot(self.plot_tabs[0].saved.id);
         Ok(())
     }
 
-    fn add_demo_console(
-        &mut self,
-        label: &str,
-        lines: Vec<String>,
-        plot: bool,
-    ) -> std::io::Result<()> {
+    fn add_demo_console(&mut self, label: &str, lines: Vec<String>) -> std::io::Result<()> {
         let id = PortId(self.connections.len() as u32);
         let identity = PortIdentity {
             path_fallback: format!("demo:{}", id.0),
@@ -155,25 +188,6 @@ impl App {
                 spans: styled.spans,
                 cursor: styled.cursor.map(|c| c as u32),
             });
-        }
-        if plot {
-            conn.extract_rules.push(ExtractRule {
-                mode: ExtractMode::Kv,
-                prefix: Some("sensor:".into()),
-                pattern: None,
-                kv_separators: None,
-            });
-            conn.extract_dirty = true;
-            conn.maintain_extract();
-            if let Some(humidity) = conn
-                .series
-                .iter_mut()
-                .find(|e| e.series.name() == "humidity")
-            {
-                humidity.own_axis = true;
-            }
-            conn.show_plot = true;
-            conn.plot_fit = true;
         }
         self.tab_order.push(TabId::Connection(id));
         self.connections.push(conn);
@@ -278,10 +292,12 @@ mod tests {
         assert!(!app.config.settings.check_updates);
         let conn = &app.connections[0];
         assert_eq!(conn.state, ConnState::Connected);
-        assert!(conn.show_plot);
-        assert_eq!(conn.series.len(), 2);
-        assert!(conn.series.iter().all(|e| e.series.len() == 90));
-        assert!(conn.series.iter().any(|e| e.own_axis));
+        assert_eq!(app.plot_tabs.len(), 1);
+        assert_eq!(app.plot_tabs[0].charts.len(), 2);
+        assert!(app.plot_tabs[0]
+            .charts
+            .iter()
+            .all(|chart| chart.series.len() == 2 && chart.series[0].series.len() == 90));
         assert!(conn
             .store
             .get(6)

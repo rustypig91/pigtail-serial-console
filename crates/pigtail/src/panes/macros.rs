@@ -21,6 +21,9 @@ impl App {
     /// its port id so switching tabs while it is delayed does not redirect the
     /// remaining commands to a different device.
     pub(crate) fn macro_target_port(&self) -> Option<PortId> {
+        if self.active_plot.is_some() {
+            return None;
+        }
         if self.merged_selected {
             self.merged_tx_port.filter(|id| {
                 self.connections

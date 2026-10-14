@@ -131,15 +131,7 @@ impl App {
             return;
         }
 
-        let active_tab = if self.merged_selected {
-            self.loaded_merged_tab
-                .and_then(|i| self.merged_tabs.get(i))
-                .map(|t| TabId::Merged(t.id))
-        } else {
-            self.connections
-                .get(self.active)
-                .map(|c| TabId::Connection(c.id))
-        };
+        let active_tab = self.selected_tab_id();
         let current = tabs
             .iter()
             .position(|id| Some(*id) == active_tab)
@@ -150,16 +142,7 @@ impl App {
             (current + 1) % tab_count
         };
 
-        match tabs[selected] {
-            TabId::Merged(id) => {
-                let index = self.merged_tabs.iter().position(|t| t.id == id).unwrap();
-                self.select_merged_tab(index);
-            }
-            TabId::Connection(id) => {
-                self.active = self.connections.iter().position(|c| c.id == id).unwrap();
-                self.merged_selected = false;
-            }
-        }
+        self.select_workspace_tab(tabs[selected]);
     }
 
     pub(crate) fn show_merged_dialog(&mut self, ctx: &egui::Context) {
@@ -277,6 +260,10 @@ impl App {
         let mut select_merged = None;
         let mut close_merged = None;
         let mut edit_merged = None;
+        let mut select_plot = None;
+        let mut close_plot = None;
+        let mut edit_plot = None;
+        let mut new_plot = false;
         let mut new_merged = false;
         let mut new_tab = false;
         let mut port_options: Option<usize> = None;
@@ -294,7 +281,8 @@ impl App {
         // the clicks do nothing.
         // A pending close must also block new editors and replacement close
         // requests until the user confirms or cancels its original target.
-        let modal_open = self.merged_dialog.is_some()
+        let modal_open = self.plot_draft.is_some()
+            || self.merged_dialog.is_some()
             || self.tab_close_confirmation.is_some()
             || self.config_dialog.is_some()
             || self.rename_dialog.is_some()
@@ -323,12 +311,9 @@ impl App {
                         let labels: Vec<_> = tabs.iter().map(|id| match id {
                             TabId::Connection(id) => self.connections.iter().find(|c| c.id == *id).unwrap().display_label().to_owned(),
                             TabId::Merged(id) => self.merged_tabs.iter().find(|t| t.id == *id).unwrap().name.clone(),
+                            TabId::Plot(id) => self.plot_tabs.iter().find(|t| t.saved.id == *id).unwrap().saved.name.clone(),
                         }).collect();
-                        let selected_tab = if self.merged_selected {
-                            self.loaded_merged_tab.map(|i| TabId::Merged(self.merged_tabs[i].id))
-                        } else {
-                            self.connections.get(self.active).map(|c| TabId::Connection(c.id))
-                        };
+                        let selected_tab = self.selected_tab_id();
                         // Keep a small window drag area even when tabs fill the
                         // strip. Split workspaces have a separate title bar.
                         let base_reserve = if self.workspace.split.is_some() { 32.0 } else { 145.0 + super::chrome::HEADER_HEIGHT };
@@ -385,7 +370,7 @@ impl App {
                                                     .unwrap();
                                                 let conn = &self.connections[i];
                                                 let selected =
-                                                    !self.merged_selected && self.active == i;
+                                                    !self.merged_selected && self.active_plot.is_none() && self.active == i;
                                                 let display_label = conn.display_label();
                                                 let device_details = if conn.name.is_some() {
                                                     format!("{}\n{}", display_label, conn.label)
@@ -431,6 +416,22 @@ impl App {
                                                         to_close = Some(i);
                                                         ui.close();
                                                     }
+                                                });
+                                            }
+
+                                            TabId::Plot(id) => {
+                                                let tab = self.plot_tabs.iter().find(|t| t.saved.id == id).unwrap();
+                                                let selected = self.active_plot == Some(id);
+                                                let (resp, close, (shape_rect, rect)) = super::chrome::device_tab(ui, &tab.saved.name, selected, egui::Color32::from_rgb(141, 219, 140), self.config.settings.header_opacity);
+                                                if selected { active_tab_rect = rect; active_tab_shape_rect = shape_rect; }
+                                                if close || resp.middle_clicked() { close_plot = Some(id); }
+                                                if !modal_open { reorder = tab_drag(ui, ctx, &resp, tab_id, position).or(reorder); }
+                                                if resp.clicked() { select_plot = Some(id); }
+                                                resp.context_menu(|ui| {
+                                                    super::chrome::menu_style(ui);
+                                                    self.show_tab_layout_menu(ui, tab_id);
+                                                    if ui.button("Options").clicked() { edit_plot = Some(id); ui.close(); }
+                                                    if ui.button("Close tab").clicked() { close_plot = Some(id); ui.close(); }
                                                 });
                                             }
 
@@ -486,11 +487,13 @@ impl App {
                                             format!("{label} — {}", conn.state)
                                         }
                                         TabId::Merged(_) => format!("{label} — merged view"),
+                                        TabId::Plot(_) => format!("{label} — plot"),
                                     };
                                     if ui.selectable_label(selected_tab == Some(*tab_id), text).clicked() {
                                         match tab_id {
                                             TabId::Connection(id) => set_active = self.connections.iter().position(|c| c.id == *id),
                                             TabId::Merged(id) => select_merged = self.merged_tabs.iter().position(|t| t.id == *id),
+                                            TabId::Plot(id) => select_plot = Some(*id),
                                         }
                                         ui.close();
                                     }
@@ -504,6 +507,7 @@ impl App {
                                 new_tab = true;
                                 ui.close();
                             }
+                            if ui.add_enabled(self.plot_tabs.len() < crate::plots::MAX_PLOT_TABS, egui::Button::new("New plot")).clicked() { new_plot = true; ui.close(); }
                             if ui.button("New merged view").clicked() {
                                 new_merged = true;
                                 ui.close();
@@ -609,8 +613,21 @@ impl App {
         ctx.data_mut(|data| data.insert_temp(self.pane_widget_id("header_backdrop"), backdrop));
 
         if let Some(i) = set_active {
+            self.active_plot = None;
             self.active = i;
             self.merged_selected = false;
+        }
+        if let Some(id) = select_plot {
+            self.select_workspace_tab(TabId::Plot(id));
+        }
+        if let Some(id) = close_plot {
+            self.request_close_plot(id);
+        }
+        if let Some(id) = edit_plot {
+            self.edit_plot(id);
+        }
+        if new_plot {
+            self.open_new_plot();
         }
         if let Some(i) = select_merged {
             self.select_merged_tab(i);
@@ -826,7 +843,7 @@ impl App {
                             "Scroll console up / down one page",
                             "Ctrl+Shift+Page Up / Down",
                         ),
-                        ("Toggle plot (connection tabs)", "Ctrl+Shift+P"),
+                        ("Open plot for connection", "Ctrl+Shift+P"),
                         ("Pin console to bottom", "Ctrl+Shift+Space"),
                         (
                             "Log / Hex / ANSI view (connection tabs)",
@@ -922,9 +939,9 @@ impl App {
         self.set_search_visible(self.show_search);
         let long_running_macros =
             self.long_running_macro_indicators(Instant::now(), self.macro_target_port());
+        let mut new_plot = false;
         let mut stop_macro_run = None;
         let mut select_view = None;
-        let mut toggle_plot = false;
         let toolbar_rect = super::workspace::show_panel(
             egui::Panel::top(self.pane_widget_id("console_toolbar"))
                 .default_size(32.0 + 10.0)
@@ -957,17 +974,17 @@ impl App {
                                     true,
                                 );
                             } else if let Some(active) = self.active_index() {
-                                let conn = &self.connections[active];
                                 if super::chrome::action_button(
                                     ui,
                                     super::chrome::ActionIcon::Plot,
-                                    conn.show_plot,
-                                    "Toggle plot · Ctrl+Shift+P",
+                                    false,
+                                    "New plot · Ctrl+Shift+P",
                                 )
                                 .clicked()
                                 {
-                                    toggle_plot = true;
+                                    new_plot = true;
                                 }
+                                let conn = &self.connections[active];
                                 let selected = if conn.screen_view {
                                     2
                                 } else if conn.hex_view {
@@ -1011,10 +1028,10 @@ impl App {
         if let Some(run_index) = stop_macro_run {
             self.stop_macro_run(run_index);
         }
+        if new_plot {
+            self.open_new_plot();
+        }
         if let Some(active) = self.active_index() {
-            if toggle_plot {
-                self.connections[active].show_plot = !self.connections[active].show_plot;
-            }
             if let Some((screen, hex)) = select_view {
                 self.connections[active].screen_view = screen;
                 self.connections[active].hex_view = hex;

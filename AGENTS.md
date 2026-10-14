@@ -21,6 +21,8 @@ changes here instead.
 - `crates/pigtail/src/app.rs` coordinates application state;
   `terminal.rs` handles terminal state and `panes/` contains the UI components.
 - `crates/pigtail/src/demo.rs` implements the hardware-free demo.
+- `crates/pigtail/src/plots.rs` owns device-aware plot tabs, draft previews,
+  source routing, paced extraction/backfill and the shared sample budget.
 - `scripts/` contains native release builds and screenshot capture.
 - `.github/workflows/build.yml` defines platform builds and release publishing.
 - `docs/receive-load-investigation.md` records receive-load analysis.
@@ -238,6 +240,85 @@ application.
 - Startup notice when a newer release is published, with "skip this version" and
   one-click download and update. Startup checks can be switched off in Settings.
 
+### Plot tabs
+
+**+ → New plot** opens a draft with a tab name and one chart. Each extraction
+rule selects one connection and uses key/value pairs (prefix and separators,
+including optional space pairing) or regex with named numeric captures. The
+selector includes unavailable remembered references and shows connection state.
+The paced preview lists matching series and invalid/no-match feedback from
+retained output. Create selects a new tab in the current pane; Cancel creates
+nothing. Empty tabs/charts and unavailable devices are allowed. Tab options and
+chart Settings use Apply/Cancel drafts; cancelling preserves definitions and
+live samples. Controls scroll in small windows, with action buttons outside.
+
+Plot tabs use the same ordering, drag/drop, split/move, middle-click close and
+close confirmation as other tabs. Closing one keeps all serial connections open.
+Plots never implicitly transmit typing, paste, macros or files to a device.
+Each chart has Follow, Fit, Settings, a Series menu for color/visibility/Y2, and
+an overflow menu for move up/down, duplicate and remove. Legend visibility also
+updates the saved series preference. Duplicates get fresh chart/rule IDs. Add chart
+works even after removing the last chart. Vertical dividers preserve relative
+heights; double-click a divider restores equal heights for that pair.
+
+Time axes link within each tab by default. Pan/zoom and Follow share a horizontal
+range; Fit uses the union of visible sample time ranges and each chart's own
+value range. A linked vertical cursor compares measurements. Independent time
+axes give every chart its own navigation and Follow/Fit. Y2 retains the existing
+affine mapping, secondary labels and original-value hover tooltips.
+
+Connections, plots, charts and rules have persistent IDs. Source references also
+retain device identity and a remembered label, but never bind by editable name
+or runtime PortId. Removing a connection preserves its samples and leaves an
+unresolved reference; opening a new identical device requires explicit rebinding.
+Ambiguous references produce warnings and do not select an arbitrary source.
+Series keys include connection ID, rule ID and extracted name, so overlapping
+rules and same-named measurements stay separate. Labels include device and rule.
+Styling survives edits/backfills while the key remains the same.
+
+Extraction runs for inactive tabs, independently of console search, Log/Hex/ANSI,
+and raw capture. It uses finalized receive lines, skips local echo and session
+markers, and rechecks a provisional line when finalized instead of duplicating
+partial values. Retained restored history uses the application's shared clock
+basis, including negative times; capture markers split traces across gaps.
+Each rule keeps at most 64 boundary IDs so history growth can preserve an evicted
+marker; when older provenance is unavailable, replay uses a conservative gap.
+Backfills and draft previews run outside painting in rotating, bounded batches
+with a four-millisecond frame budget and at most 4,000 lines per rule per batch.
+Routes index consumers by source; regexes compile only when definitions change.
+The UI explains that discarded source history cannot be recovered. Growing the
+history limit replays the resident suffix while preserving sparse older samples.
+Clear invalidates all consumers of that source, preserving other sources/styles.
+
+Plot memory shares a one-million-sample ceiling across all charts; the history
+setting still controls each series' requested cap. Each chart allows at most 64
+series, with up to 64 rules, 16 charts per tab and 32 plot tabs. Definitions and
+presentation preferences are saved, including layouts, bounds, time-axis mode,
+source references, styling, pane placement and selection. Saved horizontal bounds
+carry the app clock anchor and rebase at restart so a manual view still shows
+the same historical interval; samples are rebuilt
+from restored source history, never serialized as another raw capture. Legacy
+configs load with no plots. Legacy connection IDs are assigned and saved without
+inventing a migration for extraction rules, which were never persisted. Malformed
+new optional settings fall back individually and emit configuration warnings.
+
+Clicking a sample selects its actual source connection's Log, reveals the line
+and scrolls to its absolute source-line reference. Missing, ambiguous, evicted
+or cleared references show a concise explanation. Log selections mark only charts
+with retained samples from that line, including across split panes.
+
+Plot-tab validation on 2026-10-14 passed formatting, workspace tests with default
+and all features, Clippy for all targets with default and all features, and the
+demo feature check. Regression coverage includes source/rule collisions, partial
+lines, inactive routing, clear/reconnect gaps (including evicted markers during
+history growth), global sample limits, malformed/legacy config, clock rebasing,
+create/cancel/apply, chart duplication/reordering/removal, linked Fit/Follow/pan,
+independent pan, split restore, point navigation and input isolation. Native
+lavapipe/X11 demo inspection verified the two-chart split layout, small windows,
+scrolling draft actions, device selectors, source closure/warnings, dividers,
+shared cursor and selecting Device 2's sample into Device 2's Log pane. Real
+serial reconnection still needs a hardware check; the demo cannot verify it.
+
 ### Saved session history
 
 Captures sharing an app clock anchor are ordered by their first raw record.
@@ -300,9 +381,9 @@ gesture boundaries do not change the size.
 
 Use **Ctrl+Shift+Space** to pin the console to the bottom. On connection tabs,
 **Ctrl+Shift+Q / W / E** selects the **Log / Hex / ANSI** view.
-Use **Ctrl+Shift+P** to toggle the plot on connection tabs.
-The plot panel's **Plot extraction…** button opens extraction settings,
-including when no series have been extracted yet.
+Use **Ctrl+Shift+P** on a connection to select the most recently used plot tab
+referencing it, including in the other split pane. If none exists, open New plot
+with that connection preselected. It does nothing on merged or plot tabs.
 Use **Ctrl+Shift+M** to open the transmit macros window.
 The console right-click menu has no **Toggle plot** or **Toggle hex view** items;
 use the toolbar controls or their keyboard shortcuts.
@@ -487,7 +568,8 @@ cargo run -p pigtail --release --features demo
 
 This special build always opens a 1280 × 900 dark window with generic output
 from “device 1” and “device 2”, colored prompts and sensor labels, and temperature
-and humidity plots.
+and humidity charts in an Environment plot tab in the right pane. The left
+pane contains the simulated connection logs.
 The sample output stays still while you arrange the window and take screenshots.
 Log, ANSI, and hex views use the same sample bytes; switching tabs and exploring
 the display controls works as usual. The connections are simulated and do not

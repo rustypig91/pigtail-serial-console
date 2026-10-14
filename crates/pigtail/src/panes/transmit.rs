@@ -31,6 +31,9 @@ impl App {
     /// only when a live device is selected (directly or as the merged view's
     /// send target) and no widget holds focus. Returns whether input was sent.
     pub(crate) fn console_key_input(&mut self, ctx: &egui::Context, active: usize) -> bool {
+        if self.active_plot.is_some() {
+            return false;
+        }
         let events = ctx.input(|i| i.events.clone());
         if events.is_empty() {
             return false;
