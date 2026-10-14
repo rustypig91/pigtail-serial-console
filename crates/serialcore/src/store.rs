@@ -1,9 +1,11 @@
-//! The line store: a byte arena plus a metadata `Vec`, with front eviction.
+//! The line store: a byte arena plus a metadata deque, with front eviction.
 //!
 //! The store is owned exclusively by the UI thread (spec §5, rule 4). Data
 //! arrives only through channels. Lines are stored as bytes in one arena rather
 //! than one `String` per line — a million `String`s is a million allocations
 //! plus ~48 bytes overhead each (spec §6).
+
+use std::collections::VecDeque;
 
 use crate::clock::Timestamp;
 
@@ -70,7 +72,7 @@ impl ColorSpan {
 /// Metadata for one stored line. The bytes live in the arena.
 #[derive(Clone, Debug)]
 pub struct LineMeta {
-    /// Offset into the arena (already translated for eviction).
+    /// Offset into the arena, rebased only when dead prefix bytes are compacted.
     pub start: u32,
     pub len: u32,
     pub ts: Timestamp,
@@ -133,8 +135,8 @@ fn span_bytes(spans: &smallvec::SmallVec<[ColorSpan; 2]>) -> usize {
 /// to "evicted" (spec §7.7).
 pub struct LineStore {
     arena: Vec<u8>,
-    lines: Vec<LineMeta>,
-    /// Bytes evicted from the front of the arena, for offset translation.
+    lines: VecDeque<LineMeta>,
+    /// Bytes reclaimed from the front of the arena by compaction.
     arena_base: u64,
     /// Lines evicted from the front, for index translation.
     line_base: u64,
@@ -154,7 +156,7 @@ impl LineStore {
     pub fn new(max_lines: usize) -> LineStore {
         LineStore {
             arena: Vec::new(),
-            lines: Vec::new(),
+            lines: VecDeque::new(),
             arena_base: 0,
             line_base: 0,
             max_lines: max_lines.max(1),
@@ -200,7 +202,7 @@ impl LineStore {
     pub fn append(&mut self, line: IncomingLine) -> u64 {
         self.tx_echo_any |= line.flags.contains(LineFlags::TX_ECHO);
         if line.flags.contains(LineFlags::CONTINUATION) {
-            if let Some(last) = self.lines.last_mut() {
+            if let Some(last) = self.lines.back_mut() {
                 if last.flags.contains(LineFlags::PROVISIONAL) {
                     // The provisional line is always the arena's current tail
                     // (nothing else can extend the arena past an open
@@ -234,7 +236,7 @@ impl LineStore {
         self.span_heap_bytes += span_bytes(&line.spans);
         let mut flags = line.flags;
         flags.remove(LineFlags::CONTINUATION);
-        self.lines.push(LineMeta {
+        self.lines.push_back(LineMeta {
             start,
             len: line.text.len() as u32,
             ts: line.ts,
@@ -282,7 +284,7 @@ impl LineStore {
     /// after its provisional was already shown — where the last thing displayed
     /// is still the truest picture of what the device had on screen.
     pub fn finalize_last_provisional(&mut self) {
-        if let Some(last) = self.lines.last_mut() {
+        if let Some(last) = self.lines.back_mut() {
             if last.flags.contains(LineFlags::PROVISIONAL) {
                 last.flags.remove(LineFlags::PROVISIONAL);
                 last.cursor = None;
@@ -318,11 +320,8 @@ impl LineStore {
             return;
         }
         self.max_lines = max_lines;
-        // Evict the whole excess in one pass rather than via maybe_evict's
-        // small fixed chunks: a cap dropped far below a large resident count
-        // (e.g. 1,000,000 -> 10,000) would otherwise take hundreds of
-        // O(remaining-length) drains, turning a single shrink into O(n^2)
-        // work on the UI thread that owns this store.
+        // Discard exactly the excess, including when Settings lowers the cap
+        // far below the current count. Surviving metadata does not move.
         if self.lines.len() > self.max_lines {
             self.evict(self.lines.len() - self.max_lines);
         }
@@ -330,38 +329,34 @@ impl LineStore {
 
     /// Release backing storage no longer needed after lowering the line cap.
     pub fn shrink_to_fit(&mut self) {
+        self.compact_arena();
         self.lines.shrink_to_fit();
         self.arena.shrink_to_fit();
     }
 
-    /// Evict from the front in a ~10% chunk when over capacity. Never one line
-    /// at a time (that would be O(n) per line, spec §7.7). Also evicts on
-    /// arena byte size alone, independent of line count: a stream of
-    /// truncated lines can blow past `MAX_ARENA_BYTES` in far fewer lines
-    /// than `max_lines`, and letting the arena reach `u32::MAX` bytes would
-    /// wrap `LineMeta::start` (issue #5).
+    /// Enforce the line cap exactly. Removing front metadata is cheap; arena
+    /// bytes are reclaimed separately, without discarding extra visible lines.
+    /// Independent byte/metadata budgets still protect unusually large captures.
     fn maybe_evict(&mut self) {
-        let by_lines = if self.lines.len() > self.max_lines {
-            (self.max_lines / 10).max(1).min(self.lines.len())
-        } else {
-            0
-        };
+        self.evict(self.lines.len().saturating_sub(self.max_lines));
 
+        // Dead prefix bytes must not force additional history eviction when
+        // compaction alone brings the physical arena back below its offset cap.
+        if self.arena.len() > MAX_ARENA_BYTES {
+            self.compact_arena();
+        }
         let by_bytes = if self.arena.len() > MAX_ARENA_BYTES {
-            // Evict back down to half the budget rather than just under it,
-            // so this doesn't refire on every single append while a fast
-            // stream keeps the arena hovering near the cap.
-            let target = self.arena.len() - MAX_ARENA_BYTES / 2;
+            let target = self.arena.len() - MAX_ARENA_BYTES;
             self.lines.partition_point(|m| (m.start as usize) < target)
         } else {
             0
         };
 
-        let resident = self.arena.len()
-            + self.lines.len() * std::mem::size_of::<LineMeta>()
-            + self.span_heap_bytes;
+        let live_bytes = self.arena.len() - self.dead_prefix_bytes();
+        let resident =
+            live_bytes + self.lines.len() * std::mem::size_of::<LineMeta>() + self.span_heap_bytes;
         let by_resident = if resident > self.max_resident_bytes {
-            let target = resident - self.max_resident_bytes / 2;
+            let target = resident - self.max_resident_bytes;
             let mut freed = 0;
             self.lines
                 .iter()
@@ -375,42 +370,50 @@ impl LineStore {
         } else {
             0
         };
-        let evict_count = by_lines.max(by_bytes).max(by_resident);
-        if evict_count > 0 {
-            self.evict(evict_count);
+        self.evict(by_bytes.max(by_resident));
+        if self.arena.len() > MAX_ARENA_BYTES {
+            self.compact_arena();
         }
     }
 
-    /// Evict exactly `count` lines from the front (clamped to what's resident)
-    /// in a single arena/metadata compaction.
+    /// Discard exactly `count` oldest lines without moving surviving metadata
+    /// or text on every append. Absolute line identities keep advancing.
     fn evict(&mut self, count: usize) {
         let count = count.min(self.lines.len());
         if count == 0 {
             return;
         }
-
-        // Byte cutoff: start offset of the first line we keep.
-        let byte_cutoff = self
-            .lines
-            .get(count)
-            .map(|m| m.start as usize)
-            .unwrap_or(self.arena.len());
-
-        // Compact the arena.
-        self.arena.drain(..byte_cutoff);
-        self.arena_base += byte_cutoff as u64;
-
-        // Drop metadata and shift offsets.
-        self.span_heap_bytes -= self.lines[..count]
-            .iter()
-            .map(|m| span_bytes(&m.spans))
-            .sum::<usize>();
-        self.lines.drain(..count);
-        for m in &mut self.lines {
-            m.start -= byte_cutoff as u32;
+        for meta in self.lines.drain(..count) {
+            self.span_heap_bytes -= span_bytes(&meta.spans);
         }
         self.line_base += count as u64;
         self.evicted_any = true;
+
+        // Amortize the byte copy and offset updates over a substantial prefix.
+        // This reclaims memory, never additional lines from the visible history.
+        let dead = self.dead_prefix_bytes();
+        let live = self.arena.len() - dead;
+        if dead > 0 && dead >= (live / 10).max(1) {
+            self.compact_arena();
+        }
+    }
+
+    fn dead_prefix_bytes(&self) -> usize {
+        self.lines
+            .front()
+            .map_or(self.arena.len(), |meta| meta.start as usize)
+    }
+
+    fn compact_arena(&mut self) {
+        let cutoff = self.dead_prefix_bytes();
+        if cutoff == 0 {
+            return;
+        }
+        self.arena.drain(..cutoff);
+        self.arena_base += cutoff as u64;
+        for meta in &mut self.lines {
+            meta.start -= cutoff as u32;
+        }
     }
 
     /// Approximate resident memory footprint in bytes.
@@ -486,6 +489,100 @@ mod tests {
         assert_eq!(store.span_heap_bytes, 0);
         store.clear();
         assert_eq!(store.span_heap_bytes, 0);
+    }
+
+    #[test]
+    fn full_store_evicts_only_one_oldest_line_per_append() {
+        let clock = SessionClock::new();
+        for cap in [1, 10, 64, 100] {
+            let mut store = LineStore::new(cap);
+            let mut compactions = 0;
+            for n in 0..500 {
+                let compacted_before = store.arena_base;
+                assert_eq!(store.append(incoming(&format!("line {n}"), &clock)), n);
+                compactions += usize::from(store.arena_base != compacted_before);
+                let expected_len = (n as usize + 1).min(cap);
+                let first = n + 1 - expected_len as u64;
+                assert_eq!(store.len(), expected_len);
+                assert_eq!(store.first_abs_index(), first);
+                assert_eq!(store.next_abs_index(), n + 1);
+                assert!(first == 0 || store.get(first - 1).is_none());
+                for abs in first..=n {
+                    assert_eq!(store.get(abs).unwrap().text, format!("line {abs}"));
+                }
+            }
+            if cap >= 64 {
+                assert!(compactions < (500 - cap) / 2,
+                    "memory compaction should be amortized rather than repeated for each removed line");
+            }
+        }
+    }
+
+    #[test]
+    fn dead_prefix_does_not_evict_extra_lines_at_memory_budgets() {
+        let clock = SessionClock::new();
+        // Logical text fits the arena cap, even when one incoming line pushes
+        // the physical arena over it before the dead prefix is reclaimed.
+        let mut store = LineStore::new(40);
+        let text = "x".repeat(100);
+        for n in 0..200 {
+            store.append(incoming(&text, &clock));
+            assert_eq!(store.len(), (n + 1).min(40));
+            assert!(store.arena.len() <= MAX_ARENA_BYTES);
+            assert_eq!(store.get(n as u64).unwrap().text, text);
+        }
+        // Likewise, dead text must not count towards retained resident memory.
+        let mut store = LineStore::new(40);
+        store.max_resident_bytes = 40 * (std::mem::size_of::<LineMeta>() + 1);
+        for n in 0..200 {
+            store.append(incoming("x", &clock));
+            assert_eq!(store.len(), (n + 1).min(40));
+            assert_eq!(store.get(n as u64).unwrap().text, "x");
+        }
+    }
+
+    #[test]
+    fn continuation_and_clear_after_eviction_keep_indices_text_and_spans() {
+        let clock = SessionClock::new();
+        let mut store = LineStore::new(20);
+        for _ in 0..20 {
+            store.append(incoming("café 東京", &clock));
+        }
+        let mut provisional = incoming("draft", &clock);
+        provisional.flags = LineFlags::PROVISIONAL;
+        let abs = store.append(provisional);
+        assert_eq!(store.first_abs_index(), 1);
+        assert!(store.dead_prefix_bytes() > 0);
+        for text in ["longer café 東京", "", "ready"] {
+            let mut update = incoming(text, &clock);
+            update.flags = LineFlags::PROVISIONAL | LineFlags::CONTINUATION;
+            update.cursor = Some(text.len() as u32);
+            update.spans = (0..16)
+                .map(|_| ColorSpan {
+                    start: 0,
+                    len: 1,
+                    rgb: ColorSpan::NO_COLOR,
+                    bg: ColorSpan::NO_COLOR,
+                    bold: false,
+                })
+                .collect();
+            let expected_heap_bytes = span_bytes(&update.spans);
+            assert_eq!(store.append(update), abs);
+            assert_eq!(store.len(), 20);
+            assert_eq!(store.first_abs_index(), 1);
+            assert_eq!(store.get(abs).unwrap().text, text);
+            assert_eq!(store.get(abs).unwrap().meta.cursor, Some(text.len() as u32));
+            assert_eq!(store.get(1).unwrap().text, "café 東京");
+            assert_eq!(store.span_heap_bytes, expected_heap_bytes);
+        }
+        store.shrink_to_fit();
+        assert_eq!(store.dead_prefix_bytes(), 0);
+        assert_eq!(store.get(abs).unwrap().text, "ready");
+        store.clear();
+        assert_eq!(store.span_heap_bytes, 0);
+        assert_eq!(store.append(incoming("after", &clock)), abs + 1);
+        assert!(store.get(abs).is_none());
+        assert_eq!(store.get(abs + 1).unwrap().text, "after");
     }
 
     #[test]

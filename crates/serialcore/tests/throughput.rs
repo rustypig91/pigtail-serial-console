@@ -30,7 +30,7 @@ fn synthetic_chunk(start: usize, lines: usize) -> Vec<u8> {
 fn throughput_bounded_and_fast() {
     let clock = SessionClock::new();
     let mut framer = Framer::new();
-    let mut store = LineStore::new(200_000);
+    let mut store = LineStore::new(20_000);
     let mut index = FilterIndex::new();
     let (filter, _) = FilterSet::compile(
         &[serialcore::filter::FilterRule {
@@ -74,8 +74,9 @@ fn throughput_bounded_and_fast() {
     }
 
     // Memory bounded: the store never exceeds its cap despite 75k lines pushed.
-    assert!(store.len() <= 200_000);
-    assert!(store.evicted_any() || total_lines <= 200_000);
+    assert_eq!(store.len(), 20_000);
+    assert_eq!(store.first_abs_index(), (total_lines - 20_000) as u64);
+    assert!(store.evicted_any());
 
     // Every filtered index entry still resolves (no dangling references).
     for &abs in index.matching().iter().take(1000) {

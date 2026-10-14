@@ -251,8 +251,12 @@ pub(super) fn paint(
     if clip.intersects(rect) {
         if let Some(pointer) = pointer {
             let cursor = galley.cursor_from_pos(pointer - rect.min);
-            if (primary_pressed || response.double_clicked() || response.triple_clicked())
-                && response.contains_pointer()
+            // Floating scrollbars overlap row bounds. Unlike contains_pointer,
+            // hovered respects the widget owning the click/drag, so a scrollbar
+            // press cannot start a document selection underneath it.
+            if (primary_pressed && response.hovered())
+                || response.double_clicked()
+                || response.triple_clicked()
             {
                 state.pressed_text = true;
                 state.seen_view = true;
