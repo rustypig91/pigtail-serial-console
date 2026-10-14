@@ -170,6 +170,11 @@ application.
   the menu stays open at its original position. Row actions keep the original
   line and connection target, including in merged logs; they do not follow
   whichever row later appears beneath the pointer. This also applies to Hex.
+  Console menu gestures capture the original target from the previous rendered
+  frame on button press and open on release independently of the row widget.
+  Incoming bursts can scroll or evict that row before press processing or between
+  press and release without preventing the menu from opening while pinned.
+  Only visible widget targets are cached; labels are resolved when a press occurs.
   Menus still close on an action, Escape, or an outside click.
 - Optional **ANSI/VT** screen for interactive shells and device menus: cursor
   positioning, erase and redraw operations, scrolling regions, styled/colored

@@ -563,6 +563,22 @@ struct OwnedMenuTarget {
     line: Option<u64>,
 }
 
+// Only visible widgets are remembered, so a press can resolve the previous
+// frame's hit target even when a receive burst already removed that row.
+#[derive(Clone)]
+struct ConsoleMenuHit {
+    widget: egui::Id,
+    target: Option<(Option<PortId>, Option<u64>)>,
+    has_mark: bool,
+    merged_view: bool,
+}
+
+#[derive(Clone, Default)]
+struct ConsoleMenuHits {
+    pass: u64,
+    targets: Vec<ConsoleMenuHit>,
+}
+
 fn queue_console_menu(
     response: &egui::Response,
     id: egui::Id,
@@ -570,7 +586,23 @@ fn queue_console_menu(
     has_mark: bool,
     merged_view: bool,
 ) {
-    if response.secondary_clicked() {
+    let pass = response.ctx.cumulative_pass_nr();
+    response.ctx.data_mut(|data| {
+        let hits = data.get_temp_mut_or_default::<ConsoleMenuHits>(id.with("hit_targets"));
+        if hits.pass != pass {
+            hits.targets.clear();
+            hits.pass = pass;
+        }
+        hits.targets.push(ConsoleMenuHit {
+            widget: response.id,
+            target: target.as_ref().map(|target| (target.port, target.line)),
+            has_mark,
+            merged_view,
+        });
+    });
+    // Mouse gestures are completed by the view using their press target.
+    // Keep widget-driven opening as a fallback, including touch long-presses.
+    if response.secondary_clicked() && !egui::Popup::is_id_open(&response.ctx, id) {
         if let Some(position) = response.ctx.pointer_hover_pos() {
             let state = ConsoleMenuState {
                 position,
@@ -913,6 +945,66 @@ impl App {
         });
         self.pane_widget_id("console_context_menu").with(tab)
     }
+
+    fn begin_console_menu(&self, ctx: &egui::Context) {
+        let id = self.console_menu_id();
+        let press_id = id.with("press_target");
+        let (pressed, released, clicked, down, escape) = ctx.input(|input| {
+            (
+                input.pointer.secondary_pressed(),
+                input.pointer.secondary_released(),
+                input.pointer.secondary_clicked(),
+                input.pointer.secondary_down(),
+                input.key_pressed(egui::Key::Escape),
+            )
+        });
+        let targets = ctx.data_mut(|data| {
+            let hits = data.get_temp_mut_or_default::<ConsoleMenuHits>(id.with("hit_targets"));
+            let previous = pressed.then(|| hits.targets.clone());
+            hits.targets.clear();
+            previous
+        });
+        if let Some(targets) = targets {
+            ctx.data_mut(|data| data.remove::<ConsoleMenuState>(press_id));
+            let hit = targets.into_iter().rev().find(|hit| {
+                ctx.read_response(hit.widget).is_some_and(|response| {
+                    response.enabled()
+                        && (response.is_pointer_button_down_on() || response.secondary_clicked())
+                })
+            });
+            if let (Some(hit), Some(position)) = (hit, ctx.pointer_interact_pos()) {
+                let state = ConsoleMenuState {
+                    position,
+                    target: hit.target.map(|(port, line)| OwnedMenuTarget {
+                        port,
+                        line,
+                        label: port
+                            .and_then(|port| self.connections.iter().find(|conn| conn.id == port))
+                            .map(|conn| conn.display_label().to_owned()),
+                    }),
+                    has_mark: hit.has_mark,
+                    merged_view: hit.merged_view,
+                };
+                ctx.data_mut(|data| data.insert_temp(press_id, state));
+            }
+        }
+        if escape || (!down && !released) {
+            ctx.data_mut(|data| data.remove::<ConsoleMenuState>(press_id));
+        } else if released {
+            let state = ctx.data_mut(|data| {
+                let state = data.get_temp::<ConsoleMenuState>(press_id);
+                data.remove::<ConsoleMenuState>(press_id);
+                state
+            });
+            if clicked {
+                if let Some(state) = state {
+                    ctx.data_mut(|data| data.insert_temp(id, state));
+                    egui::Popup::open_id(ctx, id);
+                }
+            }
+        }
+    }
+
     /// Connection that currently receives keyboard input from the visible
     /// console. The merged pseudo-tab has an explicit device target instead of
     /// falling back to whichever ordinary tab was active last.
@@ -1280,6 +1372,7 @@ impl App {
             style.spacing.item_spacing.x = ROW_GAP;
             let active = self.active.min(self.connections.len().saturating_sub(1));
             self.active = active;
+            self.begin_console_menu(ctx);
 
             // Render a small continuation of scrollback above the viewport,
             // with input still clipped below the controls. Paint it into the
@@ -5542,7 +5635,9 @@ mod tests {
     #[test]
     fn context_menu_survives_incoming_output_and_keeps_its_original_target() {
         for merged in [false, true] {
-            for evict in [false, true] {
+            for (evict, arrive_before_press) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
                 let (mut app, _enum_tx) = test_app("live-context-menu");
                 for id in [PortId(0), PortId(1)] {
                     let mut conn = app.make_connection(
@@ -5627,6 +5722,9 @@ mod tests {
                     pressed,
                     modifiers: egui::Modifiers::NONE,
                 };
+                if arrive_before_press {
+                    append(&mut app, 64, 128);
+                }
                 draw(
                     &mut app,
                     vec![
@@ -5634,6 +5732,11 @@ mod tests {
                         button(point, egui::PointerButton::Secondary, true),
                     ],
                 );
+                // A pinned burst can remove the pressed row before release.
+                // Opening must belong to the console, not that row's widget.
+                if !arrive_before_press {
+                    append(&mut app, 64, 128);
+                }
                 draw(
                     &mut app,
                     vec![button(point, egui::PointerButton::Secondary, false)],
@@ -5643,10 +5746,19 @@ mod tests {
                 let state = ctx
                     .data(|data| data.get_temp::<ConsoleMenuState>(menu_id))
                     .unwrap();
+                assert_eq!(state.position, point);
+                assert!(
+                    if merged {
+                        app.merged_follow
+                    } else {
+                        app.connections[target].follow
+                    },
+                    "opening the menu must not require unpinning"
+                );
                 assert_eq!(state.target.as_ref().unwrap().line, Some(63));
                 assert_eq!(state.target.as_ref().unwrap().port, merged.then_some(port));
                 let mut output = draw(&mut app, vec![]);
-                for start in [64, 164, 264] {
+                for start in [128, 228, 328] {
                     append(&mut app, start, start + 100);
                     output = draw(&mut app, vec![]);
                     assert!(
