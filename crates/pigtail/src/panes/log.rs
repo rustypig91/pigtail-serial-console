@@ -1989,14 +1989,16 @@ impl App {
             };
             (entry < entries).then(|| conn.wrap_index.start_row(entry))
         };
-        restore_log_anchor(
-            ui,
-            "scroll_area",
-            conn.follow,
-            |row| row_of_line(row.abs),
-            row_height,
-            n_rows as f32 * row_height,
-        );
+        if !conn.follow {
+            restore_log_anchor(
+                ui,
+                "scroll_area",
+                selection_view,
+                |row| row_of_line(row.abs),
+                row_height,
+                n_rows as f32 * row_height,
+            );
+        }
         let goto = conn.scroll_to.take();
         let scroll_offset = keyboard_scroll_offset(
             ui,
@@ -2168,6 +2170,7 @@ impl App {
             ui,
             &output,
             &conn.wrap_index,
+            selection_view,
             |entry| SelectionRow {
                 port: conn.id,
                 abs: abs_of(entry),
@@ -2298,26 +2301,28 @@ impl App {
             },
         );
         let n_rows = merged_wrap.total_rows();
-        restore_log_anchor(
-            ui,
-            ("merged_scroll", merged_tab_id),
-            self.merged_follow,
-            |row| {
-                // Timestamp ties are common; identify the original connection
-                // and line rather than a sequence key reassigned by a rebuild.
-                let same = |entry: &MergedEntry| entry.port == row.port && entry.abs == row.abs;
-                let entry = if view.get(row.entry).is_some_and(same) {
-                    row.entry
-                } else {
-                    let start = view.partition_point(|entry| entry.micros < row.micros);
-                    let end = view.partition_point(|entry| entry.micros <= row.micros);
-                    start + view[start..end].iter().position(same)?
-                };
-                Some(merged_wrap.start_row(entry))
-            },
-            row_height,
-            n_rows as f32 * row_height,
-        );
+        if !self.merged_follow {
+            restore_log_anchor(
+                ui,
+                ("merged_scroll", merged_tab_id),
+                selection_view,
+                |row| {
+                    // Timestamp ties are common; identify the original connection
+                    // and line rather than a sequence key reassigned by a rebuild.
+                    let same = |entry: &MergedEntry| entry.port == row.port && entry.abs == row.abs;
+                    let entry = if view.get(row.entry).is_some_and(same) {
+                        row.entry
+                    } else {
+                        let start = view.partition_point(|entry| entry.micros < row.micros);
+                        let end = view.partition_point(|entry| entry.micros <= row.micros);
+                        start + view[start..end].iter().position(same)?
+                    };
+                    Some(merged_wrap.start_row(entry))
+                },
+                row_height,
+                n_rows as f32 * row_height,
+            );
+        }
         let scroll_offset = keyboard_scroll_offset(
             ui,
             ("merged_scroll", merged_tab_id),
@@ -2474,6 +2479,7 @@ impl App {
             ui,
             &output,
             merged_wrap,
+            selection_view,
             |entry| SelectionRow {
                 port: view[entry].port,
                 abs: view[entry].abs,
@@ -2499,6 +2505,13 @@ impl App {
     }
 
     fn show_hex_rows(&mut self, ui: &mut egui::Ui, active: usize) {
+        // Hex shares the connection scroll area but has no Log line anchor.
+        // Its scrolling must not later be corrected using a stale Log position.
+        let anchor_id = ui
+            .make_persistent_id(egui::IdSalt::new("scroll_area"))
+            .with("line_anchor");
+        ui.ctx()
+            .data_mut(|data| data.remove::<LogScrollAnchor>(anchor_id));
         let menu_id = self.console_menu_id();
         if self.show_search {
             self.connections[active].maintain_hex_search();
@@ -3300,6 +3313,7 @@ fn export_menu(ui: &mut egui::Ui, menu: &mut MenuAction) {
 // and split panes each keep their own place without persisting it across runs.
 #[derive(Clone)]
 struct LogScrollAnchor {
+    view: egui::Id,
     start_row: u64,
     top: SelectionRow,
     within_line: f32,
@@ -3308,14 +3322,11 @@ struct LogScrollAnchor {
 fn restore_log_anchor(
     ui: &egui::Ui,
     salt: impl egui::AsId,
-    follow: bool,
+    view: egui::Id,
     row_of: impl FnOnce(SelectionRow) -> Option<u64>,
     row_height: f32,
     content_height: f32,
 ) {
-    if follow {
-        return;
-    }
     let id = ui.make_persistent_id(egui::IdSalt::new(salt));
     let Some(anchor) = ui
         .ctx()
@@ -3323,6 +3334,11 @@ fn restore_log_anchor(
     else {
         return;
     };
+    // Connection tabs share the scroll area. An anchor from another tab
+    // cannot identify a line in this view, even if absolute indices coincide.
+    if anchor.view != view {
+        return;
+    }
     let row = row_of(anchor.top);
     if row == Some(anchor.start_row) {
         return;
@@ -3343,6 +3359,7 @@ fn remember_log_anchor(
     ui: &egui::Ui,
     output: &egui::scroll_area::ScrollAreaOutput<()>,
     wrap: &crate::wrap::WrapIndex,
+    view: egui::Id,
     row_at: impl Fn(usize) -> SelectionRow,
     row_height: f32,
 ) {
@@ -3354,6 +3371,7 @@ fn remember_log_anchor(
     let top_row = output.state.offset.y / row_height;
     let entry = wrap.entry_at_row(top_row.floor().max(0.0) as u64);
     let anchor = LogScrollAnchor {
+        view,
         start_row: wrap.start_row(entry),
         top: row_at(entry),
         within_line: top_row - wrap.start_row(entry) as f32,
@@ -5276,6 +5294,81 @@ mod tests {
             let output = draw(&mut app, vec![button(text_end, false), egui::Event::Copy]);
             assert!(!copied_text(&output.platform_output).is_empty());
         }
+    }
+
+    #[test]
+    fn log_anchors_do_not_cross_connection_tabs_or_hex_views() {
+        let (mut app, _enum_tx) = test_app("scroll-anchor-view-identity");
+        for port in [PortId(0), PortId(1)] {
+            let mut conn = app.make_connection(
+                port,
+                "probe".into(),
+                Default::default(),
+                Default::default(),
+                inert_handle(port),
+            );
+            conn.store = LineStore::new(100);
+            conn.follow = false;
+            // The tabs have overlapping absolute indices but different first
+            // retained lines. Reusing the first tab's anchor would jump up.
+            for i in 0..(100 + port.0 * 10) {
+                conn.store.append(IncomingLine {
+                    text: format!("line {i}"),
+                    ts: ts(i as i64),
+                    port,
+                    flags: LineFlags::default(),
+                    spans: Default::default(),
+                    cursor: None,
+                });
+            }
+            app.connections.push(conn);
+        }
+        app.config.settings.timestamp_format = TimestampFormat::None;
+        let ctx = egui::Context::default();
+        let draw = |app: &mut App, active, hex, initial_offset| {
+            let mut offset = 0.0;
+            let _ = ctx.run_test_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600.0, 300.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let id = ui.make_persistent_id(egui::IdSalt::new("scroll_area"));
+                        if let Some(offset) = initial_offset {
+                            let mut state =
+                                egui::scroll_area::State::load(&ctx, id).unwrap_or_default();
+                            state.offset.y = offset;
+                            state.store(&ctx, id);
+                        }
+                        if hex {
+                            app.show_hex_rows(ui, active);
+                            assert!(ctx
+                                .data(
+                                    |data| data.get_temp::<LogScrollAnchor>(id.with("line_anchor"))
+                                )
+                                .is_none());
+                        } else {
+                            app.show_single_rows(ui, active);
+                        }
+                        offset = egui::scroll_area::State::load(&ctx, id).unwrap().offset.y;
+                    });
+                },
+            );
+            offset
+        };
+        draw(&mut app, 0, false, None);
+        assert_eq!(draw(&mut app, 0, false, Some(250.5)), 250.5);
+        assert_eq!(draw(&mut app, 1, false, None), 250.5);
+        assert_eq!(draw(&mut app, 0, false, None), 250.5);
+        draw(&mut app, 0, true, None);
+        // History can advance while Hex is selected. Returning to Log must
+        // use the scroll state rather than a pre-Hex line anchor.
+        app.connections[0].store.set_max_lines(80);
+        assert_eq!(draw(&mut app, 0, false, Some(250.5)), 250.5);
     }
 
     #[test]

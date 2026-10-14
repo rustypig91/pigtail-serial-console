@@ -143,8 +143,11 @@ application.
   retain the same top visible line and its wrapped-row/fractional position when
   older displayed lines are evicted. Once that line is evicted, the view stays
   at the top of the remaining history as further lines are discarded. Eviction
-  alone never re-enables Pin. At the configured line limit, each new Log
-  line discards only the oldest excess line; retention no longer drops 10% in
+  alone never re-enables Pin. Log scroll anchors belong to the rendered view;
+  switching connection tabs cannot interpret another connection's line identity.
+  Hex invalidates the shared scroll area's Log anchor, so returning to Log does
+  not apply a position saved before scrolling in Hex. At the configured line limit,
+  each new Log line discards only the oldest excess line; retention no longer drops 10% in
   one batch. Metadata uses a deque and discarded text is compacted periodically,
   independently of logical eviction. Separate text/metadata memory limits may
   discard additional oldest lines when unusually large output exceeds those
