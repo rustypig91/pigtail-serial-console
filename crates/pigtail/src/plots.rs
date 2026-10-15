@@ -869,12 +869,10 @@ impl App {
                     conn.selected = Some(line);
                     conn.scroll_to = Some(line);
                     conn.follow = false;
-                    // A filtered Log must reveal the actual source line.
-                    conn.search_filter_suspended = true;
-                    conn.filter_dirty = true;
                     let port = conn.id;
                     self.select_workspace_tab(TabId::Connection(port));
-                    self.show_search = false;
+                    // A filtered Log must reveal the actual source line.
+                    self.set_search_visible(false);
                     self.save_session();
                     return;
                 }

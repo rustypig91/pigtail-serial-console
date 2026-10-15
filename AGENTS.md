@@ -309,6 +309,9 @@ Clicking a sample selects its actual source connection's Log, reveals the line
 and scrolls to its absolute source-line reference. Missing, ambiguous, evicted
 or cleared references show a concise explanation. Log selections mark only charts
 with retained samples from that line, including across split panes.
+Sample navigation across split panes runs after both panes finish rendering,
+closing the destination's search so its remembered filter cannot hide the line.
+The query and selected search display mode remain available when search reopens.
 
 Plot-tab validation on 2026-10-14 passed formatting, workspace tests with default
 and all features, Clippy for all targets with default and all features, and the
@@ -321,6 +324,11 @@ lavapipe/X11 demo inspection verified the two-chart split layout, small windows,
 scrolling draft actions, device selectors, source closure/warnings, dividers,
 shared cursor and selecting Device 2's sample into Device 2's Log pane. Real
 serial reconnection still needs a hardware check; the demo cannot verify it.
+The 2026-10-15 review added rendered-frame regression coverage for clicking a
+sample with an active filter in the destination Log, with the plot in either
+pane and both split orientations. Formatting, workspace tests and Clippy with
+default/all features, and the demo feature check passed. Native demo inspection
+was unavailable in that review environment because display tools were absent.
 
 ### Saved session history
 

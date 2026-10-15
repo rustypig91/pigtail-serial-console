@@ -440,7 +440,7 @@ impl App {
             self.edit_plot(id);
         }
         if let Some((source, line)) = navigate {
-            self.navigate_plot_sample(source, line);
+            self.request_plot_sample_navigation(source, line);
         }
     }
 }

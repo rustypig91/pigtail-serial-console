@@ -27,6 +27,10 @@ enum LayoutAction {
         boundary: usize,
     },
     Join,
+    NavigatePlotSample {
+        source: u64,
+        line: u64,
+    },
 }
 
 pub(crate) struct Workspace {
@@ -283,6 +287,16 @@ impl App {
         if let TabId::Plot(id) = id {
             self.plot_recent.retain(|old| *old != id);
             self.plot_recent.push(id);
+        }
+    }
+
+    pub(crate) fn request_plot_sample_navigation(&mut self, source: u64, line: u64) {
+        if self.workspace.rendering.is_some() {
+            // Switching panes during painting would let the current pane's
+            // save/load cycle overwrite the destination's search visibility.
+            self.workspace.pending = Some(LayoutAction::NavigatePlotSample { source, line });
+        } else {
+            self.navigate_plot_sample(source, line);
         }
     }
 
@@ -547,6 +561,9 @@ impl App {
                 self.load_pane(pane);
             }
             LayoutAction::Join => self.workspace.split = None,
+            LayoutAction::NavigatePlotSample { source, line } => {
+                self.navigate_plot_sample(source, line);
+            }
         }
         self.reconcile_workspace();
         self.persist_workspace();
@@ -1797,6 +1814,66 @@ mod tests {
             });
         }
     }
+    #[test]
+    fn clicking_a_plot_sample_in_a_split_reveals_a_filtered_source_log() {
+        for direction in [SplitDirection::Right, SplitDirection::Below] {
+            for plot_pane in [0, 1] {
+                let (mut app, _tx) = test_app("split-plot-filtered-navigation");
+                add_connection(&mut app, 1);
+                append(&mut app, 0, "temp:23.4");
+                app.connections[0].search_query = "excluded".into();
+                app.connections[0].search_filter = crate::app::SearchFilter::OnlyMatches;
+                app.open_new_plot();
+                let draft = app.plot_draft.take().unwrap();
+                let id = draft.definition.id;
+                let chart_id = draft.definition.charts[0].id;
+                app.apply_plot_draft(draft);
+                app.maintain_plots(std::time::Duration::from_secs(1));
+                app.apply_layout_action(LayoutAction::Split(
+                    if plot_pane == 1 {
+                        TabId::Plot(id)
+                    } else {
+                        TabId::Connection(PortId(1))
+                    },
+                    direction,
+                ));
+                app.select_workspace_tab(TabId::Connection(PortId(1)));
+                app.set_search_visible(true);
+                app.select_workspace_tab(TabId::Plot(id));
+                let ctx = egui::Context::default();
+                let size = egui::vec2(1200.0, 700.0);
+                frame(&mut app, &ctx, size, vec![]);
+                frame(&mut app, &ctx, size, vec![]);
+                assert!(app.workspace.panes[1 - plot_pane].show_search);
+                assert!(app.connections[0].filter_index_active());
+                let position =
+                    egui_plot::PlotMemory::load(&ctx, egui::Id::new(("chart", chart_id)))
+                        .unwrap()
+                        .transform()
+                        .frame()
+                        .center();
+                frame(
+                    &mut app,
+                    &ctx,
+                    size,
+                    vec![egui::Event::PointerMoved(position), pointer(position, true)],
+                );
+                frame(&mut app, &ctx, size, vec![pointer(position, false)]);
+                assert_eq!(app.selected_tab_id(), Some(TabId::Connection(PortId(1))));
+                assert_eq!(app.workspace.focused, 1 - plot_pane);
+                assert!(!app.show_search);
+                frame(&mut app, &ctx, size, vec![]);
+                assert!(!app.connections[0].filter_index_active());
+                assert_eq!(app.connections[0].selected, Some(0));
+                assert_eq!(app.connections[0].search_query, "excluded");
+                assert_eq!(
+                    app.connections[0].search_filter,
+                    crate::app::SearchFilter::OnlyMatches
+                );
+            }
+        }
+    }
+
     #[test]
     fn plot_tabs_roundtrip_split_placement_and_never_transmit_from_the_focused_plot() {
         let (mut app, _tx) = test_app("split-plot-persistence");
