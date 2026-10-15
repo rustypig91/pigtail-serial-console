@@ -280,9 +280,6 @@ impl PlotChart {
             let color = style
                 .and_then(|s| egui::Color32::from_hex(&s.color).ok())
                 .unwrap_or(SERIES_PALETTE[self.series.len() % SERIES_PALETTE.len()]);
-            if self.series.is_empty() {
-                self.fit = true;
-            }
             self.series.push(SeriesEntry {
                 series: Series::new(label, capacity),
                 color,
@@ -359,7 +356,15 @@ impl PlotChart {
                 continue;
             };
             if line.meta.flags.contains(LineFlags::PROVISIONAL) {
-                break;
+                // Only the tail can still be replaced by a continuation. Local
+                // echo can strand an earlier provisional line in the store;
+                // skip that partial value without stalling all later output.
+                if next + 1 == conn.store.next_abs_index() {
+                    break;
+                }
+                next += 1;
+                count += 1;
+                continue;
             }
             if line.meta.flags.contains(LineFlags::RECONNECT_MARKER) {
                 self.rules[r].mark_boundary(next + 1);
@@ -392,10 +397,10 @@ impl PlotChart {
         }
         self.rules[r].next = Some(next);
         next < conn.store.next_abs_index()
-            && conn
-                .store
-                .get(next)
-                .is_some_and(|line| !line.meta.flags.contains(LineFlags::PROVISIONAL))
+            && conn.store.get(next).is_some_and(|line| {
+                !line.meta.flags.contains(LineFlags::PROVISIONAL)
+                    || next + 1 < conn.store.next_abs_index()
+            })
     }
 }
 
@@ -1048,6 +1053,75 @@ mod tests {
         assert_eq!(series.len(), 1);
         assert_eq!(series.last().unwrap().value, 23.4);
         assert_eq!(series.last().unwrap().line, 0);
+    }
+
+    #[test]
+    fn local_echo_after_a_partial_line_does_not_block_later_samples() {
+        let (mut app, _tx) = test_app("plot-partial-before-echo");
+        connection(&mut app, 1, 11, "Device");
+        let rules = vec![rule(&app.connections[0], 101)];
+        plot(&mut app, rules);
+        line(&mut app, 0, "noise", -1, LineFlags::default());
+        line(&mut app, 0, "temp:2", 0, LineFlags::PROVISIONAL);
+        settle(&mut app);
+        line(&mut app, 0, "command", 1, LineFlags::TX_ECHO);
+        let target = line(&mut app, 0, "temp:23.4", 2, LineFlags::CONTINUATION);
+        // A batch ending immediately before a stranded partial still has work.
+        app.plot_tabs[0].charts[0].rules[0].next = None;
+        line(&mut app, 0, "temp:24", 3, LineFlags::PROVISIONAL);
+        assert!(app.plot_tabs[0].charts[0].update_rule(0, &app.connections[0], 1, Instant::now(),));
+        settle(&mut app);
+        let chart = &app.plot_tabs[0].charts[0];
+        assert_eq!(chart.series.len(), 1);
+        let series = &chart.series[0].series;
+        assert_eq!(series.len(), 1);
+        assert_eq!(series.last().unwrap().value, 23.4);
+        assert_eq!(series.last().unwrap().line, target);
+    }
+
+    #[test]
+    fn restored_manual_chart_bounds_survive_sample_backfill() {
+        for independent in [false, true] {
+            let (mut app, _tx) = test_app("plot-restored-chart-bounds");
+            connection(&mut app, 1, 11, "Device");
+            let expected = ["-20", "-50", "-10", "50"].map(str::to_owned);
+            app.config.plots = vec![SavedPlotTab {
+                id: 5001,
+                follow: false,
+                independent_time_axes: independent,
+                time_range: Some(["-20".into(), "-10".into()]),
+                charts: vec![SavedPlotChart {
+                    id: 5002,
+                    follow: false,
+                    bounds: Some(expected.clone()),
+                    rules: vec![rule(&app.connections[0], 101)],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }];
+            app.restore_plots();
+            app.select_plot(5001);
+            let ctx = egui::Context::default();
+            let render = |app: &mut App| {
+                ctx.run_test_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1000.0, 800.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| app.show_plot_tab(ui),
+                );
+            };
+            // A restored device may remain unavailable until after the first paint.
+            render(&mut app);
+            line(&mut app, 0, "temp:23.4", -15_000_000, LineFlags::default());
+            settle(&mut app);
+            render(&mut app);
+            render(&mut app);
+            assert_eq!(app.plot_tabs[0].charts[0].saved.bounds, Some(expected));
+        }
     }
 
     #[test]

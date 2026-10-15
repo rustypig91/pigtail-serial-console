@@ -279,7 +279,9 @@ Styling survives edits/backfills while the key remains the same.
 Extraction runs for inactive tabs, independently of console search, Log/Hex/ANSI,
 and raw capture. It uses finalized receive lines, skips local echo and session
 markers, and rechecks a provisional line when finalized instead of duplicating
-partial values. Retained restored history uses the application's shared clock
+partial values. A partial line stranded before local echo is skipped so it cannot
+block later samples; only the provisional tail waits for completion.
+Retained restored history uses the application's shared clock
 basis, including negative times; capture markers split traces across gaps.
 Each rule keeps at most 64 boundary IDs so history growth can preserve an evicted
 marker; when older provenance is unavailable, replay uses a conservative gap.
@@ -296,7 +298,8 @@ series, with up to 64 rules, 16 charts per tab and 32 plot tabs. Definitions and
 presentation preferences are saved, including layouts, bounds, time-axis mode,
 source references, styling, pane placement and selection. Saved horizontal bounds
 carry the app clock anchor and rebase at restart so a manual view still shows
-the same historical interval; samples are rebuilt
+the same historical interval. Backfill preserves saved manual chart bounds;
+new empty charts defer their initial Fit until samples arrive. Samples are rebuilt
 from restored source history, never serialized as another raw capture. Legacy
 configs load with no plots. Legacy connection IDs are assigned and saved without
 inventing a migration for extraction rules, which were never persisted. Malformed

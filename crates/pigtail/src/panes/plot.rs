@@ -476,7 +476,9 @@ fn draw_chart(
         Some(sec) => axis_map(group_range(&chart.series, false).or(Some(sec)), Some(sec)),
         None => AxisMap::IDENTITY,
     };
-    let fit = (std::mem::take(&mut chart.fit) || fit_shared)
+    // Keep an empty chart's initial Fit pending until there are samples. A
+    // restored manual view has no pending Fit and must survive backfill.
+    let fit = (!chart.series.is_empty() && (std::mem::take(&mut chart.fit) || fit_shared))
         .then(|| fit_bounds(&chart.series, map))
         .flatten();
     let plot_id = egui::Id::new(("chart", chart.saved.id));
@@ -1062,6 +1064,21 @@ mod tests {
             pressed,
             modifiers: egui::Modifiers::NONE,
         }
+    }
+
+    #[test]
+    fn an_empty_chart_keeps_its_initial_fit_until_samples_arrive() {
+        let mut app = chart_app();
+        app.plot_tabs[0].charts.truncate(1);
+        app.plot_tabs[0].charts[0].series.clear();
+        let ctx = egui::Context::default();
+        chart_frame(&mut app, &ctx, vec![]);
+        chart_frame(&mut app, &ctx, vec![]);
+        app.plot_tabs[0].charts[0].series = vec![entry(true, &[(20.0, 23.4)])];
+        chart_frame(&mut app, &ctx, vec![]);
+        let actual = bounds(&ctx, 1001);
+        assert!(actual.min()[0] < 20.0 && actual.max()[0] > 20.0);
+        assert!(actual.min()[1] < 23.4 && actual.max()[1] > 23.4);
     }
 
     #[test]
