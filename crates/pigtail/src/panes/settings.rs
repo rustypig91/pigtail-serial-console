@@ -5,6 +5,7 @@ use serialcore::config::{MAX_CONSOLE_FONT_SIZE, MIN_CONSOLE_FONT_SIZE};
 
 impl App {
     pub(crate) fn show_settings_window(&mut self, ctx: &egui::Context) {
+        let previous_font = self.config.settings.console_font.clone();
         let defaults = serialcore::config::Settings::default();
         let mut open = self.show_settings;
         let mut changed = false;
@@ -72,6 +73,24 @@ impl App {
                             self.config.settings.header_opacity = (opacity * 255.0 / 100.0).round() as u8;
                             changed = true;
                         }
+                        ui.end_row();
+
+                        changed |= reset_setting(ui, "Text font", "Choose the monospace font for Log, Hex, ANSI/VT and text editors. Applies to every connection and pane.", &mut self.config.settings.console_font, defaults.console_font);
+                        let selected_font = &self.config.settings.console_font;
+                        let font_label = if selected_font != "Hack" && !self.fonts.families().contains(selected_font) {
+                            format!("{selected_font} (using Hack)")
+                        } else {
+                            selected_font.clone()
+                        };
+                        egui::ComboBox::from_id_salt("console_font")
+                            .width(190.0)
+                            .wrap_mode(egui::TextWrapMode::Truncate)
+                            .selected_text(font_label)
+                            .show_ui(ui, |ui| {
+                                for font in std::iter::once("Hack").chain(self.fonts.families().iter().map(String::as_str)) {
+                                    changed |= ui.selectable_value(&mut self.config.settings.console_font, font.to_owned(), font).changed();
+                                }
+                            }).response.on_hover_text("Hack is built in. Other choices are installed monospace fonts. Restart to discover newly installed fonts. Missing fonts use Hack.");
                         ui.end_row();
 
                         changed |= reset_setting(ui, "Console text size", "Set the size of console text in points. You can also hold Ctrl and scroll over the console to adjust it.", &mut self.config.settings.console_font_size, defaults.console_font_size);
@@ -235,6 +254,9 @@ impl App {
         if !history_limit_editing || !open {
             self.request_session_cleanup();
         }
+        if self.config.settings.console_font != previous_font {
+            ctx.set_fonts(self.fonts.definitions(&self.config.settings.console_font));
+        }
         if changed {
             ctx.request_repaint();
             self.write_config();
@@ -383,6 +405,95 @@ fn format_bytes(bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use crate::app::tests::test_app;
+
+    #[test]
+    fn font_picker_applies_and_saves_the_selected_typeface() {
+        use crate::test_ui::ContextTestExt as _;
+        let (mut app, _tx) = test_app("font-picker");
+        app.show_settings = true;
+        let ctx = egui::Context::default();
+        app.fonts = crate::fonts::tests::fixture();
+        ctx.set_fonts(app.fonts.definitions("Hack"));
+        let draw = |app: &mut crate::app::App, events| {
+            ctx.run_test_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    app.show_settings_window(ui.ctx());
+                },
+            )
+        };
+        let text_center = |output: &egui::FullOutput, label: &str| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                        (text.galley.text() == label && shape.clip_rect.contains_rect(rect))
+                            .then_some(rect.center())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| panic!("missing visible label {label}"))
+        };
+        let click = |app: &mut crate::app::App, pos| {
+            let _ = draw(
+                app,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+            draw(
+                app,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                }],
+            )
+        };
+        let _ = draw(&mut app, vec![]);
+        let mut output = draw(&mut app, vec![]);
+        for selected in ["Test Mono", "Hack"] {
+            let pos = text_center(&output, app.config.settings.console_font.as_str());
+            let _ = click(&mut app, pos);
+            output = draw(&mut app, vec![]);
+            let pos = text_center(&output, selected);
+            let _ = click(&mut app, pos);
+            output = draw(&mut app, vec![]);
+            assert_eq!(app.config.settings.console_font, selected);
+            let saved = app.config.to_toml().unwrap();
+            assert_eq!(
+                serialcore::config::Config::from_toml(&saved)
+                    .unwrap()
+                    .settings
+                    .console_font,
+                selected
+            );
+            // The settings change must update egui's live fonts, not just config.
+            assert_eq!(
+                ctx.fonts_mut(
+                    |fonts| fonts.definitions().families[&egui::FontFamily::Monospace][0].clone()
+                ),
+                if selected == "Hack" {
+                    "Hack"
+                } else {
+                    "system_console"
+                }
+            );
+        }
+    }
 
     #[test]
     fn reset_all_restores_settings() {

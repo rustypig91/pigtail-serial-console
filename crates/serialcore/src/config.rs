@@ -396,6 +396,12 @@ pub struct Settings {
         skip_serializing_if = "is_default_max_lines"
     )]
     pub max_lines: usize,
+    /// Installed monospace family name, or the built-in Hack font.
+    #[serde(
+        default = "default_console_font",
+        skip_serializing_if = "is_default_console_font"
+    )]
+    pub console_font: String,
     /// Point size of the console's monospace text (see the bounds above).
     #[serde(
         default = "default_console_font_size",
@@ -431,6 +437,14 @@ pub struct Settings {
     /// something newer than this is published.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped_version: Option<String>,
+}
+
+fn default_console_font() -> String {
+    "Hack".into()
+}
+
+fn is_default_console_font(value: &String) -> bool {
+    *value == default_console_font()
 }
 
 /// Base palette, independent of the light/dark theme.
@@ -482,6 +496,7 @@ impl Default for Settings {
             vt_scrollback_rows: default_vt_scrollback_rows(),
             confirm_tab_close: true,
             max_lines: default_max_lines(),
+            console_font: default_console_font(),
             console_font_size: default_console_font_size(),
             header_opacity: default_header_opacity(),
             wrap_lines: true,
@@ -1439,6 +1454,32 @@ enabled = true
             };
             let restored: Settings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
             assert_eq!(restored.header_opacity, opacity);
+        }
+    }
+
+    #[test]
+    fn console_fonts_round_trip_and_invalid_choices_preserve_other_settings() {
+        assert_eq!(Config::from_toml("").unwrap().settings.console_font, "Hack");
+        for font in ["Hack", "Some Installed Mono"] {
+            let config = Config {
+                settings: Settings {
+                    console_font: font.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let saved = config.to_toml().unwrap();
+            assert_eq!(Config::from_toml(&saved).unwrap(), config);
+            assert_eq!(saved.contains("console_font"), font != "Hack");
+        }
+        for invalid in ["123", "[]"] {
+            let config = Config::from_toml(&format!(
+                "[settings]\nconsole_font = {invalid}\nconsole_font_size = 20\nwrap_lines = false"
+            ))
+            .unwrap();
+            assert_eq!(config.settings.console_font, "Hack");
+            assert_eq!(config.settings.console_font_size, 20);
+            assert!(!config.settings.wrap_lines);
         }
     }
 

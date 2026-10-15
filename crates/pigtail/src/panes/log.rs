@@ -1882,14 +1882,19 @@ impl App {
         // Bring the row index up to date before anything asks how tall the
         // content is or which line a row belongs to.
         self.connections[active].sync_wrap(m.cols);
-        // A change of column count or text size moves every row: the same pixel
+        // A change of columns, text size or font moves every row: the same pixel
         // offset now lands on a different line. Noting it here is what lets the
         // view be re-pinned to the line the reader was looking at, below.
-        let layout = (m.cols, self.config.settings.console_font_size);
+        let layout = (
+            m.cols,
+            self.config.settings.console_font_size,
+            self.config.settings.console_font.clone(),
+        );
         let relayout = self.connections[active]
             .console_layout
-            .replace(layout)
-            .is_some_and(|prev| prev != layout);
+            .as_ref()
+            .is_some_and(|prev| *prev != layout);
+        self.connections[active].console_layout = Some(layout);
 
         let App {
             connections,

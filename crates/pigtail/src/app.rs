@@ -168,7 +168,7 @@ pub fn load_config(paths: &AppPaths) -> Config {
 /// symbols that its proportional Ubuntu font does not (including ↑ and ↓).
 /// Reuse it as the final proportional fallback instead of bundling a second
 /// copy of another font solely for those glyphs.
-fn app_font_definitions() -> egui::FontDefinitions {
+pub(crate) fn app_font_definitions() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
     if fonts.font_data.contains_key("Hack") {
         let proportional = fonts
@@ -469,9 +469,9 @@ pub struct Connection {
     /// to it is what keeps the reader's place when the rows underneath change
     /// height — a text-size change, a window resize.
     pub top_line: Option<u64>,
-    /// Console columns and text size the view was last laid out with; `None`
+    /// Console columns, text size and font last used for layout; `None`
     /// until it has been drawn once. A change means every row moved.
-    pub console_layout: Option<(usize, u8)>,
+    pub console_layout: Option<(usize, u8, String)>,
     /// Bounded ring of raw bytes for hex view.
     pub raw_ring: VecDeque<u8>,
     /// Current cap for `raw_ring`, derived from the global history setting.
@@ -1530,6 +1530,8 @@ pub struct App {
     /// running app, so opening another file is convenient without turning a
     /// one-off transfer setting into a persistent preference.
     pub file_transfer_options: Option<TransferOptions>,
+    /// Shared installed-font metadata, scanned once per process.
+    pub(crate) fonts: std::sync::Arc<crate::fonts::SystemFonts>,
     /// Console text size to flash over the middle of the window, and the time
     /// it was set. Ctrl+wheel has nothing else to show for itself: the change
     /// it makes is legible only if you already know what you are looking for.
@@ -1636,6 +1638,7 @@ impl App {
             update_dialog: None,
             file_transfer_dialog: None,
             file_transfer_options: None,
+            fonts: crate::fonts::system_fonts(),
             font_toast: None,
             macro_runs: Vec::new(),
             connect_errors: VecDeque::new(),
@@ -1696,7 +1699,8 @@ impl App {
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>, paths: AppPaths, config: Config) -> App {
-        cc.egui_ctx.set_fonts(app_font_definitions());
+        cc.egui_ctx
+            .set_fonts(crate::fonts::system_fonts().definitions(&config.settings.console_font));
         cc.egui_ctx
             .global_style_mut(|style| style.spacing.menu_margin = egui::Margin::same(8));
 
