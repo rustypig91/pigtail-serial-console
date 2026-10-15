@@ -69,6 +69,7 @@ pub(crate) struct RuleState {
     boundaries: VecDeque<u64>,
     boundaries_dropped: bool,
     clear_generation: Option<u64>,
+    example: Option<PlotExample>,
 }
 impl RuleState {
     fn boundary_at(&self, first: u64) -> u64 {
@@ -120,6 +121,7 @@ impl RuleState {
             boundaries: VecDeque::new(),
             boundaries_dropped: false,
             clear_generation: None,
+            example: None,
         }
     }
 }
@@ -135,6 +137,7 @@ pub(crate) struct PlotChart {
     pub fit: bool,
     pub limited: bool,
     pub history_unavailable: bool,
+    preview: bool,
 }
 impl PlotChart {
     pub fn new(saved: SavedPlotChart) -> Self {
@@ -151,6 +154,7 @@ impl PlotChart {
             fit,
             limited: false,
             history_unavailable: false,
+            preview: false,
         }
     }
 
@@ -336,6 +340,7 @@ impl PlotChart {
             self.rules[r].boundary = 0;
             self.rules[r].boundaries.clear();
             self.rules[r].boundaries_dropped = false;
+            self.rules[r].example = None;
         }
         self.rules[r].clear_generation = Some(conn.plot_clear_generation);
         let first = conn.store.first_abs_index();
@@ -347,6 +352,7 @@ impl PlotChart {
         let mut next = self.rules[r].next.unwrap_or(first).max(first);
         let mut count = 0;
         let mut pairs = vec![];
+        let mut example_line = None;
         while next < conn.store.next_abs_index() && count < max_lines {
             if count > 0 && Instant::now() >= deadline {
                 break;
@@ -375,6 +381,9 @@ impl PlotChart {
                     .as_ref()
                     .unwrap()
                     .extract(line.text, &mut pairs);
+                if self.preview && !pairs.is_empty() {
+                    example_line = Some(next);
+                }
                 let boundary = self.rules[r].boundary;
                 for (name, value) in pairs.drain(..) {
                     let label = format!("{} · {} · rule {}", conn.display_label(), name, r + 1);
@@ -394,6 +403,19 @@ impl PlotChart {
             }
             next += 1;
             count += 1;
+        }
+        // Only preview engines copy an example, once per batch rather than
+        // once per sample. Normal live extraction does not retain source text.
+        if let Some(line) = example_line.and_then(|index| conn.store.get(index)) {
+            self.rules[r]
+                .compiled
+                .as_ref()
+                .unwrap()
+                .extract(line.text, &mut pairs);
+            self.rules[r].example = Some(PlotExample {
+                line: line.text.to_owned(),
+                values: pairs,
+            });
         }
         self.rules[r].next = Some(next);
         next < conn.store.next_abs_index()
@@ -432,10 +454,41 @@ impl PlotTab {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PlotExample {
+    pub line: String,
+    pub values: Vec<(String, f64)>,
+}
+
+// Devices may emit NaN. An unchanged example must compare equal so it
+// cannot keep scheduling preview repaint frames forever.
+impl PartialEq for PlotExample {
+    fn eq(&self, other: &Self) -> bool {
+        self.line == other.line
+            && self.values.len() == other.values.len()
+            && self
+                .values
+                .iter()
+                .zip(&other.values)
+                .all(|((a, x), (b, y))| a == b && x.to_bits() == y.to_bits())
+    }
+}
+
+#[derive(PartialEq)]
+pub(crate) struct RulePreview {
+    pub chart_id: u64,
+    pub rule_id: u64,
+    pub status: String,
+    pub details: String,
+    pub example: Option<PlotExample>,
+    pub series: Vec<String>,
+}
+
 pub(crate) struct PlotDraft {
     pub definition: SavedPlotTab,
     pub editing: Option<u64>,
-    pub preview: Vec<String>,
+    pub preview: Vec<RulePreview>,
+    pub selected_chart: usize,
     pub preview_dirty: bool,
     preview_engine: Option<PlotTab>,
     preview_work_cursor: usize,
@@ -448,12 +501,13 @@ impl App {
             for chart in &mut draft.preview_engine.as_mut().unwrap().charts {
                 chart.capacity = 128;
                 chart.requested_capacity = 128;
+                chart.preview = true;
             }
             draft.preview_dirty = false;
         }
         let deadline = Instant::now() + budget;
         let mut backlog = false;
-        let mut messages = vec![];
+        let mut previews = vec![];
         if let Some(tab) = &mut draft.preview_engine {
             let mut work = vec![];
             for (c, chart) in tab.charts.iter().enumerate() {
@@ -469,19 +523,7 @@ impl App {
                             if chart.rules[r].needs_update(conn, source) {
                                 work.push((c, r, *i));
                             }
-                        } else {
-                            messages.push(format!(
-                                "{}: {}; configuration can be saved.",
-                                chart.saved.title,
-                                self.plot_source_status(source)
-                            ));
                         }
-                    } else {
-                        messages.push(format!(
-                            "{} · rule {}: Select a device.",
-                            chart.saved.title,
-                            r + 1
-                        ));
                     }
                 }
             }
@@ -499,29 +541,64 @@ impl App {
                 }
             }
             for chart in &tab.charts {
-                for (r, state) in chart.rules.iter().enumerate() {
+                for (rule, state) in chart.saved.rules.iter().zip(&chart.rules) {
+                    let mut preview = RulePreview {
+                        chart_id: chart.saved.id,
+                        rule_id: rule.id,
+                        status: String::new(),
+                        details: String::new(),
+                        example: None,
+                        series: chart
+                            .keys
+                            .iter()
+                            .filter(|key| key.rule_id == rule.id)
+                            .map(|key| key.name.clone())
+                            .collect(),
+                    };
                     if let Some(error) = &state.error {
-                        messages.push(format!("{} · rule {}: {error}", chart.saved.title, r + 1));
-                    }
-                }
-                let found = if chart.series.is_empty() {
-                    if backlog {
-                        "Scanning retained history…".into()
+                        preview.status = "Invalid pattern".into();
+                        preview.details = error.clone();
+                    } else if let Some(source) = &rule.source {
+                        let mut matches = self
+                            .connections
+                            .iter()
+                            .filter(|conn| conn.persistent_id == source.connection_id);
+                        match (matches.next(), matches.next()) {
+                            (Some(conn), None) => {
+                                preview.example = state.example.clone();
+                                preview.status = if preview.example.is_some() {
+                                    "Match found"
+                                } else if state.next.is_none()
+                                    || state.next.is_some_and(|next| {
+                                        conn.store.get(next).is_some_and(|line| {
+                                            !line.meta.flags.contains(LineFlags::PROVISIONAL)
+                                                || next + 1 < conn.store.next_abs_index()
+                                        })
+                                    })
+                                {
+                                    "Scanning history…"
+                                } else if conn.store.is_empty() {
+                                    "Waiting for output…"
+                                } else {
+                                    "No matching values"
+                                }
+                                .into();
+                                preview.details = "Preview uses retained output, including restored captures. Older discarded output is unavailable. Only finalized received lines with numeric values are included.".into();
+                            }
+                            _ => {
+                                preview.status = self.plot_source_status(source);
+                                preview.details = "This source cannot be read right now. You can still save the configuration.".into();
+                            }
+                        }
                     } else {
-                        "No matching series in retained output.".into()
+                        preview.status = "Select a device".into();
+                        preview.details = "Choose the connection whose output this rule should read. You can also save a rule without a device.".into();
                     }
-                } else {
-                    chart
-                        .series
-                        .iter()
-                        .map(|entry| entry.series.name())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                messages.push(format!("{}: {found}", chart.saved.title));
+                    previews.push(preview);
+                }
             }
         }
-        draft.preview = messages;
+        draft.preview = previews;
         backlog
     }
 
@@ -743,6 +820,7 @@ impl App {
             },
             editing: None,
             preview: vec![],
+            selected_chart: 0,
             preview_dirty: true,
             preview_engine: None,
             preview_work_cursor: 0,
@@ -755,6 +833,7 @@ impl App {
                 definition: tab.definition(),
                 editing: Some(id),
                 preview: vec![],
+                selected_chart: 0,
                 preview_dirty: true,
                 preview_engine: None,
                 preview_work_cursor: 0,
@@ -1411,11 +1490,137 @@ mod tests {
             kv_separators: None,
         };
         app.update_plot_preview(&mut draft, Duration::from_secs(1));
-        assert!(draft.preview.iter().any(|s| s.contains("regex")));
+        assert!(draft.preview.iter().any(
+            |preview| preview.status == "Invalid pattern" && preview.details.contains("regex")
+        ));
         app.apply_plot_draft(draft);
         assert_eq!(app.plot_tabs.len(), 1);
         assert!(app.plot_tabs[0].charts[0].rules[0].error.is_some());
     }
+    #[test]
+    fn preview_shows_real_lines_and_values_per_rule_and_resets_after_clear_or_edit() {
+        let (mut app, _tx) = test_app("plot-preview-examples");
+        connection(&mut app, 1, 11, "Device");
+        app.open_new_plot();
+        let mut draft = app.plot_draft.take().unwrap();
+        let chart = &mut draft.definition.charts[0];
+        chart.rules[0] = rule(&app.connections[0], 101);
+        chart.rules[0].extraction.prefix = Some("KV:".into());
+        chart.rules.push(DeviceExtractRule {
+            id: 102,
+            source: Some(source_of(&app.connections[0])),
+            extraction: ExtractRule {
+                mode: ExtractMode::Regex,
+                prefix: Some("DATA:".into()),
+                pattern: Some(r"sensor=(?P<sensor>-?[\d.]+)".into()),
+                ..Default::default()
+            },
+        });
+        line(
+            &mut app,
+            0,
+            "KV: temp:23.4 rpm:1200",
+            0,
+            LineFlags::default(),
+        );
+        line(
+            &mut app,
+            0,
+            "  DATA: sensor=-12.5 °C",
+            1,
+            LineFlags::default(),
+        );
+        line(&mut app, 0, "temp:999 sensor=999", 2, LineFlags::TX_ECHO);
+        line(
+            &mut app,
+            0,
+            "temp:888 sensor=888",
+            3,
+            LineFlags::RECONNECT_MARKER,
+        );
+        line(
+            &mut app,
+            0,
+            "temp:777 sensor=777",
+            4,
+            LineFlags::PROVISIONAL,
+        );
+        assert!(!app.update_plot_preview(&mut draft, Duration::from_secs(1)));
+        assert_eq!(draft.preview.len(), 2);
+        assert_eq!(
+            draft.preview[0].example.as_ref().unwrap(),
+            &PlotExample {
+                line: "KV: temp:23.4 rpm:1200".into(),
+                values: vec![("temp".into(), 23.4), ("rpm".into(), 1200.0)],
+            }
+        );
+        assert_eq!(
+            draft.preview[1].example.as_ref().unwrap(),
+            &PlotExample {
+                line: "  DATA: sensor=-12.5 °C".into(),
+                values: vec![("sensor".into(), -12.5)],
+            }
+        );
+        assert_eq!(draft.preview[1].rule_id, 102);
+        line(
+            &mut app,
+            0,
+            "  DATA: sensor=6.25 °C",
+            5,
+            LineFlags::CONTINUATION,
+        );
+        app.update_plot_preview(&mut draft, Duration::from_secs(1));
+        // Completing a partial line uses the actual finalized text, rather
+        // than a fabricated sample generated from the regex.
+        let example = draft.preview[1].example.as_ref().unwrap();
+        assert!(example.line.contains("DATA: sensor=6.25"));
+        assert_eq!(example.values, vec![("sensor".into(), 6.25)]);
+
+        draft.definition.charts[0].rules[1].extraction.pattern = Some("[".into());
+        draft.preview_dirty = true;
+        app.update_plot_preview(&mut draft, Duration::from_secs(1));
+        assert_eq!(draft.preview[1].status, "Invalid pattern");
+        assert!(draft.preview[1].example.is_none());
+        app.clear_console(Some(PortId(1)));
+        app.update_plot_preview(&mut draft, Duration::from_secs(1));
+        assert!(draft.preview[0].example.is_none());
+        assert!(draft.preview[0].series.is_empty());
+        assert_eq!(draft.preview[0].status, "Waiting for output…");
+    }
+
+    #[test]
+    fn preview_distinguishes_empty_no_match_missing_and_ambiguous_sources() {
+        let (mut app, _tx) = test_app("plot-preview-status");
+        connection(&mut app, 1, 11, "Same name");
+        app.open_new_plot();
+        let mut draft = app.plot_draft.take().unwrap();
+        draft.definition.charts[0].rules[0] = rule(&app.connections[0], 101);
+        app.update_plot_preview(&mut draft, Duration::from_secs(1));
+        assert_eq!(draft.preview[0].status, "Waiting for output…");
+        line(&mut app, 0, "no numbers here", 0, LineFlags::default());
+        app.update_plot_preview(&mut draft, Duration::from_secs(1));
+        assert_eq!(draft.preview[0].status, "No matching values");
+        line(&mut app, 0, "temp:NaN", 1, LineFlags::default());
+        app.update_plot_preview(&mut draft, Duration::from_secs(1));
+        let previous = std::mem::take(&mut draft.preview);
+        app.update_plot_preview(&mut draft, Duration::from_secs(1));
+        assert!(
+            previous == draft.preview,
+            "A device's NaN must not cause continuous preview repaints"
+        );
+        connection(&mut app, 2, 11, "Same name");
+        app.update_plot_preview(&mut draft, Duration::from_secs(1));
+        assert!(draft.preview[0].status.contains("Ambiguous"));
+        app.connections.clear();
+        app.update_plot_preview(&mut draft, Duration::from_secs(1));
+        assert!(draft.preview[0].status.contains("Unavailable"));
+        assert!(draft.preview[0].example.is_none());
+        draft.definition.charts[0].rules[0].source = None;
+        draft.preview_dirty = true;
+        app.update_plot_preview(&mut draft, Duration::from_secs(1));
+        assert_eq!(draft.preview[0].status, "Select a device");
+    }
+
     #[test]
     fn growing_history_keeps_capture_gaps_when_the_marker_was_evicted() {
         let (mut app, _tx) = test_app("plot-backfill-evicted-boundary");

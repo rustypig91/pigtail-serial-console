@@ -503,12 +503,12 @@ impl App {
                         }
                         ui.menu_button(egui::RichText::new("+").size(20.0), |ui| {
                             super::chrome::menu_style(ui);
-                            if ui.button("New connection").clicked() {
+                            if super::chrome::tab_menu_item(ui, super::chrome::TabMenuIcon::Connection, "New connection", true).clicked() {
                                 new_tab = true;
                                 ui.close();
                             }
-                            if ui.add_enabled(self.plot_tabs.len() < crate::plots::MAX_PLOT_TABS, egui::Button::new("New plot")).clicked() { new_plot = true; ui.close(); }
-                            if ui.button("New merged view").clicked() {
+                            if super::chrome::tab_menu_item(ui, super::chrome::TabMenuIcon::Plot, "New plot", self.plot_tabs.len() < crate::plots::MAX_PLOT_TABS).clicked() { new_plot = true; ui.close(); }
+                            if super::chrome::tab_menu_item(ui, super::chrome::TabMenuIcon::Merged, "New merged view", true).clicked() {
                                 new_merged = true;
                                 ui.close();
                             }
@@ -939,7 +939,6 @@ impl App {
         self.set_search_visible(self.show_search);
         let long_running_macros =
             self.long_running_macro_indicators(Instant::now(), self.macro_target_port());
-        let mut new_plot = false;
         let mut stop_macro_run = None;
         let mut select_view = None;
         let toolbar_rect = super::workspace::show_panel(
@@ -974,16 +973,6 @@ impl App {
                                     true,
                                 );
                             } else if let Some(active) = self.active_index() {
-                                if super::chrome::action_button(
-                                    ui,
-                                    super::chrome::ActionIcon::Plot,
-                                    false,
-                                    "New plot · Ctrl+Shift+P",
-                                )
-                                .clicked()
-                                {
-                                    new_plot = true;
-                                }
                                 let conn = &self.connections[active];
                                 let selected = if conn.screen_view {
                                     2
@@ -1027,9 +1016,6 @@ impl App {
         }
         if let Some(run_index) = stop_macro_run {
             self.stop_macro_run(run_index);
-        }
-        if new_plot {
-            self.open_new_plot();
         }
         if let Some(active) = self.active_index() {
             if let Some((screen, hex)) = select_view {
@@ -1169,7 +1155,7 @@ impl App {
     }
 
     /// Secondary controls stay in the overflow menu rather than crowding the
-    /// primary Log / Hex / ANSI/VT / Plot group.
+    /// primary Log / Hex / ANSI/VT group.
     fn show_console_options(&mut self, ui: &mut egui::Ui) {
         let mut has_options = false;
         if !self.merged_selected {

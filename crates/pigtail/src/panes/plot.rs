@@ -202,7 +202,7 @@ impl App {
             Some(self.clock.start_wall().timestamp_micros());
         let id = self.plot_tabs[index].saved.id;
         let mut action = None;
-        let mut settings = false;
+        let mut settings = None;
         let mut changed = false;
         ui.spacing_mut().interact_size.y = 28.0;
         ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
@@ -218,7 +218,7 @@ impl App {
                 action = Some(ChartAction::Add);
             }
             if ui.button("Tab options").clicked() {
-                settings = true;
+                settings = Some(0);
             }
             changed |= ui
                 .checkbox(
@@ -321,7 +321,7 @@ impl App {
                         if ui.button("Fit").clicked() {
                             if linked { tab.fit = true; } else { chart.fit = true; }
                         }
-                        if ui.button("Settings").clicked() { settings = true; }
+                        if ui.button("Settings").clicked() { settings = Some(c); }
                         ui.menu_button("Series", |ui| {
                             egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
                                 for entry in &mut chart.series {
@@ -397,7 +397,7 @@ impl App {
                             ..Default::default()
                         },
                     ));
-                    settings = true;
+                    settings = Some(tab.charts.len() - 1);
                 }
                 ChartAction::Up(c) => tab.charts.swap(c, c - 1),
                 ChartAction::Down(c) => tab.charts.swap(c, c + 1),
@@ -439,8 +439,11 @@ impl App {
         if changed {
             self.save_session();
         }
-        if settings {
+        if let Some(chart) = settings {
             self.edit_plot(id);
+            if let Some(draft) = &mut self.plot_draft {
+                draft.selected_chart = chart;
+            }
         }
         if let Some((source, line)) = navigate {
             self.request_plot_sample_navigation(source, line);
@@ -690,6 +693,57 @@ fn draw_chart(
     }
 }
 
+/// Explicit tooltip rendering avoids egui's hover delay and click suppression.
+trait PlotHelp {
+    fn plot_help(self, text: &str) -> Self;
+}
+
+impl PlotHelp for egui::Response {
+    fn plot_help(self, text: &str) -> Self {
+        if self.contains_pointer() {
+            egui::Tooltip::for_widget(&self).show(|ui| {
+                ui.set_max_width(ui.spacing().tooltip_width);
+                ui.label(text);
+            });
+        }
+        self
+    }
+}
+
+fn show_rule_preview(ui: &mut egui::Ui, preview: Option<&crate::plots::RulePreview>) {
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Preview").plot_help("A real received line that produced numeric values with this rule. Preview uses retained history; older discarded output is unavailable.");
+            if let Some(preview) = preview {
+                ui.label(&preview.status).plot_help(&preview.details);
+            } else {
+                ui.weak("Preparing preview…");
+            }
+        });
+        if let Some(preview) = preview {
+            egui::ScrollArea::vertical().id_salt("preview")
+                .max_height(120.0).show(ui, |ui| {
+                    if let Some(example) = &preview.example {
+                        ui.weak("Received line").plot_help("An actual finalized line received from this device. Local echo and session markers are excluded.");
+                        ui.add(egui::Label::new(egui::RichText::new(&example.line).monospace()).wrap())
+                            .plot_help("The latest matching line scanned for this preview. Select text to copy it.");
+                        ui.horizontal_wrapped(|ui| {
+                            ui.weak("Values").plot_help("Numeric values extracted from the received line above.");
+                            for (name, value) in &example.values {
+                                ui.label(format!("{name} = {value}"));
+                            }
+                        });
+                    }
+                    if !preview.series.is_empty() {
+                        ui.label(format!("Series: {}", preview.series.join(", ")))
+                            .plot_help("All series found so far for this rule in retained output, including those absent from the example line.");
+                    }
+                });
+        }
+    });
+}
+
 impl App {
     pub(crate) fn show_plot_setup(&mut self, ctx: &egui::Context) {
         let Some(mut draft) = self.plot_draft.take() else {
@@ -731,81 +785,186 @@ impl App {
         let mut commit = false;
         let mut cancel = false;
         let mut changed = false;
-        egui::Window::new(if draft.editing.is_some() { "Plot options" } else { "New plot" }).id(egui::Id::new("plot_setup"))
-            .open(&mut open).default_width(600.0).frame(super::chrome::dialog_frame(ctx)).show(ctx, |ui| {
+        egui::Window::new(if draft.editing.is_some() { "Plot options" } else { "New plot" })
+            .id(egui::Id::new("plot_setup"))
+            .open(&mut open)
+            .default_width(600.0)
+            .default_height((ctx.content_rect().height() - 40.0).clamp(180.0, 820.0))
+            .frame(super::chrome::dialog_frame(ctx))
+            .show(ctx, |ui| {
                 super::chrome::dialog_style(ui);
-                egui::ScrollArea::vertical().max_height((ctx.content_rect().height()-170.0).max(80.0)).show(ui, |ui| {
-                    ui.horizontal(|ui| { ui.label("Tab name"); changed |= ui.text_edit_singleline(&mut draft.definition.name).changed(); });
-                    changed |= ui.checkbox(&mut draft.definition.independent_time_axes, "Independent time axes").changed();
-                    ui.weak("Backfill uses retained source history, including restored captures. Older discarded output is unavailable. Closing this tab keeps devices connected.");
-                    let mut remove_chart = None;
-                    for (c, chart) in draft.definition.charts.iter_mut().enumerate() {
-                        ui.push_id(chart.id, |ui| {
-                            ui.group(|ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label("Chart title"); changed |= ui.text_edit_singleline(&mut chart.title).changed();
-                                    if ui.small_button("Remove chart").clicked() { remove_chart = Some(c); }
+                egui::ScrollArea::vertical()
+                    .max_height((ui.available_height() - 62.0).max(80.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Plot name").plot_help("The name shown on this plot tab.");
+                            changed |= ui.add(egui::TextEdit::singleline(&mut draft.definition.name)
+                                .desired_width(ui.available_width()))
+                                .plot_help("Rename this plot tab.").changed();
+                        });
+                        let mut linked = !draft.definition.independent_time_axes;
+                        if ui.checkbox(&mut linked, "Link chart time axes")
+                            .plot_help("Share the time range, pan, zoom, Follow and Fit across charts in this tab. Clear this to navigate each chart independently.")
+                            .changed()
+                        {
+                            draft.definition.independent_time_axes = !linked;
+                            changed = true;
+                        }
+                        ui.separator();
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Charts").plot_help("Select a chart to edit it. All charts remain in the plot tab.");
+                            for (index, chart) in draft.definition.charts.iter().enumerate() {
+                                ui.selectable_value(&mut draft.selected_chart, index,
+                                    format!("{} · {}", index + 1, chart.title))
+                                    .plot_help("Edit this chart's name, devices and parsing rules.");
+                            }
+                            if ui.add_enabled(draft.definition.charts.len() < crate::plots::MAX_CHARTS,
+                                egui::Button::new("+ Add chart"))
+                                .plot_help("Add another chart to this tab. Existing charts and devices stay open.")
+                                .clicked()
+                            {
+                                let source = draft.definition.charts.get(draft.selected_chart)
+                                    .and_then(|chart| chart.rules.first())
+                                    .and_then(|rule| rule.source.clone())
+                                    .or_else(|| sources.first().cloned());
+                                draft.selected_chart = draft.definition.charts.len();
+                                draft.definition.charts.push(serialcore::config::SavedPlotChart {
+                                    id: crate::plots::new_id(),
+                                    title: format!("Chart {}", draft.selected_chart + 1),
+                                    rules: vec![serialcore::config::DeviceExtractRule {
+                                        id: crate::plots::new_id(), source, ..Default::default()
+                                    }],
+                                    ..Default::default()
                                 });
+                                changed = true;
+                            }
+                        });
+                        draft.selected_chart = draft.selected_chart.min(draft.definition.charts.len().saturating_sub(1));
+                        let mut remove_chart = false;
+                        if let Some(chart) = draft.definition.charts.get_mut(draft.selected_chart) {
+                            ui.push_id(chart.id, |ui| {
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    ui.label("Chart name").plot_help("The title displayed above this chart.");
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        remove_chart = ui.small_button("Remove chart")
+                                            .plot_help("Remove this chart when you apply the changes. Devices remain connected.").clicked();
+                                        changed |= ui.add(egui::TextEdit::singleline(&mut chart.title)
+                                            .desired_width(ui.available_width()))
+                                            .plot_help("Give the chart a descriptive name, such as Temperature.").changed();
+                                    });
+                                });
+                                let multiple_rules = chart.rules.len() > 1;
                                 let mut remove_rule = None;
                                 for (r, rule) in chart.rules.iter_mut().enumerate() {
-                                    ui.push_id(rule.id, |ui| { ui.group(|ui| {
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.strong(format!("Rule {}", r+1));
-                                            if ui.small_button("Remove rule").clicked() { remove_rule = Some(r); }
-                                        });
-                                        let current = rule.source.as_ref().map(|s| self.plot_source_status(s)).unwrap_or_else(|| "Select a device".into());
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.label("Device");
-                                            egui::ComboBox::from_id_salt("source").selected_text(current).width(320.0).show_ui(ui, |ui| {
-                                                if ui.selectable_label(rule.source.is_none(), "No device").clicked() { rule.source = None; changed = true; }
-                                                for (source,label) in sources.iter().zip(&source_labels) {
-                                                    if ui.selectable_label(rule.source.as_ref().is_some_and(|s| s.connection_id==source.connection_id),label).clicked() { rule.source = Some(source.clone()); changed = true; }
-                                                }
+                                    ui.push_id(rule.id, |ui| {
+                                        ui.separator();
+                                        if multiple_rules { ui.strong(format!("Rule {}", r + 1)); }
+                                        let current = rule.source.as_ref().map(|s| self.plot_source_status(s))
+                                            .unwrap_or_else(|| "Select a device".into());
+                                        let device_help = "Choose a source connection. Unavailable remembered connections can be kept and saved; a different connection requires explicit selection.";
+                                        ui.horizontal(|ui| {
+                                            ui.label("Device").plot_help("The connection supplying output for this rule. Several rules can read the same device.");
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                if ui.small_button("Remove rule")
+                                                    .plot_help("Remove this parsing rule when you apply the changes. Its device stays connected.").clicked()
+                                                { remove_rule = Some(r); }
+                                                egui::ComboBox::from_id_salt("source")
+                                                    .selected_text(current.as_str())
+                                                    .truncate()
+                                                    .width(ui.available_width())
+                                                    .show_ui(ui, |ui| {
+                                                        if ui.selectable_label(rule.source.is_none(), "No device")
+                                                            .plot_help("Keep this rule without a source device.").clicked()
+                                                        { rule.source = None; changed = true; }
+                                                        for (source, label) in sources.iter().zip(&source_labels) {
+                                                            if ui.selectable_label(rule.source.as_ref().is_some_and(|s| s.connection_id == source.connection_id), label)
+                                                                .plot_help(device_help).clicked()
+                                                            { rule.source = Some(source.clone()); changed = true; }
+                                                        }
+                                                    }).response.plot_help(&format!("{current}\n\n{device_help}"));
                                             });
                                         });
                                         ui.horizontal_wrapped(|ui| {
-                                            changed |= ui.selectable_value(&mut rule.extraction.mode,serialcore::config::ExtractMode::Kv,"Name = value pairs").changed();
-                                            changed |= ui.selectable_value(&mut rule.extraction.mode,serialcore::config::ExtractMode::Regex,"Regex").changed();
+                                            ui.label("Read values as").plot_help("Choose how numeric values are extracted from received lines.");
+                                            changed |= ui.selectable_value(&mut rule.extraction.mode,
+                                                serialcore::config::ExtractMode::Kv, "Name/value pairs")
+                                                .plot_help("Read pairs such as temp:23.4 or rpm=1200. Each name becomes a separate series.").changed();
+                                            changed |= ui.selectable_value(&mut rule.extraction.mode,
+                                                serialcore::config::ExtractMode::Regex, "Regex")
+                                                .plot_help("Use a regular expression. Each named numeric capture becomes a series; for example temp=(?P<temp>[\\d.]+).").changed();
                                         });
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.label("Prefix").on_hover_text("Read only lines starting with this text. The prefix itself is not parsed.");
+                                        let prefix_help = "Only read lines beginning with this text, ignoring leading whitespace. The prefix is removed before parsing. Leave empty to read any line.";
+                                        ui.horizontal(|ui| {
+                                            ui.label("Line prefix").plot_help(prefix_help);
                                             let mut prefix = rule.extraction.prefix.clone().unwrap_or_default();
-                                            if ui.add(egui::TextEdit::singleline(&mut prefix).hint_text("any line").desired_width(260.0)).changed() { rule.extraction.prefix = (!prefix.is_empty()).then_some(prefix); changed = true; }
+                                            if ui.add(egui::TextEdit::singleline(&mut prefix)
+                                                .hint_text("Any line").desired_width(ui.available_width()))
+                                                .plot_help(prefix_help).changed()
+                                            { rule.extraction.prefix = (!prefix.is_empty()).then_some(prefix); changed = true; }
                                         });
                                         match rule.extraction.mode {
                                             serialcore::config::ExtractMode::Kv => {
-                                                let separators = rule.extraction.kv_separators.clone().unwrap_or_else(||vec![':', '=']);
-                                                let mut spaced = separators.iter().any(|c|c.is_whitespace());
-                                                let mut typed: String = separators.iter().filter(|c|!c.is_whitespace()).collect();
+                                                let separators = rule.extraction.kv_separators.clone().unwrap_or_else(|| vec![':', '=']);
+                                                let mut spaced = separators.iter().any(|c| c.is_whitespace());
+                                                let mut typed: String = separators.iter().filter(|c| !c.is_whitespace()).collect();
+                                                let separator_help = "Characters separating each name from its number, such as : and = in temp:23.4 rpm=1200. Spaces, commas and semicolons separate pairs. Empty uses : and =.";
                                                 let mut edited = false;
-                                                ui.horizontal_wrapped(|ui| { ui.label("Separators"); edited |= ui.text_edit_singleline(&mut typed).changed(); });
-                                                edited |= ui.checkbox(&mut spaced,"Allow space: temp 23.4").changed();
-                                                if edited { let mut seps: Vec<_> = typed.chars().filter(|c|!c.is_whitespace()).collect(); if spaced { seps.push(' '); } rule.extraction.kv_separators=Some(seps); changed=true; }
-                                                ui.weak("e.g. temp:23.4 rpm:1200 → temp and rpm");
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Value separators").plot_help(separator_help);
+                                                    edited |= ui.add(egui::TextEdit::singleline(&mut typed)
+                                                        .desired_width(ui.available_width()))
+                                                        .plot_help(separator_help).changed();
+                                                });
+                                                edited |= ui.checkbox(&mut spaced, "Allow space-separated values")
+                                                    .plot_help("Also read pairs such as temp 23.4. Ordinary text followed by numbers may then become a series.").changed();
+                                                if edited {
+                                                    let mut seps: Vec<_> = typed.chars().filter(|c| !c.is_whitespace()).collect();
+                                                    if spaced { seps.push(' '); }
+                                                    rule.extraction.kv_separators = Some(seps);
+                                                    changed = true;
+                                                }
                                             }
                                             serialcore::config::ExtractMode::Regex => {
-                                                let mut pattern=rule.extraction.pattern.clone().unwrap_or_default();
-                                                ui.label("Pattern (named numeric capture groups)");
-                                                if ui.add(egui::TextEdit::singleline(&mut pattern).hint_text(r"temp=(?P<temp>[\d.]+)").desired_width(ui.available_width())).changed() { rule.extraction.pattern=Some(pattern);changed=true; }
+                                                let pattern_help = "Use named numeric captures, for example temp=(?P<temp>[\\d.]+). The capture name becomes the series name, and the captured text must be a number.";
+                                                ui.label("Pattern").plot_help(pattern_help);
+                                                let mut pattern = rule.extraction.pattern.clone().unwrap_or_default();
+                                                if ui.add(egui::TextEdit::singleline(&mut pattern)
+                                                    .hint_text(r"temp=(?P<temp>[\d.]+)").desired_width(ui.available_width()))
+                                                    .plot_help(pattern_help).changed()
+                                                { rule.extraction.pattern = Some(pattern); changed = true; }
                                             }
                                         }
-                                    }); });
+                                        show_rule_preview(ui, if changed { None } else {
+                                            draft.preview.iter().find(|preview| preview.chart_id == chart.id && preview.rule_id == rule.id)
+                                        });
+                                    });
                                 }
-                                if let Some(r)=remove_rule { chart.rules.remove(r); changed=true; }
-                                if ui.add_enabled(chart.rules.len()<crate::plots::MAX_RULES,egui::Button::new("Add extraction rule")).clicked() { chart.rules.push(serialcore::config::DeviceExtractRule { id:crate::plots::new_id(),source:sources.first().cloned(),..Default::default() });changed=true; }
+                                if let Some(r) = remove_rule { chart.rules.remove(r); changed = true; }
+                                if ui.add_enabled(chart.rules.len() < crate::plots::MAX_RULES,
+                                    egui::Button::new("+ Add rule"))
+                                    .plot_help("Read another device or use another parsing pattern on this chart. All rule settings stay visible.").clicked()
+                                {
+                                    let source = chart.rules.first().and_then(|rule| rule.source.clone())
+                                        .or_else(|| sources.first().cloned());
+                                    chart.rules.push(serialcore::config::DeviceExtractRule {
+                                        id: crate::plots::new_id(), source, ..Default::default()
+                                    });
+                                    changed = true;
+                                }
                             });
-                        });
-                    }
-                    if let Some(c)=remove_chart { draft.definition.charts.remove(c);changed=true; }
-                    if ui.add_enabled(draft.definition.charts.len()<crate::plots::MAX_CHARTS,egui::Button::new("Add chart")).clicked() { draft.definition.charts.push(serialcore::config::SavedPlotChart { id:crate::plots::new_id(),..Default::default() });changed=true; }
-                    ui.separator();ui.strong("Preview");
-                    for message in &draft.preview { ui.weak(message); }
-                    if draft.preview.is_empty() { ui.weak("Preparing preview…"); }
-                });
+                        }
+                        if remove_chart {
+                            draft.definition.charts.remove(draft.selected_chart);
+                            draft.selected_chart = draft.selected_chart.min(draft.definition.charts.len().saturating_sub(1));
+                            changed = true;
+                        }
+                    });
                 ui.separator();
                 ui.horizontal(|ui| {
-                    commit=ui.button(if draft.editing.is_some() { "Apply" } else { "Create" }).clicked();
-                    cancel=ui.button("Cancel").clicked();
+                    commit = ui.button(if draft.editing.is_some() { "Apply" } else { "Create" })
+                        .plot_help("Save this plot configuration. Samples are rebuilt from retained source history; discarded output cannot be recovered.").clicked();
+                    cancel = ui.button("Cancel").plot_help("Discard changes to this plot configuration.").clicked();
                 });
             });
         if commit {
@@ -815,8 +974,9 @@ impl App {
             self.apply_plot_draft(draft);
         } else if open && !cancel {
             draft.preview_dirty |= changed;
+            let previous_preview = std::mem::take(&mut draft.preview);
             let backlog = self.update_plot_preview(&mut draft, Duration::from_millis(4));
-            if backlog {
+            if backlog || previous_preview != draft.preview {
                 crate::graphics::request_animation_frame(ctx);
             }
             self.plot_draft = Some(draft);
@@ -1067,6 +1227,40 @@ mod tests {
             pressed,
             modifiers: egui::Modifiers::NONE,
         }
+    }
+
+    #[test]
+    fn chart_settings_select_the_requested_chart_in_the_draft() {
+        let mut app = chart_app();
+        let ctx = egui::Context::default();
+        chart_frame(&mut app, &ctx, vec![]);
+        let output = chart_frame(&mut app, &ctx, vec![]);
+        let position = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Settings" => {
+                    Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                }
+                _ => None,
+            })
+            .nth(1)
+            .unwrap();
+        chart_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(position),
+                chart_pointer(position, true),
+            ],
+        );
+        chart_frame(&mut app, &ctx, vec![chart_pointer(position, false)]);
+        let draft = app.plot_draft.as_ref().unwrap();
+        assert_eq!(draft.selected_chart, 1);
+        assert_eq!(
+            draft.definition.charts[draft.selected_chart].title,
+            "Second"
+        );
     }
 
     #[test]
