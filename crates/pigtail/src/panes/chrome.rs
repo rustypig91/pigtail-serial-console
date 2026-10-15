@@ -421,7 +421,6 @@ impl App {
 pub(super) enum ActionIcon {
     Search,
     Clear,
-    Plot,
 }
 
 pub(super) enum SearchControl {
@@ -613,13 +612,6 @@ pub(super) fn action_button(
                     .line_segment([c + Vec2::new(x, -1.0), c + Vec2::new(x, 3.0)], stroke);
             }
         }
-        ActionIcon::Plot => paint_view_content(
-            ui,
-            rect.translate(Vec2::new(3.0, 0.0)),
-            ViewIcon::Plot,
-            "",
-            visuals.fg_stroke.color,
-        ),
     }
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), selected, tooltip)
@@ -1023,6 +1015,70 @@ pub(super) fn popup_style(ui: &mut Ui) {
     ui.spacing_mut().button_padding = Vec2::new(10.0, 7.0);
     ui.spacing_mut().interact_size.y = 32.0;
     ui.spacing_mut().item_spacing = Vec2::new(14.0, 4.0);
+}
+
+pub(super) enum TabMenuIcon {
+    Connection,
+    Plot,
+    Merged,
+}
+
+pub(super) fn tab_menu_item(
+    ui: &mut Ui,
+    icon: TabMenuIcon,
+    label: &str,
+    enabled: bool,
+) -> Response {
+    ui.add_enabled_ui(enabled, |ui| {
+        let icon_id = ui.id().with(("tab_menu_icon", label));
+        let button =
+            egui::Button::new((egui::Atom::custom(icon_id, Vec2::splat(18.0)), label)).atom_ui(ui);
+        if let Some(rect) = button.rect(icon_id) {
+            let color = ui.style().interact(&button.response).fg_stroke.color;
+            let stroke = Stroke::new(1.3_f32, color);
+            let c = rect.center();
+            let point = |x, y| c + Vec2::new(x, y);
+            match icon {
+                TabMenuIcon::Connection => {
+                    ui.painter().rect_stroke(
+                        Rect::from_min_max(point(-4.0, -4.0), point(4.0, 3.0)),
+                        2.0,
+                        stroke,
+                        egui::StrokeKind::Middle,
+                    );
+                    for x in [-2.0, 2.0] {
+                        ui.painter()
+                            .line_segment([point(x, -7.0), point(x, -4.0)], stroke);
+                    }
+                    ui.painter()
+                        .line_segment([point(0.0, 3.0), point(0.0, 7.0)], stroke);
+                }
+                TabMenuIcon::Plot => paint_view_content(
+                    ui,
+                    Rect::from_center_size(c, Vec2::new(30.0, 18.0)),
+                    ViewIcon::Plot,
+                    "",
+                    color,
+                ),
+                TabMenuIcon::Merged => {
+                    for y in [-5.0, 5.0] {
+                        ui.painter().add(egui::Shape::line(
+                            vec![point(-7.0, y), point(-3.0, y), point(2.0, 0.0)],
+                            stroke,
+                        ));
+                    }
+                    ui.painter()
+                        .line_segment([point(2.0, 0.0), point(7.0, 0.0)], stroke);
+                    ui.painter().add(egui::Shape::line(
+                        vec![point(4.0, -3.0), point(7.0, 0.0), point(4.0, 3.0)],
+                        stroke,
+                    ));
+                }
+            }
+        }
+        button.response
+    })
+    .inner
 }
 
 pub(super) fn menu_item(ui: &mut Ui, label: &str, shortcut: &str) -> Response {

@@ -251,6 +251,34 @@ retained output. Create selects a new tab in the current pane; Cancel creates
 nothing. Empty tabs/charts and unavailable devices are allowed. Tab options and
 chart Settings use Apply/Cancel drafts; cancelling preserves definitions and
 live samples. Controls scroll in small windows, with action buttons outside.
+The setup editor has a compact numbered chart selector and edits one chart at
+a time; a chart's Settings button selects that chart. All settings for the
+selected chart remain directly visible, including line prefix, value separators
+and space pairing for name/value parsing. Add/remove chart and rule buttons
+remain visible rather than living in menus or collapsed sections. New charts
+added in the draft start with one rule, reusing the selected chart's source when
+available. **Link chart time axes** is enabled by default and is the inverse of
+the saved independent-axis option. Explanations and parsing examples live in
+tooltips that appear immediately on hover and stay visible through clicks.
+Each rule's bounded preview shows an actual finalized received line that
+produced numeric values, the extracted names and numbers, and the series found
+so far. Examples retain their original prefix and whitespace; local echo,
+session markers and provisional lines are excluded. Preview distinguishes
+scanning, waiting for output, no matching values, invalid patterns and missing
+or ambiguous sources; hover reveals error and history details. Changing a rule
+or clearing its source invalidates its old example. Preview examples belong
+only to the draft, are copied at most once per processing batch, and never add
+source text retention to normal live extraction.
+The 2026-10-15 setup refresh passed formatting, workspace tests with default
+and all features, Clippy for all targets with default and all features, and the
+demo feature check/build. After the final layout adjustment, affected app tests
+and Clippy passed again with default/all features. Regression coverage includes
+real preview lines and values, prefix/Unicode preservation, local echo and
+partial-line exclusion, clear/edit invalidation, source availability, stable
+window width, chart selection/add/remove/cancel and immediate help through
+press/release. Native software-Vulkan/X11 demo inspection verified chart-specific
+Settings, regex and name/value previews, hover help during clicks, and scrolling
+settings with fixed actions at 1280 × 900 and 720 × 540.
 
 Plot tabs use the same ordering, drag/drop, split/move, middle-click close and
 close confirmation as other tabs. Closing one keeps all serial connections open.
@@ -402,6 +430,10 @@ Use **Ctrl+Shift+P** on a connection to select the most recently used plot tab
 referencing it, including in the other split pane. If none exists, open New plot
 with that connection preselected. It does nothing on merged or plot tabs.
 Use **Ctrl+Shift+M** to open the transmit macros window.
+The console toolbar has no plot button. **+ → New plot** and **Ctrl+Shift+P**
+provide plot access. The **+** menu uses plug, chart and merging-path icons for
+**New connection**, **New plot** and **New merged view**, with aligned icon slots
+and accessible text labels. New plot remains disabled at the plot-tab limit.
 The console right-click menu has no **Toggle plot** or **Toggle hex view** items;
 use the toolbar controls or their keyboard shortcuts.
 

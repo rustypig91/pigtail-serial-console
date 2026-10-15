@@ -1936,6 +1936,136 @@ mod tests {
     }
 
     #[test]
+    fn plot_setup_selects_charts_keeps_controls_visible_and_shows_help_through_clicks() {
+        let (mut app, _tx) = test_app("plot-setup-editor");
+        add_connection(&mut app, 1);
+        append(&mut app, 0, "temp:23.4 rpm:1200");
+        app.open_new_plot();
+        let ctx = egui::Context::default();
+        ctx.global_style_mut(|style| {
+            style.animation_time = 0.0;
+            style.interaction.tooltip_delay = 60.0;
+        });
+        let render = |app: &mut App, events: Vec<egui::Event>| {
+            ctx.run_test_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |_| app.show_plot_setup(&ctx),
+            )
+        };
+        let click = |app: &mut App, label: &str| {
+            render(app, vec![egui::Event::PointerMoved(egui::pos2(0.0, 0.0))]);
+            let output = render(app, vec![]);
+            let pos = text_rect(&output, label).center();
+            render(
+                app,
+                vec![egui::Event::PointerMoved(pos), pointer(pos, true)],
+            );
+            render(app, vec![pointer(pos, false)]);
+        };
+        render(&mut app, vec![]);
+        let output = render(&mut app, vec![]);
+        let initial_width = ctx.memory(|memory| {
+            memory
+                .area_rect(egui::Id::new("plot_setup"))
+                .unwrap()
+                .width()
+        });
+        for _ in 0..20 {
+            render(&mut app, vec![]);
+        }
+        let settled_width = ctx.memory(|memory| {
+            memory
+                .area_rect(egui::Id::new("plot_setup"))
+                .unwrap()
+                .width()
+        });
+        assert!(
+            (settled_width - initial_width).abs() < 1.0,
+            "Editor widened from {initial_width} to {settled_width}"
+        );
+        for label in [
+            "Line prefix",
+            "Value separators",
+            "Allow space-separated values",
+            "Remove rule",
+            "Remove chart",
+            "+ Add rule",
+            "Preview",
+            "temp:23.4 rpm:1200",
+            "Create",
+            "Cancel",
+        ] {
+            let rect = text_rect(&output, label);
+            assert!(rect.bottom() <= 900.0, "{label}: {rect:?}");
+        }
+        let pos = text_rect(&output, "Link chart time axes").center();
+        let help = "Share the time range, pan, zoom, Follow and Fit across charts in this tab. Clear this to navigate each chart independently.";
+        render(&mut app, vec![egui::Event::PointerMoved(pos)]);
+        // Allow the popup's sizing pass, without waiting for a hover delay.
+        let output = render(&mut app, vec![]);
+        text_rect(&output, help);
+        let output = render(&mut app, vec![pointer(pos, true)]);
+        text_rect(&output, help);
+        let output = render(&mut app, vec![pointer(pos, false)]);
+        text_rect(&output, help);
+        assert!(
+            app.plot_draft
+                .as_ref()
+                .unwrap()
+                .definition
+                .independent_time_axes
+        );
+
+        click(&mut app, "+ Add chart");
+        let draft = app.plot_draft.as_ref().unwrap();
+        assert_eq!(draft.selected_chart, 1);
+        assert_eq!(draft.definition.charts.len(), 2);
+        assert_eq!(
+            draft.definition.charts[1].rules[0].source,
+            draft.definition.charts[0].rules[0].source
+        );
+        click(&mut app, "1 · Chart");
+        assert_eq!(app.plot_draft.as_ref().unwrap().selected_chart, 0);
+        click(&mut app, "+ Add rule");
+        assert_eq!(
+            app.plot_draft.as_ref().unwrap().definition.charts[0]
+                .rules
+                .len(),
+            2
+        );
+        click(&mut app, "2 · Chart 2");
+        assert_eq!(
+            app.plot_draft.as_ref().unwrap().definition.charts[1]
+                .rules
+                .len(),
+            1
+        );
+        click(&mut app, "Remove chart");
+        assert_eq!(app.plot_draft.as_ref().unwrap().selected_chart, 0);
+        click(&mut app, "Remove chart");
+        assert!(app
+            .plot_draft
+            .as_ref()
+            .unwrap()
+            .definition
+            .charts
+            .is_empty());
+        click(&mut app, "+ Add chart");
+        assert_eq!(app.plot_draft.as_ref().unwrap().definition.charts.len(), 1);
+        click(&mut app, "Cancel");
+        assert!(app.plot_draft.is_none());
+        assert!(app.plot_tabs.is_empty());
+        assert_eq!(app.connections.len(), 1);
+    }
+
+    #[test]
     fn new_plot_menu_cancel_and_create_use_isolated_drafts_and_visible_small_window_actions() {
         let (mut app, _tx) = test_app("plot-create-ui");
         add_connection(&mut app, 1);
