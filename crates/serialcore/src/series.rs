@@ -16,6 +16,8 @@ pub struct SeriesPoint {
     pub t: f64,
     pub value: f64,
     pub line: u64,
+    /// Capture/gap identity; adjacent points from different captures never join.
+    pub boundary: u64,
 }
 
 /// A single numeric series backed by a fixed-capacity ring buffer.
@@ -36,6 +38,10 @@ impl Series {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn rename(&mut self, name: impl Into<String>) {
+        self.name = name.into();
     }
 
     pub fn len(&self) -> usize {
@@ -86,11 +92,20 @@ impl Series {
     /// Timestamps must be monotonically non-decreasing within a series.
     /// Returns whether the oldest point was evicted.
     pub fn push(&mut self, t: f64, value: f64, line: u64) -> bool {
+        self.push_in_capture(t, value, line, 0)
+    }
+
+    pub fn push_in_capture(&mut self, t: f64, value: f64, line: u64, boundary: u64) -> bool {
         let evicted = self.buf.len() == self.capacity;
         if evicted {
             self.buf.pop_front();
         }
-        self.buf.push_back(SeriesPoint { t, value, line });
+        self.buf.push_back(SeriesPoint {
+            t,
+            value,
+            line,
+            boundary,
+        });
         evicted
     }
 
@@ -131,6 +146,15 @@ impl Series {
         self.buf.range(lo..hi)
     }
 
+    /// Resolve a stable source-line identity without consulting a console filter.
+    pub fn point_for_line(&self, line: u64) -> Option<SeriesPoint> {
+        let index = self.buf.partition_point(|point| point.line < line);
+        self.buf
+            .get(index)
+            .filter(|point| point.line == line)
+            .copied()
+    }
+
     /// The point nearest to time `t` (for plot→log linking).
     pub fn nearest_point(&self, t: f64) -> Option<SeriesPoint> {
         let right = self.buf.partition_point(|p| p.t < t);
@@ -159,8 +183,39 @@ impl Series {
     /// each pixel column emits both the minimum and maximum sample in that column
     /// so a transient spike is never hidden by stride sampling.
     pub fn decimate(&self, x0: f64, x1: f64, width: usize) -> Vec<[f64; 2]> {
+        Self::decimate_range(self.points_in_range(x0, x1), x0, x1, width)
+    }
+
+    /// Decimate each uninterrupted capture separately, preserving even short gaps.
+    pub fn decimate_segments(&self, x0: f64, x1: f64, width: usize) -> Vec<Vec<[f64; 2]>> {
+        let lo = self.buf.partition_point(|p| p.t < x0);
+        let hi = self.buf.partition_point(|p| p.t <= x1);
+        let mut segments = Vec::new();
+        let mut start = lo;
+        while start < hi {
+            let boundary = self.buf[start].boundary;
+            let mut end = start + 1;
+            while end < hi && self.buf[end].boundary == boundary {
+                end += 1;
+            }
+            segments.push(Self::decimate_range(
+                self.buf.range(start..end),
+                x0,
+                x1,
+                width,
+            ));
+            start = end;
+        }
+        segments
+    }
+
+    fn decimate_range(
+        in_range: vec_deque::Iter<'_, SeriesPoint>,
+        x0: f64,
+        x1: f64,
+        width: usize,
+    ) -> Vec<[f64; 2]> {
         let width = width.max(1);
-        let in_range = self.points_in_range(x0, x1);
         if in_range.len() <= width.saturating_mul(2) || x1 <= x0 {
             return in_range.map(|p| [p.t, p.value]).collect();
         }
@@ -362,5 +417,20 @@ mod tests {
         assert_eq!(s.value_range(), None);
         s.push(0.0, f64::NAN, 0);
         assert_eq!(s.value_range(), None);
+    }
+    #[test]
+    fn decimation_never_joins_captures_and_line_references_survive_eviction() {
+        let mut series = Series::new("temp", 6);
+        for i in 0..9 {
+            series.push_in_capture(i as f64, if i == 4 { 100.0 } else { i as f64 }, i, i / 3);
+        }
+        let segments = series.decimate_segments(0.0, 9.0, 1);
+        assert_eq!(segments.len(), 2);
+        assert!(segments[0].iter().any(|point| point[1] == 100.0));
+        assert!(segments[0].iter().all(|point| point[0] < 6.0));
+        assert!(segments[1].iter().all(|point| point[0] >= 6.0));
+        assert!(series.point_for_line(2).is_none());
+        assert_eq!(series.point_for_line(4).unwrap().value, 100.0);
+        assert_eq!(series.nearest_point(4.0).unwrap().boundary, 1);
     }
 }

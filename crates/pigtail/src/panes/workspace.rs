@@ -27,6 +27,10 @@ enum LayoutAction {
         boundary: usize,
     },
     Join,
+    NavigatePlotSample {
+        source: u64,
+        line: u64,
+    },
 }
 
 pub(crate) struct Workspace {
@@ -64,6 +68,32 @@ pub(super) fn show_panel(
 }
 
 impl App {
+    pub(crate) fn restore_connection_tab(
+        &self,
+        id: u64,
+        identity: &serialcore::config::PortIdentity,
+    ) -> Option<TabId> {
+        let mut candidates = self.connections.iter().filter(|conn| {
+            if id == 0 {
+                &conn.identity == identity
+            } else {
+                conn.persistent_id == id
+            }
+        });
+        let conn = candidates.next()?;
+        candidates
+            .next()
+            .is_none()
+            .then_some(TabId::Connection(conn.id))
+    }
+
+    #[cfg(feature = "demo")]
+    pub(crate) fn split_demo_plot(&mut self, id: u64) {
+        self.apply_layout_action(LayoutAction::Split(TabId::Plot(id), SplitDirection::Right));
+        self.workspace.focused = 0;
+        self.load_pane(0);
+    }
+
     fn saved_workspace_tab(&self, tab: TabId) -> Option<SavedTab> {
         match tab {
             TabId::Connection(id) => self
@@ -71,8 +101,10 @@ impl App {
                 .iter()
                 .find(|conn| conn.id == id && conn.state != ConnState::Closed)
                 .map(|conn| SavedTab::Connection {
+                    id: conn.persistent_id,
                     identity: conn.identity.clone(),
                 }),
+            TabId::Plot(id) => Some(SavedTab::Plot { id }),
             TabId::Merged(id) => self
                 .merged_tabs
                 .iter()
@@ -83,11 +115,12 @@ impl App {
 
     fn restored_workspace_tab(&self, saved: &SavedTab) -> Option<TabId> {
         match saved {
-            SavedTab::Connection { identity } => self
-                .connections
+            SavedTab::Connection { id, identity } => self.restore_connection_tab(*id, identity),
+            SavedTab::Plot { id } => self
+                .plot_tabs
                 .iter()
-                .find(|conn| &conn.identity == identity)
-                .map(|conn| TabId::Connection(conn.id)),
+                .find(|tab| tab.saved.id == *id)
+                .map(|_| TabId::Plot(*id)),
             SavedTab::Merged { index } => self
                 .merged_tabs
                 .get(*index)
@@ -144,8 +177,12 @@ impl App {
             return;
         }
         let saved = self.saved_split();
-        if self.config.split != saved {
+        let selected = self
+            .selected_tab_id()
+            .and_then(|tab| self.saved_workspace_tab(tab));
+        if self.config.split != saved || self.config.selected_tab != selected {
             self.config.split = saved;
+            self.config.selected_tab = selected;
             self.write_config();
         }
     }
@@ -153,6 +190,14 @@ impl App {
     /// Called only after restoring connections, merged views, and tab order.
     pub(crate) fn restore_workspace(&mut self) {
         let Some(saved) = self.config.split.clone() else {
+            if let Some(tab) = self
+                .config
+                .selected_tab
+                .as_ref()
+                .and_then(|saved| self.restored_workspace_tab(saved))
+            {
+                self.select_pane_tab(tab);
+            }
             return;
         };
         self.workspace = Workspace::default();
@@ -192,8 +237,10 @@ impl App {
         self.reconcile_workspace();
     }
 
-    pub(super) fn selected_tab_id(&self) -> Option<TabId> {
-        if self.merged_selected {
+    pub(crate) fn selected_tab_id(&self) -> Option<TabId> {
+        if let Some(id) = self.active_plot {
+            Some(TabId::Plot(id))
+        } else if self.merged_selected {
             self.loaded_merged_tab
                 .and_then(|i| self.merged_tabs.get(i))
                 .map(|tab| TabId::Merged(tab.id))
@@ -209,14 +256,47 @@ impl App {
             TabId::Connection(id) => {
                 if let Some(index) = self.connections.iter().position(|conn| conn.id == id) {
                     self.active = index;
+                    self.active_plot = None;
                     self.merged_selected = false;
                 }
             }
+            TabId::Plot(id) => self.select_plot(id),
             TabId::Merged(id) => {
                 if let Some(index) = self.merged_tabs.iter().position(|tab| tab.id == id) {
                     self.select_merged_tab(index);
                 }
             }
+        }
+    }
+
+    pub(crate) fn select_workspace_tab(&mut self, id: TabId) {
+        if self.workspace.split.is_some() {
+            if let Some(index) = self
+                .workspace
+                .panes
+                .iter()
+                .position(|pane| pane.tabs.contains(&id))
+            {
+                self.save_pane(self.workspace.focused);
+                self.workspace.focused = index;
+                self.workspace.panes[index].selected = Some(id);
+                self.load_pane(index);
+            }
+        }
+        self.select_pane_tab(id);
+        if let TabId::Plot(id) = id {
+            self.plot_recent.retain(|old| *old != id);
+            self.plot_recent.push(id);
+        }
+    }
+
+    pub(crate) fn request_plot_sample_navigation(&mut self, source: u64, line: u64) {
+        if self.workspace.rendering.is_some() {
+            // Switching panes during painting would let the current pane's
+            // save/load cycle overwrite the destination's search visibility.
+            self.workspace.pending = Some(LayoutAction::NavigatePlotSample { source, line });
+        } else {
+            self.navigate_plot_sample(source, line);
         }
     }
 
@@ -481,6 +561,9 @@ impl App {
                 self.load_pane(pane);
             }
             LayoutAction::Join => self.workspace.split = None,
+            LayoutAction::NavigatePlotSample { source, line } => {
+                self.navigate_plot_sample(source, line);
+            }
         }
         self.reconcile_workspace();
         self.persist_workspace();
@@ -603,10 +686,13 @@ impl App {
                             .selected_tab_id()
                             .is_some_and(|id| self.visible_pane_tabs().contains(&id))
                         {
-                            self.show_toolbar_in(ctx, &mut pane);
-                            self.show_status_footer_in(ctx, &mut pane);
-                            self.show_plot_in(&mut pane);
-                            self.show_console_in(ctx, console_tab_claimed, &mut pane);
+                            if self.active_plot.is_some() {
+                                self.show_plot_tab(&mut pane);
+                            } else {
+                                self.show_toolbar_in(ctx, &mut pane);
+                                self.show_status_footer_in(ctx, &mut pane);
+                                self.show_console_in(ctx, console_tab_claimed, &mut pane);
+                            }
                         }
                         self.save_pane(index);
                         if index == self.workspace.focused {
@@ -624,10 +710,13 @@ impl App {
         } else {
             self.workspace.rects = [None; 2];
             self.show_header(ui);
-            self.show_toolbar(ui);
-            self.show_status_footer(ui);
-            self.show_plot(ui);
-            self.show_console(ui, console_tab_claimed);
+            if self.active_plot.is_some() {
+                self.show_plot_tab(ui);
+            } else {
+                self.show_toolbar(ui);
+                self.show_status_footer(ui);
+                self.show_console(ui, console_tab_claimed);
+            }
         }
         if let Some(action) = self.workspace.pending.take() {
             self.apply_layout_action(action);
@@ -1258,15 +1347,16 @@ mod tests {
         assert_eq!(app.workspace.focused, 0);
     }
     #[test]
-    fn search_and_plots_leave_console_space_in_both_panes() {
+    fn search_keeps_console_space_with_plot_tabs_open_in_both_panes() {
         let (mut app, _tx) = test_app("split-plots-search");
         add_connection(&mut app, 1);
         add_connection(&mut app, 2);
         append(&mut app, 0, "left console");
         append(&mut app, 1, "right console");
-        for conn in &mut app.connections {
-            conn.show_plot = true;
-        }
+        app.open_new_plot();
+        let draft = app.plot_draft.take().unwrap();
+        app.apply_plot_draft(draft);
+        app.select_workspace_tab(TabId::Connection(PortId(1)));
         app.apply_layout_action(LayoutAction::Split(
             TabId::Connection(PortId(2)),
             SplitDirection::Below,
@@ -1525,6 +1615,14 @@ mod tests {
                         .path_fallback = format!("test-device-{old}");
                 }
                 restored.next_merged_id = 40;
+                for conn in &mut restored.connections {
+                    conn.persistent_id = saved
+                        .last_open
+                        .iter()
+                        .find(|s| s.identity == conn.identity)
+                        .unwrap()
+                        .id;
+                }
                 restored.config = saved.clone();
                 restored.restore_merged_views();
                 restored.restore_workspace();
@@ -1583,6 +1681,14 @@ mod tests {
         let (mut restored, _tx2) = test_app("persist-missing-restored");
         add_connection(&mut restored, 90);
         restored.connections[0].identity.path_fallback = "test-device-1".into();
+        for conn in &mut restored.connections {
+            conn.persistent_id = saved
+                .last_open
+                .iter()
+                .find(|s| s.identity == conn.identity)
+                .unwrap()
+                .id;
+        }
         restored.config = saved;
         restored.restore_merged_views();
         restored.restore_workspace();
@@ -1707,5 +1813,186 @@ mod tests {
                 app.connections[0].follow
             });
         }
+    }
+    #[test]
+    fn clicking_a_plot_sample_in_a_split_reveals_a_filtered_source_log() {
+        for direction in [SplitDirection::Right, SplitDirection::Below] {
+            for plot_pane in [0, 1] {
+                let (mut app, _tx) = test_app("split-plot-filtered-navigation");
+                add_connection(&mut app, 1);
+                append(&mut app, 0, "temp:23.4");
+                app.connections[0].search_query = "excluded".into();
+                app.connections[0].search_filter = crate::app::SearchFilter::OnlyMatches;
+                app.open_new_plot();
+                let draft = app.plot_draft.take().unwrap();
+                let id = draft.definition.id;
+                let chart_id = draft.definition.charts[0].id;
+                app.apply_plot_draft(draft);
+                app.maintain_plots(std::time::Duration::from_secs(1));
+                app.apply_layout_action(LayoutAction::Split(
+                    if plot_pane == 1 {
+                        TabId::Plot(id)
+                    } else {
+                        TabId::Connection(PortId(1))
+                    },
+                    direction,
+                ));
+                app.select_workspace_tab(TabId::Connection(PortId(1)));
+                app.set_search_visible(true);
+                app.select_workspace_tab(TabId::Plot(id));
+                let ctx = egui::Context::default();
+                let size = egui::vec2(1200.0, 700.0);
+                frame(&mut app, &ctx, size, vec![]);
+                frame(&mut app, &ctx, size, vec![]);
+                assert!(app.workspace.panes[1 - plot_pane].show_search);
+                assert!(app.connections[0].filter_index_active());
+                let position =
+                    egui_plot::PlotMemory::load(&ctx, egui::Id::new(("chart", chart_id)))
+                        .unwrap()
+                        .transform()
+                        .frame()
+                        .center();
+                frame(
+                    &mut app,
+                    &ctx,
+                    size,
+                    vec![egui::Event::PointerMoved(position), pointer(position, true)],
+                );
+                frame(&mut app, &ctx, size, vec![pointer(position, false)]);
+                assert_eq!(app.selected_tab_id(), Some(TabId::Connection(PortId(1))));
+                assert_eq!(app.workspace.focused, 1 - plot_pane);
+                assert!(!app.show_search);
+                frame(&mut app, &ctx, size, vec![]);
+                assert!(!app.connections[0].filter_index_active());
+                assert_eq!(app.connections[0].selected, Some(0));
+                assert_eq!(app.connections[0].search_query, "excluded");
+                assert_eq!(
+                    app.connections[0].search_filter,
+                    crate::app::SearchFilter::OnlyMatches
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plot_tabs_roundtrip_split_placement_and_never_transmit_from_the_focused_plot() {
+        let (mut app, _tx) = test_app("split-plot-persistence");
+        persistable_connections(&mut app);
+        app.open_new_plot();
+        let draft = app.plot_draft.take().unwrap();
+        let id = draft.definition.id;
+        app.apply_plot_draft(draft);
+        app.apply_layout_action(LayoutAction::Split(TabId::Plot(id), SplitDirection::Right));
+        let ctx = egui::Context::default();
+        let size = egui::vec2(1000.0, 600.0);
+        frame(&mut app, &ctx, size, vec![]);
+        frame(&mut app, &ctx, size, vec![]);
+        assert_eq!(app.selected_tab_id(), Some(TabId::Plot(id)));
+        assert!(app.macro_target_port().is_none());
+        frame(
+            &mut app,
+            &ctx,
+            size,
+            vec![
+                egui::Event::Text("no serial bytes".into()),
+                egui::Event::Paste("no paste".into()),
+            ],
+        );
+        assert!(app.connections.iter().all(|conn| conn.tx_input.is_empty()));
+        app.save_session();
+        let saved = serialcore::config::Config::from_toml(&app.config.to_toml().unwrap()).unwrap();
+        assert_eq!(
+            saved.split.as_ref().unwrap().panes[1].selected,
+            Some(SavedTab::Plot { id })
+        );
+        let (mut restored, _tx2) = test_app("split-plot-restored");
+        for (index, connection) in saved.last_open.iter().enumerate() {
+            add_connection(&mut restored, 80 + index as u32);
+            let conn = restored.connections.last_mut().unwrap();
+            conn.persistent_id = connection.id;
+            conn.identity = connection.identity.clone();
+        }
+        restored.config = saved;
+        restored.restore_plots();
+        restored.restore_merged_views();
+        restored.restore_workspace();
+        assert_eq!(restored.workspace.split, Some(SplitDirection::Right));
+        assert_eq!(restored.selected_tab_id(), Some(TabId::Plot(id)));
+        let persistent = restored.connections[0].persistent_id;
+        append(&mut restored, 0, "source line");
+        restored.navigate_plot_sample(persistent, 0);
+        assert_eq!(restored.workspace.focused, 0);
+        assert_eq!(
+            restored.selected_tab_id(),
+            Some(TabId::Connection(PortId(80)))
+        );
+        assert_eq!(restored.connections[0].scroll_to, Some(0));
+        restored.config.settings.confirm_tab_close = false;
+        restored.request_close_plot(id);
+        assert_eq!(restored.connections.len(), 3);
+        assert!(restored.plot_tabs.is_empty());
+        restored.reconcile_workspace();
+        assert!(restored.workspace.split.is_none());
+    }
+
+    #[test]
+    fn new_plot_menu_cancel_and_create_use_isolated_drafts_and_visible_small_window_actions() {
+        let (mut app, _tx) = test_app("plot-create-ui");
+        add_connection(&mut app, 1);
+        let ctx = egui::Context::default();
+        let size = egui::vec2(620.0, 440.0);
+        let render = |app: &mut App, events: Vec<egui::Event>| {
+            ctx.run_test_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    app.prepare_workspace(&ctx);
+                    app.show_workspace(ui, false);
+                    app.show_tool_windows(&ctx);
+                },
+            )
+        };
+        let click = |app: &mut App, label: &str| {
+            let _ = render(app, vec![]);
+            let output = render(app, vec![]);
+            let pos = text_rect(&output, label).center();
+            render(
+                app,
+                vec![egui::Event::PointerMoved(pos), pointer(pos, true)],
+            );
+            render(app, vec![pointer(pos, false)]);
+        };
+        click(&mut app, "+");
+        click(&mut app, "New plot");
+        let draft = app.plot_draft.as_ref().unwrap();
+        assert_eq!(
+            draft.definition.charts[0].rules[0]
+                .source
+                .as_ref()
+                .unwrap()
+                .connection_id,
+            app.connections[0].persistent_id
+        );
+        let output = render(&mut app, vec![]);
+        for label in ["Create", "Cancel"] {
+            assert!(text_rect(&output, label).bottom() <= size.y);
+        }
+        click(&mut app, "Cancel");
+        assert!(app.plot_draft.is_none());
+        assert!(app.plot_tabs.is_empty());
+        click(&mut app, "+");
+        click(&mut app, "New plot");
+        let id = app.plot_draft.as_ref().unwrap().definition.id;
+        click(&mut app, "Create");
+        assert_eq!(app.selected_tab_id(), Some(TabId::Plot(id)));
+        assert_eq!(app.plot_tabs.len(), 1);
+        assert_eq!(app.connections.len(), 1);
+        app.edit_plot(id);
+        app.plot_draft.as_mut().unwrap().definition.name = "Cancelled rename".into();
+        click(&mut app, "Cancel");
+        assert_ne!(app.plot_tabs[0].saved.name, "Cancelled rename");
     }
 }

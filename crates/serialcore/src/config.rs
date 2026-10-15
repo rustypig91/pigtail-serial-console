@@ -342,6 +342,7 @@ pub enum ExtractMode {
 
 /// A numeric-series extraction rule (see spec §7.13).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ExtractRule {
     pub mode: ExtractMode,
     /// Only lines starting with this prefix are parsed, when set.
@@ -353,6 +354,17 @@ pub struct ExtractRule {
     /// Key/value separators for kv mode; defaults cover `:` and `=`.
     #[serde(default)]
     pub kv_separators: Option<Vec<char>>,
+}
+
+impl Default for ExtractRule {
+    fn default() -> Self {
+        Self {
+            mode: ExtractMode::Kv,
+            prefix: None,
+            pattern: None,
+            kv_separators: None,
+        }
+    }
 }
 
 /// Bounds for [`Settings::console_font_size`], shared by the settings pane and
@@ -610,6 +622,9 @@ impl<'de> Deserialize<'de> for TransmitMacro {
 /// the next launch (remembered session).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedConnection {
+    /// Persistent workspace identity, independent of the runtime reader ID.
+    #[serde(default)]
+    pub id: u64,
     #[serde(default)]
     pub view: ConsoleView,
     pub identity: PortIdentity,
@@ -641,8 +656,130 @@ pub struct SavedMergedView {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SavedTab {
-    Connection { identity: PortIdentity },
-    Merged { index: usize },
+    Connection {
+        #[serde(default)]
+        id: u64,
+        identity: PortIdentity,
+    },
+    Merged {
+        index: usize,
+    },
+    Plot {
+        id: u64,
+    },
+}
+
+/// A reference never follows a renamed tab or a newly opened identical device.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlotSource {
+    pub connection_id: u64,
+    pub identity: PortIdentity,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DeviceExtractRule {
+    pub id: u64,
+    pub source: Option<PlotSource>,
+    pub extraction: ExtractRule,
+}
+
+impl Default for DeviceExtractRule {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            source: None,
+            extraction: ExtractRule {
+                mode: ExtractMode::Kv,
+                prefix: None,
+                pattern: None,
+                kv_separators: None,
+            },
+        }
+    }
+}
+
+/// Identity includes the rule, even when two rules extract the same key.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlotSeriesKey {
+    pub source_id: u64,
+    pub rule_id: u64,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlotSeriesStyle {
+    pub key: PlotSeriesKey,
+    pub color: String,
+    pub visible: bool,
+    pub secondary_axis: bool,
+}
+impl Default for PlotSeriesStyle {
+    fn default() -> Self {
+        Self {
+            key: PlotSeriesKey::default(),
+            color: "#6cb6ff".into(),
+            visible: true,
+            secondary_axis: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SavedPlotChart {
+    pub id: u64,
+    pub title: String,
+    pub rules: Vec<DeviceExtractRule>,
+    pub styles: Vec<PlotSeriesStyle>,
+    /// Relative height in the vertical stack.
+    pub weight: u16,
+    pub follow: bool,
+    /// Decimal strings preserve floating point bounds without weakening Config equality.
+    pub bounds: Option<[String; 4]>,
+}
+impl Default for SavedPlotChart {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            title: "Chart".into(),
+            rules: vec![],
+            styles: vec![],
+            weight: 1000,
+            follow: true,
+            bounds: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SavedPlotTab {
+    pub id: u64,
+    pub name: String,
+    pub charts: Vec<SavedPlotChart>,
+    pub independent_time_axes: bool,
+    pub follow: bool,
+    pub time_range: Option<[String; 2]>,
+    /// App clock origin for rebasing saved horizontal bounds on restart.
+    pub time_anchor_micros: Option<i64>,
+}
+impl Default for SavedPlotTab {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            name: "Plot".into(),
+            charts: vec![],
+            independent_time_axes: false,
+            follow: true,
+            time_range: None,
+            time_anchor_micros: None,
+        }
+    }
 }
 
 /// Placement of the second pane relative to the first.
@@ -691,6 +828,10 @@ pub struct Config {
     pub merged_views: Vec<SavedMergedView>,
     #[serde(default)]
     pub tab_order: Vec<SavedTab>,
+    #[serde(default)]
+    pub plots: Vec<SavedPlotTab>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_tab: Option<SavedTab>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split: Option<SavedSplit>,
 }
@@ -726,6 +867,18 @@ impl Config {
         for key in ["last_open", "preset"] {
             if let Some(entries) = value.get_mut(key).and_then(toml::Value::as_array_mut) {
                 for (index, entry) in entries.iter_mut().enumerate() {
+                    if key == "last_open"
+                        && entry
+                            .get("id")
+                            .is_some_and(|id| id.clone().try_into::<u64>().is_err())
+                    {
+                        tracing::warn!(
+                            section = format!("{key}[{index}]"),
+                            option = "id",
+                            "ignoring malformed configuration option; using its default value"
+                        );
+                        entry.as_table_mut().expect("connection table").remove("id");
+                    }
                     discard_invalid_options::<PortConfig>(
                         entry,
                         &format!("{key}[{index}]"),
@@ -736,6 +889,108 @@ impl Config {
                 }
             }
         }
+        if let Some(plots) = value.get_mut("plots") {
+            if let Some(tabs) = plots.as_array_mut() {
+                tabs.retain(|tab| {
+                    if tab.is_table() {
+                        true
+                    } else {
+                        tracing::warn!(section = "plots", "ignoring malformed plot definition");
+                        false
+                    }
+                });
+                for (i, tab) in tabs.iter_mut().enumerate() {
+                    if let Some(charts) = tab.get_mut("charts").and_then(toml::Value::as_array_mut)
+                    {
+                        charts
+                            .retain(|chart| keep_plot_entry(chart, &format!("plots[{i}].charts")));
+                        for (j, chart) in charts.iter_mut().enumerate() {
+                            if let Some(rules) =
+                                chart.get_mut("rules").and_then(toml::Value::as_array_mut)
+                            {
+                                rules.retain(|rule| {
+                                    keep_plot_entry(rule, &format!("plots[{i}].charts[{j}].rules"))
+                                });
+                                for (k, rule) in rules.iter_mut().enumerate() {
+                                    if let Some(extraction) = rule.get_mut("extraction") {
+                                        discard_invalid_options::<ExtractRule>(
+                                            extraction,
+                                            &format!(
+                                                "plots[{i}].charts[{j}].rules[{k}].extraction"
+                                            ),
+                                            |_| true,
+                                        );
+                                    }
+                                    if let Some(source) = rule.get_mut("source") {
+                                        discard_invalid_options::<PlotSource>(
+                                            source,
+                                            &format!("plots[{i}].charts[{j}].rules[{k}].source"),
+                                            |_| true,
+                                        );
+                                    }
+                                    discard_invalid_options::<DeviceExtractRule>(
+                                        rule,
+                                        &format!("plots[{i}].charts[{j}].rules[{k}]"),
+                                        |_| true,
+                                    );
+                                }
+                            }
+                            if let Some(styles) =
+                                chart.get_mut("styles").and_then(toml::Value::as_array_mut)
+                            {
+                                styles.retain(|style| {
+                                    keep_plot_entry(
+                                        style,
+                                        &format!("plots[{i}].charts[{j}].styles"),
+                                    )
+                                });
+                                for (k, style) in styles.iter_mut().enumerate() {
+                                    discard_invalid_options::<PlotSeriesStyle>(
+                                        style,
+                                        &format!("plots[{i}].charts[{j}].styles[{k}]"),
+                                        |_| true,
+                                    );
+                                }
+                            }
+                            discard_invalid_options::<SavedPlotChart>(
+                                chart,
+                                &format!("plots[{i}].charts[{j}]"),
+                                |c| c.weight > 0 && c.bounds.as_ref().is_none_or(valid_bounds),
+                            );
+                        }
+                    }
+                    discard_invalid_options::<SavedPlotTab>(tab, &format!("plots[{i}]"), |tab| {
+                        tab.time_range.as_ref().is_none_or(|range| {
+                            valid_bounds(&[
+                                range[0].clone(),
+                                "0".into(),
+                                range[1].clone(),
+                                "1".into(),
+                            ])
+                        })
+                    });
+                }
+            } else {
+                tracing::warn!(
+                    section = "plots",
+                    "ignoring malformed configuration section; using no plots"
+                );
+                *plots = toml::Value::Array(vec![]);
+            }
+        }
+        if let Some(selected) = value.get("selected_tab") {
+            if selected.clone().try_into::<SavedTab>().is_err() {
+                tracing::warn!(
+                    section = "workspace",
+                    option = "selected_tab",
+                    "ignoring malformed configuration option"
+                );
+                value
+                    .as_table_mut()
+                    .expect("config table")
+                    .remove("selected_tab");
+            }
+        }
         value.try_into()
     }
 
@@ -743,6 +998,23 @@ impl Config {
     pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(self)
     }
+}
+
+fn keep_plot_entry(value: &toml::Value, section: &str) -> bool {
+    if value.is_table() {
+        true
+    } else {
+        tracing::warn!(section, "ignoring malformed plot definition");
+        false
+    }
+}
+
+fn valid_bounds(bounds: &[String; 4]) -> bool {
+    let values: Option<Vec<f64>> = bounds
+        .iter()
+        .map(|bound| bound.parse::<f64>().ok().filter(|v| v.is_finite()))
+        .collect();
+    values.is_some_and(|values| values[0] < values[2] && values[1] < values[3])
 }
 
 /// Validate each option separately so one bad value cannot discard valid peers.
@@ -794,6 +1066,8 @@ impl Default for Config {
             last_open: Vec::new(),
             merged_views: Vec::new(),
             tab_order: Vec::new(),
+            plots: Vec::new(),
+            selected_tab: None,
             split: None,
         }
     }
@@ -1270,6 +1544,7 @@ bold = true
                 repeat_indefinitely: false,
             }],
             last_open: vec![SavedConnection {
+                id: 0,
                 view: ConsoleView::Ansi,
                 identity: PortIdentity {
                     vid: Some(3),
@@ -1281,6 +1556,8 @@ bold = true
             }],
             merged_views: Vec::new(),
             tab_order: Vec::new(),
+            plots: Vec::new(),
+            selected_tab: None,
             split: None,
         };
         let s = cfg.to_toml().unwrap();
@@ -1350,5 +1627,130 @@ bold = true
         assert_eq!(cfg.last_open.len(), 1);
         assert_eq!(cfg.last_open[0].name, None);
         assert_eq!(cfg.last_open[0].view, ConsoleView::Log);
+    }
+}
+
+#[cfg(test)]
+mod plot_config_tests {
+    use super::*;
+
+    #[test]
+    fn old_configs_load_without_plot_definitions_or_connection_ids() {
+        let config = Config::from_toml(
+            r#"
+            [[last_open]]
+            identity = { path_fallback = "/dev/ttyUSB0" }
+            baud = 9600
+            [[tab_order]]
+            kind = "connection"
+            identity = { path_fallback = "/dev/ttyUSB0" }
+        "#,
+        )
+        .unwrap();
+        assert!(config.plots.is_empty());
+        assert_eq!(config.last_open[0].id, 0);
+        assert!(matches!(
+            config.tab_order[0],
+            SavedTab::Connection { id: 0, .. }
+        ));
+        assert_eq!(
+            Config::from_toml(&config.to_toml().unwrap()).unwrap(),
+            config
+        );
+    }
+
+    #[test]
+    fn malformed_plot_options_preserve_valid_neighbors_and_nested_extraction_settings() {
+        let config = Config::from_toml(r#"
+            selected_tab = 12
+            [[plots]]
+            id = 1
+            name = "Environment"
+            independent_time_axes = "invalid"
+            [[plots.charts]]
+            id = 2
+            title = "Temperature"
+            weight = -1
+            follow = false
+            bounds = ["0", "nan", "1", "2"]
+            [[plots.charts.rules]]
+            id = 3
+            source = { connection_id = "invalid", label = "Remembered", identity = { path_fallback = "device" } }
+            extraction = { mode = "regex", prefix = 7, pattern = "temp=(?P<temp>[0-9]+)" }
+        "#).unwrap();
+        let tab = &config.plots[0];
+        assert_eq!(tab.name, "Environment");
+        assert!(!tab.independent_time_axes);
+        let chart = &tab.charts[0];
+        assert_eq!(chart.title, "Temperature");
+        assert_eq!(chart.weight, 1000);
+        assert!(!chart.follow);
+        assert!(chart.bounds.is_none());
+        let rule = &chart.rules[0];
+        assert_eq!(rule.id, 3);
+        assert_eq!(rule.extraction.mode, ExtractMode::Regex);
+        assert!(rule.extraction.prefix.is_none());
+        assert!(rule.extraction.pattern.is_some());
+        assert_eq!(rule.source.as_ref().unwrap().connection_id, 0);
+        assert_eq!(rule.source.as_ref().unwrap().label, "Remembered");
+        assert!(config.selected_tab.is_none());
+        assert_eq!(
+            Config::from_toml(&config.to_toml().unwrap()).unwrap(),
+            config
+        );
+    }
+
+    #[test]
+    fn plot_definitions_styles_and_workspace_state_roundtrip_exactly() {
+        let source = PlotSource {
+            connection_id: 11,
+            label: "Device".into(),
+            identity: PortIdentity {
+                path_fallback: "device".into(),
+                ..Default::default()
+            },
+        };
+        let rule = DeviceExtractRule {
+            id: 101,
+            source: Some(source),
+            ..Default::default()
+        };
+        let chart = SavedPlotChart {
+            id: 201,
+            title: "Temperature".into(),
+            rules: vec![rule],
+            weight: 650,
+            follow: false,
+            bounds: Some(["-4".into(), "2.5".into(), "100".into(), "7.5".into()]),
+            styles: vec![PlotSeriesStyle {
+                key: PlotSeriesKey {
+                    source_id: 11,
+                    rule_id: 101,
+                    name: "temp".into(),
+                },
+                color: "#ff0000".into(),
+                visible: false,
+                secondary_axis: true,
+            }],
+        };
+        let tab = SavedPlotTab {
+            id: 301,
+            name: "Environment".into(),
+            charts: vec![chart],
+            independent_time_axes: true,
+            follow: false,
+            time_anchor_micros: Some(1234),
+            time_range: Some(["-4".into(), "100".into()]),
+        };
+        let config = Config {
+            plots: vec![tab],
+            tab_order: vec![SavedTab::Plot { id: 301 }],
+            selected_tab: Some(SavedTab::Plot { id: 301 }),
+            ..Default::default()
+        };
+        assert_eq!(
+            Config::from_toml(&config.to_toml().unwrap()).unwrap(),
+            config
+        );
     }
 }

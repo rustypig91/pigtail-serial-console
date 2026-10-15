@@ -4,6 +4,7 @@
 use crate::app::{App, SeriesEntry};
 use egui_plot::{AxisHints, HPlacement, Legend, Line, Plot, PlotBounds, PlotPoints, VLine};
 use std::collections::HashSet;
+use std::time::Duration;
 
 /// How a "Y2" series' own units are laid over the plot's single coordinate
 /// space.
@@ -159,267 +160,670 @@ fn fit_bounds(all: &[SeriesEntry], map: AxisMap) -> Option<PlotBounds> {
     Some(PlotBounds::from_min_max([x0, y0], [x1, y1]))
 }
 
+#[derive(Clone, Copy)]
+enum ChartAction {
+    Add,
+    Up(usize),
+    Down(usize),
+    Duplicate(usize),
+    Remove(usize),
+}
+
+fn time_union(charts: &[crate::plots::PlotChart]) -> Option<(f64, f64)> {
+    charts
+        .iter()
+        .flat_map(|chart| &chart.series)
+        .filter(|entry| entry.visible && entry.series.value_range().is_some())
+        .filter_map(|entry| entry.series.t_range())
+        .fold(None, merge_range)
+}
+
+fn parse_range(values: &[String; 2]) -> Option<(f64, f64)> {
+    let lo = values[0].parse::<f64>().ok()?;
+    let hi = values[1].parse::<f64>().ok()?;
+    (lo.is_finite() && hi.is_finite() && lo < hi).then_some((lo, hi))
+}
+
 impl App {
-    pub(crate) fn show_plot(&mut self, ui: &mut egui::Ui) {
-        self.show_plot_in(ui);
+    pub(crate) fn show_plot_tab(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::NONE
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| self.show_plot_tab_in(ui));
     }
 
-    pub(crate) fn show_plot_in(&mut self, parent: &mut egui::Ui) {
-        if self.merged_selected || self.connections.is_empty() {
+    fn show_plot_tab_in(&mut self, ui: &mut egui::Ui) {
+        let Some(index) = self
+            .active_plot
+            .and_then(|id| self.plot_tabs.iter().position(|tab| tab.saved.id == id))
+        else {
             return;
-        }
-        let active = self.active.min(self.connections.len() - 1);
-        // The plot is off by default; enable it from the toolbar or shortcut.
-        if !self.connections[active].show_plot {
-            return;
-        }
-
-        let max_height = (parent.available_height() - 100.0).max(40.0);
-        let panel = egui::Panel::bottom(self.pane_widget_id("plot"))
-            .resizable(true)
-            .default_size(220.0)
-            .max_size(max_height);
-        super::workspace::show_panel(panel, parent, |ui| {
-            self.show_plot_header(ui, active);
-            self.show_plot_body(ui, active);
-        });
-    }
-
-    fn show_plot_header(&mut self, ui: &mut egui::Ui, active: usize) {
+        };
+        self.plot_tabs[index].saved.time_anchor_micros =
+            Some(self.clock.start_wall().timestamp_micros());
+        let id = self.plot_tabs[index].saved.id;
+        let mut action = None;
+        let mut settings = false;
+        let mut changed = false;
+        ui.spacing_mut().interact_size.y = 28.0;
+        ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
         ui.horizontal_wrapped(|ui| {
-            let conn = &mut self.connections[active];
-            if ui.button("Hide").on_hover_text("Hide plot").clicked() {
-                conn.show_plot = false;
-            }
+            ui.heading(&self.plot_tabs[index].saved.name);
             if ui
-                .button("Plot extraction…")
-                .on_hover_text("Configure rules for extracting plotted values from received text")
+                .add_enabled(
+                    self.plot_tabs[index].charts.len() < crate::plots::MAX_CHARTS,
+                    egui::Button::new("Add chart"),
+                )
                 .clicked()
             {
-                self.show_extract_win = true;
+                action = Some(ChartAction::Add);
             }
-            ui.separator();
-            if conn.series.is_empty() {
-                ui.weak("No series yet — add a rule in Plot extraction…");
+            if ui.button("Tab options").clicked() {
+                settings = true;
             }
-            let follow = conn.plot_follow;
-            if ui
-                .selectable_label(follow, "Follow")
-                .on_hover_text("Pin the view to the latest data")
-                .clicked()
-            {
-                conn.plot_follow = !follow;
-            }
-            // Panning or zooming away from the data leaves no way back short of
-            // guessing; this finds it again.
-            let anything_to_fit = conn
-                .series
-                .iter()
-                .any(|e| e.visible && !e.series.is_empty());
-            if ui
-                .add_enabled(anything_to_fit, egui::Button::new("Fit"))
-                .on_hover_text("Zoom out to show every visible series in full")
-                .on_disabled_hover_text("Nothing plotted yet")
-                .clicked()
-            {
-                conn.plot_fit = true;
-            }
-            ui.separator();
-            // Per-series visibility + colour + own-axis toggles.
-            for entry in &mut conn.series {
-                ui.checkbox(&mut entry.visible, "");
-                ui.color_edit_button_srgba(&mut entry.color)
-                    .on_hover_text("Change series colour");
-                ui.label(entry.series.name());
-                ui.checkbox(&mut entry.own_axis, "Y2")
-                    .on_hover_text("Put this series on a separate right axis");
-                ui.separator();
-            }
+            changed |= ui
+                .checkbox(
+                    &mut self.plot_tabs[index].saved.independent_time_axes,
+                    "Independent time axes",
+                )
+                .changed();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.show_app_menu(ui)
+            });
         });
-        for err in &self.connections[active].extract_errors {
-            ui.colored_label(egui::Color32::from_rgb(0xff, 0x88, 0x55), err);
-        }
-    }
-
-    fn show_plot_body(&mut self, ui: &mut egui::Ui, active: usize) {
-        let conn = &mut self.connections[active];
-
-        // The Y2 split. Scanning the series for their extents is only worth
-        // anything when something is actually on the second axis, and nothing
-        // is unless the user ticks the box — so the common case pays nothing.
-        //
-        // `secondary` has to agree exactly with what `group_range` counts:
-        // a Y2 series whose only samples are non-finite has a range of
-        // `None`, and if `secondary` disagreed by including it anyway, the
-        // ruler and label formatter below would switch on for an axis that
-        // `map` was never actually built to cover.
-        let secondary_range = group_range(&conn.series, true);
-        let secondary: HashSet<String> = match secondary_range {
-            Some(_) => conn
-                .series
-                .iter()
-                .filter(|e| e.visible && e.own_axis && e.series.value_range().is_some())
-                .map(|e| e.series.name().to_string())
-                .collect(),
-            None => HashSet::new(),
-        };
-        let map = match secondary_range {
-            Some(sec) => axis_map(group_range(&conn.series, false).or(Some(sec)), Some(sec)),
-            None => AxisMap::IDENTITY,
-        };
-
-        // Latest time across series, for auto-follow.
-        let max_t = conn
-            .series
+        ui.separator();
+        let selected: Vec<Vec<_>> = self.plot_tabs[index]
+            .charts
             .iter()
-            .filter_map(|e| e.series.t_range().map(|(_, b)| b))
-            .fold(f64::MIN, f64::max);
-        let follow = conn.plot_follow && max_t > f64::MIN;
-
-        // Selected line's time, for the log→plot marker.
-        let selected_t = conn
-            .selected
-            .and_then(|abs| conn.store.get(abs))
-            .map(|l| l.meta.ts.micros as f64 / 1_000_000.0);
-
-        // Taken now, so a click that lands while the plot is hidden or the tab
-        // is elsewhere does not queue up a surprise later.
-        let fit = std::mem::take(&mut conn.plot_fit)
-            .then(|| fit_bounds(&conn.series, map))
-            .flatten();
-
-        let mut clicked_t: Option<f64> = None;
-        let mut dragged = false;
-
-        let mut plot = Plot::new(egui::Id::new(("plot", conn.id.0)))
-            .legend(Legend::default())
-            .allow_scroll(true)
-            .x_axis_label("t (s)");
-        if !secondary.is_empty() {
-            // A ruler down the right-hand side reading in the Y2 series' own
-            // units. Its ticks stand at primary coordinates like everything
-            // else the plot draws; only the *labels* are run back through the
-            // map, which is what the second axis actually amounts to here.
-            plot = plot
-                .custom_y_axes(vec![
-                    AxisHints::new_y(),
-                    AxisHints::new_y().placement(HPlacement::Right).formatter(
-                        move |mark, _range| {
-                            format_tick(map.to_secondary(mark.value), mark.step_size / map.scale)
-                        },
-                    ),
-                ])
-                // Hovering a Y2 trace has to report the number the device
-                // actually printed, not where the trace was moved to.
-                .label_formatter(move |params| {
-                    let (name, point) = match params {
-                        egui_plot::HoverPosition::NearDataPoint {
-                            plot_name,
-                            position,
-                            ..
-                        } => (*plot_name, position),
-                        egui_plot::HoverPosition::Elsewhere { position } => ("", position),
-                    };
-                    let y = if secondary.contains(name) {
-                        map.to_secondary(point.y)
+            .map(|chart| {
+                chart
+                    .keys
+                    .iter()
+                    .zip(&chart.series)
+                    .filter_map(|(key, entry)| {
+                        entry
+                            .series
+                            .point_for_line(self.plot_selected_line(key.source_id)?)
+                            .map(|point| point.t)
+                    })
+                    .collect()
+            })
+            .collect();
+        let statuses: Vec<Vec<_>> = self.plot_tabs[index]
+            .charts
+            .iter()
+            .map(|chart| {
+                chart
+                    .saved
+                    .rules
+                    .iter()
+                    .filter_map(|rule| rule.source.as_ref())
+                    .map(|source| self.plot_source_status(source))
+                    .collect()
+            })
+            .collect();
+        let mut navigate = None;
+        let tab = &mut self.plot_tabs[index];
+        let linked = !tab.saved.independent_time_axes;
+        let union = time_union(&tab.charts);
+        // An unavailable source or a pending backfill can leave the whole tab
+        // empty on its first paint. Keep the shared Fit pending as well as each
+        // chart's Fit so late samples establish one linked time range.
+        let fit_all = union.is_some() && std::mem::take(&mut tab.fit);
+        let mut shared = tab.saved.time_range.as_ref().and_then(parse_range);
+        if linked {
+            if fit_all {
+                shared = union.map(|(lo, hi)| {
+                    if lo == hi {
+                        (lo - 0.5, hi + 0.5)
                     } else {
-                        point.y
-                    };
-                    if name.is_empty() {
-                        Some(format!("t = {:.3}s\ny = {y:.4}", point.x))
-                    } else {
-                        Some(format!("{name}\nt = {:.3}s\ny = {y:.4}", point.x))
+                        (lo, hi)
                     }
                 });
+            } else if tab.saved.follow {
+                if let Some((_, latest)) = union {
+                    let span = shared.map(|(lo, hi)| hi - lo).unwrap_or(10.0).max(1e-6);
+                    shared = Some((latest - span, latest));
+                }
+            }
         }
-        let response = plot.show(ui, |pui| {
-            let bounds = pui.plot_bounds();
-            let (mut x0, mut x1) = (bounds.min()[0], bounds.max()[0]);
-            let width = (pui.response().rect.width() as usize).clamp(64, 4096);
-
-            // Fit wins over follow for the frame it happens on, and has to
-            // be applied *here*: the decimation below reads `x0`/`x1`, so a
-            // window set after it would draw this frame's lines against the
-            // old one — a plot that looks empty until the next repaint.
-            if let Some(b) = fit {
-                pui.set_plot_bounds(b);
-                x0 = b.min()[0];
-                x1 = b.max()[0];
-            } else if follow {
-                // Auto-follow: shift the window so it ends at the latest
-                // sample, preserving the current span.
-                let span = (x1 - x0).max(1e-6);
-                x1 = max_t;
-                x0 = x1 - span;
-                pui.set_plot_bounds(PlotBounds::from_min_max(
-                    [x0, bounds.min()[1]],
-                    [x1, bounds.max()[1]],
-                ));
-            }
-
-            for entry in &conn.series {
-                if !entry.visible {
-                    continue;
+        if tab.charts.is_empty() {
+            ui.centered_and_justified(|ui| {
+                if ui.button("Add chart").clicked() {
+                    action = Some(ChartAction::Add);
                 }
-                let mut pts = entry.series.decimate(x0, x1, width);
-                // Decimation picked the min/max of each column from the raw
-                // values; the map is affine with a positive scale, so those
-                // are still the min/max after it. Identity for anything not
-                // on Y2, so this applies uniformly.
-                let m = map.for_entry(entry.own_axis);
-                for p in &mut pts {
-                    p[1] = m.to_primary(p[1]);
-                }
-                let line = Line::new(entry.series.name(), PlotPoints::from(pts))
-                    .color(entry.color)
-                    .name(entry.series.name());
-                pui.line(line);
-            }
-
-            if let Some(t) = selected_t {
-                pui.vline(
-                    VLine::new("", t)
-                        .color(egui::Color32::from_gray(180))
-                        .width(1.0_f32),
-                );
-            }
-
-            if pui.response().clicked() {
-                if let Some(coord) = pui.pointer_coordinate() {
-                    clicked_t = Some(coord.x);
-                }
-            }
-            dragged = pui.response().dragged();
-        });
-
-        let _ = response;
-
-        // Pan disengages follow (spec §7.13).
-        if dragged && conn.plot_follow {
-            conn.plot_follow = false;
-        }
-
-        // Plot→log: clicking picks the nearest sample and scrolls the log to it.
-        if let Some(t) = clicked_t {
-            let mut best: Option<(f64, u64)> = None;
-            for entry in &conn.series {
-                if !entry.visible {
-                    continue;
-                }
-                if let Some(p) = entry.series.nearest_point(t) {
-                    let d = (p.t - t).abs();
-                    if best.map(|(bd, _)| d < bd).unwrap_or(true) {
-                        best = Some((d, p.line));
+            });
+        } else {
+            let count = tab.charts.len();
+            let height = ui.available_height().max(count as f32 * 180.0);
+            let usable = (height - (count - 1) as f32 * 8.0).max(1.0);
+            let total_weight: f32 = tab
+                .charts
+                .iter()
+                .map(|chart| chart.saved.weight.max(1) as f32)
+                .sum();
+            let weights: Vec<_> = tab
+                .charts
+                .iter()
+                .map(|chart| chart.saved.weight.max(1) as f32 / total_weight)
+                .collect();
+            let mut divider = None;
+            egui::ScrollArea::vertical().id_salt(("plot_stack", id)).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for (c, chart) in tab.charts.iter_mut().enumerate() {
+                    let card_height = (usable * weights[c]).max(140.0);
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), card_height), egui::Sense::hover());
+                    let mut card = ui.new_child(egui::UiBuilder::new().id_salt(chart.saved.id).max_rect(rect.shrink2(egui::vec2(0.0, 4.0))));
+                    card.set_clip_rect(rect.intersect(ui.clip_rect()));
+                    card.horizontal_wrapped(|ui| {
+                        ui.strong(&chart.saved.title);
+                        let follow = if linked { &mut tab.saved.follow } else { &mut chart.saved.follow };
+                        if ui.selectable_label(*follow, "Follow").clicked() { *follow = !*follow; changed = true; }
+                        if ui.button("Fit").clicked() {
+                            if linked { tab.fit = true; } else { chart.fit = true; }
+                        }
+                        if ui.button("Settings").clicked() { settings = true; }
+                        ui.menu_button("Series", |ui| {
+                            egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                                for entry in &mut chart.series {
+                                    ui.horizontal(|ui| {
+                                        changed |= ui.checkbox(&mut entry.visible, "").changed();
+                                        changed |= ui.color_edit_button_srgba(&mut entry.color).changed();
+                                        ui.label(entry.series.name());
+                                        changed |= ui.checkbox(&mut entry.own_axis, "Y2").changed();
+                                    });
+                                }
+                                if chart.series.is_empty() { ui.weak("No series yet. Configure extraction rules in Settings."); }
+                            });
+                        });
+                        ui.menu_button("⋯", |ui| {
+                            for (label, enabled, request) in [
+                                ("Move up", c > 0, ChartAction::Up(c)),
+                                ("Move down", c + 1 < count, ChartAction::Down(c)),
+                                ("Duplicate", count < crate::plots::MAX_CHARTS, ChartAction::Duplicate(c)),
+                                ("Remove chart", true, ChartAction::Remove(c)),
+                            ] { if ui.add_enabled(enabled, egui::Button::new(label)).clicked() { action = Some(request); ui.close(); } }
+                        });
+                    });
+                    for (r, runtime) in chart.rules.iter().enumerate() {
+                        if let Some(error) = &runtime.error { card.colored_label(egui::Color32::YELLOW, format!("Rule {}: {error}", r+1)); }
+                    }
+                    if let Some(status) = statuses[c].iter().find(|s| !s.ends_with("Connected")) { card.colored_label(egui::Color32::YELLOW, status).on_hover_text(statuses[c].join("\n")); }
+                    if chart.limited || chart.history_unavailable { card.weak("Retained history only; older output or samples may be unavailable."); }
+                    if chart.series.is_empty() { card.weak("No samples yet. Settings can preview retained source output."); }
+                    let follow = if linked { tab.saved.follow } else { chart.saved.follow };
+                    let result = draw_chart(&mut card, chart, if linked { shared } else { None }, follow, fit_all && linked, &selected[c], linked.then(||egui::Id::new(("plot_cursor",id))));
+                    if let Some((source, line)) = result.navigate { navigate = Some((source, line)); }
+                    changed |= result.presentation_changed;
+                    if result.interacted {
+                        if linked { tab.saved.follow = false; shared = Some(result.time); }
+                        else { chart.saved.follow = false; }
+                        changed = true;
+                        crate::graphics::request_animation_frame(ui.ctx());
+                    }
+                    if changed || result.interacted { chart.remember_styles(); }
+                    if c+1 < count {
+                        let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 8.0), egui::Sense::drag());
+                        ui.painter().line_segment([rect.left_center(), rect.right_center()], egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color));
+                        response.clone().on_hover_cursor(egui::CursorIcon::ResizeVertical);
+                        if response.dragged() { divider = Some((c, ui.input(|i| i.pointer.delta().y))); }
+                        if response.double_clicked() { divider = Some((c, f32::NAN)); }
                     }
                 }
+            });
+            if let Some((c, delta)) = divider {
+                let sum = tab.charts[c].saved.weight as f32 + tab.charts[c + 1].saved.weight as f32;
+                let weight = if delta.is_nan() {
+                    sum / 2.0
+                } else {
+                    tab.charts[c].saved.weight as f32 + delta / usable * total_weight
+                };
+                tab.charts[c].saved.weight =
+                    weight.clamp(sum * 0.1, sum * 0.9).round().max(1.0) as u16;
+                tab.charts[c + 1].saved.weight =
+                    (sum - tab.charts[c].saved.weight as f32).round().max(1.0) as u16;
+                changed = true;
             }
-            if let Some((_, line)) = best {
-                conn.selected = Some(line);
-                conn.scroll_to = Some(line);
+        }
+        if linked {
+            tab.saved.time_range = shared.map(|(lo, hi)| [lo.to_string(), hi.to_string()]);
+        }
+        if let Some(action) = action {
+            match action {
+                ChartAction::Add => {
+                    tab.charts.push(crate::plots::PlotChart::new(
+                        serialcore::config::SavedPlotChart {
+                            id: crate::plots::new_id(),
+                            title: format!("Chart {}", tab.charts.len() + 1),
+                            ..Default::default()
+                        },
+                    ));
+                    settings = true;
+                }
+                ChartAction::Up(c) => tab.charts.swap(c, c - 1),
+                ChartAction::Down(c) => tab.charts.swap(c, c + 1),
+                ChartAction::Remove(c) => {
+                    tab.charts.remove(c);
+                }
+                ChartAction::Duplicate(c) => {
+                    tab.charts[c].remember_styles();
+                    let mut saved = tab.charts[c].saved.clone();
+                    saved.id = crate::plots::new_id();
+                    saved.title = format!("{} copy", saved.title);
+                    for rule in &mut saved.rules {
+                        let old = rule.id;
+                        rule.id = crate::plots::new_id();
+                        for style in &mut saved.styles {
+                            if style.key.rule_id == old {
+                                style.key.rule_id = rule.id;
+                            }
+                        }
+                    }
+                    tab.charts
+                        .insert(c + 1, crate::plots::PlotChart::new(saved));
+                }
             }
+            changed = true;
+            self.plot_routes_dirty = true;
+            self.resize_plot_history();
+        }
+        // Persist bounds through the normal debounce, without serializing samples.
+        let saved = self
+            .plot_tabs
+            .iter_mut()
+            .map(crate::plots::PlotTab::definition)
+            .collect::<Vec<_>>();
+        if self.config.plots != saved {
+            self.config.plots = saved;
+            self.write_config();
+        }
+        if changed {
+            self.save_session();
+        }
+        if settings {
+            self.edit_plot(id);
+        }
+        if let Some((source, line)) = navigate {
+            self.request_plot_sample_navigation(source, line);
         }
     }
 }
+
+struct ChartResult {
+    navigate: Option<(u64, u64)>,
+    time: (f64, f64),
+    interacted: bool,
+    presentation_changed: bool,
+}
+
+fn draw_chart(
+    ui: &mut egui::Ui,
+    chart: &mut crate::plots::PlotChart,
+    shared: Option<(f64, f64)>,
+    follow: bool,
+    fit_shared: bool,
+    selected: &[f64],
+    link_group: Option<egui::Id>,
+) -> ChartResult {
+    let secondary_range = group_range(&chart.series, true);
+    let secondary: HashSet<String> = if secondary_range.is_some() {
+        chart
+            .series
+            .iter()
+            .filter(|e| e.visible && e.own_axis && e.series.value_range().is_some())
+            .map(|e| e.series.name().to_string())
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let map = match secondary_range {
+        Some(sec) => axis_map(group_range(&chart.series, false).or(Some(sec)), Some(sec)),
+        None => AxisMap::IDENTITY,
+    };
+    // Keep an empty chart's initial Fit pending until there are samples. A
+    // restored manual view has no pending Fit and must survive backfill.
+    let fit = (!chart.series.is_empty() && (std::mem::take(&mut chart.fit) || fit_shared))
+        .then(|| fit_bounds(&chart.series, map))
+        .flatten();
+    let plot_id = egui::Id::new(("chart", chart.saved.id));
+    let item_id = |i: usize| {
+        chart
+            .keys
+            .get(i)
+            .map(|key| egui::Id::new((chart.saved.id, key)))
+            .unwrap_or_else(|| egui::Id::new((chart.saved.id, i)))
+    };
+    let hidden: Vec<_> = chart
+        .series
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| !entry.visible)
+        .map(|(i, _)| item_id(i))
+        .collect();
+    let initial = egui_plot::PlotMemory::load(ui.ctx(), plot_id).is_none();
+    if let Some(mut memory) = egui_plot::PlotMemory::load(ui.ctx(), plot_id) {
+        memory.hidden_items = hidden.iter().copied().collect();
+        memory.store(ui.ctx(), plot_id);
+    }
+    let saved_bounds = chart.saved.bounds.as_ref().and_then(|s| {
+        let x = parse_range(&[s[0].clone(), s[2].clone()])?;
+        let y = parse_range(&[s[1].clone(), s[3].clone()])?;
+        Some(PlotBounds::from_min_max([x.0, y.0], [x.1, y.1]))
+    });
+    let mut plot = Plot::new(plot_id)
+        .id(plot_id)
+        .legend(
+            Legend::default()
+                .grouping(egui_plot::LegendGrouping::ById)
+                .hidden_items(hidden),
+        )
+        .height(ui.available_height().max(40.0))
+        .allow_scroll(true)
+        .x_axis_label("t (s)");
+    if let Some(group) = link_group {
+        plot = plot.link_cursor(group, [true, false]);
+    }
+    if !secondary.is_empty() {
+        plot = plot
+            .custom_y_axes(vec![
+                AxisHints::new_y(),
+                AxisHints::new_y()
+                    .placement(HPlacement::Right)
+                    .formatter(move |mark, _| {
+                        format_tick(map.to_secondary(mark.value), mark.step_size / map.scale)
+                    }),
+            ])
+            .label_formatter(move |params| {
+                let (name, point) = match params {
+                    egui_plot::HoverPosition::NearDataPoint {
+                        plot_name,
+                        position,
+                        ..
+                    } => (*plot_name, position),
+                    egui_plot::HoverPosition::Elsewhere { position } => ("", position),
+                };
+                let y = if secondary.contains(name) {
+                    map.to_secondary(point.y)
+                } else {
+                    point.y
+                };
+                Some(format!("{name}\nt = {:.3}s\ny = {y:.4}", point.x))
+            });
+    }
+    let response = plot.show(ui, |pui| {
+        let mut bounds = pui.plot_bounds();
+        if initial {
+            if let Some(saved) = saved_bounds {
+                bounds = saved;
+            }
+        }
+        if let Some(fit) = fit {
+            bounds = fit;
+        }
+        let mut x = (bounds.min()[0], bounds.max()[0]);
+        if let Some(shared) = shared {
+            x = shared;
+        } else if follow && fit.is_none() {
+            if let Some((_, last)) = chart
+                .series
+                .iter()
+                .filter(|e| e.visible)
+                .filter_map(|e| e.series.t_range())
+                .fold(None, merge_range)
+            {
+                let span = (x.1 - x.0).max(1e-6);
+                x = (last - span, last);
+            }
+        }
+        pui.set_plot_bounds(PlotBounds::from_min_max(
+            [x.0, bounds.min()[1]],
+            [x.1, bounds.max()[1]],
+        ));
+        let width = (pui.response().rect.width() as usize).clamp(64, 4096);
+        for (i, entry) in chart.series.iter().enumerate() {
+            let segments = if entry.visible {
+                entry.series.decimate_segments(x.0, x.1, width)
+            } else {
+                vec![]
+            };
+            if segments.is_empty() {
+                // Keep legend identity and saved visibility even outside the time window.
+                pui.line(
+                    Line::new(
+                        entry.series.name(),
+                        PlotPoints::from(
+                            entry
+                                .series
+                                .last()
+                                .map(|point| {
+                                    [
+                                        point.t,
+                                        map.for_entry(entry.own_axis).to_primary(point.value),
+                                    ]
+                                })
+                                .into_iter()
+                                .collect::<Vec<_>>(),
+                        ),
+                    )
+                    .color(entry.color)
+                    .id(item_id(i)),
+                );
+            }
+            for mut pts in segments {
+                for p in &mut pts {
+                    p[1] = map.for_entry(entry.own_axis).to_primary(p[1]);
+                }
+                if pts.len() == 1 {
+                    pui.points(
+                        egui_plot::Points::new(entry.series.name(), PlotPoints::from(pts))
+                            .color(entry.color)
+                            .id(item_id(i))
+                            .radius(3.0),
+                    );
+                } else {
+                    pui.line(
+                        Line::new(entry.series.name(), PlotPoints::from(pts))
+                            .color(entry.color)
+                            .id(item_id(i)),
+                    );
+                }
+            }
+        }
+        for t in selected {
+            pui.vline(VLine::new("", *t).color(egui::Color32::from_gray(180)));
+        }
+        (pui.pointer_coordinate(), pui.response().clicked())
+    });
+    let mut presentation_changed = false;
+    if let Some(memory) = egui_plot::PlotMemory::load(ui.ctx(), plot_id) {
+        for (i, entry) in chart.series.iter_mut().enumerate() {
+            if entry.series.is_empty() {
+                continue;
+            }
+            let id = chart
+                .keys
+                .get(i)
+                .map(|key| egui::Id::new((chart.saved.id, key)))
+                .unwrap_or_else(|| egui::Id::new((chart.saved.id, i)));
+            let visible = !memory.hidden_items.contains(&id);
+            presentation_changed |= entry.visible != visible;
+            entry.visible = visible;
+        }
+    }
+    let bounds = *response.transform.bounds();
+    chart.saved.bounds = Some([
+        bounds.min()[0].to_string(),
+        bounds.min()[1].to_string(),
+        bounds.max()[0].to_string(),
+        bounds.max()[1].to_string(),
+    ]);
+    let mut navigate = None;
+    if response.inner.1 {
+        if let Some(pointer) = response.inner.0 {
+            let mut best: Option<(f64, u64, u64)> = None;
+            for (key, entry) in chart
+                .keys
+                .iter()
+                .zip(&chart.series)
+                .filter(|(_, e)| e.visible)
+            {
+                if let Some(point) = entry.series.nearest_point(pointer.x) {
+                    let dx = (point.t - pointer.x) / (bounds.max()[0] - bounds.min()[0]).max(1e-6);
+                    let dy = (map.for_entry(entry.own_axis).to_primary(point.value) - pointer.y)
+                        / (bounds.max()[1] - bounds.min()[1]).max(1e-6);
+                    let distance = dx * dx + dy * dy;
+                    if distance.is_finite() && best.is_none_or(|(d, _, _)| distance < d) {
+                        best = Some((distance, key.source_id, point.line));
+                    }
+                }
+            }
+            navigate = best.map(|(_, source, line)| (source, line));
+        }
+    }
+    let interacted = response.response.dragged()
+        || (response.response.hovered()
+            && ui.input(|i| i.smooth_scroll_delta != egui::Vec2::ZERO || i.zoom_delta() != 1.0));
+    ChartResult {
+        navigate,
+        time: (bounds.min()[0], bounds.max()[0]),
+        interacted,
+        presentation_changed,
+    }
+}
+
+impl App {
+    pub(crate) fn show_plot_setup(&mut self, ctx: &egui::Context) {
+        let Some(mut draft) = self.plot_draft.take() else {
+            return;
+        };
+        let mut sources: Vec<_> = self
+            .connections
+            .iter()
+            .map(crate::plots::source_of)
+            .collect();
+        for source in draft
+            .definition
+            .charts
+            .iter()
+            .flat_map(|chart| &chart.rules)
+            .filter_map(|rule| rule.source.as_ref())
+        {
+            if !sources
+                .iter()
+                .any(|s| s.connection_id == source.connection_id)
+            {
+                sources.push(source.clone());
+            }
+        }
+        for saved in &self.config.last_open {
+            if saved.id != 0 && !sources.iter().any(|s| s.connection_id == saved.id) {
+                sources.push(serialcore::config::PlotSource {
+                    connection_id: saved.id,
+                    identity: saved.identity.clone(),
+                    label: saved.name.clone().unwrap_or_else(|| saved.identity.label()),
+                });
+            }
+        }
+        let source_labels: Vec<_> = sources
+            .iter()
+            .map(|source| self.plot_source_status(source))
+            .collect();
+        let mut open = true;
+        let mut commit = false;
+        let mut cancel = false;
+        let mut changed = false;
+        egui::Window::new(if draft.editing.is_some() { "Plot options" } else { "New plot" }).id(egui::Id::new("plot_setup"))
+            .open(&mut open).default_width(600.0).frame(super::chrome::dialog_frame(ctx)).show(ctx, |ui| {
+                super::chrome::dialog_style(ui);
+                egui::ScrollArea::vertical().max_height((ctx.content_rect().height()-170.0).max(80.0)).show(ui, |ui| {
+                    ui.horizontal(|ui| { ui.label("Tab name"); changed |= ui.text_edit_singleline(&mut draft.definition.name).changed(); });
+                    changed |= ui.checkbox(&mut draft.definition.independent_time_axes, "Independent time axes").changed();
+                    ui.weak("Backfill uses retained source history, including restored captures. Older discarded output is unavailable. Closing this tab keeps devices connected.");
+                    let mut remove_chart = None;
+                    for (c, chart) in draft.definition.charts.iter_mut().enumerate() {
+                        ui.push_id(chart.id, |ui| {
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Chart title"); changed |= ui.text_edit_singleline(&mut chart.title).changed();
+                                    if ui.small_button("Remove chart").clicked() { remove_chart = Some(c); }
+                                });
+                                let mut remove_rule = None;
+                                for (r, rule) in chart.rules.iter_mut().enumerate() {
+                                    ui.push_id(rule.id, |ui| { ui.group(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.strong(format!("Rule {}", r+1));
+                                            if ui.small_button("Remove rule").clicked() { remove_rule = Some(r); }
+                                        });
+                                        let current = rule.source.as_ref().map(|s| self.plot_source_status(s)).unwrap_or_else(|| "Select a device".into());
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label("Device");
+                                            egui::ComboBox::from_id_salt("source").selected_text(current).width(320.0).show_ui(ui, |ui| {
+                                                if ui.selectable_label(rule.source.is_none(), "No device").clicked() { rule.source = None; changed = true; }
+                                                for (source,label) in sources.iter().zip(&source_labels) {
+                                                    if ui.selectable_label(rule.source.as_ref().is_some_and(|s| s.connection_id==source.connection_id),label).clicked() { rule.source = Some(source.clone()); changed = true; }
+                                                }
+                                            });
+                                        });
+                                        ui.horizontal_wrapped(|ui| {
+                                            changed |= ui.selectable_value(&mut rule.extraction.mode,serialcore::config::ExtractMode::Kv,"Name = value pairs").changed();
+                                            changed |= ui.selectable_value(&mut rule.extraction.mode,serialcore::config::ExtractMode::Regex,"Regex").changed();
+                                        });
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label("Prefix").on_hover_text("Read only lines starting with this text. The prefix itself is not parsed.");
+                                            let mut prefix = rule.extraction.prefix.clone().unwrap_or_default();
+                                            if ui.add(egui::TextEdit::singleline(&mut prefix).hint_text("any line").desired_width(260.0)).changed() { rule.extraction.prefix = (!prefix.is_empty()).then_some(prefix); changed = true; }
+                                        });
+                                        match rule.extraction.mode {
+                                            serialcore::config::ExtractMode::Kv => {
+                                                let separators = rule.extraction.kv_separators.clone().unwrap_or_else(||vec![':', '=']);
+                                                let mut spaced = separators.iter().any(|c|c.is_whitespace());
+                                                let mut typed: String = separators.iter().filter(|c|!c.is_whitespace()).collect();
+                                                let mut edited = false;
+                                                ui.horizontal_wrapped(|ui| { ui.label("Separators"); edited |= ui.text_edit_singleline(&mut typed).changed(); });
+                                                edited |= ui.checkbox(&mut spaced,"Allow space: temp 23.4").changed();
+                                                if edited { let mut seps: Vec<_> = typed.chars().filter(|c|!c.is_whitespace()).collect(); if spaced { seps.push(' '); } rule.extraction.kv_separators=Some(seps); changed=true; }
+                                                ui.weak("e.g. temp:23.4 rpm:1200 → temp and rpm");
+                                            }
+                                            serialcore::config::ExtractMode::Regex => {
+                                                let mut pattern=rule.extraction.pattern.clone().unwrap_or_default();
+                                                ui.label("Pattern (named numeric capture groups)");
+                                                if ui.add(egui::TextEdit::singleline(&mut pattern).hint_text(r"temp=(?P<temp>[\d.]+)").desired_width(ui.available_width())).changed() { rule.extraction.pattern=Some(pattern);changed=true; }
+                                            }
+                                        }
+                                    }); });
+                                }
+                                if let Some(r)=remove_rule { chart.rules.remove(r); changed=true; }
+                                if ui.add_enabled(chart.rules.len()<crate::plots::MAX_RULES,egui::Button::new("Add extraction rule")).clicked() { chart.rules.push(serialcore::config::DeviceExtractRule { id:crate::plots::new_id(),source:sources.first().cloned(),..Default::default() });changed=true; }
+                            });
+                        });
+                    }
+                    if let Some(c)=remove_chart { draft.definition.charts.remove(c);changed=true; }
+                    if ui.add_enabled(draft.definition.charts.len()<crate::plots::MAX_CHARTS,egui::Button::new("Add chart")).clicked() { draft.definition.charts.push(serialcore::config::SavedPlotChart { id:crate::plots::new_id(),..Default::default() });changed=true; }
+                    ui.separator();ui.strong("Preview");
+                    for message in &draft.preview { ui.weak(message); }
+                    if draft.preview.is_empty() { ui.weak("Preparing preview…"); }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    commit=ui.button(if draft.editing.is_some() { "Apply" } else { "Create" }).clicked();
+                    cancel=ui.button("Cancel").clicked();
+                });
+            });
+        if commit {
+            if draft.definition.name.trim().is_empty() {
+                draft.definition.name = "Plot".into();
+            }
+            self.apply_plot_draft(draft);
+        } else if open && !cancel {
+            draft.preview_dirty |= changed;
+            let backlog = self.update_plot_preview(&mut draft, Duration::from_millis(4));
+            if backlog {
+                crate::graphics::request_animation_frame(ctx);
+            }
+            self.plot_draft = Some(draft);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,5 +1006,257 @@ mod tests {
         assert_eq!(format_tick(0.25, 0.01), "0.25");
         assert_eq!(format_tick(1200.0, 100.0), "1200");
         assert_eq!(format_tick(3.0, 0.0), "3", "a zero step is still drawable");
+    }
+    fn chart_app() -> App {
+        let (mut app, _tx) = crate::app::tests::test_app("plot-chart-ui");
+        let mut first = crate::plots::PlotChart::new(serialcore::config::SavedPlotChart {
+            id: 1001,
+            title: "First".into(),
+            follow: false,
+            ..Default::default()
+        });
+        first.series = vec![
+            entry(true, &[(-20.0, 1.0), (10.0, 2.0)]),
+            entry(false, &[(-1000.0, 3.0), (1000.0, 4.0)]),
+        ];
+        let mut second = crate::plots::PlotChart::new(serialcore::config::SavedPlotChart {
+            id: 1002,
+            title: "Second".into(),
+            follow: false,
+            ..Default::default()
+        });
+        second.series = vec![entry(true, &[(-5.0, 100.0), (40.0, 200.0)])];
+        let mut tab = crate::plots::PlotTab::new(serialcore::config::SavedPlotTab {
+            id: 1000,
+            name: "Charts".into(),
+            follow: false,
+            ..Default::default()
+        });
+        tab.charts = vec![first, second];
+        app.plot_tabs.push(tab);
+        app.select_plot(1000);
+        app
+    }
+    fn chart_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        use crate::test_ui::ContextTestExt as _;
+        ctx.run_test_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 800.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| app.show_plot_tab(ui),
+        )
+    }
+    fn bounds(ctx: &egui::Context, id: u64) -> PlotBounds {
+        *egui_plot::PlotMemory::load(ctx, egui::Id::new(("chart", id)))
+            .unwrap()
+            .bounds()
+    }
+    fn chart_pointer(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn an_empty_chart_keeps_its_initial_fit_until_samples_arrive() {
+        let mut app = chart_app();
+        app.plot_tabs[0].charts.truncate(1);
+        app.plot_tabs[0].charts[0].series.clear();
+        let ctx = egui::Context::default();
+        chart_frame(&mut app, &ctx, vec![]);
+        chart_frame(&mut app, &ctx, vec![]);
+        app.plot_tabs[0].charts[0].series = vec![entry(true, &[(20.0, 23.4)])];
+        chart_frame(&mut app, &ctx, vec![]);
+        let actual = bounds(&ctx, 1001);
+        assert!(actual.min()[0] < 20.0 && actual.max()[0] > 20.0);
+        assert!(actual.min()[1] < 23.4 && actual.max()[1] > 23.4);
+    }
+
+    #[test]
+    fn initially_empty_linked_charts_fit_the_shared_range_when_samples_arrive() {
+        for follow in [false, true] {
+            let mut app = chart_app();
+            app.plot_tabs[0].saved.follow = follow;
+            for chart in &mut app.plot_tabs[0].charts {
+                chart.series.clear();
+            }
+            let ctx = egui::Context::default();
+            chart_frame(&mut app, &ctx, vec![]);
+            chart_frame(&mut app, &ctx, vec![]);
+            app.plot_tabs[0].charts[0].series = vec![entry(true, &[(-20.0, 1.0), (10.0, 2.0)])];
+            app.plot_tabs[0].charts[1].series = vec![entry(true, &[(-5.0, 100.0), (40.0, 200.0)])];
+            chart_frame(&mut app, &ctx, vec![]);
+            chart_frame(&mut app, &ctx, vec![]);
+            for id in [1001, 1002] {
+                let actual = bounds(&ctx, id);
+                assert_eq!((actual.min()[0], actual.max()[0]), (-20.0, 40.0));
+            }
+            assert_eq!(
+                app.plot_tabs[0].saved.time_range,
+                Some(["-20".into(), "40".into()])
+            );
+        }
+    }
+
+    #[test]
+    fn linked_fit_uses_visible_time_union_and_independent_value_bounds() {
+        let mut app = chart_app();
+        let ctx = egui::Context::default();
+        chart_frame(&mut app, &ctx, vec![]);
+        chart_frame(&mut app, &ctx, vec![]);
+        let first = bounds(&ctx, 1001);
+        let second = bounds(&ctx, 1002);
+        assert_eq!((first.min()[0], first.max()[0]), (-20.0, 40.0));
+        assert_eq!((second.min()[0], second.max()[0]), (-20.0, 40.0));
+        assert!(first.max()[1] < 10.0);
+        assert!(second.min()[1] > 90.0);
+        app.plot_tabs[0].saved.independent_time_axes = true;
+        for chart in &mut app.plot_tabs[0].charts {
+            chart.fit = true;
+        }
+        chart_frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            (bounds(&ctx, 1001).min()[0], bounds(&ctx, 1001).max()[0]),
+            (-20.0, 10.0)
+        );
+        assert_eq!(
+            (bounds(&ctx, 1002).min()[0], bounds(&ctx, 1002).max()[0]),
+            (-5.0, 40.0)
+        );
+    }
+
+    #[test]
+    fn panning_second_chart_synchronizes_linked_time_but_independent_pan_stays_local() {
+        for independent in [false, true] {
+            let mut app = chart_app();
+            app.plot_tabs[0].saved.independent_time_axes = independent;
+            let ctx = egui::Context::default();
+            chart_frame(&mut app, &ctx, vec![]);
+            chart_frame(&mut app, &ctx, vec![]);
+            let initial_first = bounds(&ctx, 1001);
+            let initial_second = bounds(&ctx, 1002);
+            let start = egui_plot::PlotMemory::load(&ctx, egui::Id::new(("chart", 1002_u64)))
+                .unwrap()
+                .transform()
+                .frame()
+                .center();
+            let end = start + egui::vec2(60.0, 0.0);
+            chart_frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(start), chart_pointer(start, true)],
+            );
+            chart_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(end)]);
+            chart_frame(&mut app, &ctx, vec![chart_pointer(end, false)]);
+            chart_frame(&mut app, &ctx, vec![]);
+            let first = bounds(&ctx, 1001);
+            let second = bounds(&ctx, 1002);
+            assert_ne!(second.min()[0], initial_second.min()[0]);
+            if independent {
+                assert_eq!(first, initial_first);
+            } else {
+                assert!((first.min()[0] - second.min()[0]).abs() < 1e-8);
+                assert!((first.max()[0] - second.max()[0]).abs() < 1e-8);
+            }
+        }
+    }
+
+    #[test]
+    fn follow_uses_shared_latest_sample_and_preserves_horizontal_span() {
+        let mut app = chart_app();
+        let ctx = egui::Context::default();
+        chart_frame(&mut app, &ctx, vec![]);
+        chart_frame(&mut app, &ctx, vec![]);
+        app.plot_tabs[0].saved.follow = true;
+        app.plot_tabs[0].charts[1].series[0]
+            .series
+            .push(100.0, 150.0, 3);
+        chart_frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            (bounds(&ctx, 1001).min()[0], bounds(&ctx, 1001).max()[0]),
+            (40.0, 100.0)
+        );
+        assert_eq!(
+            (bounds(&ctx, 1002).min()[0], bounds(&ctx, 1002).max()[0]),
+            (40.0, 100.0)
+        );
+    }
+    #[test]
+    fn chart_menu_duplicates_with_fresh_ids_reorders_and_keeps_last_chart_removal_usable() {
+        let mut app = chart_app();
+        let ctx = egui::Context::default();
+        app.plot_tabs[0].charts[0]
+            .saved
+            .rules
+            .push(serialcore::config::DeviceExtractRule {
+                id: 1101,
+                ..Default::default()
+            });
+        app.plot_tabs[0].charts[0]
+            .saved
+            .styles
+            .push(serialcore::config::PlotSeriesStyle {
+                key: serialcore::config::PlotSeriesKey {
+                    source_id: 11,
+                    rule_id: 1101,
+                    name: "temp".into(),
+                },
+                ..Default::default()
+            });
+        let click = |app: &mut App, label: &str| {
+            chart_frame(app, &ctx, vec![]);
+            let output = chart_frame(app, &ctx, vec![]);
+            let pos = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => {
+                        Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing chart action {label}"));
+            chart_frame(
+                app,
+                &ctx,
+                vec![egui::Event::PointerMoved(pos), chart_pointer(pos, true)],
+            );
+            chart_frame(app, &ctx, vec![chart_pointer(pos, false)]);
+        };
+        click(&mut app, "⋯");
+        click(&mut app, "Duplicate");
+        let tab = &app.plot_tabs[0];
+        assert_eq!(tab.charts.len(), 3);
+        let copy = tab.charts[1].saved.id;
+        assert_ne!(copy, 1001);
+        assert_ne!(tab.charts[1].saved.rules[0].id, 1101);
+        assert_eq!(
+            tab.charts[1].saved.styles[0].key.rule_id,
+            tab.charts[1].saved.rules[0].id
+        );
+        click(&mut app, "⋯");
+        click(&mut app, "Move down");
+        assert_eq!(app.plot_tabs[0].charts[0].saved.id, copy);
+        for _ in 0..3 {
+            click(&mut app, "⋯");
+            click(&mut app, "Remove chart");
+        }
+        assert_eq!(app.active_plot, Some(1000));
+        assert!(app.plot_tabs[0].charts.is_empty());
+        click(&mut app, "Add chart");
+        assert_eq!(app.plot_tabs[0].charts.len(), 1);
+        assert!(app.plot_draft.is_some());
     }
 }

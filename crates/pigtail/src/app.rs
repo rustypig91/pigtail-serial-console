@@ -2,17 +2,16 @@
 //! `panes` modules; holds no IO — data arrives from reader threads via channels.
 
 use crate::paths::AppPaths;
+use crate::plots::{PlotDraft, PlotTab};
 use crate::wrap::WrapIndex;
 use crossbeam_channel::Receiver;
 use serialcore::clock::{SessionClock, Timestamp};
 use serialcore::config::{
-    Config, ExtractRule, PortConfig, PortIdentity, SavedConnection, SavedMergedView, SavedTab,
-    TransmitMacro,
+    Config, PortConfig, PortIdentity, SavedConnection, SavedMergedView, SavedTab, TransmitMacro,
 };
 use serialcore::enumerate::{
     match_identity, spawn_enumerator, DiscoveredPort, EnumEvent, MatchResult,
 };
-use serialcore::extract::CompiledExtract;
 use serialcore::filter::{Combine, FilterIndex, FilterRule, FilterSet};
 use serialcore::framer::Framer;
 use serialcore::reader::{self, ConnState, ErrorScope, ReaderEvent, SourceSpec};
@@ -35,12 +34,8 @@ const RECEIVE_FRAME_BUDGET: Duration = Duration::from_millis(8);
 const RECEIVE_MAX_LINES_PER_PORT: usize = 4000;
 const RECEIVE_MAX_EVENTS_PER_PORT: usize = 64;
 const RECEIVE_RAW_CHUNK_BYTES: usize = 4096;
-const MAX_EXTRACTED_SERIES: usize = 64;
-const MAX_TOTAL_SERIES_POINTS: usize = 1_000_000;
-
-fn series_point_capacity(requested: usize, count: usize) -> usize {
-    requested.min(MAX_TOTAL_SERIES_POINTS / count.max(1)).max(2)
-}
+pub(crate) const MAX_EXTRACTED_SERIES: usize = 64;
+pub(crate) const MAX_TOTAL_SERIES_POINTS: usize = 1_000_000;
 
 /// Retention limits derived from the single user-facing memory setting.
 ///
@@ -433,6 +428,8 @@ impl TabError {
 
 /// One open connection (a tab).
 pub struct Connection {
+    pub persistent_id: u64,
+    pub(crate) plot_clear_generation: u64,
     pub id: PortId,
     /// Automatically detected device/path label. Kept even when `name` is set
     /// so clearing a custom name can restore it without re-enumerating.
@@ -539,26 +536,6 @@ pub struct Connection {
     pub selected: Option<u64>,
     /// Scroll request: centre this absolute line on the next frame.
     pub scroll_to: Option<u64>,
-    // Plotting (spec §7.13).
-    pub extract_rules: Vec<ExtractRule>,
-    pub extract_compiled: Vec<CompiledExtract>,
-    pub extract_dirty: bool,
-    pub extract_errors: Vec<String>,
-    pub series: Vec<SeriesEntry>,
-    pub series_index: HashMap<String, usize>,
-    /// Current per-series point cap, derived from the global history setting.
-    series_capacity: usize,
-    /// Largest capacity whose recoverable console history has been replayed.
-    /// Kept separate from `series_capacity` so interactive increases can be
-    /// applied cheaply and coalesced into one rebuild when editing finishes.
-    series_backfilled_capacity: usize,
-    /// Set once at least one plotted series has discarded a point.
-    pub(crate) series_evicted_any: bool,
-    pub plot_follow: bool,
-    /// Set by the plot's Fit button, consumed by the next frame's draw: the
-    /// bounds can only be set from inside the plot's own closure.
-    pub plot_fit: bool,
-    pub show_plot: bool,
     // Transmit state. Line ending / echo / history settings live in
     // `port_config`. `tx_input` accumulates the current input line locally (for
     // history recall and, when enabled, local echo).
@@ -644,9 +621,8 @@ impl Connection {
     }
 
     pub(crate) fn apply_history_limits(&mut self, limits: HistoryLimits) {
-        self.history_allocation_shrink_pending |= limits.max_lines < self.history_max_lines
-            || limits.raw_bytes < self.raw_capacity
-            || limits.series_points < self.series_capacity;
+        self.history_allocation_shrink_pending |=
+            limits.max_lines < self.history_max_lines || limits.raw_bytes < self.raw_capacity;
         self.history_max_lines = limits.max_lines;
         self.store.set_max_lines(limits.max_lines);
         self.raw_capacity = limits.raw_bytes;
@@ -658,39 +634,17 @@ impl Connection {
             &[],
             self.raw_capacity,
         );
-        let shrank = limits.series_points < self.series_capacity;
-        self.series_capacity = limits.series_points;
-        let point_capacity = series_point_capacity(self.series_capacity, self.series.len());
-        for entry in &mut self.series {
-            self.series_evicted_any |= entry.series.set_capacity(point_capacity);
-        }
-        if shrank {
-            // A lower cap invalidates backfill above it, but an intermediate
-            // drag value must not claim that history missing since the last
-            // settled capacity has already been replayed.
-            self.series_backfilled_capacity =
-                self.series_backfilled_capacity.min(self.series_capacity);
-        }
     }
 
-    /// Settle one or more history-capacity edits. This replays recoverable plot
-    /// history after increases and releases excess backing allocations after
-    /// decreases. Settings calls it only once its DragValue is no longer being
+    /// Settle a history-capacity edit and release excess backing allocations. Settings calls it only once its DragValue is no longer being
     /// dragged, avoiding a scan or reallocation for every intermediate value.
     /// Returns whether a decrease was settled, so app-level caches derived from
     /// console history can be invalidated once instead of on every drag frame.
     pub(crate) fn finish_history_capacity_change(&mut self) -> bool {
-        if self.series_capacity > self.series_backfilled_capacity {
-            self.grow_series_history();
-            self.series_backfilled_capacity = self.series_capacity;
-        }
         let history_shrank = self.history_allocation_shrink_pending;
         if history_shrank {
             self.store.shrink_to_fit();
             self.raw_ring.shrink_to_fit();
-            for entry in &mut self.series {
-                entry.series.shrink_to_fit();
-            }
             self.history_allocation_shrink_pending = false;
         }
         history_shrank
@@ -702,7 +656,6 @@ impl Connection {
         let mut changed = false;
         let mut lines = 0;
         let mut events = 0;
-        let mut pairs: Vec<(String, f64)> = Vec::new();
         // Finish each batch in order, yielding between lines as well as events.
         // At least one unit progresses even with a very small per-port share.
         loop {
@@ -728,14 +681,7 @@ impl Connection {
                 lines += 1;
                 // Parse SGR colours and strip other escapes (spec §2, §7.9).
                 let styled = serialcore::ansi::parse_line(&line.text, line.cursor);
-                let is_data = feeds_plot(line.flags);
                 let text = styled.text;
-                pairs.clear();
-                if is_data {
-                    for rule in &self.extract_compiled {
-                        rule.extract(&text, &mut pairs);
-                    }
-                }
                 // Where a genuinely new line would land. A
                 // `CONTINUATION` instead replaces the open provisional
                 // line in place and hands back *its* index, which is
@@ -759,13 +705,6 @@ impl Connection {
                 // new line — still counts as one.
                 if !self.follow && abs >= next {
                     self.new_since_scroll += 1;
-                }
-                // Run extraction and push points (spec §7.13).
-                if !pairs.is_empty() {
-                    let t = line.ts.micros as f64 / 1_000_000.0;
-                    for (name, value) in pairs.drain(..) {
-                        self.push_series_point(&name, t, value, abs);
-                    }
                 }
                 continue;
             }
@@ -1105,172 +1044,11 @@ impl Connection {
             self.filter_index.extend(&self.store, &set);
         }
     }
-
-    /// Compile any changed extraction rules and, when they have changed,
-    /// re-derive every series from the lines already in the console.
-    ///
-    /// Re-reading the session is the whole point: a rule is written *after*
-    /// seeing the output that suggested it, and a plot that began at the moment
-    /// you finished typing would omit exactly the lines that prompted the rule.
-    fn maintain_extract(&mut self) {
-        if !self.extract_dirty {
-            return;
-        }
-        self.extract_dirty = false;
-        self.extract_compiled.clear();
-        self.extract_errors.clear();
-        for rule in &self.extract_rules {
-            match CompiledExtract::compile(rule) {
-                Ok(c) => self.extract_compiled.push(c),
-                Err(e) => self.extract_errors.push(e),
-            }
-        }
-        self.rebuild_series();
-    }
-
-    /// Re-run the compiled rules over the whole store, replacing the series.
-    fn rebuild_series(&mut self) {
-        // Colour, visibility and Y2 belong to the series *name*, not to the rule
-        // text that happened to produce it: keep them across a re-read so
-        // touching a rule does not reshuffle a plot you have just set up.
-        let remembered: HashMap<String, SeriesStyle> = self
-            .series
-            .iter()
-            .map(|e| {
-                (
-                    e.series.name().to_string(),
-                    SeriesStyle {
-                        color: e.color,
-                        visible: e.visible,
-                        own_axis: e.own_axis,
-                    },
-                )
-            })
-            .collect();
-        self.series.clear();
-        self.series_index.clear();
-        self.series_backfilled_capacity = self.series_capacity;
-        if self.extract_compiled.is_empty() {
-            return;
-        }
-        // Destructured so the store stays borrowed for reading while the series
-        // it feeds are written — disjoint fields, but only field access proves
-        // that to the borrow checker.
-        let Connection {
-            store,
-            series,
-            series_index,
-            extract_compiled,
-            ..
-        } = self;
-        self.series_evicted_any |= extract_all(
-            store,
-            extract_compiled,
-            series,
-            series_index,
-            &remembered,
-            self.series_capacity,
-        );
-    }
-
-    /// Grow each series and backfill it from the resident console without
-    /// throwing away samples whose source lines have already been evicted.
-    fn grow_series_history(&mut self) {
-        let first_resident = self.store.first_abs_index();
-        let capacity = series_point_capacity(self.series_capacity, self.series.len());
-        for entry in &mut self.series {
-            self.series_evicted_any |= entry.series.set_capacity(capacity);
-            // The suffix is replayed below. The prefix cannot be reconstructed
-            // from the line store, so it must survive the rebuild in place.
-            entry.series.retain_before_line(first_resident);
-        }
-        if self.extract_compiled.is_empty() {
-            return;
-        }
-        let Connection {
-            store,
-            series,
-            series_index,
-            extract_compiled,
-            ..
-        } = self;
-        self.series_evicted_any |= extract_all(
-            store,
-            extract_compiled,
-            series,
-            series_index,
-            &HashMap::new(),
-            self.series_capacity,
-        );
-    }
-
-    fn push_series_point(&mut self, name: &str, t: f64, value: f64, line: u64) {
-        let (idx, trimmed) = series_slot(
-            &mut self.series,
-            &mut self.series_index,
-            None,
-            name,
-            self.series_capacity,
-        );
-        self.series_evicted_any |= trimmed;
-        if let Some(idx) = idx {
-            self.series_evicted_any |= self.series[idx].series.push(t, value, line);
-        }
-    }
-}
-
-/// How a series is drawn, remembered by name across a rebuild.
-#[derive(Clone, Copy)]
-struct SeriesStyle {
-    color: egui::Color32,
-    visible: bool,
-    own_axis: bool,
-}
-
-/// Index of the series called `name`, appending it when it is new. `remembered`
-/// gives back the look a series of that name had before a rebuild.
-fn series_slot(
-    series: &mut Vec<SeriesEntry>,
-    index: &mut HashMap<String, usize>,
-    remembered: Option<&HashMap<String, SeriesStyle>>,
-    name: &str,
-    capacity: usize,
-) -> (Option<usize>, bool) {
-    if let Some(&i) = index.get(name) {
-        return (Some(i), false);
-    }
-    if series.len() >= MAX_EXTRACTED_SERIES {
-        return (None, true);
-    }
-    let capacity = series_point_capacity(capacity, series.len() + 1);
-    let mut trimmed = false;
-    for entry in series.iter_mut() {
-        if entry.series.set_capacity(capacity) {
-            entry.series.shrink_to_fit();
-            trimmed = true;
-        }
-    }
-    let style = remembered
-        .and_then(|m| m.get(name).copied())
-        .unwrap_or_else(|| SeriesStyle {
-            color: SERIES_PALETTE[series.len() % SERIES_PALETTE.len()],
-            visible: true,
-            own_axis: false,
-        });
-    series.push(SeriesEntry {
-        series: Series::new(name.to_string(), capacity),
-        color: style.color,
-        visible: style.visible,
-        own_axis: style.own_axis,
-    });
-    index.insert(name.to_string(), series.len() - 1);
-    (Some(series.len() - 1), trimmed)
 }
 
 /// Whether a line's text is something the extraction rules should read.
 ///
-/// Shared by live ingest ([`Connection::drain_events`]) and the re-read
-/// ([`extract_all`]) so the plot cannot depend on which of the two produced a
+/// Shared by incremental extraction and retained-history backfill so the plot cannot depend on which of the two produced a
 /// point. Three kinds of line are excluded:
 ///
 /// - a reconnect/session marker, which is the app talking, not the device;
@@ -1283,55 +1061,10 @@ fn series_slot(
 ///   completed line, and the first is a spike that never existed (issue #38).
 ///   A line is plottable once it is terminated, which is also when its number
 ///   is known to be whole.
-fn feeds_plot(flags: LineFlags) -> bool {
+pub(crate) fn feeds_plot(flags: LineFlags) -> bool {
     !flags.contains(LineFlags::RECONNECT_MARKER)
         && !flags.contains(LineFlags::TX_ECHO)
         && !flags.contains(LineFlags::PROVISIONAL)
-}
-
-/// Fill `series` by running `rules` over every line of `store` that this run
-/// recorded.
-///
-/// Restored history is skipped. It sits at a negative stamp (see
-/// [`SessionClock::micros_at`]), often hours or days below zero, and folding it
-/// into the same axis would stretch the plot across the gap between two runs to
-/// show a handful of stale points. The plot covers the session in front of you.
-fn extract_all(
-    store: &LineStore,
-    rules: &[CompiledExtract],
-    series: &mut Vec<SeriesEntry>,
-    index: &mut HashMap<String, usize>,
-    remembered: &HashMap<String, SeriesStyle>,
-    capacity: usize,
-) -> bool {
-    let mut pairs: Vec<(String, f64)> = Vec::new();
-    let mut evicted = false;
-    for abs in store.first_abs_index()..store.next_abs_index() {
-        let Some(line) = store.get(abs) else {
-            continue;
-        };
-        // The gate live ingest applies (see `feeds_plot`), plus the session
-        // cut-off.
-        if !feeds_plot(line.meta.flags) || line.meta.ts.micros < 0 {
-            continue;
-        }
-        pairs.clear();
-        for rule in rules {
-            rule.extract(line.text, &mut pairs);
-        }
-        if pairs.is_empty() {
-            continue;
-        }
-        let t = line.meta.ts.micros as f64 / 1_000_000.0;
-        for (name, value) in pairs.drain(..) {
-            let (idx, trimmed) = series_slot(series, index, Some(remembered), &name, capacity);
-            evicted |= trimmed;
-            if let Some(idx) = idx {
-                evicted |= series[idx].series.push(t, value, abs);
-            }
-        }
-    }
-    evicted
 }
 
 /// Working state of the modal new-connection dialog (spec-redesign: opening a
@@ -1486,6 +1219,7 @@ pub struct MergedTab {
 pub enum TabId {
     Connection(PortId),
     Merged(u64),
+    Plot(u64),
 }
 
 pub struct MergedDialog {
@@ -1765,7 +1499,13 @@ pub struct App {
     session_cleanup_tx: Option<crossbeam_channel::Sender<usize>>,
     session_cleanup_limit: Option<usize>,
     pub show_highlight_win: bool,
-    pub show_extract_win: bool,
+    pub plot_tabs: Vec<PlotTab>,
+    pub active_plot: Option<u64>,
+    pub plot_draft: Option<PlotDraft>,
+    pub(crate) plot_routes: HashMap<u64, Vec<(usize, usize, usize)>>,
+    pub(crate) plot_routes_dirty: bool,
+    pub(crate) plot_work_cursor: usize,
+    pub(crate) plot_recent: Vec<u64>,
     /// `Some(port_id)` while the popup showing that connection's `last_error`
     /// in full is open (clicked from the footer's error indicator). Keyed by
     /// the connection it was opened for, not "whichever tab is active", so
@@ -1813,6 +1553,7 @@ impl App {
     /// hand-rolled `Wake`/channel), so a new field is added to `App` in one
     /// place instead of two struct literals kept in sync by hand.
     fn assemble(config: Config, paths: AppPaths, wake: Wake, enum_rx: Receiver<EnumEvent>) -> App {
+        crate::plots::reserve_ids(&config);
         App {
             demo_mode: false,
             clock: SessionClock::new(),
@@ -1878,7 +1619,13 @@ impl App {
             session_cleanup_tx: None,
             session_cleanup_limit: None,
             show_highlight_win: false,
-            show_extract_win: false,
+            plot_tabs: vec![],
+            active_plot: None,
+            plot_draft: None,
+            plot_routes: HashMap::new(),
+            plot_routes_dirty: true,
+            plot_work_cursor: 0,
+            plot_recent: vec![],
             show_error_win: None,
             show_search: false,
             search_focus_request: false,
@@ -2001,7 +1748,13 @@ impl App {
         // Cloning is an `Arc` bump, and it keeps the loop below from holding a
         // shared borrow of `app` across the `connections.last_mut()`.
         let clock = app.clock.clone();
-        for saved in app.config.last_open.clone() {
+        let mut assigned_connection_ids = false;
+        for (saved_index, mut saved) in app.config.last_open.clone().into_iter().enumerate() {
+            if saved.id == 0 {
+                saved.id = crate::plots::new_id();
+                app.config.last_open[saved_index].id = saved.id;
+                assigned_connection_ids = true;
+            }
             // The non-saving inner call, not `open_connection`: `last_open` is
             // already exactly this list, and saving after each entry would
             // rewrite it from `self.connections` mid-restore, permanently
@@ -2009,6 +1762,7 @@ impl App {
             // later one succeeds and triggers the save.
             if app.open_connection_inner(saved.identity.clone(), None, saved.config, saved.name) {
                 let conn = app.connections.last_mut().unwrap();
+                conn.persistent_id = saved.id;
                 conn.restore_view(saved.view);
                 preload_last_session(
                     conn,
@@ -2022,8 +1776,12 @@ impl App {
         app.active = 0;
         app.merged_selected = false;
         app.start_session_cleanup();
+        app.restore_plots();
         app.restore_merged_views();
         app.restore_workspace();
+        if assigned_connection_ids {
+            app.write_config();
+        }
 
         app
     }
@@ -2334,7 +2092,7 @@ impl App {
             conn.rts = rts;
             conn.last_error = None;
             conn.deferred_session_error = None;
-            // Console (store, raw_ring, filters, search, plot series, marks,
+            // Console (store, raw_ring, filters, search, marks,
             // selection, scroll position) is intentionally left untouched —
             // except for closing any line the old reader left open, since the
             // reader that would have completed it is being replaced.
@@ -2435,6 +2193,7 @@ impl App {
         conn.name = name.and_then(|name| normalized_tab_name(&name));
         self.tab_order = self.ordered_tabs();
         self.connections.push(conn);
+        self.active_plot = None;
         self.active = self.connections.len() - 1;
         self.merged_selected = false;
         self.invalidate_merged_views();
@@ -2468,11 +2227,12 @@ impl App {
             .tab_order
             .iter()
             .filter_map(|tab| match tab {
-                SavedTab::Connection { identity } => self
-                    .connections
+                SavedTab::Connection { id, identity } => self.restore_connection_tab(*id, identity),
+                SavedTab::Plot { id } => self
+                    .plot_tabs
                     .iter()
-                    .find(|conn| &conn.identity == identity)
-                    .map(|conn| TabId::Connection(conn.id)),
+                    .find(|tab| tab.saved.id == *id)
+                    .map(|_| TabId::Plot(*id)),
                 SavedTab::Merged { index } => self
                     .merged_tabs
                     .get(*index)
@@ -2505,6 +2265,7 @@ impl App {
             // next launch.
             .filter(|c| c.state != ConnState::Closed)
             .map(|c| SavedConnection {
+                id: c.persistent_id,
                 view: c.selected_view(),
                 identity: c.identity.clone(),
                 name: c.name.clone(),
@@ -2528,6 +2289,7 @@ impl App {
                     .collect(),
             })
             .collect();
+        self.persist_plots();
         self.config.tab_order = self
             .ordered_tabs()
             .iter()
@@ -2537,8 +2299,10 @@ impl App {
                     .iter()
                     .find(|conn| conn.id == *id && conn.state != ConnState::Closed)
                     .map(|conn| SavedTab::Connection {
+                        id: conn.persistent_id,
                         identity: conn.identity.clone(),
                     }),
+                TabId::Plot(id) => Some(SavedTab::Plot { id: *id }),
                 TabId::Merged(id) => self
                     .merged_tabs
                     .iter()
@@ -2557,6 +2321,7 @@ impl App {
             .iter()
             .map(|c| TabId::Connection(c.id))
             .chain(self.merged_tabs.iter().map(|t| TabId::Merged(t.id)))
+            .chain(self.plot_tabs.iter().map(|t| TabId::Plot(t.saved.id)))
             .collect();
         let mut order: Vec<_> = self
             .tab_order
@@ -2651,6 +2416,8 @@ impl App {
         let rts = port_config.rts_on_open;
         let limits = history_limits(self.config.settings.max_lines);
         Connection {
+            persistent_id: crate::plots::new_id(),
+            plot_clear_generation: 0,
             id,
             label,
             name: None,
@@ -2712,18 +2479,6 @@ impl App {
             search_tested_upto: 0,
             selected: None,
             scroll_to: None,
-            extract_rules: Vec::new(),
-            extract_compiled: Vec::new(),
-            extract_dirty: false,
-            extract_errors: Vec::new(),
-            series: Vec::new(),
-            series_index: HashMap::new(),
-            series_capacity: limits.series_points,
-            series_backfilled_capacity: limits.series_points,
-            series_evicted_any: false,
-            plot_follow: true,
-            plot_fit: false,
-            show_plot: false,
             tx_input: String::new(),
             tx_history: Vec::new(),
             tx_history_pos: None,
@@ -2969,11 +2724,9 @@ impl App {
             self.active = self.connections.len().saturating_sub(1);
         }
         self.invalidate_merged_views();
-        if self.connections.is_empty() && !self.merged_selected {
-            if let Some(TabId::Merged(id)) = self.ordered_tabs().last().copied() {
-                if let Some(index) = self.merged_tabs.iter().position(|tab| tab.id == id) {
-                    self.select_merged_tab(index);
-                }
+        if self.connections.is_empty() && !self.merged_selected && self.active_plot.is_none() {
+            if let Some(tab) = self.ordered_tabs().last().copied() {
+                self.select_workspace_tab(tab);
             }
         }
         self.save_session();
@@ -3161,10 +2914,10 @@ impl App {
         let mut settled_change = false;
         let mut history_shrank = false;
         for conn in &mut self.connections {
-            settled_change |= conn.series_capacity > conn.series_backfilled_capacity
-                || conn.history_allocation_shrink_pending;
+            settled_change |= conn.history_allocation_shrink_pending;
             history_shrank |= conn.finish_history_capacity_change();
         }
+        self.resize_plot_history();
         if history_shrank {
             self.invalidate_merged_views();
         }
@@ -3233,6 +2986,7 @@ impl App {
         self.maintain_merged();
         self.maintain_merged_filter(true);
         self.maintain_merged_search(true);
+        self.active_plot = None;
         self.merged_selected = true;
         if !self.merged_tx_port.is_some_and(|id| {
             self.merged_contains(id)
@@ -3772,8 +3526,7 @@ impl App {
             conn.search_matches.clear();
             conn.search_pos = None;
             conn.search_tested_upto = conn.store.next_abs_index();
-            conn.series.clear();
-            conn.series_index.clear();
+            conn.plot_clear_generation = conn.plot_clear_generation.wrapping_add(1);
             conn.selected = None;
             conn.scroll_to = None;
             conn.mark_micros = None;
@@ -3806,13 +3559,13 @@ impl App {
             || self.macro_shortcut_conflict.is_some()
             || self.tab_close_confirmation.is_some()
             || self.show_highlight_win
-            || self.show_extract_win
+            || self.plot_draft.is_some()
             || self.show_error_win.is_some()
     }
 
     /// Index of the active connection, clamped, or `None` if there are none.
     pub fn active_index(&self) -> Option<usize> {
-        if self.connections.is_empty() {
+        if self.connections.is_empty() || self.active_plot.is_some() {
             None
         } else {
             Some(self.active.min(self.connections.len() - 1))
@@ -3929,12 +3682,14 @@ impl eframe::App for App {
         let mut any_data = false;
         let receive_budget = RECEIVE_FRAME_BUDGET / self.connections.len().max(1) as u32;
         for conn in &mut self.connections {
-            // Before the drain: a rule edited last frame re-reads the console's
-            // history here, and the lines arriving below then extend it once.
-            conn.maintain_extract();
             if conn.drain_events(max_lines, receive_budget) {
                 any_data = true;
             }
+        }
+
+        let plot_backlog = self.maintain_plots(Duration::from_millis(4));
+        if plot_backlog {
+            crate::graphics::request_animation_frame(ctx);
         }
 
         // Maintain derived indices.
@@ -3989,6 +3744,7 @@ impl eframe::App for App {
         // immediately in that case; otherwise coalesce rapid edits and wake the
         // on-demand UI when their one-second deadline arrives.
         if ctx.input(|i| i.viewport().close_requested()) {
+            self.persist_plots();
             self.flush_config();
         } else {
             self.maintain_config(ctx);
@@ -4012,6 +3768,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        self.persist_plots();
         self.persist_workspace();
         self.flush_config();
     }
@@ -4324,128 +4081,6 @@ pub(crate) mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
-    fn stored(lines: &[(&str, i64, LineFlags)]) -> LineStore {
-        let mut store = LineStore::new(1000);
-        for (text, micros, flags) in lines {
-            store.append(IncomingLine {
-                text: (*text).to_string(),
-                ts: Timestamp {
-                    wall: chrono::Utc::now(),
-                    micros: *micros,
-                },
-                port: PortId(0),
-                flags: *flags,
-                spans: Default::default(),
-                cursor: None,
-            });
-        }
-        store
-    }
-
-    /// The default rule: every `name:value` / `name=value` pair on a line.
-    fn kv_rules() -> Vec<CompiledExtract> {
-        vec![CompiledExtract::compile(&ExtractRule {
-            mode: serialcore::config::ExtractMode::Kv,
-            prefix: None,
-            pattern: None,
-            kv_separators: None,
-        })
-        .unwrap()]
-    }
-
-    fn extracted(store: &LineStore, remembered: &HashMap<String, SeriesStyle>) -> Vec<SeriesEntry> {
-        let mut series = Vec::new();
-        let mut index = HashMap::new();
-        extract_all(
-            store,
-            &kv_rules(),
-            &mut series,
-            &mut index,
-            remembered,
-            history_limits(1_000_000).series_points,
-        );
-        series
-    }
-
-    /// The point of re-reading: a rule is written after seeing the output that
-    /// suggested it, and used to plot nothing until the *next* line arrived.
-    #[test]
-    fn a_rule_reads_the_lines_already_in_the_console() {
-        let store = stored(&[
-            ("temp:1", 1_000_000, LineFlags::default()),
-            ("nothing here", 2_000_000, LineFlags::default()),
-            ("temp:3", 3_000_000, LineFlags::default()),
-        ]);
-        let series = extracted(&store, &HashMap::new());
-        assert_eq!(series.len(), 1);
-        assert_eq!(series[0].series.name(), "temp");
-        assert_eq!(series[0].series.len(), 2);
-        let last = series[0].series.last().unwrap();
-        assert_eq!((last.t, last.value), (3.0, 3.0));
-        assert_eq!(last.line, 2, "the point still points back at its line");
-    }
-
-    /// Everything the live path skips, the re-read skips too — plus the
-    /// previous run's output, which sits at a negative stamp.
-    #[test]
-    fn a_re_read_takes_only_this_session_s_device_output() {
-        let store = stored(&[
-            ("temp:9", -60_000_000, LineFlags::default()),
-            ("temp:2", 0, LineFlags::RECONNECT_MARKER),
-            ("temp:5", 1_000_000, LineFlags::TX_ECHO),
-            ("temp:7", 2_000_000, LineFlags::default()),
-        ]);
-        let series = extracted(&store, &HashMap::new());
-        assert_eq!(series.len(), 1);
-        assert_eq!(series[0].series.len(), 1);
-        assert_eq!(series[0].series.last().unwrap().value, 7.0);
-    }
-
-    /// Editing a rule must not reshuffle a plot you have just set up.
-    #[test]
-    fn a_re_read_keeps_the_look_of_a_series_it_finds_again() {
-        let store = stored(&[("temp:1 rpm:2", 1_000_000, LineFlags::default())]);
-        let mut remembered = HashMap::new();
-        remembered.insert(
-            "rpm".to_string(),
-            SeriesStyle {
-                color: egui::Color32::RED,
-                visible: false,
-                own_axis: true,
-            },
-        );
-        let series = extracted(&store, &remembered);
-        let rpm = series.iter().find(|e| e.series.name() == "rpm").unwrap();
-        assert_eq!(rpm.color, egui::Color32::RED);
-        assert!(!rpm.visible);
-        assert!(rpm.own_axis, "the Y2 toggle survives the re-read");
-        let temp = series.iter().find(|e| e.series.name() == "temp").unwrap();
-        assert_eq!(
-            temp.color, SERIES_PALETTE[0],
-            "a series seen for the first time still takes a palette colour"
-        );
-    }
-
-    /// A line the device is still writing is shown provisionally and replaced
-    /// in place as it grows, so extracting one plots a number that is still
-    /// being typed. The re-read has always skipped it by construction (it walks
-    /// the settled store); this pins the rule down explicitly.
-    #[test]
-    fn a_re_read_skips_a_line_the_device_is_still_writing() {
-        let store = stored(&[
-            ("temp:23", 1_000_000, LineFlags::PROVISIONAL),
-            ("rpm:1200", 2_000_000, LineFlags::default()),
-        ]);
-        let series = extracted(&store, &HashMap::new());
-        assert_eq!(
-            series
-                .iter()
-                .map(|e| e.series.name().to_string())
-                .collect::<Vec<_>>(),
-            vec!["rpm".to_string()],
-            "a half-written line is not a sample"
-        );
-    }
     fn ring(cap: usize, pushes: &[&[u8]]) -> (VecDeque<u8>, u64, bool) {
         let mut ring = VecDeque::new();
         let mut base = 0;
@@ -4515,135 +4150,6 @@ pub(crate) mod tests {
             },
             "the full Settings range scales all three derived limits"
         );
-    }
-
-    #[test]
-    fn lowering_memory_setting_trims_open_hex_and_plot_history() {
-        let (app, _enum_tx) = test_app("lower-history-limits");
-        let id = PortId(0);
-        let mut conn = app.make_connection(
-            id,
-            "probe".into(),
-            identity("A1"),
-            PortConfig::default(),
-            inert_handle(id),
-        );
-        conn.push_raw_bytes(&vec![0x55; 2 * 1024 * 1024]);
-        let raw_allocation_before = conn.raw_ring.capacity();
-        for i in 0..2_000 {
-            conn.push_series_point("temp", i as f64, i as f64, i);
-        }
-
-        conn.apply_history_limits(history_limits(10_000));
-        assert_eq!(
-            conn.raw_ring.capacity(),
-            raw_allocation_before,
-            "an interactive resize defers reallocating until the edit settles"
-        );
-        assert!(conn.finish_history_capacity_change());
-
-        assert_eq!(conn.raw_ring.len(), MIN_RAW_BYTES);
-        assert_eq!(conn.raw_ring.capacity(), conn.raw_ring.len());
-        assert!(conn.raw_ring.capacity() < raw_allocation_before);
-        assert_eq!(conn.raw_base, MIN_RAW_BYTES as u64);
-        assert!(conn.raw_evicted_any);
-        assert_eq!(conn.series[0].series.len(), 1_000);
-        assert_eq!(conn.series[0].series.t_range(), Some((1_000.0, 1_999.0)));
-        assert!(conn.series_evicted_any);
-    }
-
-    #[test]
-    fn raising_plot_limit_rebuilds_points_still_in_the_console() {
-        let (app, _enum_tx) = test_app("raise-history-limits");
-        let id = PortId(0);
-        let mut conn = app.make_connection(
-            id,
-            "probe".into(),
-            identity("A1"),
-            PortConfig::default(),
-            inert_handle(id),
-        );
-        conn.apply_history_limits(history_limits(10_000));
-        assert!(conn.finish_history_capacity_change());
-        conn.extract_compiled = kv_rules();
-        let wall = chrono::Utc::now();
-        for i in 0..2_000 {
-            conn.store.append(IncomingLine {
-                text: format!("temp:{i}"),
-                ts: Timestamp {
-                    wall,
-                    micros: i as i64,
-                },
-                port: id,
-                flags: LineFlags::default(),
-                spans: Default::default(),
-                cursor: None,
-            });
-        }
-        conn.rebuild_series();
-        assert_eq!(conn.series[0].series.len(), 1_000);
-
-        // Model a drag that overshoots and settles lower. Neither intermediate
-        // update may rebuild, and shrinking from the overshoot must not forget
-        // that history above the original 1,000-point cap is still missing.
-        conn.apply_history_limits(history_limits(30_000));
-        conn.apply_history_limits(history_limits(20_000));
-        assert_eq!(
-            conn.series[0].series.len(),
-            1_000,
-            "capacity growth stays cheap until the edit is committed"
-        );
-        assert!(conn.finish_history_capacity_change());
-
-        assert_eq!(conn.series[0].series.len(), 2_000);
-        assert_eq!(conn.series[0].series.t_range(), Some((0.0, 0.001999)));
-    }
-
-    #[test]
-    fn raising_plot_limit_preserves_sparse_points_older_than_the_console() {
-        let (app, _enum_tx) = test_app("raise-sparse-history-limit");
-        let id = PortId(0);
-        let mut conn = app.make_connection(
-            id,
-            "probe".into(),
-            identity("A1"),
-            PortConfig::default(),
-            inert_handle(id),
-        );
-        conn.apply_history_limits(history_limits(10_000));
-        assert!(conn.finish_history_capacity_change());
-        conn.extract_compiled = kv_rules();
-        let wall = chrono::Utc::now();
-        for i in 0..20_000 {
-            let is_sample = i % 100 == 0;
-            let text = if is_sample {
-                format!("temp:{i}")
-            } else {
-                "noise".to_string()
-            };
-            let abs = conn.store.append(IncomingLine {
-                text,
-                ts: Timestamp {
-                    wall,
-                    micros: i as i64,
-                },
-                port: id,
-                flags: LineFlags::default(),
-                spans: Default::default(),
-                cursor: None,
-            });
-            if is_sample {
-                conn.push_series_point("temp", i as f64 / 1_000_000.0, i as f64, abs);
-            }
-        }
-        assert!(conn.store.first_abs_index() > 0);
-        assert_eq!(conn.series[0].series.len(), 200);
-
-        conn.apply_history_limits(history_limits(DEFAULT_HISTORY_LINES));
-        assert!(!conn.finish_history_capacity_change());
-
-        assert_eq!(conn.series[0].series.len(), 200);
-        assert_eq!(conn.series[0].series.t_range(), Some((0.0, 0.0199)));
     }
 
     /// A minimal `App`, built by hand rather than through `App::new` (which
@@ -5028,6 +4534,11 @@ pub(crate) mod tests {
         // Reversed allocation order proves source membership uses identities.
         add_merged_test_connection(&mut restored, PortId(80), "port-2", &[]);
         add_merged_test_connection(&mut restored, PortId(90), "port-1", &[]);
+        for conn in &mut restored.connections {
+            if let Some(saved) = saved.last_open.iter().find(|s| s.identity == conn.identity) {
+                conn.persistent_id = saved.id;
+            }
+        }
         restored.config = saved.clone();
         restored.restore_merged_views();
         assert_eq!(
@@ -6760,24 +6271,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn growing_plot_history_keeps_the_shared_point_limit() {
-        let (mut app, _enum_tx) = test_app("receive-grow-series-budget");
-        let _tx = conn_with_injected_events(&mut app, PortId(0));
-        let conn = &mut app.connections[0];
-        for i in 0..MAX_EXTRACTED_SERIES {
-            conn.push_series_point(&format!("key{i}"), 0.0, 1.0, 0);
-        }
-        conn.series_capacity = usize::MAX;
-        conn.grow_series_history();
-        // Backfill must leave the same limit in place for subsequent samples.
-        let capacity = MAX_TOTAL_SERIES_POINTS / MAX_EXTRACTED_SERIES;
-        for i in 0..=capacity {
-            conn.push_series_point("key0", i as f64, 1.0, i as u64);
-        }
-        assert_eq!(conn.series[0].series.len(), capacity);
-    }
-
-    #[test]
     fn small_receive_budget_makes_progress_for_each_port() {
         let (mut app, _enum_tx) = test_app("receive-fairness");
         for id in [PortId(0), PortId(1)] {
@@ -6797,30 +6290,6 @@ pub(crate) mod tests {
             assert_eq!(conn.store.len(), 1);
             assert_eq!(conn.store.get(0).unwrap().text, "first");
         }
-    }
-
-    #[test]
-    fn extraction_bounds_series_names_and_shares_the_point_budget() {
-        let (mut app, _enum_tx) = test_app("receive-series-budget");
-        let _tx = conn_with_injected_events(&mut app, PortId(0));
-        let conn = &mut app.connections[0];
-        conn.series_capacity = usize::MAX;
-        for i in 0..MAX_EXTRACTED_SERIES + 10 {
-            conn.push_series_point(&format!("key{i}"), i as f64, 1.0, i as u64);
-        }
-        assert_eq!(conn.series.len(), MAX_EXTRACTED_SERIES);
-        assert_eq!(conn.series_index.len(), MAX_EXTRACTED_SERIES);
-        assert!(conn.series_evicted_any);
-        assert!(
-            series_point_capacity(usize::MAX, conn.series.len()) * conn.series.len()
-                <= MAX_TOTAL_SERIES_POINTS
-        );
-        conn.push_series_point("key0", 100.0, 2.0, 100);
-        assert_eq!(
-            conn.series[0].series.len(),
-            2,
-            "existing keys still receive samples"
-        );
     }
 
     /// Manual diagnostic: exercise the real UI ingest path without hardware.
@@ -6878,88 +6347,6 @@ pub(crate) mod tests {
             assert_eq!(conn.store.next_abs_index(), updates as u64);
             eprintln!("{name}: completed in {frames} drains; longest drain {worst:?}");
         }
-    }
-
-    /// Issue #38: a line the device is still writing reaches the UI twice —
-    /// once as a `PROVISIONAL` flush after ~20ms of silence, once as the
-    /// `CONTINUATION` that completes it — and `LineStore::append` replaces the
-    /// first in place, keeping its absolute index. Extracting the provisional
-    /// plots a number that is still being typed, and nothing takes it back
-    /// when the real one lands.
-    ///
-    /// The batch here is produced by the real `Framer`, not hand-written, so
-    /// this stays bound to what the reader actually emits.
-    #[test]
-    fn a_half_written_line_does_not_plant_a_plot_point() {
-        let (mut app, _enum_tx) = test_app("provisional-plot");
-
-        let id = PortId(0);
-        let mut conn = app.make_connection(
-            id,
-            "probe".into(),
-            identity("A1"),
-            PortConfig::default(),
-            inert_handle(id),
-        );
-        let (tx, rx) = crossbeam_channel::unbounded();
-        conn.handle.events = rx;
-        conn.extract_rules = vec![ExtractRule {
-            mode: serialcore::config::ExtractMode::Kv,
-            prefix: None,
-            pattern: None,
-            kv_separators: None,
-        }];
-        conn.extract_dirty = true;
-        app.connections.push(conn);
-
-        // `temp:23.4\n` split across two reads, as a slow device (or a USB
-        // latency boundary) delivers it: the first half is flushed while the
-        // line is still open.
-        let clock = SessionClock::new();
-        let mut framer = Framer::new();
-        let mut lines = Vec::new();
-        framer.push(b"temp:23", clock.now(), &mut lines);
-        assert!(lines.is_empty(), "nothing is terminated yet");
-        let provisional = framer
-            .flush_provisional()
-            .expect("the open line is shown provisionally");
-        assert!(provisional.flags.contains(LineFlags::PROVISIONAL));
-        assert_eq!(provisional.text, "temp:23");
-        lines.push(provisional);
-        framer.push(b".4\n", clock.now(), &mut lines);
-        assert!(
-            lines[1].flags.contains(LineFlags::CONTINUATION),
-            "the completed line replaces the provisional one in place"
-        );
-        assert_eq!(lines[1].text, "temp:23.4");
-
-        tx.send(ReaderEvent::Batch(reader::Batch {
-            lines,
-            raw: b"temp:23.4\n".to_vec(),
-        }))
-        .unwrap();
-
-        let conn = &mut app.connections[0];
-        conn.maintain_extract();
-        conn.drain_events(1000, Duration::from_secs(1));
-
-        assert_eq!(conn.store.len(), 1, "the two events are one line");
-        let temp = conn
-            .series
-            .iter()
-            .find(|e| e.series.name() == "temp")
-            .expect("temp is plotted");
-        assert_eq!(
-            temp.series.len(),
-            1,
-            "one line is one sample, not one per redraw of it"
-        );
-        assert_eq!(
-            temp.series.last().unwrap().value,
-            23.4,
-            "and it is the value the line finally held, not the half of it \
-             that happened to be on screen first"
-        );
     }
 
     /// Issue #39: search tested every absolute index exactly once, but the
@@ -7268,7 +6655,9 @@ mod render_diagnostic {
         for mode in ["log", "hex", "ansi", "plot", "large-log"] {
             let (mut app, _tx) = tests::test_app(&format!("render-{mode}"));
             app.seed_demo().unwrap();
-            app.connections[0].show_plot = mode == "plot";
+            if mode == "plot" {
+                app.open_new_plot();
+            }
             app.connections[0].hex_view = mode == "hex";
             app.connections[0].screen_view = mode == "ansi";
             if mode == "large-log" {
