@@ -264,8 +264,11 @@ impl App {
         let mut navigate = None;
         let tab = &mut self.plot_tabs[index];
         let linked = !tab.saved.independent_time_axes;
-        let fit_all = std::mem::take(&mut tab.fit);
         let union = time_union(&tab.charts);
+        // An unavailable source or a pending backfill can leave the whole tab
+        // empty on its first paint. Keep the shared Fit pending as well as each
+        // chart's Fit so late samples establish one linked time range.
+        let fit_all = union.is_some() && std::mem::take(&mut tab.fit);
         let mut shared = tab.saved.time_range.as_ref().and_then(parse_range);
         if linked {
             if fit_all {
@@ -1079,6 +1082,32 @@ mod tests {
         let actual = bounds(&ctx, 1001);
         assert!(actual.min()[0] < 20.0 && actual.max()[0] > 20.0);
         assert!(actual.min()[1] < 23.4 && actual.max()[1] > 23.4);
+    }
+
+    #[test]
+    fn initially_empty_linked_charts_fit_the_shared_range_when_samples_arrive() {
+        for follow in [false, true] {
+            let mut app = chart_app();
+            app.plot_tabs[0].saved.follow = follow;
+            for chart in &mut app.plot_tabs[0].charts {
+                chart.series.clear();
+            }
+            let ctx = egui::Context::default();
+            chart_frame(&mut app, &ctx, vec![]);
+            chart_frame(&mut app, &ctx, vec![]);
+            app.plot_tabs[0].charts[0].series = vec![entry(true, &[(-20.0, 1.0), (10.0, 2.0)])];
+            app.plot_tabs[0].charts[1].series = vec![entry(true, &[(-5.0, 100.0), (40.0, 200.0)])];
+            chart_frame(&mut app, &ctx, vec![]);
+            chart_frame(&mut app, &ctx, vec![]);
+            for id in [1001, 1002] {
+                let actual = bounds(&ctx, id);
+                assert_eq!((actual.min()[0], actual.max()[0]), (-20.0, 40.0));
+            }
+            assert_eq!(
+                app.plot_tabs[0].saved.time_range,
+                Some(["-20".into(), "40".into()])
+            );
+        }
     }
 
     #[test]

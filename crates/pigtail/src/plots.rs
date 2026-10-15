@@ -608,12 +608,18 @@ impl App {
         for tab in &mut self.plot_tabs {
             for chart in &mut tab.charts {
                 let grew = capacity > chart.capacity || requested > chart.requested_capacity;
+                let shrank = capacity < chart.capacity || requested < chart.requested_capacity;
                 chart.capacity = capacity;
                 chart.requested_capacity = requested;
                 let point_capacity = chart.point_capacity(chart.series.len());
                 for (key, entry) in chart.keys.iter().zip(&mut chart.series) {
                     chart.limited |= entry.series.set_capacity(point_capacity);
-                    entry.series.shrink_to_fit();
+                    // Settings settles history on every UI frame, even when
+                    // its window is closed. Keep spare allocation for incoming
+                    // samples unless a retention budget actually decreased.
+                    if shrank {
+                        entry.series.shrink_to_fit();
+                    }
                     if grew {
                         if let Some(conn) = self
                             .connections

@@ -329,6 +329,12 @@ sample with an active filter in the destination Log, with the plot in either
 pane and both split orientations. Formatting, workspace tests and Clippy with
 default/all features, and the demo feature check passed. Native demo inspection
 was unavailable in that review environment because display tools were absent.
+Further review found that initially empty linked charts consumed their shared
+Fit before samples arrived. The shared Fit now waits for plottable data;
+rendered-frame regression coverage checks the resulting common time range with
+Follow both on and off. Plot-history settling releases excess series allocation
+only when a retention budget decreases, avoiding repeated shrink/grow copies as
+samples arrive between UI frames.
 
 ### Saved session history
 
