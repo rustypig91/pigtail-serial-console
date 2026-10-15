@@ -417,6 +417,24 @@ Use **Ctrl+Shift+Tab** to cycle forwards through tabs in the current pane.
 Use **F6** to switch focus between split panes.
 Use **F1** for About, **F2** for Settings, and **Ctrl+Shift+S** to save the current view as text.
 
+In **Settings → Appearance → Text font**, choose the built-in Hack font (default)
+or a monospace family installed on the current system. The global choice applies
+immediately to Log, merged logs, Hex, ANSI/VT and monospace text editors in both
+panes, and persists by family name across restarts. Discovery uses `fontdb` once
+per process, including system and user font directories; restart after installing
+fonts. The selected face (including its collection index) is loaded on demand;
+other system fonts are not copied into egui. Missing or unreadable choices fall
+back to Hack and emit a warning without overwriting the saved preference.
+Reset restores Hack. Font changes invalidate text layouts and recompute wrapping
+and VT cell dimensions; unpinned Log views retain their line anchor. Only egui's
+existing default fonts are bundled, and its symbol fallbacks remain available.
+The 2026-10-15 system-font revision passed formatting, workspace tests and
+all-target Clippy with default/all features, and the demo feature check.
+Coverage includes saved family names and malformed settings, installed-family
+filtering, face loading, missing-font fallback, host-font rendering and clicking
+the settings picker with live font replacement. Native visual inspection was
+unavailable because display and screenshot tools were absent.
+
 In **Settings → Appearance**, choose Dark or Light and a separate Blue, Green, or
 Red base color. Each theme remembers its own base color across restarts.
 Plain Page Up / Page Down and arrow keys retain their normal terminal behavior.
