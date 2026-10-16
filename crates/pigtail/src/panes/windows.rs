@@ -273,10 +273,9 @@ impl App {
             .show(ctx, |ui| {
                 super::chrome::dialog_style(ui);
                 ui.label(err.msg.as_str());
-                // Nothing else ever clears a session-scoped error: the
-                // connection recovering doesn't fix a capture file that
-                // couldn't be written, so without this it would sit in the
-                // footer for the rest of the run.
+                // Session failures need explicit dismissal: reconnecting
+                // doesn't fix a capture file that couldn't be written.
+                // Dropped-command warnings can also be dismissed early.
                 if err.scope == ErrorScope::Session {
                     ui.separator();
                     dismiss = ui.button("Dismiss").clicked();

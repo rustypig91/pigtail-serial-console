@@ -401,7 +401,8 @@ pub struct RawSession {
 /// An error shown on a connection's tab, paired with what it is about.
 ///
 /// The scope is what keeps a reconnect from erasing errors it doesn't fix:
-/// only the link's own failures are retired by the link coming back.
+/// link failures retire on recovery; dropped-command warnings retire on the
+/// next connection state update.
 #[derive(Clone, Debug)]
 pub struct TabError {
     pub scope: ErrorScope,
@@ -416,6 +417,10 @@ pub struct TransferProgress {
 }
 
 impl TabError {
+    fn is_dropped_command(&self) -> bool {
+        self.scope == ErrorScope::Session && self.msg.ends_with(": dropped, not connected")
+    }
+
     /// An error about the link itself, raised by the UI rather than the reader
     /// (a spawn that failed before any reader existed to report it).
     pub fn connection(msg: impl Into<String>) -> Self {
@@ -499,8 +504,8 @@ pub struct Connection {
     /// The runs whose bytes the ring holds, oldest first.
     pub raw_sessions: Vec<RawSession>,
     /// The most recent error on this connection, kept with its scope: a
-    /// successful (re)connect retires a [`ErrorScope::Connection`] error but
-    /// says nothing about a [`ErrorScope::Session`] one, which outlives it.
+    /// successful (re)connect retires link errors, and any connection state
+    /// update retires dropped-command warnings. Genuine session failures persist.
     pub last_error: Option<TabError>,
     /// Session failure temporarily hidden by a higher-priority link error.
     deferred_session_error: Option<TabError>,
@@ -759,41 +764,34 @@ impl Connection {
                     self.store.finalize_last_provisional();
                     self.mark_raw_discontinuity();
                 }
-                if matches!(s, ConnState::Connected | ConnState::DeviceMissing)
-                    && matches!(
-                        self.last_error,
-                        Some(TabError {
-                            scope: ErrorScope::Connection,
-                            ..
-                        })
-                    )
-                {
+                if self.last_error.as_ref().is_some_and(|error| {
+                    (error.scope == ErrorScope::Connection
+                        && matches!(s, ConnState::Connected | ConnState::DeviceMissing))
+                        || error.is_dropped_command()
+                }) {
                     // A successful connection or confirmed absence supersedes
                     // the previous link failure. Absence is a waiting state.
-                    // Session-scoped errors (a capture file that couldn't
-                    // be opened, say) are untouched by reconnecting, so
-                    // they survive it.
+                    // Any state update supersedes a dropped-command warning;
+                    // actual session failures require explicit dismissal.
                     self.last_error = self.deferred_session_error.take();
                 }
                 self.set_state(s);
             }
             ReaderEvent::Error { scope, msg } => {
                 tracing::warn!(port = self.id.0, "{msg}");
-                // A command dropped during device absence must not erase a
-                // retained failure, including one restored after a link error.
-                if scope == ErrorScope::Session
-                    && msg.ends_with(": dropped, not connected")
-                    && self.last_error.is_some()
+                let error = TabError { scope, msg };
+                // Dropped commands must not replace or queue behind an existing
+                // error or warning, including waiting states and a failure
+                // hidden by a link error.
+                if error.is_dropped_command()
+                    && (self.state != ConnState::Connected
+                        || self.last_error.is_some()
+                        || self.deferred_session_error.is_some())
                 {
                     return;
                 }
-                // A dropped-command notice (session-scoped) while the link
-                // itself is down would otherwise clobber the connection
-                // error explaining *why* — and unlike a connection error,
-                // nothing later clears it, so it would keep hiding the
-                // real cause for the rest of the outage. The link being
-                // down already implies commands can't get through, so
-                // just keep showing that.
+                // A link error takes priority, but must not erase a genuine
+                // session failure that reconnecting cannot fix.
                 let hides_connection_error = scope == ErrorScope::Session
                     && matches!(
                         self.last_error,
@@ -803,21 +801,16 @@ impl Connection {
                         })
                     );
                 if hides_connection_error {
-                    // Dropped commands add nothing to a link failure, but a
-                    // capture/control failure must survive the outage.
-                    if !msg.ends_with(": dropped, not connected") {
-                        self.deferred_session_error = Some(TabError { scope, msg });
-                    }
+                    self.deferred_session_error = Some(error);
                 } else {
                     if scope == ErrorScope::Connection
-                        && self
-                            .last_error
-                            .as_ref()
-                            .is_some_and(|error| error.scope == ErrorScope::Session)
+                        && self.last_error.as_ref().is_some_and(|error| {
+                            error.scope == ErrorScope::Session && !error.is_dropped_command()
+                        })
                     {
                         self.deferred_session_error = self.last_error.take();
                     }
-                    self.last_error = Some(TabError { scope, msg });
+                    self.last_error = Some(error);
                 }
             }
             ReaderEvent::TransferProgress { sent, total } => {
@@ -5694,9 +5687,8 @@ pub(crate) mod tests {
     /// reconnecting is reported as a session-scoped error. It must not
     /// clobber a connection error
     /// already explaining *why* the link is down — that message is more
-    /// useful, and unlike a connection error, nothing later clears a session
-    /// error, so overwriting it would hide the real cause for the rest of
-    /// the outage.
+    /// useful. Dropped-command warnings are shown only when no other error or
+    /// warning is active, and clear on the next connection state update.
     #[test]
     fn dropped_command_error_does_not_hide_the_connection_error() {
         let (mut app, _enum_tx) = test_app("dropped-command-error");
@@ -5740,6 +5732,7 @@ pub(crate) mod tests {
         // A session error is still shown when nothing more important is
         // already up.
         app.connections[0].last_error = None;
+        app.connections[0].set_state(ConnState::Connected);
         tx.send(ReaderEvent::Error {
             scope: ErrorScope::Session,
             msg: "transmit: dropped, not connected".into(),
@@ -5750,6 +5743,192 @@ pub(crate) mod tests {
             app.connections[0].last_error.as_ref().unwrap().msg,
             "transmit: dropped, not connected"
         );
+    }
+
+    #[test]
+    fn footer_restores_connected_status_after_a_dropped_command() {
+        let (mut app, _tx) = test_app("dropped-command-footer-recovery");
+        let id = PortId(0);
+        let mut conn = app.make_connection(
+            id,
+            "probe".into(),
+            Default::default(),
+            Default::default(),
+            inert_handle(id),
+        );
+        let (tx, rx) = crossbeam_channel::unbounded();
+        conn.handle.events = rx;
+        app.connections.push(conn);
+        let ctx = egui::Context::default();
+        for (event, label) in [
+            (ReaderEvent::State(ConnState::Connected), "Connected"),
+            (
+                ReaderEvent::Error {
+                    scope: ErrorScope::Session,
+                    msg: "transmit: dropped, not connected".into(),
+                },
+                "Command not sent",
+            ),
+            (ReaderEvent::State(ConnState::Connected), "Connected"),
+            (
+                ReaderEvent::State(ConnState::DeviceMissing),
+                "Device missing",
+            ),
+            (
+                ReaderEvent::Error {
+                    scope: ErrorScope::Session,
+                    msg: "transmit: dropped, not connected".into(),
+                },
+                "Device missing",
+            ),
+            (ReaderEvent::State(ConnState::Reconnecting), "Reconnecting"),
+            (
+                ReaderEvent::Error {
+                    scope: ErrorScope::Session,
+                    msg: "transmit: dropped, not connected".into(),
+                },
+                "Reconnecting",
+            ),
+            (ReaderEvent::State(ConnState::Connected), "Connected"),
+        ] {
+            tx.send(event).unwrap();
+            app.connections[0].drain_events(1000, Duration::from_secs(1));
+            let output = ctx.run_test_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 300.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.show_status_footer(ui),
+            );
+            let statuses: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text)
+                        if [
+                            "Device missing",
+                            "Reconnecting",
+                            "Command not sent",
+                            "Connected",
+                        ]
+                        .contains(&text.galley.text()) =>
+                    {
+                        Some(text.galley.text())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(statuses, [label]);
+        }
+    }
+
+    #[test]
+    fn dropped_command_status_clears_on_reconnect() {
+        let (app, _enum_tx) = test_app("dropped-command-recovery");
+        for label in ["transmit", "file transfer", "dtr", "rts", "break"] {
+            let mut conn = app.make_connection(
+                PortId(0),
+                "probe".into(),
+                identity("A1"),
+                PortConfig::default(),
+                inert_handle(PortId(0)),
+            );
+            conn.apply_reader_event(ReaderEvent::State(ConnState::Connected));
+            conn.apply_reader_event(ReaderEvent::Error {
+                scope: ErrorScope::Session,
+                msg: format!("{label}: dropped, not connected"),
+            });
+            assert!(conn.last_error.is_some(), "{label}");
+            conn.apply_reader_event(ReaderEvent::State(ConnState::Connected));
+            assert!(conn.last_error.is_none(), "{label}");
+            assert!(conn.deferred_session_error.is_none());
+        }
+    }
+
+    #[test]
+    fn waiting_states_supersede_dropped_command_warnings() {
+        let (app, _enum_tx) = test_app("dropped-command-waiting-states");
+        for state in [
+            ConnState::Disconnected,
+            ConnState::Connecting,
+            ConnState::Lost,
+            ConnState::Reconnecting,
+            ConnState::DeviceMissing,
+            ConnState::Closed,
+        ] {
+            let mut conn = app.make_connection(
+                PortId(0),
+                "probe".into(),
+                identity("A1"),
+                PortConfig::default(),
+                inert_handle(PortId(0)),
+            );
+            let dropped = ReaderEvent::Error {
+                scope: ErrorScope::Session,
+                msg: "transmit: dropped, not connected".into(),
+            };
+            // A notice can reach the UI before the reader's state update.
+            conn.set_state(ConnState::Connected);
+            conn.apply_reader_event(dropped.clone());
+            assert!(conn.last_error.is_some());
+            conn.apply_reader_event(ReaderEvent::State(state));
+            assert!(conn.last_error.is_none(), "{state:?}");
+            // Once waiting, the state already explains why sending cannot work.
+            conn.apply_reader_event(dropped);
+            assert!(conn.last_error.is_none(), "{state:?}");
+            assert!(conn.deferred_session_error.is_none());
+        }
+    }
+
+    #[test]
+    fn dropped_command_warning_never_replaces_or_survives_another_status() {
+        let (app, _enum_tx) = test_app("dropped-command-priority");
+        for (scope, msg) in [
+            (ErrorScope::Connection, "permission denied"),
+            (ErrorScope::Session, "log write: disk full"),
+            (
+                ErrorScope::Session,
+                "file transfer: another transfer is already active",
+            ),
+        ] {
+            for dropped_first in [true, false] {
+                let mut conn = app.make_connection(
+                    PortId(0),
+                    "probe".into(),
+                    identity("A1"),
+                    PortConfig::default(),
+                    inert_handle(PortId(0)),
+                );
+                conn.set_state(ConnState::Connected);
+                let dropped = ReaderEvent::Error {
+                    scope: ErrorScope::Session,
+                    msg: "transmit: dropped, not connected".into(),
+                };
+                let other = ReaderEvent::Error {
+                    scope,
+                    msg: msg.into(),
+                };
+                let events = if dropped_first {
+                    [dropped, other]
+                } else {
+                    [other, dropped]
+                };
+                for event in events {
+                    conn.apply_reader_event(event);
+                }
+                assert_eq!(conn.last_error.as_ref().unwrap().msg, msg);
+                assert!(conn.deferred_session_error.is_none());
+                conn.apply_reader_event(ReaderEvent::State(ConnState::Connected));
+                if scope == ErrorScope::Connection {
+                    assert!(conn.last_error.is_none());
+                } else {
+                    assert_eq!(conn.last_error.as_ref().unwrap().msg, msg);
+                }
+            }
+        }
     }
 
     #[test]
