@@ -682,7 +682,7 @@ impl App {
     fn show_console_actions(&mut self, ui: &mut egui::Ui) {
         self.show_app_menu(ui);
         let export = ui
-            .scope(|ui| {
+            .add_enabled_ui(self.export.is_none(), |ui| {
                 egui::containers::menu::MenuButton::from_button(
                     egui::Button::new(" ")
                         .frame(false)

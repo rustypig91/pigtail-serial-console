@@ -13,7 +13,8 @@ use serialcore::config::{TimestampFormat, MAX_CONSOLE_FONT_SIZE, MIN_CONSOLE_FON
 use serialcore::reader::ConnState;
 use serialcore::store::{LineFlags, LineRef, LineStore, PortId};
 use std::hash::{Hash, Hasher};
-use std::io::{BufWriter, Write};
+#[cfg(test)]
+use std::io::Write;
 
 /// The colour the console draws a session boundary in, shared with the hex
 /// view's own boundary rows.
@@ -2844,7 +2845,7 @@ impl App {
 
     /// Export the active connection's current (filtered) view to a file.
     pub(crate) fn export_active_view(&mut self, active: usize, as_csv: bool) {
-        if self.connections.get(active).is_none() {
+        if self.export.is_some() || self.connections.get(active).is_none() {
             return;
         }
         let ext = if as_csv { "csv" } else { "txt" };
@@ -2856,19 +2857,8 @@ impl App {
             return;
         };
 
-        let conn = &self.connections[active];
-        let result = std::fs::File::create(path).and_then(|file| {
-            let mut writer = BufWriter::new(file);
-            write_active_export(&mut writer, conn, as_csv)?;
-            writer.flush()
-        });
-        if let Err(e) = result {
-            // Not `conn.last_error`: that field carries what the reader
-            // reports about a connection (its link, or its capture file),
-            // whereas an export is a UI action the user is standing there
-            // waiting on — a modal answers it where they're looking.
-            self.record_connect_error("Couldn't export", e.to_string());
-        }
+        let snapshot = active_export_snapshot(&self.connections[active]);
+        self.start_export(snapshot, path, as_csv);
     }
 
     /// Export the merged tab exactly as displayed: timestamp-interleaved,
@@ -2876,6 +2866,9 @@ impl App {
     /// tag. CSV gets the tag as a separate column; text mirrors the console's
     /// `[tag] timestamp text` layout.
     pub(crate) fn export_merged_view(&mut self, as_csv: bool) {
+        if self.export.is_some() {
+            return;
+        }
         let ext = if as_csv { "csv" } else { "txt" };
         let Some(path) = rfd::FileDialog::new()
             .add_filter(ext, &[ext])
@@ -2885,14 +2878,8 @@ impl App {
             return;
         };
 
-        let result = std::fs::File::create(path).and_then(|file| {
-            let mut writer = BufWriter::new(file);
-            write_merged_export(&mut writer, &self.connections, self.merged_view(), as_csv)?;
-            writer.flush()
-        });
-        if let Err(e) = result {
-            self.record_connect_error("Couldn't export", e.to_string());
-        }
+        let snapshot = merged_export_snapshot(&self.connections, self.merged_view());
+        self.start_export(snapshot, path, as_csv);
     }
 }
 
@@ -2921,93 +2908,65 @@ fn show_rows_with_header(
     })
 }
 
-/// Stream one connection's displayed rows to `writer`, without materializing
-/// either the selected indices or the formatted export as a whole.
+/// Freeze the displayed subset before handing it to the worker. Formatting
+/// and all filesystem access happen off the UI thread; no Connection is shared.
+fn active_export_snapshot(conn: &Connection) -> serialcore::export::Snapshot {
+    let mut snapshot = serialcore::export::Snapshot::new(None);
+    let indices: Box<dyn Iterator<Item = u64> + '_> = if conn.filter_index_active() {
+        Box::new(conn.filter_index.matching().iter().copied())
+    } else {
+        Box::new(conn.store.first_abs_index()..conn.store.next_abs_index())
+    };
+    for abs in indices {
+        if let Some(line) = conn.store.get(abs) {
+            snapshot.push(line, 0);
+        }
+    }
+    snapshot
+}
+
+fn merged_export_snapshot(
+    connections: &[Connection],
+    entries: &[MergedEntry],
+) -> serialcore::export::Snapshot {
+    let tag_chars = merged_tag_width(connections);
+    let tags = connections
+        .iter()
+        .map(|conn| short_tag(conn.merged_label(), tag_chars))
+        .collect();
+    let mut snapshot = serialcore::export::Snapshot::new(Some(tags));
+    for entry in entries {
+        let Some((tag, conn)) = connections
+            .iter()
+            .enumerate()
+            .find(|(_, conn)| conn.id == entry.port)
+        else {
+            continue;
+        };
+        if let Some(line) = conn.store.get(entry.abs) {
+            snapshot.push(line, tag);
+        }
+    }
+    snapshot
+}
+
+#[cfg(test)]
 fn write_active_export(
     writer: &mut impl Write,
     conn: &Connection,
     as_csv: bool,
 ) -> std::io::Result<()> {
-    if as_csv {
-        writeln!(writer, "wall_time,micros,flags,text")?;
-    }
-
-    let filtered = conn.filter_index_active();
-    let matching = conn.filter_index.matching();
-    let first = conn.store.first_abs_index();
-    let end = conn.store.next_abs_index();
-    let indices: Box<dyn Iterator<Item = u64> + '_> = if filtered {
-        Box::new(matching.iter().copied())
-    } else {
-        Box::new(first..end)
-    };
-
-    for abs in indices {
-        let Some(line) = conn.store.get(abs) else {
-            continue;
-        };
-        if as_csv {
-            writeln!(
-                writer,
-                "{},{},{},{}",
-                // Local time like the console shows, but with the UTC offset
-                // appended so the exported column stays unambiguous to
-                // whatever reads it.
-                line.meta
-                    .ts
-                    .wall
-                    .with_timezone(&chrono::Local)
-                    .format("%Y-%m-%dT%H:%M:%S%.6f%:z"),
-                line.meta.ts.micros,
-                line.meta.flags.0,
-                csv_escape(line.text),
-            )?;
-        } else {
-            writeln!(writer, "{}  {}", wall_clock(line.meta.ts), line.text)?;
-        }
-    }
-    Ok(())
+    active_export_snapshot(conn).write(writer, as_csv)
 }
 
-/// Stream the merged view to `writer`, so its memory use does not scale with
-/// the number or size of retained lines.
+#[cfg(test)]
 fn write_merged_export(
     writer: &mut impl Write,
     connections: &[Connection],
     entries: &[MergedEntry],
     as_csv: bool,
 ) -> std::io::Result<()> {
-    let tag_chars = merged_tag_width(connections);
-    if as_csv {
-        writeln!(writer, "port,wall_time,micros,flags,text")?;
-    }
-    for entry in entries {
-        let Some(conn) = connections.iter().find(|conn| conn.id == entry.port) else {
-            continue;
-        };
-        let Some(line) = conn.store.get(entry.abs) else {
-            continue;
-        };
-        let tag = short_tag(conn.merged_label(), tag_chars);
-        if as_csv {
-            writeln!(
-                writer,
-                "{},{},{},{},{}",
-                csv_escape(&tag),
-                line.meta
-                    .ts
-                    .wall
-                    .with_timezone(&chrono::Local)
-                    .format("%Y-%m-%dT%H:%M:%S%.6f%:z"),
-                line.meta.ts.micros,
-                line.meta.flags.0,
-                csv_escape(line.text),
-            )?;
-        } else {
-            writeln!(writer, "{tag}  {}  {}", wall_clock(line.meta.ts), line.text)?;
-        }
-    }
-    Ok(())
+    merged_export_snapshot(connections, entries).write(writer, as_csv)
 }
 
 fn search_filter_controls(
@@ -4378,15 +4337,6 @@ fn draw_search_ticks<T>(
             [egui::pos2(x, y), egui::pos2(rect.right(), y)],
             egui::Stroke::new(2.0_f32, color),
         );
-    }
-}
-
-/// Quote a CSV field if it contains a comma, quote, or newline.
-fn csv_escape(s: &str) -> String {
-    if s.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s.to_string()
     }
 }
 
@@ -7654,6 +7604,12 @@ mod tests {
         assert!(csv.starts_with("port,wall_time,micros,flags,text\n"));
         assert!(csv.contains("[beta ]"));
         assert!(csv.contains("\"alarm, now\""));
+
+        let snapshot = merged_export_snapshot(&connections, &entries);
+        drop(connections);
+        let mut frozen_csv = Vec::new();
+        snapshot.write(&mut frozen_csv, true).unwrap();
+        assert_eq!(String::from_utf8(frozen_csv).unwrap(), csv);
     }
 
     #[test]
@@ -8182,6 +8138,7 @@ mod tests {
         assert_eq!(lines[0], "wall_time,micros,flags,text");
         assert!(lines[1].ends_with(",2,0,\"keep, \"\"quoted\"\"\""));
         assert!(!csv.contains("drop"));
+        let snapshot = active_export_snapshot(conn);
         for (mode, keep, drop) in [
             (crate::app::SearchFilter::HideMatches, false, true),
             (crate::app::SearchFilter::Highlight, true, true),
@@ -8195,6 +8152,10 @@ mod tests {
             assert_eq!(text.contains("drop"), drop);
             assert_eq!(app.connections[0].store.len(), 2);
         }
+        app.connections.clear();
+        let mut frozen_csv = Vec::new();
+        snapshot.write(&mut frozen_csv, true).unwrap();
+        assert_eq!(String::from_utf8(frozen_csv).unwrap(), csv);
     }
 
     #[test]

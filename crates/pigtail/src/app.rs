@@ -1391,6 +1391,7 @@ impl MergedTabState {
 }
 
 pub struct App {
+    pub(crate) export: Option<serialcore::export::Task>,
     pub(crate) search_history: crate::search_history::SearchHistory,
     pub(crate) demo_mode: bool,
     pub clock: SessionClock,
@@ -1557,6 +1558,7 @@ impl App {
     fn assemble(config: Config, paths: AppPaths, wake: Wake, enum_rx: Receiver<EnumEvent>) -> App {
         crate::plots::reserve_ids(&config);
         App {
+            export: None,
             demo_mode: false,
             clock: SessionClock::new(),
             config,
@@ -3662,6 +3664,7 @@ impl eframe::App for App {
         let ctx = &ui.ctx().clone();
         self.poll_enumerator();
         self.poll_folder_open_results();
+        self.poll_export();
         self.poll_update_check();
         self.poll_update_install(ctx);
         if self.install_rx.is_some()
@@ -3731,6 +3734,7 @@ impl eframe::App for App {
         self.show_keyboard_shortcuts_window(ctx);
         self.show_update_dialog(ctx);
         self.show_file_transfer(ctx);
+        self.show_export(ctx);
         self.show_font_toast(ctx);
         self.show_connect_error(ctx);
         // Keep the guard focused until every widget has been drawn, so none of
