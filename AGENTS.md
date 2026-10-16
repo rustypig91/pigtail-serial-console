@@ -167,9 +167,18 @@ application.
   unrelated session failures, which remain visible until dismissed. Successful
   reconnection clears link errors. A link error temporarily takes priority over
   a session failure; clearing it restores that failure, including failures
-  reported during the outage. Dropped-command warnings do not replace a
-  visible or deferred failure. Error details remain available in the
+  reported during the outage. Dropped-command warnings do not replace an
+  existing error or warning (including waiting connection states), are never
+  deferred behind a later link error, and clear on the next connection state
+  update, including successful reconnection. Error details remain available in the
   overflow menu.
+  Issue #154 regression coverage checks dropped transmit/file/control commands,
+  every waiting state, competing errors/warnings in both arrival orders, and
+  rendered-footer recovery. Formatting, app tests with default/all features,
+  all-target Clippy with default/all features, and the demo check passed.
+  Workspace runs encountered core load-test timeout and throughput timing
+  failures; both passed isolated reruns. Native GUI inspection was unavailable
+  because display automation tools were absent.
   Console context menus belong to the pane's selected view rather than a
   virtualized row. Incoming output may scroll or evict the clicked row while
   the menu stays open at its original position. Row actions keep the original
