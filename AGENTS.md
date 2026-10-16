@@ -394,6 +394,21 @@ samples arrive between UI frames.
 
 ### Saved session history
 
+Clear console immediately resets the connection's Log, Hex and ANSI/VT state.
+The UI discards incoming batches and dropped-output notices until the reader
+acknowledges every pending clear in event order. The reader sends each boundary
+after resetting framing/backlog and attempting capture truncation, including
+when truncation fails; errors and connection/transfer events remain visible.
+Output after the final boundary is retained even if already queued when the UI
+finishes clearing. Replacing a reader resets its pending acknowledgements.
+
+The 2026-10-16 clear-boundary revision reproduced issue #83 before the fix.
+Regression coverage includes racing batches and gap notices, repeated clears,
+fresh queued output, control events, reader replacement, capture failures and
+clearing a full channel at EOF. Formatting, workspace tests and all-target
+Clippy with default/all features, and the demo feature check passed. Native
+GUI inspection was unavailable because display tools were absent.
+
 Captures sharing an app clock anchor are ordered by their first raw record.
 Empty captures use the raw file's modification time (creation or latest clear),
 so a cleared empty capture stops older history without hiding or deleting output

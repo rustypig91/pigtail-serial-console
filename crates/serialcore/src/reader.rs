@@ -94,6 +94,9 @@ pub struct Batch {
 pub enum ReaderEvent {
     State(ConnState),
     Batch(Batch),
+    /// Ordered clear boundary: all earlier output belongs to the discarded
+    /// capture. Sent once per processed ClearLog, even if truncation fails.
+    LogCleared,
     /// The UI fell far enough behind that old live-view batches had to be
     /// discarded. Ordered ahead of the retained batches, so the UI can put a
     /// visible boundary exactly where the gap occurred.
@@ -297,9 +300,10 @@ impl ReaderHandle {
     /// Truncate this port's session capture back to its header and drop
     /// whatever the reader still holds unsent, so output the user cleared from
     /// the console doesn't survive on disk (or come back as preloaded history
-    /// next launch).
-    pub fn clear_log(&self) {
-        let _ = self.cmd.send(ReaderCommand::ClearLog);
+    /// next launch). Returns whether the command was queued. Until its ordered
+    /// `LogCleared` event arrives, the UI must discard batches and gap notices.
+    pub fn clear_log(&self) -> bool {
+        self.cmd.send(ReaderCommand::ClearLog).is_ok()
     }
 
     /// Signal shutdown and join the thread.
@@ -475,7 +479,7 @@ impl Backlog {
 }
 
 impl EventTx {
-    /// Send, blocking if the channel is full. Used for state and error events,
+    /// Send, blocking if the channel is full. Used for control events,
     /// which are rare and must not be dropped.
     fn send(&self, ev: ReaderEvent) {
         if self.tx.send(ev).is_ok() {
@@ -955,6 +959,7 @@ fn clear_log(targets: ClearTargets<'_>, event_tx: &EventTx) {
             event_tx.send(ReaderEvent::session_error(format!("clear log: {e}")));
         }
     }
+    event_tx.send(ReaderEvent::LogCleared);
 }
 
 fn drain_commands(
@@ -1992,6 +1997,93 @@ mod tests {
     }
 
     #[test]
+    fn clear_acknowledgements_follow_old_output_even_when_capture_clear_fails() {
+        for fail_capture in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut capture = SessionWriter::create(dir.path(), &test_meta()).unwrap();
+            capture.write_record(0, b"old\n").unwrap();
+            if fail_capture {
+                let meta_path = capture.meta_path().to_path_buf();
+                std::fs::remove_file(&meta_path).unwrap();
+                std::fs::create_dir(&meta_path).unwrap();
+            }
+            let mut writer = Some(capture);
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let events = EventTx {
+                tx,
+                wake: Wake::none(),
+            };
+            events.send(ReaderEvent::Batch(Batch {
+                raw: b"queued old\n".to_vec(),
+                ..Default::default()
+            }));
+            let mut framer = Framer::new();
+            let mut pending = Batch {
+                raw: b"partial".to_vec(),
+                ..Default::default()
+            };
+            let now = SessionClock::new().now();
+            framer.push(b"partial", now, &mut pending.lines);
+            let mut backlog = Backlog::default();
+            backlog.push_with_limit(
+                Batch {
+                    raw: b"backlog\n".to_vec(),
+                    ..Default::default()
+                },
+                now,
+                usize::MAX,
+            );
+            let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+            cmd_tx.send(ReaderCommand::ClearLog).unwrap();
+            cmd_tx.send(ReaderCommand::ClearLog).unwrap();
+            drain_commands(
+                &cmd_rx,
+                &mut WriteSink::default(),
+                ClearTargets {
+                    writer: &mut writer,
+                    framer: &mut framer,
+                    pending: &mut pending,
+                    backlog: &mut backlog,
+                },
+                &mut None,
+                &mut PacedTransmit::default(),
+                &events,
+            );
+            assert!(pending.lines.is_empty());
+            assert!(pending.raw.is_empty());
+            assert!(backlog.batches.is_empty());
+            framer.push(b"new\n", now, &mut pending.lines);
+            assert_eq!(pending.lines.len(), 1);
+            assert_eq!(pending.lines[0].text, "new");
+            pending.raw.extend_from_slice(b"new\n");
+            flush_batch(&mut pending, &mut backlog, &events, &framer, now);
+            let mut acknowledgements = 0;
+            let mut errors = 0;
+            let mut raw = Vec::new();
+            for event in rx.try_iter() {
+                match event {
+                    ReaderEvent::Batch(batch) => {
+                        assert_eq!(acknowledgements, if raw.is_empty() { 0 } else { 2 });
+                        raw.push(batch.raw);
+                    }
+                    ReaderEvent::LogCleared => acknowledgements += 1,
+                    ReaderEvent::Error {
+                        scope: ErrorScope::Session,
+                        msg,
+                    } => {
+                        assert!(msg.starts_with("clear log:"));
+                        errors += 1;
+                    }
+                    event => panic!("unexpected event: {event:?}"),
+                }
+            }
+            assert_eq!(acknowledgements, 2);
+            assert_eq!(errors, if fail_capture { 2 } else { 0 });
+            assert_eq!(raw, [b"queued old\n".to_vec(), b"new\n".to_vec()]);
+        }
+    }
+
+    #[test]
     fn clearing_while_eof_is_draining_discards_backlog_and_capture() {
         let dir = tempfile::tempdir().unwrap();
         let (eof, eof_rx) = crossbeam_channel::bounded(1);
@@ -2010,15 +2102,18 @@ mod tests {
         };
         let handle = spawn(config, SourceSpec::OneShot(Box::new(src))).unwrap();
         eof_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        handle.clear_log();
-        // Mimic clearing the UI's snapshot of already queued output.
-        for _ in 0..handle.events.len() {
-            handle.events.try_recv().unwrap();
-        }
-        let mut remaining_raw = 0;
+        assert!(handle.clear_log());
+        // Drain the full channel, including output queued before the clear.
+        let mut acknowledged = false;
         loop {
             match handle.events.recv_timeout(Duration::from_secs(5)).unwrap() {
-                ReaderEvent::Batch(batch) => remaining_raw += batch.raw.len(),
+                ReaderEvent::LogCleared => acknowledged = true,
+                ReaderEvent::Batch(_) | ReaderEvent::OutputDropped { .. } => {
+                    assert!(
+                        !acknowledged,
+                        "cleared backlog must precede acknowledgement"
+                    );
+                }
                 ReaderEvent::State(ConnState::Closed) => break,
                 _ => {}
             }
@@ -2036,10 +2131,7 @@ mod tests {
             "clear must truncate the capture even while EOF is draining"
         );
         assert!(crate::session::read_meta(&capture).unwrap().cleared);
-        assert!(
-            remaining_raw <= BATCH_MAX_RAW,
-            "cleared backlog must not reappear"
-        );
+        assert!(acknowledged, "a clear at EOF must still be acknowledged");
     }
 
     #[test]
@@ -2119,6 +2211,7 @@ mod tests {
                     }
                 }
                 Ok(ReaderEvent::OutputDropped { .. }) => {}
+                Ok(ReaderEvent::LogCleared) => {}
                 Ok(ReaderEvent::Error { .. }) => {}
                 Ok(ReaderEvent::TransferProgress { .. } | ReaderEvent::TransferEnded) => {}
                 Err(_) => {}
