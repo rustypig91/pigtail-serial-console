@@ -157,7 +157,8 @@ pub enum Outcome {
     Cancelled,
 }
 
-/// Dropping the handle cancels an unfinished export, including on app exit.
+/// Dropping the handle cancels an unfinished export and waits for worker cleanup,
+/// including on app exit. An in-progress commit is allowed to finish.
 /// Cancellation is accepted until the atomic replacement starts; after that
 /// the UI should show Finishing and disable Cancel.
 pub struct Task {
@@ -165,6 +166,7 @@ pub struct Task {
     pub total: usize,
     control: Arc<Control>,
     result: Receiver<io::Result<Outcome>>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Task {
@@ -174,7 +176,7 @@ impl Task {
         let worker_control = control.clone();
         let worker_path = path.clone();
         let (tx, result) = crossbeam_channel::bounded(1);
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("export".into())
             .spawn(move || {
                 let result = run_export(&snapshot, &worker_path, csv, &worker_control);
@@ -186,6 +188,7 @@ impl Task {
             total,
             control,
             result,
+            worker: Some(worker),
         })
     }
 
@@ -217,6 +220,11 @@ impl Task {
 impl Drop for Task {
     fn drop(&mut self) {
         self.cancel();
+        // Detached threads are terminated when main returns. Keep the process
+        // alive until the temporary file has been removed or committed.
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -317,6 +325,57 @@ mod tests {
             run_export(&snapshot("received"), &path, false, &control).unwrap(),
             Outcome::Cancelled
         );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "old");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn dropping_a_task_waits_for_temporary_file_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("export.txt");
+        std::fs::write(&path, "old").unwrap();
+        let control = Arc::new(Control::default());
+        let worker_control = control.clone();
+        let worker_path = path.clone();
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let (result_tx, result_rx) = crossbeam_channel::bounded(1);
+        let worker = std::thread::spawn(move || {
+            let result = crate::fs::atomic_write_with(&worker_path, |file| {
+                file.write_all(b"partial")?;
+                // Hold an actual export temp file until Drop requests cancellation.
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                worker_control.check_cancelled()
+            });
+            result_tx.send(result.map(|()| Outcome::Completed)).unwrap();
+        });
+        let task = Task {
+            path: path.clone(),
+            total: 1,
+            control: control.clone(),
+            result: result_rx,
+            worker: Some(worker),
+        };
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        let (dropped_tx, dropped_rx) = crossbeam_channel::bounded(1);
+        let dropping = std::thread::spawn(move || {
+            drop(task);
+            dropped_tx.send(()).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while control.phase.load(Ordering::SeqCst) != CANCELLED {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            dropped_rx.recv_timeout(Duration::from_millis(100)),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout)
+        );
+        release_tx.send(()).unwrap();
+        dropped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        dropping.join().unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), "old");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }

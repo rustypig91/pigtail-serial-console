@@ -170,4 +170,22 @@ mod tests {
         assert!(app.export.is_none());
         assert_eq!(app.connect_errors.back().unwrap().title, "Couldn't export");
     }
+
+    #[test]
+    fn exit_finishes_export_cleanup_before_returning() {
+        let (mut app, _tx) = test_app("export-exit-cleanup");
+        std::fs::create_dir_all(&app.paths.sessions).unwrap();
+        let path = app.paths.sessions.join("export.txt");
+        app.start_export(Snapshot::new(None), path, false);
+        assert!(app.export.is_some());
+        eframe::App::on_exit(&mut app);
+        assert!(app.export.is_none());
+        assert!(std::fs::read_dir(&app.paths.sessions)
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".pigtail-write-")));
+    }
 }

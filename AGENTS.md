@@ -248,7 +248,8 @@ application.
   beside the destination, flushes and syncs it, then atomically replaces the
   destination. Accepted cancellation and write/commit failures preserve an
   existing destination and remove the temporary file. Failures use the existing
-  **Couldn't export** dialog. Closing the app requests cancellation.
+  **Couldn't export** dialog. Closing the app requests cancellation and waits for
+  worker cleanup before exiting; a replacement already in progress finishes first.
 - Startup notice when a newer release is published, with "skip this version" and
   one-click download and update. Startup checks can be switched off in Settings.
 
@@ -258,7 +259,7 @@ The 2026-10-16 export revision passed formatting, workspace tests with default
 and all features, all-target Clippy with default/all features, and the demo
 check/build. Final focused tests cover active/merged snapshots after source
 closure, CSV escaping, progress/Cancel rendering, worker error reporting,
-cancellation during serialization (including long lines), and preserving the
+exit-time cleanup, cancellation during serialization (including long lines), and preserving the
 destination/removing temporary files on cancellation or write/commit failure.
 Native X11 demo inspection used a throttled 500,000-row fixture to verify the
 progress window alongside split logs/plots. Wayland ignored synthetic mouse

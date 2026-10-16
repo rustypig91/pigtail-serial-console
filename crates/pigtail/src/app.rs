@@ -3776,6 +3776,8 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        // Cancel and finish export cleanup before the native event loop exits.
+        self.export.take();
         self.persist_plots();
         self.persist_workspace();
         self.flush_config();
