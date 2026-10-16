@@ -439,6 +439,9 @@ pub struct Connection {
     pub identity: PortIdentity,
     pub port_config: PortConfig,
     pub handle: reader::ReaderHandle,
+    /// Number of ordered clear boundaries still expected from this reader.
+    /// Output is ignored until every requested clear has been acknowledged.
+    pending_log_clears: usize,
     pub store: LineStore,
     pub state: ConnState,
     /// Advances whenever a connected port leaves `Connected`. Macro runs copy
@@ -741,6 +744,11 @@ impl Connection {
 
     fn apply_reader_event(&mut self, ev: ReaderEvent) {
         match ev {
+            ReaderEvent::Batch(_) | ReaderEvent::OutputDropped { .. }
+                if self.pending_log_clears > 0 => {}
+            ReaderEvent::LogCleared => {
+                self.pending_log_clears = self.pending_log_clears.saturating_sub(1);
+            }
             ReaderEvent::State(s) => {
                 // Leaving Connected ends whatever line was still open. The
                 // reader finalizes it for us when it had bytes in hand; this
@@ -2039,6 +2047,7 @@ impl App {
         // after the spawn rather than before it.
         self.connections[index].handle.shutdown_in_place();
         self.connections[index].discard_pending_output();
+        self.connections[index].pending_log_clears = 0;
         self.connections[index].mark_raw_discontinuity();
         // `shutdown_in_place` drains and discards the old reader's final
         // events, including `TransferEnded`, so retire its UI state here.
@@ -2430,6 +2439,7 @@ impl App {
             identity,
             port_config,
             handle,
+            pending_log_clears: 0,
             store: LineStore::new(limits.max_lines),
             state: ConnState::Connecting,
             disconnect_generation: 0,
@@ -3485,8 +3495,8 @@ impl App {
     /// itself.
     ///
     /// Discard output already owned by the UI and ask the reader to discard
-    /// its backlog. Bytes concurrently handed to the channel can still arrive
-    /// before the reader processes the clear command.
+    /// its backlog. Ignore output until the reader's ordered acknowledgement,
+    /// including bytes concurrently handed to the channel before that boundary.
     pub fn clear_console(&mut self, port: Option<PortId>) {
         let targets: Vec<usize> = match port {
             Some(id) => self
@@ -3511,10 +3521,16 @@ impl App {
             // wouldn't actually be truncated even though the UI below is
             // cleared regardless. Skip it, matching the DTR/RTS/break/
             // transmit guards elsewhere against a zombie tab.
-            if conn.state != ConnState::Closed {
-                conn.handle.clear_log();
+            if conn.state != ConnState::Closed && conn.handle.clear_log() {
+                conn.pending_log_clears += 1;
+                // Leave the channel ordered: a fast reader may already have
+                // queued its acknowledgement and fresh output. Only discard
+                // the partly consumed batch here; gate queued output below.
+                conn.pending_lines = Vec::new().into_iter();
+                conn.pending_raw = Vec::new().into_iter();
+            } else {
+                conn.discard_pending_output();
             }
-            conn.discard_pending_output();
             conn.store.clear();
             conn.reset_terminal();
             // The offsets restart at zero with the next byte: nothing is left
@@ -6214,6 +6230,95 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn clearing_console_rejects_output_until_the_last_acknowledgement() {
+        for clears in [1, 2] {
+            let (mut app, _enum_tx) = test_app("receive-clear-race");
+            let tx = conn_with_injected_events(&mut app, PortId(0));
+            for _ in 0..clears {
+                app.clear_console(Some(PortId(0)));
+            }
+            assert_eq!(app.connections[0].pending_log_clears, clears);
+            let conn = &mut app.connections[0];
+            let send_output = |raw: &[u8]| {
+                let mut lines = Vec::new();
+                serialcore::framer::Framer::new().push(raw, app.clock.now(), &mut lines);
+                tx.send(ReaderEvent::Batch(reader::Batch {
+                    lines,
+                    raw: raw.to_vec(),
+                }))
+                .unwrap();
+            };
+            for _ in 0..clears {
+                conn.transfer_progress = Some(TransferProgress {
+                    file_name: "test.bin".into(),
+                    sent: 0,
+                    total: 10,
+                });
+                // A read/flush raced the click, or belongs to an earlier clear.
+                send_output(b"old\n");
+                tx.send(ReaderEvent::OutputDropped {
+                    raw_bytes: 10,
+                    line_updates: 1,
+                    at: app.clock.now(),
+                })
+                .unwrap();
+                tx.send(ReaderEvent::Error {
+                    scope: ErrorScope::Session,
+                    msg: "keep this error".into(),
+                })
+                .unwrap();
+                tx.send(ReaderEvent::State(ConnState::Connected)).unwrap();
+                tx.send(ReaderEvent::TransferEnded).unwrap();
+                conn.drain_events(1000, Duration::from_secs(1));
+                assert!(conn.store.is_empty());
+                assert!(conn.raw_ring.is_empty());
+                assert!(conn.terminal.screen().contents().is_empty());
+                assert_eq!(conn.state, ConnState::Connected);
+                assert_eq!(conn.last_error.as_ref().unwrap().msg, "keep this error");
+                assert!(conn.transfer_progress.is_none());
+                tx.send(ReaderEvent::LogCleared).unwrap();
+            }
+            // No frame between the final acknowledgement and the fresh batch.
+            send_output(b"new\n");
+            conn.drain_events(1000, Duration::from_secs(1));
+            assert_eq!(conn.pending_log_clears, 0);
+            assert_eq!(conn.store.len(), 1);
+            assert_eq!(
+                conn.store.get(conn.store.first_abs_index()).unwrap().text,
+                "new"
+            );
+            assert_eq!(conn.raw_ring.iter().copied().collect::<Vec<_>>(), b"new\n");
+            assert_eq!(conn.terminal.screen().contents(), "new");
+        }
+    }
+
+    #[test]
+    fn clearing_console_preserves_fresh_output_already_queued_behind_the_boundary() {
+        let (mut app, _enum_tx) = test_app("receive-clear-fast-ack");
+        let tx = conn_with_injected_events(&mut app, PortId(0));
+        // Model a reader fast enough to enqueue both events before the UI's
+        // clear path can inspect the channel. Snapshot-draining would lose new.
+        tx.send(ReaderEvent::LogCleared).unwrap();
+        let mut lines = Vec::new();
+        serialcore::framer::Framer::new().push(b"new\n", app.clock.now(), &mut lines);
+        tx.send(ReaderEvent::Batch(reader::Batch {
+            lines,
+            raw: b"new\n".to_vec(),
+        }))
+        .unwrap();
+        app.clear_console(Some(PortId(0)));
+        let conn = &mut app.connections[0];
+        conn.drain_events(1000, Duration::from_secs(1));
+        assert_eq!(conn.pending_log_clears, 0);
+        assert_eq!(conn.store.len(), 1);
+        assert_eq!(
+            conn.store.get(conn.store.first_abs_index()).unwrap().text,
+            "new"
+        );
+        assert_eq!(conn.raw_ring.iter().copied().collect::<Vec<_>>(), b"new\n");
+    }
+
+    #[test]
     fn clearing_console_discards_queued_output_but_preserves_control_events() {
         let (mut app, _enum_tx) = test_app("receive-clear-queued");
         let tx = conn_with_injected_events(&mut app, PortId(0));
@@ -6262,6 +6367,7 @@ pub(crate) mod tests {
         app.connections[0].drain_events(1000, Duration::ZERO);
         app.connections[0].drain_events(1000, Duration::ZERO);
         assert!(app.connections[0].pending_raw.len() > 0);
+        app.connections[0].pending_log_clears = 2;
         app.reconnect_with_config(
             PortId(0),
             Some("/nonexistent/pigtail-review-port".into()),
@@ -6270,6 +6376,7 @@ pub(crate) mod tests {
         let conn = &mut app.connections[0];
         assert_eq!(conn.pending_raw.len(), 0);
         assert_eq!(conn.pending_lines.len(), 0);
+        assert_eq!(conn.pending_log_clears, 0);
         assert_eq!(conn.raw_contiguous_start, conn.raw_next());
         assert!(conn
             .store
