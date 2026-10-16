@@ -236,9 +236,37 @@ application.
   New connection scroll within small windows while their Apply/Connect and Cancel
   buttons remain outside the scrolling area.
 - DTR/RTS toggles and break signal
-- Export the current (filtered) view to `.txt` or `.csv`
+- Export the current (filtered) Log subset to `.txt` or `.csv`. After choosing
+  a destination, the UI copies the selected text and minimal metadata into an
+  immutable snapshot; timestamp/CSV formatting and all file I/O run on a worker.
+  Incoming output, filtering changes, eviction and closing tabs cannot change
+  that snapshot. Merged exports retain their displayed ordering and source tags.
+  One export runs at a time across both panes. A nonmodal **Exporting view**
+  window shows the destination, line progress and **Cancel**, leaving the console
+  usable. It remains visible while cancellation finishes; Cancel is disabled
+  once atomic replacement starts. The worker writes a unique temporary file
+  beside the destination, flushes and syncs it, then atomically replaces the
+  destination. Accepted cancellation and write/commit failures preserve an
+  existing destination and remove the temporary file. Failures use the existing
+  **Couldn't export** dialog. Closing the app requests cancellation and waits for
+  worker cleanup before exiting; a replacement already in progress finishes first.
 - Startup notice when a newer release is published, with "skip this version" and
   one-click download and update. Startup checks can be switched off in Settings.
+
+### Export validation
+
+The 2026-10-16 export revision passed formatting, workspace tests with default
+and all features, all-target Clippy with default/all features, and the demo
+check/build. Final focused tests cover active/merged snapshots after source
+closure, CSV escaping, progress/Cancel rendering, worker error reporting,
+exit-time cleanup, cancellation during serialization (including long lines), and preserving the
+destination/removing temporary files on cancellation or write/commit failure.
+Native X11 demo inspection used a throttled 500,000-row fixture to verify the
+progress window alongside split logs/plots. Wayland ignored synthetic mouse
+events, so native Cancel interaction was covered by rendered-frame and worker
+tests instead. Snapshot creation still copies the selected resident text and
+minimal metadata on the UI thread; export memory scales with that snapshot,
+without retaining another formatted copy of the full output.
 
 ### Plot tabs
 

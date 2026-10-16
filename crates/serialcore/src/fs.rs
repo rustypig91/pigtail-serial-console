@@ -10,6 +10,15 @@ use std::path::Path;
 /// writers from sharing or deleting one another's temporary files. A failed
 /// write or persist leaves the previous destination untouched.
 pub fn atomic_write(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    atomic_write_with(path, |file| file.write_all(contents.as_ref()))
+}
+
+/// Stream into a temporary file, replacing the destination only if `write`
+/// succeeds. Returning an error (including cancellation) removes the temp file.
+pub fn atomic_write_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -17,7 +26,7 @@ pub fn atomic_write(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<
     let mut temp = tempfile::Builder::new()
         .prefix(".pigtail-write-")
         .tempfile_in(parent)?;
-    temp.write_all(contents.as_ref())?;
+    write(temp.as_file_mut())?;
     temp.flush()?;
     temp.persist(path).map(|_| ()).map_err(Into::into)
 }
