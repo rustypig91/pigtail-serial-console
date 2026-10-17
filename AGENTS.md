@@ -125,6 +125,9 @@ application.
   own list, then omitted from the global configuration on save. New connections
   start with independent, disabled ERROR/WARNING/INFO rules. Malformed per-port
   rule lists fall back to empty with a configuration warning.
+  Malformed saved-connection entry types return configuration errors rather
+  than panicking during per-connection rule and macro migration. Regression
+  coverage includes scalar, nested-array and mixed valid/invalid entries.
   The console right-click menu omits **New plot** and **Macros**; those remain
   available from the **+** menu and app menu/shortcut respectively. Selection
   actions for adding a macro or highlight rule remain available.

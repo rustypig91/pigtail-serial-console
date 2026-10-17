@@ -903,6 +903,11 @@ impl Config {
         for key in ["last_open", "preset"] {
             if let Some(entries) = value.get_mut(key).and_then(toml::Value::as_array_mut) {
                 for (index, entry) in entries.iter_mut().enumerate() {
+                    // Leave invalid entry types for deserialization to report;
+                    // migration must not panic on a malformed configuration.
+                    if !entry.is_table() {
+                        continue;
+                    }
                     if key == "last_open"
                         && entry
                             .get("id")
@@ -1292,6 +1297,19 @@ highlight = [{ pattern = "own", color = "#abcdef" }]
         let value: toml::Value = toml::from_str(&serialized).unwrap();
         assert!(value.get("highlight").is_none());
         assert_eq!(Config::from_toml(&serialized).unwrap(), cfg);
+    }
+
+    #[test]
+    fn malformed_saved_connection_entries_return_errors_without_panicking() {
+        for source in [
+            "last_open = [42]",
+            "last_open = ['bad']",
+            "last_open = [false]",
+            "last_open = [[]]",
+            "last_open = [{ identity = { path_fallback = 'COM1' } }, 42]",
+        ] {
+            assert!(Config::from_toml(source).is_err(), "{source}");
+        }
     }
 
     #[test]
