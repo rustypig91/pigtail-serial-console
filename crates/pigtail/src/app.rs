@@ -443,6 +443,10 @@ pub struct Connection {
     pub name: Option<String>,
     pub identity: PortIdentity,
     pub port_config: PortConfig,
+    pub macros: Vec<TransmitMacro>,
+    pub highlight: Vec<serialcore::config::HighlightRule>,
+    pub highlight_cache: Vec<CompiledHighlight>,
+    pub highlight_dirty: bool,
     pub handle: reader::ReaderHandle,
     /// Number of ordered clear boundaries still expected from this reader.
     /// Output is ignored until every requested clear has been acknowledged.
@@ -596,6 +600,32 @@ impl SearchFilter {
 }
 
 impl Connection {
+    /// Recompile this connection's rules only when edited.
+    fn rebuild_highlight_if_dirty(&mut self) {
+        if !self.highlight_dirty {
+            return;
+        }
+        self.highlight_dirty = false;
+        self.highlight_cache.clear();
+        for rule in &self.highlight {
+            if !rule.enabled || rule.pattern.is_empty() {
+                continue;
+            }
+            let Ok(re) = regex::RegexBuilder::new(&rule.pattern)
+                .case_insensitive(!rule.case_sensitive)
+                .build()
+            else {
+                continue;
+            };
+            self.highlight_cache.push(CompiledHighlight {
+                re,
+                case_sensitive: rule.case_sensitive,
+                color: parse_hex_color(&rule.color)
+                    .unwrap_or(egui::Color32::from_rgb(0xff, 0x55, 0x55)),
+            });
+        }
+    }
+
     fn selected_view(&self) -> serialcore::config::ConsoleView {
         use serialcore::config::ConsoleView;
         if self.screen_view {
@@ -1173,7 +1203,7 @@ pub struct FileTransferDialog {
 /// One in-flight macro execution. The definition is copied when it starts so
 /// editing or deleting a macro cannot change a sequence halfway through.
 pub(crate) struct MacroRun {
-    /// Catalog position of the definition that started this run. It becomes
+    /// Position within `port`'s catalog of the definition that started this run. It becomes
     /// `None` if that definition is deleted while its copied steps continue.
     pub(crate) macro_index: Option<usize>,
     pub(crate) name: String,
@@ -1202,6 +1232,7 @@ pub(crate) struct MacroWait {
 /// Draft owned by the separate add/edit window. Config is changed only when
 /// the user saves, so closing the editor can discard every in-progress change.
 pub(crate) struct MacroEditor {
+    pub(crate) port: PortId,
     pub(crate) index: Option<usize>,
     pub(crate) draft: TransmitMacro,
     pub(crate) step_selection: Option<usize>,
@@ -1417,9 +1448,6 @@ pub struct App {
     pub config_dialog: Option<ConfigDialog>,
     /// `Some` while the modal tab-name dialog is open.
     pub rename_dialog: Option<RenameDialog>,
-    /// Compiled global highlight rules; rebuilt when `highlight_dirty`.
-    pub highlight_cache: Vec<CompiledHighlight>,
-    pub highlight_dirty: bool,
     /// Runtime master switch for rendering highlights. Individual rule states
     /// stay untouched so they can be restored with one click from the footer.
     pub highlights_visible: bool,
@@ -1491,16 +1519,18 @@ pub struct App {
     pub show_about: bool,
     pub(crate) tab_close_confirmation: Option<(TabId, bool)>,
     pub show_macros_win: bool,
+    pub(crate) macros_port: Option<PortId>,
     /// Global reference for the keyboard commands Rusty's Pigtail reserves.
     pub show_keyboard_shortcuts: bool,
     pub(crate) macro_editor: Option<MacroEditor>,
     /// Macro definition awaiting confirmation because it is currently running.
-    pub(crate) macro_running_edit_confirmation: Option<usize>,
+    pub(crate) macro_running_edit_confirmation: Option<(PortId, usize)>,
     /// Target macro, requested digit, and the macro currently owning it.
-    pub(crate) macro_shortcut_conflict: Option<(usize, u8, usize)>,
+    pub(crate) macro_shortcut_conflict: Option<(PortId, usize, u8, usize)>,
     session_cleanup_tx: Option<crossbeam_channel::Sender<usize>>,
     session_cleanup_limit: Option<usize>,
     pub show_highlight_win: bool,
+    pub highlight_port: Option<PortId>,
     pub plot_tabs: Vec<PlotTab>,
     pub active_plot: Option<u64>,
     pub plot_draft: Option<PlotDraft>,
@@ -1575,8 +1605,6 @@ impl App {
             next_port_id: 0,
             config_dialog: None,
             rename_dialog: None,
-            highlight_cache: Vec::new(),
-            highlight_dirty: true,
             highlights_visible: true,
             merged: Vec::new(),
             merged_seq: 0,
@@ -1617,6 +1645,7 @@ impl App {
             show_about: false,
             tab_close_confirmation: None,
             show_macros_win: false,
+            macros_port: None,
             show_keyboard_shortcuts: false,
             macro_editor: None,
             macro_running_edit_confirmation: None,
@@ -1624,6 +1653,7 @@ impl App {
             session_cleanup_tx: None,
             session_cleanup_limit: None,
             show_highlight_win: false,
+            highlight_port: None,
             plot_tabs: vec![],
             active_plot: None,
             plot_draft: None,
@@ -1770,6 +1800,8 @@ impl App {
             if app.open_connection_inner(saved.identity.clone(), None, saved.config, saved.name) {
                 let conn = app.connections.last_mut().unwrap();
                 conn.persistent_id = saved.id;
+                conn.highlight = saved.highlight;
+                conn.macros = saved.macros;
                 conn.restore_view(saved.view);
                 preload_last_session(
                     conn,
@@ -2278,6 +2310,8 @@ impl App {
                 identity: c.identity.clone(),
                 name: c.name.clone(),
                 config: c.port_config.clone(),
+                highlight: c.highlight.clone(),
+                macros: c.macros.clone(),
             })
             .collect();
         self.config.merged_views = self
@@ -2431,6 +2465,10 @@ impl App {
             name: None,
             identity,
             port_config,
+            macros: Vec::new(),
+            highlight: serialcore::config::default_highlight_rules(),
+            highlight_cache: Vec::new(),
+            highlight_dirty: true,
             handle,
             pending_log_clears: 0,
             store: LineStore::new(limits.max_lines),
@@ -2758,29 +2796,9 @@ impl App {
         }
     }
 
-    /// Recompile global highlight rules when they change.
     fn rebuild_highlight_if_dirty(&mut self) {
-        if !self.highlight_dirty {
-            return;
-        }
-        self.highlight_dirty = false;
-        self.highlight_cache.clear();
-        for rule in &self.config.highlight {
-            if !rule.enabled || rule.pattern.is_empty() {
-                continue;
-            }
-            let Ok(re) = regex::RegexBuilder::new(&rule.pattern)
-                .case_insensitive(!rule.case_sensitive)
-                .build()
-            else {
-                continue;
-            };
-            self.highlight_cache.push(CompiledHighlight {
-                re,
-                case_sensitive: rule.case_sensitive,
-                color: parse_hex_color(&rule.color)
-                    .unwrap_or(egui::Color32::from_rgb(0xff, 0x55, 0x55)),
-            });
+        for conn in &mut self.connections {
+            conn.rebuild_highlight_if_dirty();
         }
     }
 
@@ -4556,6 +4574,7 @@ pub(crate) mod tests {
         for conn in &mut restored.connections {
             if let Some(saved) = saved.last_open.iter().find(|s| s.identity == conn.identity) {
                 conn.persistent_id = saved.id;
+                conn.highlight = saved.highlight.clone();
             }
         }
         restored.config = saved.clone();
@@ -4864,17 +4883,90 @@ pub(crate) mod tests {
     #[test]
     fn highlight_rules_honor_case_sensitivity() {
         let (mut app, _enum_tx) = test_app("highlight-case-sensitive");
-        let rule = &mut app.config.highlight[0];
+        let id = PortId(1);
+        app.connections.push(app.make_connection(
+            id,
+            "Device 1".into(),
+            Default::default(),
+            Default::default(),
+            inert_handle(id),
+        ));
+        let conn = &mut app.connections[0];
+        let rule = &mut conn.highlight[0];
         rule.enabled = true;
         rule.case_sensitive = true;
-        app.rebuild_highlight_if_dirty();
-        assert!(app.highlight_cache[0].re.is_match("ERROR"));
-        assert!(!app.highlight_cache[0].re.is_match("error"));
+        conn.rebuild_highlight_if_dirty();
+        assert!(conn.highlight_cache[0].re.is_match("ERROR"));
+        assert!(!conn.highlight_cache[0].re.is_match("error"));
 
-        app.config.highlight[0].case_sensitive = false;
-        app.highlight_dirty = true;
+        conn.highlight[0].case_sensitive = false;
+        conn.highlight_dirty = true;
+        conn.rebuild_highlight_if_dirty();
+        assert!(conn.highlight_cache[0].re.is_match("error"));
+    }
+
+    #[test]
+    fn connection_highlights_render_independently_in_single_and_merged_logs_and_save() {
+        let (mut app, _enum_tx) = test_app("connection-highlights");
+        let colors = ["#123456", "#abcdef"];
+        for (index, color) in colors.iter().enumerate() {
+            add_merged_test_connection(
+                &mut app,
+                PortId(index as u32),
+                &format!("Device {index}"),
+                &[("ERROR", index as i64, LineFlags::default())],
+            );
+            let rule = &mut app.connections[index].highlight[0];
+            rule.enabled = true;
+            rule.color = (*color).into();
+        }
         app.rebuild_highlight_if_dirty();
-        assert!(app.highlight_cache[0].re.is_match("error"));
+        app.config.settings.timestamp_format = serialcore::config::TimestampFormat::None;
+        app.create_merged_tab(vec![PortId(0), PortId(1)]);
+        app.maintain_merged();
+        let ctx = egui::Context::default();
+        for merged in [false, true] {
+            app.merged_selected = merged;
+            for active in 0..2 {
+                app.active = active;
+                for _ in 0..3 {
+                    let _ = ctx.run_test_ui(Default::default(), |ui| app.show_console(ui, false));
+                }
+                let output = ctx.run_test_ui(Default::default(), |ui| app.show_console(ui, false));
+                let painted: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| {
+                        let egui::Shape::Text(text) = &shape.shape else {
+                            return None;
+                        };
+                        (text.galley.text() == "ERROR")
+                            .then(|| text.galley.job.sections[0].format.color)
+                    })
+                    .collect();
+                let expected: Vec<_> = if merged {
+                    colors.to_vec()
+                } else {
+                    vec![colors[active]]
+                }
+                .iter()
+                .map(|color| parse_hex_color(color).unwrap())
+                .collect();
+                assert_eq!(painted, expected, "merged={merged}, active={active}");
+            }
+        }
+        app.connections[0].highlight.clear();
+        app.connections[0].highlight_dirty = true;
+        app.rebuild_highlight_if_dirty();
+        assert!(app.connections[0].highlight_cache.is_empty());
+        assert_eq!(
+            app.connections[1].highlight_cache[0].color,
+            parse_hex_color(colors[1]).unwrap()
+        );
+        app.save_session();
+        let saved = Config::from_toml(&app.config.to_toml().unwrap()).unwrap();
+        assert!(saved.last_open[0].highlight.is_empty());
+        assert_eq!(saved.last_open[1].highlight, app.connections[1].highlight);
     }
 
     #[test]

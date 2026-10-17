@@ -509,8 +509,6 @@ struct MenuAction {
     macro_editor_open: bool,
     set_ts: Option<TimestampFormat>,
     open_highlight: bool,
-    open_extract: bool,
-    open_macros: bool,
     toggle_search: bool,
     set_mark: bool,
     /// Line the mark goes on: whichever row the menu was opened over, or `None`
@@ -1899,16 +1897,15 @@ impl App {
 
         let App {
             connections,
-            highlight_cache,
             highlights_visible,
             ..
         } = self;
+        let conn = &mut connections[active];
         let highlights = if *highlights_visible {
-            highlight_cache.as_slice()
+            conn.highlight_cache.as_slice()
         } else {
             &[]
         };
-        let conn = &mut connections[active];
         let follow = conn.follow;
         // Whether the *user* set a mark, which is what the menu offers to clear.
         let has_mark = conn.mark_micros.is_some();
@@ -2251,18 +2248,12 @@ impl App {
             .map(|tab| tab.id);
         let App {
             connections,
-            highlight_cache,
             highlights_visible,
             merged,
             merged_filtered,
             merged_wrap,
             ..
         } = self;
-        let highlights = if *highlights_visible {
-            highlight_cache.as_slice()
-        } else {
-            &[]
-        };
         let view = if filter_active {
             merged_filtered.as_slice()
         } else {
@@ -2440,7 +2431,11 @@ impl App {
                         rows,
                         prev_micros: None,
                         mark: session_start,
-                        highlight: highlights,
+                        highlight: if *highlights_visible {
+                            &conn.highlight_cache
+                        } else {
+                            &[]
+                        },
                         search_re: if highlight_all_matches || cur_match_seq == Some(seq) {
                             search_re.as_ref()
                         } else {
@@ -2710,6 +2705,14 @@ impl App {
     /// A merged row names its own port instead, which is what keeps "toggle
     /// DTR" off a device the reader isn't even looking at.
     fn apply_menu(&mut self, active: usize, menu: MenuAction) {
+        // The connection the port-specific actions land on. A named port that
+        // has since gone away resolves to nothing at all: falling back to the
+        // active tab is exactly how a merged row's action could reach the wrong
+        // device.
+        let target = match menu.port {
+            Some(id) => self.connections.iter().position(|c| c.id == id),
+            None => Some(active),
+        };
         if let Some((action, text)) = menu.selection {
             match action {
                 SelectionAction::Search => {
@@ -2736,37 +2739,35 @@ impl App {
                 }
                 SelectionAction::Macro => {
                     if self.macro_editor.is_none() {
-                        self.open_macro_editor(None);
-                        if let Some(editor) = &mut self.macro_editor {
-                            editor.draft.steps =
-                                vec![serialcore::config::MacroStep::Command { text }];
+                        if let Some(port) = target
+                            .and_then(|index| self.connections.get(index))
+                            .map(|conn| conn.id)
+                        {
+                            self.open_macro_editor_for(port, None);
+                            if let Some(editor) = &mut self.macro_editor {
+                                editor.draft.steps =
+                                    vec![serialcore::config::MacroStep::Command { text }];
+                            }
                         }
                     }
                 }
                 SelectionAction::Highlight => {
-                    self.config
-                        .highlight
-                        .push(serialcore::config::HighlightRule {
+                    if let Some(conn) = target.and_then(|i| self.connections.get_mut(i)) {
+                        conn.highlight.push(serialcore::config::HighlightRule {
                             pattern: regex::escape(&text),
                             color: "#ff5555".into(),
                             case_sensitive: true,
                             bold: false,
                             enabled: true,
                         });
-                    self.highlight_dirty = true;
-                    self.show_highlight_win = true;
-                    self.write_config();
+                        conn.highlight_dirty = true;
+                        self.highlight_port = Some(conn.id);
+                        self.show_highlight_win = true;
+                        self.save_session();
+                    }
                 }
             }
         }
-        // The connection the port-specific actions land on. A named port that
-        // has since gone away resolves to nothing at all: falling back to the
-        // active tab is exactly how a merged row's action could reach the wrong
-        // device.
-        let target = match menu.port {
-            Some(id) => self.connections.iter().position(|c| c.id == id),
-            None => Some(active),
-        };
         // Everything below the mark is port-specific, so a menu whose port is
         // gone leaves no trace — not even the format switch that "set mark"
         // would otherwise make on its way to setting nothing.
@@ -2782,14 +2783,11 @@ impl App {
             self.config.settings.timestamp_format = TimestampFormat::Mark;
             self.write_config();
         }
-        if menu.open_macros {
-            self.show_macros_win = true;
-        }
         if menu.open_highlight {
-            self.show_highlight_win = !self.show_highlight_win;
-        }
-        if menu.open_extract {
-            self.open_new_plot();
+            if let Some(conn) = target.and_then(|i| self.connections.get(i)) {
+                self.highlight_port = Some(conn.id);
+                self.show_highlight_win = true;
+            }
         }
         if menu.toggle_search {
             self.set_search_visible(!self.show_search);
@@ -3102,6 +3100,7 @@ fn console_menu(
         .ctx()
         .data(|data| data.get_temp::<SelectionMenu>(selection_menu_id()))
         .unwrap_or_default();
+    menu.port = target.as_ref().and_then(|t| t.port);
     if selection.hit {
         ui.add_enabled_ui(!selection.text.is_empty(), |ui| {
             if super::chrome::menu_item(ui, "Copy", "Ctrl+Shift+C").clicked() {
@@ -3114,7 +3113,11 @@ fn console_menu(
                 ("Add macro...", SelectionAction::Macro),
                 ("Add highlight rule...", SelectionAction::Highlight),
             ] {
-                let enabled = !matches!(action, SelectionAction::Macro) || !menu.macro_editor_open;
+                let enabled = match action {
+                    SelectionAction::Macro => !menu.macro_editor_open && target.is_some(),
+                    SelectionAction::Highlight => target.is_some(),
+                    SelectionAction::Search => true,
+                };
                 let shortcut = if matches!(action, SelectionAction::Search) {
                     "Ctrl+Shift+F"
                 } else {
@@ -3135,10 +3138,6 @@ fn console_menu(
         });
         return;
     }
-    // Only one context menu can be open at a time, so this closure runs for the
-    // one the user actually opened — recording its port once up here is enough
-    // for whichever item they then pick.
-    menu.port = target.as_ref().and_then(|t| t.port);
     let line = target.as_ref().and_then(|t| t.line);
     // A merged row names its own port. The label heads the block of items that
     // actually act on it, rather than the whole menu — see there.
@@ -3178,18 +3177,6 @@ fn console_menu(
         menu.export = Some(false);
         ui.close();
     }
-    if super::chrome::menu_item(ui, "Macros…", "Ctrl+Shift+M").clicked() {
-        menu.open_macros = true;
-        ui.close();
-    }
-    if ui.button("Highlight rules…").clicked() {
-        menu.open_highlight = true;
-        ui.close();
-    }
-    if own_console && ui.button("New plot…").clicked() {
-        menu.open_extract = true;
-        ui.close();
-    }
     if merged_view {
         ui.separator();
         export_menu(ui, menu);
@@ -3206,6 +3193,10 @@ fn console_menu(
             ui.weak(label)
                 .on_hover_text("What the items below act on — not the whole merged view");
             ui.add_space(2.0);
+        }
+        if ui.button("Highlight rules…").clicked() {
+            menu.open_highlight = true;
+            ui.close();
         }
         ui.menu_button("Control lines", |ui| {
             super::chrome::menu_style(ui);
@@ -4914,6 +4905,87 @@ mod tests {
 
     use super::*;
     use crate::app::tests::{inert_handle, test_app};
+
+    #[test]
+    fn merged_highlight_actions_keep_the_clicked_connection_target() {
+        let (mut app, _tx) = test_app("merged-highlight-target");
+        for id in [PortId(1), PortId(2)] {
+            app.connections.push(app.make_connection(
+                id,
+                format!("Device {}", id.0),
+                Default::default(),
+                Default::default(),
+                inert_handle(id),
+            ));
+        }
+        app.merged_selected = true;
+        let ctx = egui::Context::default();
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                selection_menu_id(),
+                SelectionMenu {
+                    hit: true,
+                    text: "ERROR".into(),
+                },
+            )
+        });
+        let mut menu = MenuAction::default();
+        let _ = ctx.run_test_ui(Default::default(), |ui| {
+            console_menu(
+                ui,
+                &mut menu,
+                Some(MenuTarget::row(PortId(2), "Device 2", 0)),
+                TimestampFormat::None,
+                false,
+                true,
+            )
+        });
+        assert_eq!(
+            menu.port,
+            Some(PortId(2)),
+            "selection menus must retain the source too"
+        );
+        menu.selection = Some((SelectionAction::Highlight, "ERROR".into()));
+        app.apply_menu(0, menu);
+        assert_eq!(app.connections[0].highlight.len(), 3);
+        assert_eq!(app.connections[1].highlight.len(), 4);
+        assert_eq!(app.highlight_port, Some(PortId(2)));
+        app.show_highlight_win = false;
+        app.apply_menu(
+            0,
+            MenuAction {
+                port: Some(PortId(2)),
+                open_highlight: true,
+                ..Default::default()
+            },
+        );
+        assert!(app.show_highlight_win);
+        app.connections.remove(1);
+        app.show_highlight_win = false;
+        app.apply_menu(
+            0,
+            MenuAction {
+                port: Some(PortId(2)),
+                open_highlight: true,
+                selection: Some((SelectionAction::Highlight, "stale".into())),
+                ..Default::default()
+            },
+        );
+        assert!(!app.show_highlight_win);
+        assert_eq!(app.connections[0].highlight.len(), 3);
+        ctx.data_mut(|data| data.insert_temp(selection_menu_id(), SelectionMenu::default()));
+        let output = ctx.run_test_ui(Default::default(), |ui| {
+            console_menu(
+                ui,
+                &mut MenuAction::default(),
+                None,
+                TimestampFormat::None,
+                false,
+                true,
+            )
+        });
+        assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "Highlight rules…")));
+    }
     use serialcore::config::{PortConfig, PortIdentity};
     use serialcore::store::{ColorSpan, IncomingLine, LineMeta};
 
@@ -6006,7 +6078,10 @@ mod tests {
             assert!(
                 matches!(&app.macro_editor.as_ref().unwrap().draft.steps[0], serialcore::config::MacroStep::Command { text: value } if value == text)
             );
-            assert!(app.config.macros.is_empty(), "macro remains a draft");
+            assert!(
+                app.connections[0].macros.is_empty(),
+                "macro remains a draft"
+            );
             app.macro_editor.as_mut().unwrap().draft.name = "Unsaved draft".into();
             app.apply_menu(
                 0,
@@ -6030,7 +6105,7 @@ mod tests {
                 },
             );
             assert_eq!(
-                app.config.highlight.last().unwrap().pattern,
+                app.connections[0].highlight.last().unwrap().pattern,
                 regex::escape(text)
             );
             app.show_highlight_win = false;
