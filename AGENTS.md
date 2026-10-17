@@ -108,7 +108,36 @@ application.
   for its controls; long queries remain clipped without moving those controls.
   The textbox fills its allocated field width, leaving only the normal widget
   spacing before the regex control.
-- Highlight rules (color/bold by pattern)
+- Highlight rules belong to each connection. The window title shows
+  **Highlight rules — <connection name>** and stays attached to that connection
+  when switching tabs or panes; closing the connection closes its editor.
+  Merged rows use their source connection's rules. Right-click a merged row to
+  edit its source's rules; merged empty space has no highlight-rule action.
+  Adding a rule from selected text applies it to the right-clicked connection.
+  A colored highlighter button beside Pin in the footer indicates that valid,
+  enabled rules are applied to the displayed Log. Clicking opens that port's
+  rules; merged views with several active sources offer a connection selector.
+  Hidden highlights, inactive/invalid rules, Hex and ANSI/VT show no indicator.
+  Footer controls retain their space in narrow panes; the merged Send to
+  selector truncates within the remaining space.
+  Rules persist with each saved connection, including an explicitly empty list.
+  Legacy shared rules are copied into remembered connections that lack their
+  own list, then omitted from the global configuration on save. New connections
+  start with independent, disabled ERROR/WARNING/INFO rules. Malformed per-port
+  rule lists fall back to empty with a configuration warning.
+  The console right-click menu omits **New plot** and **Macros**; those remain
+  available from the **+** menu and app menu/shortcut respectively. Selection
+  actions for adding a macro or highlight rule remain available.
+  Regression coverage checks independent single/merged rendering, editor titles
+  and edits after tab changes, closing the editor's connection, merged-row and
+  stale selection targets, and migration/persistence of empty and malformed lists.
+  Footer frame coverage checks both themes, narrow/wide layouts, visibility
+  switches and display modes, and direct/merged editor targets.
+  The 2026-10-17 revision passed formatting, app tests and all-target Clippy with
+  default/all features, and the demo check. Workspace runs hit the known core
+  receive-overload timeout; isolated reruns passed with both feature selections,
+  as did the remaining core tests and integration tests. Native visual inspection
+  was unavailable because the display server could not be reached.
 - Multiple ports as persistent, user-named tabs, plus optional merged views that label
   and interleave selected connections by timestamp.
   Choose **New merged view** from the **+** menu and select the
@@ -229,8 +258,41 @@ application.
   pane are restored on restart.
 - Transmit with configurable line endings, send history, and hex input
 - Drop files onto a console, or use **Send file…**, to send raw bytes, paced text lines, or hex-decoded data
-- Named transmit macros with reorderable command, delay, and regex wait steps,
-  finite or indefinite looping, and assignable Ctrl+Shift+0 through Ctrl+Shift+9 shortcuts
+- Each connection owns its named transmit macros, with reorderable command,
+  delay and regex wait steps, finite or indefinite looping, and assignable
+  Ctrl+Shift+0 through Ctrl+Shift+9 shortcuts. New connections start empty.
+  The catalog and Add/Edit titles name their connection and keep that target
+  through tab or pane changes. In merged views, open Macros for the selected
+  **Send to** connection; disconnected connections can still be edited.
+  **Copy from connection** in the catalog offers individual macros or **Copy all
+  macros** from another open connection. Copies are independent and keep their
+  assigned key if free on the destination, otherwise use its first free key in
+  1–9, 0 order; no free key leaves the copy Unassigned. Unassigned/invalid source
+  keys also use the first free destination key. Shortcut lookup, conflict checks,
+  run controls, edit confirmation and deletion indices are scoped to the owner.
+  Each connection's macros persist with its saved session. Legacy shared macros
+  are copied into saved connections lacking an explicit list; empty lists remain
+  empty. With no saved destination, old definitions remain available under
+  **Saved macros from previous version** in the copy menu, without being inherited
+  by new connections. Malformed per-connection lists fall back to empty and warn.
+  The catalog list scrolls with Add/Copy controls outside its scrolling area.
+  The Add/Edit macro window includes a **Shortcut** selector with **Unassigned**
+  and all ten digit shortcuts. Occupied shortcuts name their owner and are
+  disabled; the catalog's existing reassignment confirmation remains available.
+  New drafts suggest the first free shortcut in 1–9, 0 order, without reserving
+  it. Save commits the selected shortcut with the definition; Cancel or closing
+  discards it. Saving rejects conflicting or invalid assignments. Command and
+  wait-for fields center their text vertically within the step row.
+  Rendered-frame coverage checks both step field alignments, selecting/saving
+  and cancelling shortcuts, occupied entries, persistence and duplicate rejection.
+  Per-connection regressions cover copy-one/all, key preservation/collisions and
+  exhaustion, source independence, same-key execution on separate ports and
+  merged Send to, catalog/editor ownership after tab changes and closure, and
+  running edit/delete isolation. Configuration tests cover legacy migration,
+  empty/explicit lists, malformed options and orphaned imports.
+  The 2026-10-17 macro revision passed formatting, workspace tests and all-target
+  Clippy with default/all features, and the demo check. Native visual inspection was unavailable
+  because the display server could not be reached.
 - Per-connection **Send delay** in Port options (milliseconds between outgoing bytes,
   default 0), applied to typing, paste, macros, and file transfers. The delay is saved
   with each connection and port preset. The obsolete global delay setting is ignored

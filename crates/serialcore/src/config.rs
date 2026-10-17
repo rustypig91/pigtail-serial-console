@@ -646,6 +646,12 @@ pub struct SavedConnection {
     /// Optional user-assigned name shown in the tab and merged view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Ordered rules owned by this connection, including an explicitly empty list.
+    #[serde(default)]
+    pub highlight: Vec<HighlightRule>,
+    /// Macros owned by this connection; an explicit empty list stays empty.
+    #[serde(default, rename = "macro")]
+    pub macros: Vec<TransmitMacro>,
     #[serde(flatten)]
     pub config: PortConfig,
 }
@@ -823,19 +829,16 @@ pub struct SavedSplit {
 }
 
 /// Top-level config, matching the TOML layout in spec §7.14.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default, skip_serializing_if = "is_default")]
     pub settings: Settings,
-    /// Global highlight rules applied to every connection (spec §7.9).
-    #[serde(default)]
-    pub highlight: Vec<HighlightRule>,
     /// Named port-config presets for the new-connection dialog.
     #[serde(default, rename = "preset")]
     pub presets: Vec<NamedConfig>,
-    /// Reusable transmit command sequences, available to every connection.
-    #[serde(default, rename = "macro")]
-    pub macros: Vec<TransmitMacro>,
+    /// Import-only legacy definitions when no saved connection could receive them.
+    #[serde(default, rename = "macro", skip_serializing_if = "Vec::is_empty")]
+    pub legacy_macros: Vec<TransmitMacro>,
     /// Connections open at last exit, reopened on the next launch.
     #[serde(default, rename = "last_open")]
     pub last_open: Vec<SavedConnection>,
@@ -855,6 +858,24 @@ impl Config {
     /// Parse from a TOML string.
     pub fn from_toml(s: &str) -> Result<Config, toml::de::Error> {
         let mut value: toml::Value = toml::from_str(s)?;
+        // Copy legacy shared rules and macros into remembered connections once.
+        // Explicit per-connection lists (including []) always take precedence.
+        let legacy_highlight = value
+            .get("highlight")
+            .cloned()
+            .unwrap_or_else(|| toml::Value::Array(Vec::new()));
+        let legacy_macros = value
+            .get("macro")
+            .cloned()
+            .unwrap_or_else(|| toml::Value::Array(Vec::new()));
+        let migrate_macros = value
+            .get("last_open")
+            .and_then(toml::Value::as_array)
+            .is_some_and(|connections| {
+                connections
+                    .iter()
+                    .any(|connection| connection.get("macro").is_none())
+            });
         if let Some(settings) = value.get_mut("settings") {
             if settings.is_table() {
                 if settings
@@ -893,6 +914,31 @@ impl Config {
                             "ignoring malformed configuration option; using its default value"
                         );
                         entry.as_table_mut().expect("connection table").remove("id");
+                    }
+                    if key == "last_open" {
+                        let table = entry.as_table_mut().expect("connection table");
+                        let macros = table
+                            .entry("macro")
+                            .or_insert_with(|| legacy_macros.clone());
+                        if macros.clone().try_into::<Vec<TransmitMacro>>().is_err() {
+                            tracing::warn!(
+                                section = format!("{key}[{index}]"),
+                                option = "macro",
+                                "ignoring malformed macros; using no macros"
+                            );
+                            *macros = toml::Value::Array(Vec::new());
+                        }
+                        let rules = table
+                            .entry("highlight")
+                            .or_insert_with(|| legacy_highlight.clone());
+                        if rules.clone().try_into::<Vec<HighlightRule>>().is_err() {
+                            tracing::warn!(
+                                section = format!("{key}[{index}]"),
+                                option = "highlight",
+                                "ignoring malformed highlight rules; using no rules"
+                            );
+                            *rules = toml::Value::Array(Vec::new());
+                        }
                     }
                     discard_invalid_options::<PortConfig>(
                         entry,
@@ -1006,6 +1052,9 @@ impl Config {
                     .remove("selected_tab");
             }
         }
+        if migrate_macros {
+            value.as_table_mut().expect("config table").remove("macro");
+        }
         value.try_into()
     }
 
@@ -1062,33 +1111,8 @@ where
     }
 }
 
-/// A fresh config (no file on disk yet, or an unreadable one) starts with a
-/// starter set of highlight rules — ERROR/WARNING/INFO — left *disabled* so
-/// they're discoverable without changing anyone's log colours unasked.
-///
-/// This is intentionally *not* wired up as `highlight`'s `#[serde(default)]`:
-/// that path also fires when parsing a config that has zero highlights
-/// because the user cleared them, and an empty `Vec` serializes identically
-/// to an absent key, so that would resurrect these rules on every load and
-/// break the (de)serialization round-trip.
-impl Default for Config {
-    fn default() -> Config {
-        Config {
-            settings: Settings::default(),
-            highlight: default_highlight_rules(),
-            presets: Vec::new(),
-            macros: Vec::new(),
-            last_open: Vec::new(),
-            merged_views: Vec::new(),
-            tab_order: Vec::new(),
-            plots: Vec::new(),
-            selected_tab: None,
-            split: None,
-        }
-    }
-}
-
-fn default_highlight_rules() -> Vec<HighlightRule> {
+/// Starter rules for a newly opened connection; disabled until enabled by the user.
+pub fn default_highlight_rules() -> Vec<HighlightRule> {
     vec![
         HighlightRule {
             pattern: "ERROR".into(),
@@ -1163,11 +1187,11 @@ mod tests {
 
     #[test]
     fn fresh_config_seeds_disabled_error_warning_info_highlights() {
-        let cfg = Config::default();
-        let patterns: Vec<&str> = cfg.highlight.iter().map(|r| r.pattern.as_str()).collect();
+        let rules = default_highlight_rules();
+        let patterns: Vec<&str> = rules.iter().map(|r| r.pattern.as_str()).collect();
         assert_eq!(patterns, vec!["ERROR", "WARNING", "INFO"]);
         assert!(
-            cfg.highlight.iter().all(|r| !r.enabled),
+            rules.iter().all(|r| !r.enabled),
             "seeded highlight rules must start disabled"
         );
     }
@@ -1186,18 +1210,20 @@ pattern = "PANIC"
 color = "#ff0000"
 bold = true
 enabled = true
+[[last_open]]
+identity = { path_fallback = "COM1" }
 "##,
         )
         .expect("a config from before the checkbox was removed still parses");
-        assert_eq!(cfg.highlight.len(), 1);
+        assert_eq!(cfg.last_open[0].highlight.len(), 1);
         assert!(
-            cfg.highlight[0].bold,
+            cfg.last_open[0].highlight[0].bold,
             "the setting is preserved, not dropped"
         );
 
         let back = Config::from_toml(&cfg.to_toml().unwrap()).unwrap();
         assert!(
-            back.highlight[0].bold,
+            back.last_open[0].highlight[0].bold,
             "and survives a round trip through save"
         );
     }
@@ -1210,30 +1236,70 @@ enabled = true
 pattern = "ERROR"
 color = "#ff0000"
 enabled = true
+[[last_open]]
+identity = { path_fallback = "COM1" }
 "##,
         )
         .expect("a config from before case sensitivity was added still parses");
         assert!(
-            !old.highlight[0].case_sensitive,
+            !old.last_open[0].highlight[0].case_sensitive,
             "existing highlights keep their case-insensitive behaviour"
         );
 
         let mut cfg = old;
-        cfg.highlight[0].case_sensitive = true;
+        cfg.last_open[0].highlight[0].case_sensitive = true;
         let back = Config::from_toml(&cfg.to_toml().unwrap()).unwrap();
-        assert!(back.highlight[0].case_sensitive);
+        assert!(back.last_open[0].highlight[0].case_sensitive);
     }
 
     #[test]
     fn config_with_explicitly_empty_highlights_round_trips_empty() {
-        // An empty `Vec` and an absent `[[highlight]]` key look identical on
-        // the wire, so parsing must not resurrect the seeded defaults here —
-        // only `Config::default()` (no file / unreadable file) should.
-        let mut cfg = Config::default();
-        cfg.highlight.clear();
+        let mut cfg =
+            Config::from_toml("[[last_open]]\nidentity = { path_fallback = 'COM1' }").unwrap();
+        cfg.last_open[0].highlight.clear();
         let s = cfg.to_toml().unwrap();
         let back = Config::from_toml(&s).unwrap();
-        assert!(back.highlight.is_empty());
+        assert!(back.last_open[0].highlight.is_empty());
+    }
+
+    #[test]
+    fn legacy_highlights_migrate_without_overwriting_connection_rules() {
+        let mut cfg = Config::from_toml(
+            r##"
+[[highlight]]
+pattern = "legacy"
+color = "#123456"
+[[last_open]]
+identity = { path_fallback = "COM1" }
+[[last_open]]
+identity = { path_fallback = "COM2" }
+[[last_open]]
+identity = { path_fallback = "COM3" }
+highlight = []
+[[last_open]]
+identity = { path_fallback = "COM4" }
+highlight = [{ pattern = "own", color = "#abcdef" }]
+"##,
+        )
+        .unwrap();
+        assert_eq!(cfg.last_open[0].highlight, cfg.last_open[1].highlight);
+        assert_eq!(cfg.last_open[0].highlight[0].pattern, "legacy");
+        assert!(cfg.last_open[2].highlight.is_empty());
+        assert_eq!(cfg.last_open[3].highlight[0].pattern, "own");
+        cfg.last_open[0].highlight.clear();
+        assert_eq!(cfg.last_open[1].highlight.len(), 1);
+        let serialized = cfg.to_toml().unwrap();
+        let value: toml::Value = toml::from_str(&serialized).unwrap();
+        assert!(value.get("highlight").is_none());
+        assert_eq!(Config::from_toml(&serialized).unwrap(), cfg);
+    }
+
+    #[test]
+    fn malformed_connection_highlights_do_not_discard_neighboring_settings() {
+        let cfg = Config::from_toml("[[last_open]]\nidentity = { path_fallback = 'COM1' }\nbaud = 9600\nhighlight = 'bad'\n[[last_open]]\nidentity = { path_fallback = 'COM2' }\nhighlight = [{ pattern = 'ok', color = '#ff0000' }]").unwrap();
+        assert_eq!(cfg.last_open[0].config.baud, 9600);
+        assert!(cfg.last_open[0].highlight.is_empty());
+        assert_eq!(cfg.last_open[1].highlight[0].pattern, "ok");
     }
 
     #[test]
@@ -1544,20 +1610,22 @@ rts_on_open = false
 pattern = "ERROR|FATAL"
 color = "#ff5555"
 bold = true
+[[last_open]]
+identity = { path_fallback = "COM1" }
 "##;
         let cfg = Config::from_toml(toml_src).expect("parse");
         assert_eq!(cfg.settings.timestamp_format, TimestampFormat::Delta);
         assert_eq!(cfg.settings.max_lines, 1_000_000);
         assert_eq!(cfg.presets.len(), 1);
         assert_eq!(cfg.presets[0].config.baud, 921_600);
-        assert_eq!(cfg.highlight.len(), 1);
+        assert_eq!(cfg.last_open[0].highlight.len(), 1);
     }
 
     #[test]
     fn config_roundtrips() {
         let cfg = Config {
             settings: Settings::default(),
-            highlight: vec![],
+            legacy_macros: Vec::new(),
             presets: vec![NamedConfig {
                 name: "fast".into(),
                 config: PortConfig {
@@ -1565,28 +1633,30 @@ bold = true
                     ..PortConfig::default()
                 },
             }],
-            macros: vec![TransmitMacro {
-                name: "Reboot and inspect".into(),
-                description: "Restart the target and read its status".into(),
-                steps: vec![
-                    MacroStep::Command {
-                        text: "reboot".into(),
-                    },
-                    MacroStep::Delay { delay_ms: 500 },
-                    MacroStep::WaitFor {
-                        pattern: "ready\\s+ok".into(),
-                    },
-                    MacroStep::Command {
-                        text: "status".into(),
-                    },
-                ],
-                shortcut: Some(2),
-                repeat_count: 3,
-                repeat_indefinitely: false,
-            }],
             last_open: vec![SavedConnection {
                 id: 0,
                 view: ConsoleView::Ansi,
+                highlight: default_highlight_rules(),
+                macros: vec![TransmitMacro {
+                    name: "Reboot and inspect".into(),
+                    description: "Restart the target and read its status".into(),
+                    steps: vec![
+                        MacroStep::Command {
+                            text: "reboot".into(),
+                        },
+                        MacroStep::Delay { delay_ms: 500 },
+                        MacroStep::WaitFor {
+                            pattern: "ready\\s+ok".into(),
+                        },
+                        MacroStep::Command {
+                            text: "status".into(),
+                        },
+                    ],
+                    shortcut: Some(2),
+                    repeat_count: 3,
+                    repeat_indefinitely: false,
+                }],
+
                 identity: PortIdentity {
                     vid: Some(3),
                     pid: Some(4),
@@ -1609,7 +1679,7 @@ bold = true
     #[test]
     fn macros_are_backward_compatible_and_roundtrip() {
         let old = Config::from_toml("[settings]\nmax_lines = 1000\n").unwrap();
-        assert!(old.macros.is_empty());
+        assert!(old.last_open.is_empty());
 
         // The first macro format had a command list and one delay shared by
         // every pair. It migrates to explicit ordered steps when read.
@@ -1621,12 +1691,14 @@ bold = true
                 commands = ["erase", "program", "verify"]
                 delay_ms = 250
                 shortcut = 7
+                [[last_open]]
+                identity = { path_fallback = "COM1" }
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.macros.len(), 1);
+        assert_eq!(cfg.last_open[0].macros.len(), 1);
         assert_eq!(
-            cfg.macros[0].steps,
+            cfg.last_open[0].macros[0].steps,
             [
                 MacroStep::Command {
                     text: "erase".into()
@@ -1641,10 +1713,62 @@ bold = true
                 },
             ]
         );
-        assert_eq!(cfg.macros[0].shortcut, Some(7));
-        assert_eq!(cfg.macros[0].repeat_count, 1);
-        assert!(!cfg.macros[0].repeat_indefinitely);
+        assert_eq!(cfg.last_open[0].macros[0].shortcut, Some(7));
+        assert_eq!(cfg.last_open[0].macros[0].repeat_count, 1);
+        assert!(!cfg.last_open[0].macros[0].repeat_indefinitely);
         assert_eq!(Config::from_toml(&cfg.to_toml().unwrap()).unwrap(), cfg);
+    }
+
+    #[test]
+    fn macros_migrate_per_connection_without_replacing_explicit_lists() {
+        let cfg = Config::from_toml(
+            r#"
+[[macro]]
+name = "Legacy"
+commands = ["old"]
+shortcut = 7
+[[last_open]]
+identity = { path_fallback = "COM1" }
+[[last_open]]
+identity = { path_fallback = "COM2" }
+macro = []
+[[last_open]]
+identity = { path_fallback = "COM3" }
+macro = [{ name = "Own", commands = ["own"], shortcut = 7 }]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.last_open[0].macros[0].name, "Legacy");
+        assert!(cfg.last_open[1].macros.is_empty());
+        assert_eq!(cfg.last_open[2].macros[0].name, "Own");
+        assert!(cfg.legacy_macros.is_empty());
+        assert_eq!(Config::from_toml(&cfg.to_toml().unwrap()).unwrap(), cfg);
+    }
+
+    #[test]
+    fn orphaned_legacy_macros_remain_available_for_explicit_copying() {
+        let mut cfg = Config::from_toml("[[macro]]\nname = 'Saved'\ncommands = ['keep']").unwrap();
+        assert_eq!(cfg.legacy_macros.len(), 1);
+        assert!(cfg.last_open.is_empty());
+        let mut conn =
+            Config::from_toml("[[last_open]]\nidentity = { path_fallback = 'COM1' }\nmacro = []")
+                .unwrap();
+        cfg.last_open.append(&mut conn.last_open);
+        let restored = Config::from_toml(&cfg.to_toml().unwrap()).unwrap();
+        assert_eq!(restored.legacy_macros.len(), 1);
+        assert!(
+            restored.last_open[0].macros.is_empty(),
+            "opening a connection must not inherit saved imports"
+        );
+        assert_eq!(restored, cfg);
+    }
+
+    #[test]
+    fn malformed_connection_macros_preserve_other_options_and_connections() {
+        let cfg = Config::from_toml("[[last_open]]\nidentity = { path_fallback = 'COM1' }\nbaud = 9600\nmacro = 'bad'\n[[last_open]]\nidentity = { path_fallback = 'COM2' }\nmacro = [{ name = 'Good', commands = ['ok'] }]").unwrap();
+        assert!(cfg.last_open[0].macros.is_empty());
+        assert_eq!(cfg.last_open[0].config.baud, 9600);
+        assert_eq!(cfg.last_open[1].macros[0].name, "Good");
     }
 
     #[test]

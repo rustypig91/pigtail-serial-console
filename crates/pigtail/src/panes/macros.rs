@@ -15,27 +15,62 @@ const MACRO_INDICATOR_DELAY: Duration = Duration::from_millis(500);
 const MAX_MACRO_REPEAT_COUNT: u32 = 1_000_000;
 
 impl App {
+    /// Editing is available while a device is disconnected too.
+    pub(crate) fn macro_context_port(&self) -> Option<PortId> {
+        if self.active_plot.is_some() {
+            return None;
+        }
+        if self.merged_selected {
+            self.merged_tx_port.filter(|id| {
+                self.merged_contains(*id) && self.connections.iter().any(|conn| conn.id == *id)
+            })
+        } else {
+            self.active_index().map(|index| self.connections[index].id)
+        }
+    }
+
+    pub(crate) fn open_macro_catalog(&mut self) {
+        self.macros_port = self.macro_context_port();
+        self.show_macros_win = true;
+    }
+
+    fn copy_connection_macros(
+        &mut self,
+        source: PortId,
+        target: PortId,
+        index: Option<usize>,
+    ) -> usize {
+        if source == target {
+            return 0;
+        }
+        let Some(source) = self.connections.iter().find(|conn| conn.id == source) else {
+            return 0;
+        };
+        let definitions = match index {
+            Some(index) => source.macros.get(index).cloned().into_iter().collect(),
+            None => source.macros.clone(),
+        };
+        let Some(target) = self.connections.iter_mut().find(|conn| conn.id == target) else {
+            return 0;
+        };
+        let count = append_copied_macros(&mut target.macros, definitions);
+        if count > 0 {
+            self.save_session();
+        }
+        count
+    }
+
     /// The connection a macro started right now should keep targeting.
     ///
     /// In the merged view this is the explicit "Send to" device. A run stores
     /// its port id so switching tabs while it is delayed does not redirect the
     /// remaining commands to a different device.
     pub(crate) fn macro_target_port(&self) -> Option<PortId> {
-        if self.active_plot.is_some() {
-            return None;
-        }
-        if self.merged_selected {
-            self.merged_tx_port.filter(|id| {
-                self.connections
-                    .iter()
-                    .any(|conn| conn.id == *id && conn.state == ConnState::Connected)
-            })
-        } else {
-            self.active_index()
-                .map(|index| &self.connections[index])
-                .filter(|conn| conn.state == ConnState::Connected)
-                .map(|conn| conn.id)
-        }
+        self.macro_context_port().filter(|port| {
+            self.connections
+                .iter()
+                .any(|conn| conn.id == *port && conn.state == ConnState::Connected)
+        })
     }
 
     /// Reserve an assigned Ctrl+Shift+digit chord before raw console input.
@@ -61,9 +96,14 @@ impl App {
             egui::Key::Num9,
         ];
         let modifiers = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
+        let Some(conn) = self
+            .macro_target_port()
+            .and_then(|port| self.connections.iter().find(|conn| conn.id == port))
+        else {
+            return;
+        };
         let assignments: [Option<usize>; 10] = std::array::from_fn(|digit| {
-            self.config
-                .macros
+            conn.macros
                 .iter()
                 .position(|macro_def| macro_def.shortcut == Some(digit as u8))
         });
@@ -83,12 +123,31 @@ impl App {
         self.show_macro_editor(ctx);
     }
 
-    /// Read-only macro catalog. Definitions are changed only in the separate
-    /// add/edit window so an accidental click cannot rewrite configuration.
+    /// Manage the bound connection's macros; definition edits use separate drafts.
     fn show_macro_catalog(&mut self, ctx: &egui::Context) {
         let mut open = self.show_macros_win;
-        let target_port = self.macro_target_port();
-        let can_run = target_port.is_some();
+        if self.macros_port.is_none() {
+            self.macros_port = self.macro_context_port();
+        }
+        let Some(port) = self.macros_port else {
+            egui::Window::new("Transmit macros").open(&mut open).frame(super::chrome::dialog_frame(ctx)).show(ctx, |ui| {
+                ui.label("Select a connection, or choose Send to in a merged view, to manage macros.");
+            });
+            self.show_macros_win = open;
+            return;
+        };
+        let Some(connection_index) = self.connections.iter().position(|conn| conn.id == port)
+        else {
+            self.show_macros_win = false;
+            return;
+        };
+        let title = format!(
+            "Transmit macros — {}",
+            self.connections[connection_index].display_label()
+        );
+        let target_port = Some(port);
+        let can_run = self.connections[connection_index].state == ConnState::Connected;
+        let mut copy = None;
         // Confirmation windows retain catalog indices. Prevent edits behind
         // them from moving those indices before the user answers.
         let definition_dialog_open = self.macro_editor.is_some()
@@ -103,7 +162,8 @@ impl App {
         let mut shortcut_change = None;
         let mut shortcut_conflict = None;
 
-        egui::Window::new("Transmit macros")
+        egui::Window::new(title)
+            .id(egui::Id::new("Transmit macros"))
             .open(&mut open)
             .default_width(460.0)
             .default_height(360.0)
@@ -111,160 +171,173 @@ impl App {
             .show(ctx, |ui| {
                 super::chrome::dialog_style(ui);
                 ui.weak(
-                    "Each command uses the selected device's line ending. Shortcuts run only \
+                    "Each command uses this connection's line ending. Shortcuts run only \
                      while the console has keyboard focus.",
                 );
                 if !can_run {
                     ui.colored_label(
                         ui.visuals().warn_fg_color,
-                        "Select a connection (and a Send to device in Merged) to run a macro.",
+                        "This connection is not connected. Macros can still be edited and copied.",
                     );
                 }
                 ui.separator();
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    if self.config.macros.is_empty() {
-                        ui.weak("No macros configured.");
-                    }
-                    for (index, macro_def) in self.config.macros.iter().enumerate() {
-                        let running = self.macro_runs.iter().any(|run| {
-                            run.macro_index == Some(index) && Some(run.port) == target_port
-                        });
-                        ui.group(|ui| {
-                            ui.horizontal(|ui| {
-                                let name = if macro_def.name.trim().is_empty() {
-                                    "(unnamed)"
-                                } else {
-                                    macro_def.name.trim()
-                                };
-                                ui.strong(name);
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui
-                                            .add_enabled(
-                                                !definition_dialog_open,
-                                                egui::Button::new("Delete"),
-                                            )
-                                            .clicked()
-                                        {
-                                            remove = Some(index);
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                !definition_dialog_open,
-                                                egui::Button::new("Edit macro"),
-                                            )
-                                            .clicked()
-                                        {
-                                            edit = Some(index);
-                                        }
-                                        let can_start = !definition_dialog_open
-                                            && can_run
-                                            && macro_has_command(macro_def);
-                                        if ui
-                                            .add_enabled(
-                                                running || can_start,
-                                                egui::Button::new(if running {
-                                                    "Stop"
-                                                } else {
-                                                    "Run"
-                                                }),
-                                            )
-                                            .clicked()
-                                        {
-                                            if running {
-                                                if let Some(port) = target_port {
-                                                    stop = Some((index, port));
-                                                }
-                                            } else {
-                                                run = Some(index);
-                                            }
-                                        }
-                                    },
-                                );
+                let list_height = (ui.available_height()
+                    - ui.spacing().interact_size.y
+                    - ui.spacing().item_spacing.y)
+                    .max(0.0);
+                egui::ScrollArea::vertical()
+                    .max_height(list_height)
+                    .min_scrolled_height(0.0)
+                    .show(ui, |ui| {
+                        if self.connections[connection_index].macros.is_empty() {
+                            ui.weak("No macros configured.");
+                        }
+                        for (index, macro_def) in
+                            self.connections[connection_index].macros.iter().enumerate()
+                        {
+                            let running = self.macro_runs.iter().any(|run| {
+                                run.macro_index == Some(index) && Some(run.port) == target_port
                             });
-                            let description = if macro_def.description.trim().is_empty() {
-                                "—"
-                            } else {
-                                macro_def.description.trim()
-                            };
-                            egui::Grid::new(("macro-summary", index))
-                                .num_columns(2)
-                                .spacing([12.0, 4.0])
-                                .show(ui, |ui| {
-                                    ui.label("Description");
-                                    ui.label(description);
-                                    ui.end_row();
-                                    ui.label("Shortcut");
-                                    let current = macro_def.shortcut.filter(|digit| *digit <= 9);
-                                    let mut selected = current;
-                                    ui.add_enabled_ui(!definition_dialog_open, |ui| {
-                                        egui::ComboBox::from_id_salt((
-                                            "macro-catalog-shortcut",
-                                            index,
-                                        ))
-                                        .selected_text(shortcut_label(current))
-                                        .show_ui(
-                                            ui,
-                                            |ui| {
-                                                super::chrome::popup_style(ui);
-                                                ui.selectable_value(
-                                                    &mut selected,
-                                                    None,
-                                                    "Unassigned",
-                                                );
-                                                for digit in SHORTCUT_ORDER {
-                                                    let owner = shortcut_owner(
-                                                        &self.config.macros,
-                                                        digit,
-                                                        Some(index),
-                                                    );
-                                                    let label = owner.map_or_else(
-                                                        || shortcut_label(Some(digit)),
-                                                        |owner| {
-                                                            format!(
-                                                                "{} — used by {}",
-                                                                shortcut_label(Some(digit)),
-                                                                macro_display_name(
-                                                                    &self.config.macros[owner]
-                                                                )
-                                                            )
-                                                        },
-                                                    );
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    let name = if macro_def.name.trim().is_empty() {
+                                        "(unnamed)"
+                                    } else {
+                                        macro_def.name.trim()
+                                    };
+                                    ui.strong(name);
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .add_enabled(
+                                                    !definition_dialog_open,
+                                                    egui::Button::new("Delete"),
+                                                )
+                                                .clicked()
+                                            {
+                                                remove = Some(index);
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    !definition_dialog_open,
+                                                    egui::Button::new("Edit macro"),
+                                                )
+                                                .clicked()
+                                            {
+                                                edit = Some(index);
+                                            }
+                                            let can_start = !definition_dialog_open
+                                                && can_run
+                                                && macro_has_command(macro_def);
+                                            if ui
+                                                .add_enabled(
+                                                    running || can_start,
+                                                    egui::Button::new(if running {
+                                                        "Stop"
+                                                    } else {
+                                                        "Run"
+                                                    }),
+                                                )
+                                                .clicked()
+                                            {
+                                                if running {
+                                                    if let Some(port) = target_port {
+                                                        stop = Some((index, port));
+                                                    }
+                                                } else {
+                                                    run = Some(index);
+                                                }
+                                            }
+                                        },
+                                    );
+                                });
+                                let description = if macro_def.description.trim().is_empty() {
+                                    "—"
+                                } else {
+                                    macro_def.description.trim()
+                                };
+                                egui::Grid::new(("macro-summary", index))
+                                    .num_columns(2)
+                                    .spacing([12.0, 4.0])
+                                    .show(ui, |ui| {
+                                        ui.label("Description");
+                                        ui.label(description);
+                                        ui.end_row();
+                                        ui.label("Shortcut");
+                                        let current =
+                                            macro_def.shortcut.filter(|digit| *digit <= 9);
+                                        let mut selected = current;
+                                        ui.add_enabled_ui(!definition_dialog_open, |ui| {
+                                            egui::ComboBox::from_id_salt((
+                                                "macro-catalog-shortcut",
+                                                index,
+                                            ))
+                                            .selected_text(shortcut_label(current))
+                                            .show_ui(
+                                                ui,
+                                                |ui| {
+                                                    super::chrome::popup_style(ui);
                                                     ui.selectable_value(
                                                         &mut selected,
-                                                        Some(digit),
-                                                        label,
+                                                        None,
+                                                        "Unassigned",
                                                     );
+                                                    for digit in SHORTCUT_ORDER {
+                                                        let owner = shortcut_owner(
+                                                            &self.connections[connection_index]
+                                                                .macros,
+                                                            digit,
+                                                            Some(index),
+                                                        );
+                                                        let label = owner.map_or_else(
+                                                            || shortcut_label(Some(digit)),
+                                                            |owner| {
+                                                                format!(
+                                                                    "{} — used by {}",
+                                                                    shortcut_label(Some(digit)),
+                                                                    macro_display_name(
+                                                                        &self.connections
+                                                                            [connection_index]
+                                                                            .macros[owner]
+                                                                    )
+                                                                )
+                                                            },
+                                                        );
+                                                        ui.selectable_value(
+                                                            &mut selected,
+                                                            Some(digit),
+                                                            label,
+                                                        );
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        if selected != current {
+                                            if let Some(digit) = selected {
+                                                if let Some(owner) = shortcut_owner(
+                                                    &self.connections[connection_index].macros,
+                                                    digit,
+                                                    Some(index),
+                                                ) {
+                                                    shortcut_conflict = Some((index, digit, owner));
+                                                } else {
+                                                    shortcut_change = Some((index, Some(digit)));
                                                 }
-                                            },
-                                        );
-                                    });
-                                    if selected != current {
-                                        if let Some(digit) = selected {
-                                            if let Some(owner) = shortcut_owner(
-                                                &self.config.macros,
-                                                digit,
-                                                Some(index),
-                                            ) {
-                                                shortcut_conflict = Some((index, digit, owner));
                                             } else {
-                                                shortcut_change = Some((index, Some(digit)));
+                                                shortcut_change = Some((index, None));
                                             }
-                                        } else {
-                                            shortcut_change = Some((index, None));
                                         }
-                                    }
-                                    ui.end_row();
-                                    ui.label("Runs");
-                                    ui.label(macro_runs_label(macro_def));
-                                    ui.end_row();
-                                });
-                        });
-                        ui.add_space(6.0);
-                    }
-                });
+                                        ui.end_row();
+                                        ui.label("Runs");
+                                        ui.label(macro_runs_label(macro_def));
+                                        ui.end_row();
+                                    });
+                            });
+                            ui.add_space(6.0);
+                        }
+                    });
 
                 ui.horizontal(|ui| {
                     if ui
@@ -273,10 +346,62 @@ impl App {
                     {
                         add = true;
                     }
+                    ui.add_enabled_ui(!definition_dialog_open, |ui| {
+                        ui.menu_button("Copy from connection", |ui| {
+                            super::chrome::menu_style(ui);
+                            let mut any = false;
+                            for source in self
+                                .connections
+                                .iter()
+                                .filter(|conn| conn.id != port && !conn.macros.is_empty())
+                            {
+                                any = true;
+                                ui.menu_button(source.display_label(), |ui| {
+                                    if ui.button("Copy all macros").clicked() {
+                                        copy = Some((Some(source.id), None));
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    for (index, definition) in source.macros.iter().enumerate() {
+                                        if ui.button(macro_display_name(definition)).clicked() {
+                                            copy = Some((Some(source.id), Some(index)));
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                            }
+                            if !self.config.legacy_macros.is_empty() {
+                                any = true;
+                                ui.menu_button("Saved macros from previous version", |ui| {
+                                    if ui.button("Copy all macros").clicked() {
+                                        copy = Some((None, None));
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    for (index, definition) in
+                                        self.config.legacy_macros.iter().enumerate()
+                                    {
+                                        if ui.button(macro_display_name(definition)).clicked() {
+                                            copy = Some((None, Some(index)));
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                            }
+                            if !any {
+                                ui.weak("No macros on other connections.");
+                            }
+                        });
+                    });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if !self.macro_runs.is_empty() {
+                        let count = self
+                            .macro_runs
+                            .iter()
+                            .filter(|run| run.port == port)
+                            .count();
+                        if count > 0 {
                             stop_all = ui.button("Stop all").clicked();
-                            ui.label(format!("{} running", self.macro_runs.len()));
+                            ui.label(format!("{count} running"));
                         }
                     });
                 });
@@ -284,22 +409,26 @@ impl App {
 
         self.show_macros_win = open;
         if stop_all {
-            self.macro_runs.clear();
+            self.macro_runs.retain(|run| run.port != port);
         }
         if let Some((index, port)) = stop {
             self.stop_macro_on_port(index, port);
         }
         if let Some((index, shortcut)) = shortcut_change {
-            if set_macro_shortcut(&mut self.config.macros, index, shortcut) {
-                self.write_config();
+            if set_macro_shortcut(
+                &mut self.connections[connection_index].macros,
+                index,
+                shortcut,
+            ) {
+                self.save_session();
             }
         }
         if let Some(conflict) = shortcut_conflict {
-            self.macro_shortcut_conflict = Some(conflict);
+            self.macro_shortcut_conflict = Some((port, conflict.0, conflict.1, conflict.2));
         }
         if let Some(index) = remove {
-            self.config.macros.remove(index);
-            for running in &mut self.macro_runs {
+            self.connections[connection_index].macros.remove(index);
+            for running in self.macro_runs.iter_mut().filter(|run| run.port == port) {
                 match running.macro_index {
                     Some(running_index) if running_index == index => running.macro_index = None,
                     Some(running_index) if running_index > index => {
@@ -308,7 +437,7 @@ impl App {
                     _ => {}
                 }
             }
-            self.write_config();
+            self.save_session();
             if run == Some(index) {
                 run = None;
             } else if run.is_some_and(|run_index| run_index > index) {
@@ -319,25 +448,49 @@ impl App {
             if self
                 .macro_runs
                 .iter()
-                .any(|run| run.macro_index == Some(index))
+                .any(|run| run.port == port && run.macro_index == Some(index))
             {
-                self.macro_running_edit_confirmation = Some(index);
+                self.macro_running_edit_confirmation = Some((port, index));
             } else {
-                self.open_macro_editor(Some(index));
+                self.open_macro_editor_for(port, Some(index));
             }
         } else if add {
-            self.open_macro_editor(None);
+            self.open_macro_editor_for(port, None);
+        }
+        if let Some((source, index)) = copy {
+            egui::Popup::close_all(ctx);
+            if let Some(source) = source {
+                self.copy_connection_macros(source, port, index);
+            } else {
+                let definitions = match index {
+                    Some(index) => self
+                        .config
+                        .legacy_macros
+                        .get(index)
+                        .cloned()
+                        .into_iter()
+                        .collect(),
+                    None => self.config.legacy_macros.clone(),
+                };
+                append_copied_macros(&mut self.connections[connection_index].macros, definitions);
+                self.save_session();
+            }
         }
         if let Some(index) = run {
-            self.start_macro(index, Instant::now());
+            self.start_macro_on_port(port, index, Instant::now());
         }
     }
 
     fn show_running_macro_edit_confirmation(&mut self, ctx: &egui::Context) {
-        let Some(index) = self.macro_running_edit_confirmation else {
+        let Some((port, index)) = self.macro_running_edit_confirmation else {
             return;
         };
-        let Some(macro_def) = self.config.macros.get(index) else {
+        let Some(macro_def) = self
+            .connections
+            .iter()
+            .find(|conn| conn.id == port)
+            .and_then(|conn| conn.macros.get(index))
+        else {
             self.macro_running_edit_confirmation = None;
             return;
         };
@@ -345,11 +498,11 @@ impl App {
         let running_count = self
             .macro_runs
             .iter()
-            .filter(|run| run.macro_index == Some(index))
+            .filter(|run| run.port == port && run.macro_index == Some(index))
             .count();
         if running_count == 0 {
             self.macro_running_edit_confirmation = None;
-            self.open_macro_editor(Some(index));
+            self.open_macro_editor_for(port, Some(index));
             return;
         }
 
@@ -372,7 +525,7 @@ impl App {
                 ui.label(format!(
                     "\"{name}\" is running on {running_count} {terminals}."
                 ));
-                ui.label("Continuing will stop it on every terminal before editing.");
+                ui.label("Continuing will stop it on this connection before editing.");
                 ui.horizontal(|ui| {
                     continue_editing = ui.button("Stop and edit").clicked();
                     cancel = ui.button("Cancel").clicked();
@@ -380,25 +533,33 @@ impl App {
             });
 
         if continue_editing {
-            self.stop_macro(index);
+            self.stop_macro(port, index);
             self.macro_running_edit_confirmation = None;
-            self.open_macro_editor(Some(index));
+            self.open_macro_editor_for(port, Some(index));
         } else if cancel || !open {
             self.macro_running_edit_confirmation = None;
         }
     }
 
-    pub(super) fn open_macro_editor(&mut self, index: Option<usize>) {
-        let draft = index
-            .and_then(|index| self.config.macros.get(index).cloned())
+    pub(super) fn open_macro_editor_for(&mut self, port: PortId, index: Option<usize>) {
+        let Some(conn) = self.connections.iter().find(|conn| conn.id == port) else {
+            return;
+        };
+        let mut draft = index
+            .and_then(|index| conn.macros.get(index).cloned())
             .unwrap_or_else(|| TransmitMacro {
                 name: "New macro".into(),
                 steps: vec![MacroStep::Command {
                     text: String::new(),
                 }],
+                shortcut: SHORTCUT_ORDER
+                    .into_iter()
+                    .find(|digit| shortcut_owner(&conn.macros, *digit, None).is_none()),
                 ..Default::default()
             });
+        draft.shortcut = draft.shortcut.filter(|digit| *digit <= 9);
         self.macro_editor = Some(MacroEditor {
+            port,
             index,
             step_selection: (!draft.steps.is_empty()).then_some(0),
             draft,
@@ -409,6 +570,14 @@ impl App {
         let Some(mut editor) = self.macro_editor.take() else {
             return;
         };
+        let Some(connection_index) = self
+            .connections
+            .iter()
+            .position(|conn| conn.id == editor.port)
+        else {
+            return;
+        };
+        let macros = &self.connections[connection_index].macros;
         let mut open = true;
         let mut save = false;
         let mut cancel = false;
@@ -418,87 +587,133 @@ impl App {
             "Add macro"
         };
 
-        egui::Window::new(title)
-            .open(&mut open)
-            .collapsible(false)
-            .default_width(520.0)
-            .default_height(420.0)
-            .frame(super::chrome::dialog_frame(ctx))
-            .show(ctx, |ui| {
-                super::chrome::dialog_style(ui);
-                egui::Grid::new("macro-editor-fields")
-                    .num_columns(2)
-                    .spacing([12.0, 6.0])
-                    .show(ui, |ui| {
-                        ui.label("Name");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut editor.draft.name)
-                                .hint_text("Macro name")
-                                .desired_width(340.0),
-                        );
-                        ui.end_row();
+        egui::Window::new(format!(
+            "{title} — {}",
+            self.connections[connection_index].display_label()
+        ))
+        .id(egui::Id::new(title))
+        .open(&mut open)
+        .collapsible(false)
+        .default_width(520.0)
+        .default_height(420.0)
+        .frame(super::chrome::dialog_frame(ctx))
+        .show(ctx, |ui| {
+            super::chrome::dialog_style(ui);
+            egui::Grid::new("macro-editor-fields")
+                .num_columns(2)
+                .spacing([12.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Name");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut editor.draft.name)
+                            .hint_text("Macro name")
+                            .desired_width(340.0),
+                    );
+                    ui.end_row();
 
-                        ui.label("Description");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut editor.draft.description)
-                                .hint_text("What this sequence does")
-                                .desired_width(340.0),
-                        );
-                        ui.end_row();
+                    ui.label("Description");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut editor.draft.description)
+                            .hint_text("What this sequence does")
+                            .desired_width(340.0),
+                    );
+                    ui.end_row();
 
-                        ui.label("Runs");
-                        ui.horizontal(|ui| {
-                            ui.radio_value(&mut editor.draft.repeat_indefinitely, false, "Run");
-                            ui.add_enabled(
-                                !editor.draft.repeat_indefinitely,
-                                egui::DragValue::new(&mut editor.draft.repeat_count)
-                                    .range(1..=MAX_MACRO_REPEAT_COUNT)
-                                    .suffix(" times"),
-                            );
-                            ui.radio_value(
-                                &mut editor.draft.repeat_indefinitely,
-                                true,
-                                "Indefinitely",
-                            );
+                    ui.label("Shortcut");
+                    egui::ComboBox::from_id_salt("macro-editor-shortcut")
+                        .selected_text(shortcut_label(editor.draft.shortcut))
+                        .show_ui(ui, |ui| {
+                            super::chrome::popup_style(ui);
+                            ui.selectable_value(&mut editor.draft.shortcut, None, "Unassigned");
+                            for digit in SHORTCUT_ORDER {
+                                let owner = shortcut_owner(macros, digit, editor.index);
+                                let label = owner.map_or_else(
+                                    || shortcut_label(Some(digit)),
+                                    |owner| {
+                                        format!(
+                                            "{} — used by {}",
+                                            shortcut_label(Some(digit)),
+                                            macro_display_name(&macros[owner])
+                                        )
+                                    },
+                                );
+                                if ui
+                                    .add_enabled(
+                                        owner.is_none(),
+                                        egui::Button::selectable(
+                                            editor.draft.shortcut == Some(digit),
+                                            label,
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    editor.draft.shortcut = Some(digit);
+                                    ui.close();
+                                }
+                            }
                         });
-                        ui.end_row();
-                    });
+                    ui.end_row();
 
-                ui.separator();
-                show_macro_steps(ui, &mut editor);
-                ui.separator();
-                let wait_patterns_valid = editor.draft.steps.iter().all(|step| match step {
-                    MacroStep::WaitFor { pattern } => Regex::new(pattern).is_ok(),
-                    _ => true,
-                });
-                ui.horizontal(|ui| {
-                    save = ui
-                        .add_enabled(wait_patterns_valid, egui::Button::new("Save"))
-                        .clicked();
-                    cancel = ui.button("Cancel").clicked();
-                    if !wait_patterns_valid {
-                        ui.colored_label(
-                            ui.visuals().error_fg_color,
-                            "Fix invalid wait-for expressions before saving.",
+                    ui.label("Runs");
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut editor.draft.repeat_indefinitely, false, "Run");
+                        ui.add_enabled(
+                            !editor.draft.repeat_indefinitely,
+                            egui::DragValue::new(&mut editor.draft.repeat_count)
+                                .range(1..=MAX_MACRO_REPEAT_COUNT)
+                                .suffix(" times"),
                         );
-                    }
+                        ui.radio_value(&mut editor.draft.repeat_indefinitely, true, "Indefinitely");
+                    });
+                    ui.end_row();
                 });
-            });
 
-        if save {
-            save_macro(&mut self.config.macros, editor);
-            self.write_config();
+            ui.separator();
+            show_macro_steps(ui, &mut editor);
+            ui.separator();
+            let wait_patterns_valid = editor.draft.steps.iter().all(|step| match step {
+                MacroStep::WaitFor { pattern } => Regex::new(pattern).is_ok(),
+                _ => true,
+            });
+            let shortcut_valid = macro_shortcut_available(macros, &editor);
+            ui.horizontal(|ui| {
+                save = ui
+                    .add_enabled(
+                        wait_patterns_valid && shortcut_valid,
+                        egui::Button::new("Save"),
+                    )
+                    .clicked();
+                cancel = ui.button("Cancel").clicked();
+                if !wait_patterns_valid {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        "Fix invalid wait-for expressions before saving.",
+                    );
+                } else if !shortcut_valid {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        "Choose an available shortcut before saving.",
+                    );
+                }
+            });
+        });
+
+        if save && save_macro(&mut self.connections[connection_index].macros, &editor).is_some() {
+            self.save_session();
         } else if open && !cancel {
             self.macro_editor = Some(editor);
         }
     }
 
     fn show_shortcut_conflict(&mut self, ctx: &egui::Context) {
-        let Some((target, digit, owner)) = self.macro_shortcut_conflict else {
+        let Some((port, target, digit, owner)) = self.macro_shortcut_conflict else {
             return;
         };
-        let owner_name = self
-            .config
+        let Some(conn) = self.connections.iter_mut().find(|conn| conn.id == port) else {
+            self.macro_shortcut_conflict = None;
+            return;
+        };
+        let owner_name = conn
             .macros
             .get(owner)
             .map(macro_display_name)
@@ -523,8 +738,8 @@ impl App {
                 });
             });
         if move_shortcut {
-            if transfer_macro_shortcut(&mut self.config.macros, target, digit) {
-                self.write_config();
+            if transfer_macro_shortcut(&mut conn.macros, target, digit) {
+                self.save_session();
             }
             self.macro_shortcut_conflict = None;
         } else if keep_shortcut {
@@ -536,10 +751,14 @@ impl App {
         let Some(port) = self.macro_target_port() else {
             return false;
         };
+        self.start_macro_on_port(port, index, now)
+    }
+
+    fn start_macro_on_port(&mut self, port: PortId, index: usize, now: Instant) -> bool {
         let Some(disconnect_generation) = self
             .connections
             .iter()
-            .find(|conn| conn.id == port)
+            .find(|conn| conn.id == port && conn.state == ConnState::Connected)
             .map(|conn| conn.disconnect_generation)
         else {
             return false;
@@ -551,7 +770,12 @@ impl App {
         {
             return false;
         }
-        let Some(macro_def) = self.config.macros.get(index) else {
+        let Some(macro_def) = self
+            .connections
+            .iter()
+            .find(|conn| conn.id == port)
+            .and_then(|conn| conn.macros.get(index))
+        else {
             return false;
         };
         if !macro_has_command(macro_def) {
@@ -597,9 +821,9 @@ impl App {
         }
     }
 
-    fn stop_macro(&mut self, macro_index: usize) {
+    fn stop_macro(&mut self, port: PortId, macro_index: usize) {
         self.macro_runs
-            .retain(|run| run.macro_index != Some(macro_index));
+            .retain(|run| run.port != port || run.macro_index != Some(macro_index));
     }
 
     fn stop_macro_on_port(&mut self, macro_index: usize, port: PortId) {
@@ -910,6 +1134,7 @@ fn show_macro_steps(ui: &mut egui::Ui, editor: &mut MacroEditor) {
                             let edit = ui.add_sized(
                                 [300.0, row_height],
                                 egui::TextEdit::singleline(text)
+                                    .vertical_align(egui::Align::Center)
                                     .hint_text("command")
                                     .font(egui::TextStyle::Monospace),
                             );
@@ -935,6 +1160,7 @@ fn show_macro_steps(ui: &mut egui::Ui, editor: &mut MacroEditor) {
                             let edit = ui.add_sized(
                                 [300.0, row_height],
                                 egui::TextEdit::singleline(pattern)
+                                    .vertical_align(egui::Align::Center)
                                     .hint_text("regular expression")
                                     .font(egui::TextStyle::Monospace),
                             );
@@ -1141,22 +1367,40 @@ fn shortcut_owner(
         .map(|(index, _)| index)
 }
 
-fn save_macro(macros: &mut Vec<TransmitMacro>, mut editor: MacroEditor) -> usize {
+fn append_copied_macros(macros: &mut Vec<TransmitMacro>, definitions: Vec<TransmitMacro>) -> usize {
+    let count = definitions.len();
+    for mut definition in definitions {
+        definition.shortcut = definition
+            .shortcut
+            .filter(|digit| *digit <= 9 && shortcut_owner(macros, *digit, None).is_none())
+            .or_else(|| {
+                SHORTCUT_ORDER
+                    .into_iter()
+                    .find(|digit| shortcut_owner(macros, *digit, None).is_none())
+            });
+        macros.push(definition);
+    }
+    count
+}
+
+fn macro_shortcut_available(macros: &[TransmitMacro], editor: &MacroEditor) -> bool {
+    editor
+        .draft
+        .shortcut
+        .is_none_or(|digit| digit <= 9 && shortcut_owner(macros, digit, editor.index).is_none())
+}
+
+fn save_macro(macros: &mut Vec<TransmitMacro>, editor: &MacroEditor) -> Option<usize> {
+    if !macro_shortcut_available(macros, editor) {
+        return None;
+    }
     let target = editor.index.filter(|index| *index < macros.len());
-    // Preserve existing ownership (including an explicit Unassigned choice).
-    // Allocate only when saving a new macro so canceled drafts reserve nothing.
-    editor.draft.shortcut = match target {
-        Some(index) => macros[index].shortcut,
-        None => SHORTCUT_ORDER
-            .into_iter()
-            .find(|digit| shortcut_owner(macros, *digit, None).is_none()),
-    };
     if let Some(index) = target {
-        macros[index] = editor.draft;
-        index
+        macros[index] = editor.draft.clone();
+        Some(index)
     } else {
-        macros.push(editor.draft);
-        macros.len() - 1
+        macros.push(editor.draft.clone());
+        Some(macros.len() - 1)
     }
 }
 
@@ -1199,9 +1443,389 @@ mod tests {
     use crate::test_ui::ContextTestExt as _;
     use serialcore::config::{LineEnding, PortConfig};
 
+    #[test]
+    fn copied_macros_keep_free_keys_then_allocate_locally_without_sharing_definitions() {
+        let mut app = app_with_macro(100);
+        let target = PortId(1);
+        app.connections.push(app.make_connection(
+            target,
+            "Target".into(),
+            Default::default(),
+            Default::default(),
+            inert_handle(target),
+        ));
+        assert!(app.connections[1].macros.is_empty());
+        app.active = 1;
+        app.open_macro_editor_for(target, None);
+        assert_eq!(app.macro_editor.take().unwrap().draft.shortcut, Some(1));
+        assert_eq!(app.copy_connection_macros(PortId(0), target, None), 1);
+        assert_eq!(app.connections[1].macros[0], app.connections[0].macros[0]);
+        assert_eq!(app.copy_connection_macros(PortId(0), target, Some(0)), 1);
+        assert_eq!(app.connections[1].macros[1].shortcut, Some(1));
+        for digit in [2, 3, 4, 5, 6, 8, 9, 0] {
+            app.copy_connection_macros(PortId(0), target, Some(0));
+            assert_eq!(
+                app.connections[1].macros.last().unwrap().shortcut,
+                Some(digit)
+            );
+        }
+        app.copy_connection_macros(PortId(0), target, Some(0));
+        assert_eq!(app.connections[1].macros.last().unwrap().shortcut, None);
+        app.connections[1].macros[0].steps.clear();
+        assert!(!app.connections[0].macros[0].steps.is_empty());
+        app.save_session();
+        let restored =
+            serialcore::config::Config::from_toml(&app.config.to_toml().unwrap()).unwrap();
+        assert_eq!(restored.last_open[0].macros, app.connections[0].macros);
+        assert_eq!(restored.last_open[1].macros, app.connections[1].macros);
+        assert_eq!(app.copy_connection_macros(target, target, None), 0);
+        assert_eq!(app.copy_connection_macros(PortId(99), target, None), 0);
+        assert_eq!(app.copy_connection_macros(PortId(0), PortId(99), None), 0);
+    }
+
+    #[test]
+    fn catalog_copies_macros_and_keeps_edits_bound_to_its_connection_after_tab_changes() {
+        let mut app = app_with_macro(100);
+        let target = PortId(1);
+        app.connections.push(app.make_connection(
+            target,
+            "Target".into(),
+            Default::default(),
+            Default::default(),
+            inert_handle(target),
+        ));
+        app.active = 1;
+        app.open_macro_catalog();
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run_test_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.show_macros_window(ui.ctx()),
+            )
+        };
+        let click = |app: &mut App, label: &str| {
+            frame(app, vec![]);
+            let output = frame(app, vec![]);
+            let pos = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => {
+                        let pos = text.pos + text.galley.size() / 2.0;
+                        assert!(
+                            shape.clip_rect.contains(pos),
+                            "{label} clipped at {pos:?}, clip={:?}",
+                            shape.clip_rect
+                        );
+                        Some(pos)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing {label}: {:?}",
+                        output
+                            .shapes
+                            .iter()
+                            .filter_map(|shape| match &shape.shape {
+                                egui::Shape::Text(text) => Some(text.galley.text()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                    )
+                });
+            frame(
+                app,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        };
+        click(&mut app, "Copy from connection");
+        click(&mut app, "probe");
+        click(&mut app, "Setup");
+        assert_eq!(app.connections[1].macros[0].shortcut, Some(7));
+        app.active = 0;
+        click(&mut app, "+ Add macro");
+        assert_eq!(app.macro_editor.as_ref().unwrap().port, target);
+        assert_eq!(app.macro_editor.as_ref().unwrap().draft.shortcut, Some(1));
+        click(&mut app, "Save");
+        assert_eq!(app.connections[1].macros.len(), 2);
+        assert_eq!(app.connections[0].macros.len(), 1);
+        click(&mut app, "Copy from connection");
+        click(&mut app, "probe");
+        click(&mut app, "Copy all macros");
+        assert_eq!(app.connections[1].macros.len(), 3);
+        assert_eq!(app.connections[1].macros[2].shortcut, Some(2));
+        let output = frame(&mut app, vec![]);
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "Transmit macros — Target")));
+        app.connections[1].set_state(ConnState::Connected);
+        assert!(app.start_macro_on_port(PortId(0), 0, Instant::now()));
+        assert!(app.start_macro_on_port(target, 0, Instant::now()));
+        click(&mut app, "Edit macro");
+        assert_eq!(app.macro_running_edit_confirmation, Some((target, 0)));
+        click(&mut app, "Stop and edit");
+        assert_eq!(app.macro_runs.len(), 1);
+        assert_eq!(app.macro_runs[0].port, PortId(0));
+        assert_eq!(app.macro_editor.as_ref().unwrap().port, target);
+        click(&mut app, "Cancel");
+        assert!(app.start_macro_on_port(target, 0, Instant::now()));
+        click(&mut app, "Delete");
+        assert_eq!(app.connections[1].macros.len(), 2);
+        assert_eq!(app.macro_runs[0].macro_index, Some(0));
+        assert_eq!(app.macro_runs[1].macro_index, None);
+        app.open_macro_editor_for(target, Some(0));
+        app.connections.remove(1);
+        frame(&mut app, vec![]);
+        assert!(!app.show_macros_win);
+        assert!(app.macro_editor.is_none());
+        assert_eq!(app.connections[0].macros.len(), 1);
+    }
+
+    #[test]
+    fn identical_shortcuts_run_the_selected_connections_definition_including_merged_targets() {
+        let mut app = app_with_macro(100);
+        let other = PortId(1);
+        let mut conn = app.make_connection(
+            other,
+            "Other".into(),
+            Default::default(),
+            PortConfig {
+                local_echo: true,
+                ..Default::default()
+            },
+            inert_handle(other),
+        );
+        conn.macros.push(TransmitMacro {
+            name: "Other macro".into(),
+            shortcut: Some(7),
+            steps: vec![
+                MacroStep::Command {
+                    text: "other-command".into(),
+                },
+                MacroStep::Delay { delay_ms: 1000 },
+            ],
+            ..Default::default()
+        });
+        conn.set_state(ConnState::Connected);
+        app.connections.push(conn);
+        for (active, merged) in [(0, false), (1, false), (0, true)] {
+            let ctx = egui::Context::default();
+            if merged {
+                app.create_merged_tab(vec![PortId(0), other]);
+                app.merged_tx_port = Some(other);
+            }
+            app.active = active;
+            ctx.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Num7,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                }],
+                ..Default::default()
+            });
+            app.consume_macro_shortcut(&ctx);
+            assert!(ctx.input(|input| input.events.is_empty()));
+            let _ = ctx.end_test_pass();
+            let run = app.macro_runs.last().unwrap();
+            assert_eq!(
+                run.port,
+                if active == 0 && !merged {
+                    PortId(0)
+                } else {
+                    other
+                }
+            );
+            assert_eq!(
+                run.name,
+                if active == 0 && !merged {
+                    "Setup"
+                } else {
+                    "Other macro"
+                }
+            );
+            app.macro_runs.clear();
+        }
+        assert!(app.start_macro_on_port(PortId(0), 0, Instant::now()));
+        assert!(app.start_macro_on_port(other, 0, Instant::now()));
+        app.stop_macro(PortId(0), 0);
+        assert_eq!(app.macro_runs.len(), 1);
+        assert_eq!(app.macro_runs[0].port, other);
+    }
+
+    #[test]
+    fn macro_step_text_is_vertically_centered_in_tall_fields() {
+        let mut editor = MacroEditor {
+            port: PortId(0),
+            index: None,
+            draft: TransmitMacro {
+                steps: vec![
+                    MacroStep::Command { text: "440".into() },
+                    MacroStep::WaitFor {
+                        pattern: "READY".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+            step_selection: Some(0),
+        };
+        let ctx = egui::Context::default();
+        let output = ctx.run_test_ui(Default::default(), |ui| {
+            crate::panes::chrome::dialog_style(ui);
+            show_macro_steps(ui, &mut editor);
+        });
+        for value in ["440", "READY"] {
+            let text = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == value => {
+                        Some(text.galley.rect.translate(text.pos.to_vec2()))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let field = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect)
+                        if (rect.rect.width() - 300.0).abs() < 1.0
+                            && rect.rect.height() >= 30.0
+                            && rect.rect.contains(text.center()) =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert!(
+                (text.center().y - field.center().y).abs() < 1.0,
+                "{value}: text={text:?}, field={field:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn macro_editor_shortcut_selection_is_saved_only_on_save() {
+        let mut app = app_with_macro(100);
+        app.connections[0].macros.push(TransmitMacro {
+            name: "Other".into(),
+            shortcut: Some(2),
+            ..Default::default()
+        });
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run_test_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.show_macro_editor(ui.ctx()),
+            )
+        };
+        let click = |app: &mut App, label: &str| {
+            frame(app, vec![]);
+            let output = frame(app, vec![]);
+            let pos = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => {
+                        Some(text.pos + text.galley.size() / 2.0)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing {label}"));
+            frame(
+                app,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        };
+        app.open_macro_editor_for(PortId(0), Some(0));
+        click(&mut app, "Ctrl+Shift+7");
+        click(&mut app, "Ctrl+Shift+2 — used by Other");
+        assert_eq!(app.macro_editor.as_ref().unwrap().draft.shortcut, Some(7));
+        if !egui::Popup::is_any_open(&ctx) {
+            click(&mut app, "Ctrl+Shift+7");
+        }
+        click(&mut app, "Ctrl+Shift+3");
+        assert_eq!(app.macro_editor.as_ref().unwrap().draft.shortcut, Some(3));
+        assert_eq!(app.connections[0].macros[0].shortcut, Some(7));
+        click(&mut app, "Save");
+        assert!(app.macro_editor.is_none());
+        assert_eq!(app.connections[0].macros[0].shortcut, Some(3));
+        app.open_macro_editor_for(PortId(0), Some(0));
+        click(&mut app, "Ctrl+Shift+3");
+        click(&mut app, "Unassigned");
+        click(&mut app, "Cancel");
+        assert_eq!(app.connections[0].macros[0].shortcut, Some(3));
+        app.open_macro_editor_for(PortId(0), Some(0));
+        click(&mut app, "Ctrl+Shift+3");
+        click(&mut app, "Unassigned");
+        click(&mut app, "Save");
+        assert_eq!(app.connections[0].macros[0].shortcut, None);
+        let saved = serialcore::config::Config::from_toml(&app.config.to_toml().unwrap()).unwrap();
+        assert_eq!(saved.last_open[0].macros[0].shortcut, None);
+        assert_eq!(saved.last_open[0].macros[1].shortcut, Some(2));
+        app.open_macro_editor_for(PortId(0), None);
+        let mut editor = app.macro_editor.take().unwrap();
+        editor.draft.shortcut = Some(2);
+        assert!(save_macro(&mut app.connections[0].macros, &editor).is_none());
+        assert_eq!(
+            app.connections[0].macros.len(),
+            2,
+            "occupied assignments must never be duplicated"
+        );
+    }
+
     fn app_with_macro(delay_ms: u64) -> App {
         let (mut app, _enum_tx) = test_app("transmit-macro");
-        app.config.macros.push(TransmitMacro {
+        let id = PortId(0);
+        let conn = app.make_connection(
+            id,
+            "probe".into(),
+            Default::default(),
+            PortConfig {
+                line_ending: LineEnding::CrLf,
+                local_echo: true,
+                ..Default::default()
+            },
+            inert_handle(id),
+        );
+        app.connections.push(conn);
+        app.connections[0].macros.push(TransmitMacro {
             name: "Setup".into(),
             description: "Prepare target".into(),
             steps: vec![
@@ -1216,19 +1840,7 @@ mod tests {
             shortcut: Some(7),
             ..Default::default()
         });
-        let id = PortId(0);
-        let conn = app.make_connection(
-            id,
-            "probe".into(),
-            Default::default(),
-            PortConfig {
-                line_ending: LineEnding::CrLf,
-                local_echo: true,
-                ..Default::default()
-            },
-            inert_handle(id),
-        );
-        app.connections.push(conn);
+
         app.connections[0].set_state(ConnState::Connected);
         app
     }
@@ -1347,7 +1959,7 @@ mod tests {
         for (early_response, delay_ms) in [(false, 0), (true, 0), (false, 100), (true, 100)] {
             let mut app = app_with_macro(100);
             app.connections[0].port_config.send_delay_ms = 20;
-            app.config.macros[0].steps = vec![
+            app.connections[0].macros[0].steps = vec![
                 MacroStep::Command {
                     text: "reboot".into(),
                 },
@@ -1396,7 +2008,7 @@ mod tests {
     fn disabling_pacing_does_not_reuse_the_previous_commands_receive_start() {
         let mut app = app_with_macro(0);
         app.connections[0].port_config.send_delay_ms = 20;
-        app.config.macros[0].steps = vec![
+        app.connections[0].macros[0].steps = vec![
             MacroStep::Command {
                 text: "first".into(),
             },
@@ -1460,8 +2072,8 @@ mod tests {
     fn paced_macro_does_not_repeat_or_advance_after_a_failed_send() {
         let mut app = app_with_macro(0);
         app.connections[0].port_config.send_delay_ms = 20;
-        app.config.macros[0].repeat_indefinitely = true;
-        app.config.macros[0].steps = vec![MacroStep::Command {
+        app.connections[0].macros[0].repeat_indefinitely = true;
+        app.connections[0].macros[0].steps = vec![MacroStep::Command {
             text: "first".into(),
         }];
         let started = Instant::now();
@@ -1539,6 +2151,11 @@ mod tests {
 
         assert!(app.start_macro(0, started));
         app.active = 1;
+        assert!(
+            !app.start_macro(0, started),
+            "new connections have no inherited macros"
+        );
+        assert_eq!(app.copy_connection_macros(PortId(0), second_id, Some(0)), 1);
         assert!(app.start_macro(0, started));
         assert!(!app.start_macro(0, started));
         assert_eq!(app.macro_runs.len(), 2);
@@ -1563,7 +2180,7 @@ mod tests {
     #[test]
     fn each_delay_step_controls_only_what_follows_it() {
         let mut app = app_with_macro(100);
-        app.config.macros[0].steps.extend([
+        app.connections[0].macros[0].steps.extend([
             MacroStep::Delay { delay_ms: 250 },
             MacroStep::Command {
                 text: "third".into(),
@@ -1586,10 +2203,10 @@ mod tests {
     #[test]
     fn a_finite_loop_runs_the_macro_the_requested_number_of_times() {
         let mut app = app_with_macro(100);
-        app.config.macros[0].steps = vec![MacroStep::Command {
+        app.connections[0].macros[0].steps = vec![MacroStep::Command {
             text: "again".into(),
         }];
-        app.config.macros[0].repeat_count = 3;
+        app.connections[0].macros[0].repeat_count = 3;
         let started = Instant::now();
         app.start_macro(0, started);
 
@@ -1605,10 +2222,10 @@ mod tests {
     #[test]
     fn an_indefinite_loop_runs_until_stopped() {
         let mut app = app_with_macro(100);
-        app.config.macros[0].steps = vec![MacroStep::Command {
+        app.connections[0].macros[0].steps = vec![MacroStep::Command {
             text: "again".into(),
         }];
-        app.config.macros[0].repeat_indefinitely = true;
+        app.connections[0].macros[0].repeat_indefinitely = true;
         let started = Instant::now();
         app.start_macro(0, started);
 
@@ -1618,20 +2235,20 @@ mod tests {
         assert_eq!(echoed(&app), ["again", "again", "again"]);
         assert_eq!(app.macro_runs.len(), 1);
 
-        app.stop_macro(0);
+        app.stop_macro(PortId(0), 0);
         assert!(app.macro_runs.is_empty());
     }
 
     #[test]
     fn a_trailing_delay_is_preserved_between_loop_iterations() {
         let mut app = app_with_macro(100);
-        app.config.macros[0].steps = vec![
+        app.connections[0].macros[0].steps = vec![
             MacroStep::Command {
                 text: "again".into(),
             },
             MacroStep::Delay { delay_ms: 100 },
         ];
-        app.config.macros[0].repeat_count = 2;
+        app.connections[0].macros[0].repeat_count = 2;
         let started = Instant::now();
         app.start_macro(0, started);
 
@@ -1652,7 +2269,7 @@ mod tests {
     #[test]
     fn wait_for_matches_only_new_bus_data_and_can_span_batches() {
         let mut app = app_with_macro(100);
-        app.config.macros[0].steps = vec![
+        app.connections[0].macros[0].steps = vec![
             MacroStep::Command {
                 text: "reboot".into(),
             },
@@ -1684,7 +2301,7 @@ mod tests {
     #[test]
     fn wait_for_does_not_match_across_a_receive_gap() {
         let mut app = app_with_macro(100);
-        app.config.macros[0].steps = vec![
+        app.connections[0].macros[0].steps = vec![
             MacroStep::Command {
                 text: "reboot".into(),
             },
@@ -1717,7 +2334,7 @@ mod tests {
     #[test]
     fn a_final_wait_for_keeps_the_macro_running_until_it_matches() {
         let mut app = app_with_macro(100);
-        app.config.macros[0].steps = vec![
+        app.connections[0].macros[0].steps = vec![
             MacroStep::Command {
                 text: "reboot".into(),
             },
@@ -1743,7 +2360,7 @@ mod tests {
     #[test]
     fn invalid_wait_for_expression_stops_a_hand_edited_macro() {
         let mut app = app_with_macro(100);
-        app.config.macros[0].steps = vec![
+        app.connections[0].macros[0].steps = vec![
             MacroStep::Command {
                 text: "first".into(),
             },
@@ -1803,25 +2420,35 @@ mod tests {
 
     #[test]
     fn new_macros_take_free_shortcuts_in_keyboard_order() {
-        let mut macros = Vec::new();
-        let editor = || MacroEditor {
-            index: None,
-            draft: TransmitMacro::default(),
-            step_selection: None,
-        };
+        let mut app = app_with_macro(0);
+        app.connections[0].macros.clear();
         for digit in SHORTCUT_ORDER {
-            let index = save_macro(&mut macros, editor());
-            assert_eq!(macros[index].shortcut, Some(digit));
+            app.open_macro_editor_for(PortId(0), None);
+            let editor = app.macro_editor.take().unwrap();
+            assert_eq!(editor.draft.shortcut, Some(digit));
+            let index = save_macro(&mut app.connections[0].macros, &editor).unwrap();
+            assert_eq!(app.connections[0].macros[index].shortcut, Some(digit));
         }
-        let index = save_macro(&mut macros, editor());
-        assert_eq!(macros[index].shortcut, None);
-        macros[3].shortcut = None;
-        let mut edit = editor();
-        edit.index = Some(3);
-        save_macro(&mut macros, edit);
-        assert_eq!(macros[3].shortcut, None, "editing preserves Unassigned");
-        let index = save_macro(&mut macros, editor());
-        assert_eq!(macros[index].shortcut, Some(4), "reuse the first gap");
+        app.open_macro_editor_for(PortId(0), None);
+        let editor = app.macro_editor.take().unwrap();
+        let index = save_macro(&mut app.connections[0].macros, &editor).unwrap();
+        assert_eq!(app.connections[0].macros[index].shortcut, None);
+        app.connections[0].macros[3].shortcut = None;
+        app.open_macro_editor_for(PortId(0), Some(3));
+        let editor = app.macro_editor.take().unwrap();
+        save_macro(&mut app.connections[0].macros, &editor).unwrap();
+        assert_eq!(
+            app.connections[0].macros[3].shortcut, None,
+            "editing preserves Unassigned"
+        );
+        app.open_macro_editor_for(PortId(0), None);
+        let editor = app.macro_editor.take().unwrap();
+        assert_eq!(editor.draft.shortcut, Some(4), "reuse the first gap");
+        assert_eq!(
+            app.connections[0].macros.len(),
+            11,
+            "drafts reserve nothing until saved"
+        );
     }
 
     #[test]
@@ -1831,7 +2458,7 @@ mod tests {
             (egui::Key::Equals, Some(egui::Key::Num0)),
         ] {
             let mut app = app_with_macro(100);
-            app.config.macros[0].shortcut = Some(0);
+            app.connections[0].macros[0].shortcut = Some(0);
             let ctx = egui::Context::default();
             let _ = ctx.run_test_ui(
                 egui::RawInput {
@@ -1885,7 +2512,7 @@ mod tests {
     #[test]
     fn shortcut_uses_the_physical_digit_when_shift_changes_the_logical_key() {
         let mut app = app_with_macro(100);
-        app.config.macros[0].shortcut = Some(2);
+        app.connections[0].macros[0].shortcut = Some(2);
         let ctx = egui::Context::default();
         // On layouts including Swedish and German, Shift+2 is a quote. Winit
         // exposes that as the logical key while preserving the digit as the
@@ -1912,7 +2539,7 @@ mod tests {
     #[test]
     fn every_assigned_shortcut_in_one_input_batch_is_consumed_and_started() {
         let mut app = app_with_macro(100);
-        app.config.macros.push(TransmitMacro {
+        app.connections[0].macros.push(TransmitMacro {
             name: "Second".into(),
             steps: vec![MacroStep::Command {
                 text: "other".into(),
@@ -1964,7 +2591,7 @@ mod tests {
         });
         app.consume_macro_shortcut(&ctx);
         assert_eq!(app.macro_runs.len(), 1);
-        app.stop_macro(0);
+        app.stop_macro(PortId(0), 0);
         let _ = ctx.end_test_pass();
 
         // egui determines repeat state from the key-down state retained
@@ -1984,35 +2611,43 @@ mod tests {
     #[test]
     fn confirming_a_conflict_moves_the_occupied_shortcut() {
         let mut app = app_with_macro(100);
-        app.config.macros.push(TransmitMacro {
+        app.connections[0].macros.push(TransmitMacro {
             name: "Second".into(),
             ..Default::default()
         });
 
-        assert_eq!(shortcut_owner(&app.config.macros, 7, Some(1)), Some(0));
-        assert!(transfer_macro_shortcut(&mut app.config.macros, 1, 7));
+        assert_eq!(
+            shortcut_owner(&app.connections[0].macros, 7, Some(1)),
+            Some(0)
+        );
+        assert!(transfer_macro_shortcut(
+            &mut app.connections[0].macros,
+            1,
+            7
+        ));
 
-        assert_eq!(app.config.macros[0].shortcut, None);
-        assert_eq!(app.config.macros[1].shortcut, Some(7));
+        assert_eq!(app.connections[0].macros[0].shortcut, None);
+        assert_eq!(app.connections[0].macros[1].shortcut, Some(7));
     }
 
     #[test]
     fn editing_uses_a_draft_until_save() {
         let mut app = app_with_macro(100);
-        app.open_macro_editor(Some(0));
+        app.open_macro_editor_for(PortId(0), Some(0));
         app.macro_editor.as_mut().unwrap().draft.name = "Changed".into();
 
-        assert_eq!(app.config.macros[0].name, "Setup");
+        assert_eq!(app.connections[0].macros[0].name, "Setup");
 
         let editor = app.macro_editor.take().unwrap();
-        save_macro(&mut app.config.macros, editor);
-        assert_eq!(app.config.macros[0].name, "Changed");
+        save_macro(&mut app.connections[0].macros, &editor).unwrap();
+        assert_eq!(app.connections[0].macros[0].name, "Changed");
     }
 
     #[test]
-    fn definition_editor_cannot_change_a_shortcut() {
+    fn definition_editor_saves_the_selected_shortcut() {
         let mut app = app_with_macro(100);
         let editor = MacroEditor {
+            port: PortId(0),
             index: Some(0),
             draft: TransmitMacro {
                 name: "Changed".into(),
@@ -2022,9 +2657,9 @@ mod tests {
             step_selection: None,
         };
 
-        assert_eq!(save_macro(&mut app.config.macros, editor), 0);
-        assert_eq!(app.config.macros[0].name, "Changed");
-        assert_eq!(app.config.macros[0].shortcut, Some(7));
+        assert_eq!(save_macro(&mut app.connections[0].macros, &editor), Some(0));
+        assert_eq!(app.connections[0].macros[0].name, "Changed");
+        assert_eq!(app.connections[0].macros[0].shortcut, Some(2));
     }
 
     #[test]
@@ -2078,7 +2713,7 @@ mod tests {
     #[test]
     fn every_macro_on_a_port_stops_when_it_disconnects() {
         let mut app = app_with_macro(100);
-        app.config.macros.push(TransmitMacro {
+        app.connections[0].macros.push(TransmitMacro {
             name: "Other".into(),
             steps: vec![
                 MacroStep::Command {

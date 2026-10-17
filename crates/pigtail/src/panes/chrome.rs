@@ -494,6 +494,44 @@ pub(super) fn search_warning(ui: &mut Ui, error: &str) {
     response.on_hover_text(format!("Invalid regex\n{error}"));
 }
 
+pub(super) fn highlights_button(ui: &mut Ui) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(22.0, 18.0), Sense::click());
+    let color = if ui.visuals().dark_mode {
+        Color32::from_rgb(240, 200, 90)
+    } else {
+        Color32::from_rgb(140, 90, 10)
+    };
+    ui.painter().rect_filled(
+        rect,
+        4.0,
+        color.gamma_multiply(if response.hovered() { 0.24 } else { 0.12 }),
+    );
+    let point = |x, y| rect.center() + Vec2::new(x, y);
+    let stroke = Stroke::new(1.2, color);
+    ui.painter().add(egui::Shape::closed_line(
+        [
+            (-5.0, 1.0),
+            (1.0, -5.0),
+            (5.0, -1.0),
+            (-1.0, 5.0),
+            (-4.0, 5.0),
+        ]
+        .map(|(x, y)| point(x, y))
+        .to_vec(),
+        stroke,
+    ));
+    ui.painter()
+        .line_segment([point(-5.0, 7.0), point(5.0, 7.0)], stroke);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            "Highlight rules active",
+        )
+    });
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 pub(super) fn pin_button(ui: &mut Ui, pinned: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(28.0, 18.0), Sense::click());
     let visuals = ui.style().interact_selectable(&response, pinned);

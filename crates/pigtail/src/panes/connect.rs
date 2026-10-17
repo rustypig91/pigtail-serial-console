@@ -95,7 +95,7 @@ impl App {
         if ctx.input_mut(|input| {
             input.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::M)
         }) {
-            self.show_macros_win = true;
+            self.open_macro_catalog();
         }
     }
 
@@ -745,7 +745,11 @@ impl App {
     }
 
     pub(crate) fn show_app_menu(&mut self, ui: &mut egui::Ui) {
-        let macros_tooltip = macro_tooltip(&self.config.macros);
+        let macros_tooltip = macro_tooltip(
+            self.macro_context_port()
+                .and_then(|port| self.connections.iter().find(|conn| conn.id == port))
+                .map_or(&[], |conn| conn.macros.as_slice()),
+        );
         let menu = ui
             .menu_button("     ", |ui| {
                 super::chrome::menu_style(ui);
@@ -763,7 +767,7 @@ impl App {
                     .on_hover_text(&macros_tooltip)
                     .clicked()
                 {
-                    self.show_macros_win = true;
+                    self.open_macro_catalog();
                     ui.close();
                 }
                 if ui.button("Show keyboard shortcuts").clicked() {
@@ -1034,6 +1038,24 @@ impl App {
     pub(crate) fn show_status_footer_in(&mut self, ctx: &egui::Context, parent: &mut egui::Ui) {
         let dark = ctx.global_style().visuals.dark_mode;
         let mut toggle_pin = false;
+        let mut edit_highlights = None;
+        let highlight_ports: Vec<_> = self
+            .connections
+            .iter()
+            .filter(|conn| {
+                self.highlights_visible
+                    && !conn.highlight_cache.is_empty()
+                    && if self.merged_selected {
+                        self.merged_contains(conn.id)
+                    } else {
+                        self.active_index()
+                            .is_some_and(|index| self.connections[index].id == conn.id)
+                            && !conn.hex_view
+                            && !conn.screen_view
+                    }
+            })
+            .map(|conn| (conn.id, conn.display_label().to_owned()))
+            .collect();
         super::workspace::show_panel(
             egui::Panel::bottom(self.pane_widget_id("status_footer")).frame(
                 egui::Frame::NONE
@@ -1060,84 +1082,137 @@ impl App {
                     .insert(egui::TextStyle::Small, egui::FontId::proportional(11.0));
                 ui.spacing_mut().interact_size.y = 14.0;
                 ui.spacing_mut().item_spacing.x = 10.0;
-                ui.horizontal(|ui| {
-                    let width = ui.available_width();
-                    let (follow, unread) = if self.merged_selected {
-                        ui.weak("Merged");
-                        ui.weak(format!("{} lines", self.merged_view().len()));
-                        let selected_label = self
-                            .merged_tx_port
-                            .and_then(|id| self.connections.iter().find(|conn| conn.id == id))
-                            .map(|conn| short_label(conn.display_label()))
-                            .unwrap_or_else(|| "Select device".into());
-                        let mut selected = self.merged_tx_port;
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 5.0;
-                            ui.weak("Send to:");
-                            egui::ComboBox::from_id_salt(self.pane_widget_id("merged_tx_device"))
-                                .selected_text(selected_label)
-                                .show_ui(ui, |ui| {
-                                    super::chrome::popup_style(ui);
-                                    for conn in self
-                                        .connections
-                                        .iter()
-                                        .filter(|conn| self.merged_contains(conn.id))
-                                    {
-                                        if ui
-                                            .add_enabled(
-                                                conn.state != ConnState::Closed,
-                                                egui::Button::selectable(
-                                                    selected == Some(conn.id),
-                                                    short_label(conn.display_label()),
-                                                ),
-                                            )
-                                            .clicked()
-                                        {
-                                            selected = Some(conn.id);
+                let status = if self.merged_selected {
+                    Some((self.merged_follow, self.merged_new_since_scroll))
+                } else {
+                    self.active_index().map(|index| {
+                        let conn = &self.connections[index];
+                        (conn.follow, conn.new_since_scroll)
+                    })
+                };
+                let Some((follow, unread)) = status else {
+                    ui.weak("No connection");
+                    return;
+                };
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 18.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if super::chrome::pin_button(ui, follow).clicked() {
+                            toggle_pin = true;
+                        }
+                        if !highlight_ports.is_empty() {
+                            let response = super::chrome::highlights_button(ui);
+                            if let [(port, name)] = highlight_ports.as_slice() {
+                                if response
+                                    .on_hover_text(format!(
+                                        "Highlight rules active for {name} · Click to edit"
+                                    ))
+                                    .clicked()
+                                {
+                                    edit_highlights = Some(*port);
+                                }
+                            } else {
+                                egui::Popup::menu(&response).show(|ui| {
+                                    super::chrome::menu_style(ui);
+                                    ui.weak("Highlight rules for");
+                                    for (port, name) in &highlight_ports {
+                                        if ui.button(name).clicked() {
+                                            edit_highlights = Some(*port);
+                                            ui.close();
                                         }
                                     }
                                 });
-                        });
-                        self.merged_tx_port = selected;
-                        (self.merged_follow, self.merged_new_since_scroll)
-                    } else if let Some(active) = self.active_index() {
-                        let conn = &self.connections[active];
-                        let (label, color, details) = connection_status(conn);
-                        let status = ui.colored_label(color, label);
-                        if status.contains_pointer() {
-                            egui::Tooltip::for_widget(&status).show(|ui| {
-                                ui.set_max_width(ui.spacing().tooltip_width);
-                                ui.label(details);
-                            });
+                                response.on_hover_text(
+                                    "Highlight rules active · Click to choose a connection to edit",
+                                );
+                            }
                         }
-                        let lines =
-                            if !conn.hex_view && !conn.screen_view && conn.filter_index_active() {
-                                conn.filter_index.len()
+                        if !follow && unread > 0 && ui.available_width() > 80.0 {
+                            ui.weak(format!("{unread} new"));
+                        }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            // Keep status text and the send selector clear of the
+                            // fixed footer controls, including in narrow split panes.
+                            ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
+                            let width = ui.available_width();
+                            if self.merged_selected {
+                                ui.weak("Merged");
+                                ui.weak(format!("{} lines", self.merged_view().len()));
+                                let selected_label = self
+                                    .merged_tx_port
+                                    .and_then(|id| {
+                                        self.connections.iter().find(|conn| conn.id == id)
+                                    })
+                                    .map(|conn| short_label(conn.display_label()))
+                                    .unwrap_or_else(|| "Select device".into());
+                                let mut selected = self.merged_tx_port;
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 5.0;
+                                    ui.weak("Send to:");
+                                    egui::ComboBox::from_id_salt(
+                                        self.pane_widget_id("merged_tx_device"),
+                                    )
+                                    .width(ui.available_width().clamp(24.0, 120.0))
+                                    .truncate()
+                                    .selected_text(selected_label)
+                                    .show_ui(ui, |ui| {
+                                        super::chrome::popup_style(ui);
+                                        for conn in self
+                                            .connections
+                                            .iter()
+                                            .filter(|conn| self.merged_contains(conn.id))
+                                        {
+                                            if ui
+                                                .add_enabled(
+                                                    conn.state != ConnState::Closed,
+                                                    egui::Button::selectable(
+                                                        selected == Some(conn.id),
+                                                        short_label(conn.display_label()),
+                                                    ),
+                                                )
+                                                .clicked()
+                                            {
+                                                selected = Some(conn.id);
+                                            }
+                                        }
+                                    });
+                                });
+                                self.merged_tx_port = selected;
+                            } else if let Some(active) = self.active_index() {
+                                let conn = &self.connections[active];
+                                let (label, color, details) = connection_status(conn);
+                                let status = ui.colored_label(color, label);
+                                if status.contains_pointer() {
+                                    egui::Tooltip::for_widget(&status).show(|ui| {
+                                        ui.set_max_width(ui.spacing().tooltip_width);
+                                        ui.label(details);
+                                    });
+                                }
+                                let lines = if !conn.hex_view
+                                    && !conn.screen_view
+                                    && conn.filter_index_active()
+                                {
+                                    conn.filter_index.len()
+                                } else {
+                                    conn.store.len()
+                                };
+                                ui.weak(format!("{lines} lines"));
+                                if width > 450.0 {
+                                    ui.weak(conn.port_config.summary());
+                                }
                             } else {
-                                conn.store.len()
-                            };
-                        ui.weak(format!("{lines} lines"));
-                        if width > 450.0 {
-                            ui.weak(conn.port_config.summary());
-                        }
-                        (conn.follow, conn.new_since_scroll)
-                    } else {
-                        ui.weak("No connection");
-                        return;
-                    };
-                    if ui.available_width() > 28.0 {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if super::chrome::pin_button(ui, follow).clicked() {
-                                toggle_pin = true;
-                            }
-                            if !follow && unread > 0 && ui.available_width() > 80.0 {
-                                ui.weak(format!("{unread} new"));
+                                ui.weak("No connection");
                             }
                         });
-                    }
-                });
+                    },
+                );
             },
         );
+        if let Some(port) = edit_highlights {
+            self.highlight_port = Some(port);
+            self.show_highlight_win = true;
+        }
         if toggle_pin {
             if self.merged_selected {
                 self.merged_follow = !self.merged_follow;
@@ -1173,7 +1248,14 @@ impl App {
                 }
             }
         }
-        if self.config.highlight.iter().any(|rule| rule.enabled) {
+        if self.connections.iter().any(|conn| {
+            (if self.merged_selected {
+                self.merged_contains(conn.id)
+            } else {
+                self.active_index()
+                    .is_some_and(|index| self.connections[index].id == conn.id)
+            }) && conn.highlight.iter().any(|rule| rule.enabled)
+        }) {
             has_options = true;
             ui.checkbox(&mut self.highlights_visible, "Highlights");
         }
@@ -1799,6 +1881,135 @@ mod tests {
     use egui::{Event, Key};
     use serialcore::config::TransmitMacro;
     use serialcore::store::PortId;
+
+    #[test]
+    fn footer_highlight_indicator_opens_only_the_displayed_connections_rules() {
+        let (mut app, _tx) = test_app("footer-highlights");
+        let highlight_re = regex::Regex::new("ERROR").unwrap();
+        for id in [PortId(1), PortId(2), PortId(3)] {
+            let mut conn = app.make_connection(
+                id,
+                format!("Device {}", id.0),
+                Default::default(),
+                Default::default(),
+                inert_handle(id),
+            );
+            if id != PortId(3) {
+                conn.highlight_cache.push(crate::app::CompiledHighlight {
+                    re: highlight_re.clone(),
+                    case_sensitive: false,
+                    color: egui::Color32::RED,
+                });
+            }
+            app.connections.push(conn);
+        }
+        let ctx = egui::Context::default();
+        let frame = |app: &mut crate::app::App, width, events| {
+            ctx.run_test_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 400.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.show_status_footer(ui),
+            )
+        };
+        let indicator = |output: &egui::FullOutput| {
+            output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect) if rect.rect.size() == egui::vec2(22.0, 18.0) => {
+                    assert!(
+                        rect.rect.center().y > 360.0,
+                        "footer must remain a slim strip"
+                    );
+                    assert!(
+                        shape.clip_rect.contains_rect(rect.rect),
+                        "indicator must fit narrow footers"
+                    );
+                    Some(rect.rect.center())
+                }
+                _ => None,
+            })
+        };
+        let click = |pos| {
+            vec![
+                Event::PointerMoved(pos),
+                Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        for dark in [true, false] {
+            ctx.set_visuals(if dark {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            });
+            for width in [256.0, 800.0] {
+                app.active = 1;
+                frame(&mut app, width, vec![]);
+                let pos = indicator(&frame(&mut app, width, vec![])).unwrap();
+                app.show_highlight_win = false;
+                frame(&mut app, width, click(pos));
+                assert!(app.show_highlight_win);
+                assert_eq!(app.highlight_port, Some(PortId(2)));
+                assert!(
+                    app.highlights_visible,
+                    "clicking opens the editor without hiding rules"
+                );
+                app.highlights_visible = false;
+                assert!(indicator(&frame(&mut app, width, vec![])).is_none());
+                app.highlights_visible = true;
+                app.connections[1].hex_view = true;
+                assert!(indicator(&frame(&mut app, width, vec![])).is_none());
+                app.connections[1].hex_view = false;
+                app.connections[1].screen_view = true;
+                assert!(indicator(&frame(&mut app, width, vec![])).is_none());
+                app.connections[1].screen_view = false;
+                app.active = 2;
+                assert!(indicator(&frame(&mut app, width, vec![])).is_none());
+            }
+        }
+        app.create_merged_tab(vec![PortId(1), PortId(2)]);
+        for width in [256.0, 800.0] {
+            frame(&mut app, width, vec![]);
+            let pos = indicator(&frame(&mut app, width, vec![])).unwrap();
+            app.show_highlight_win = false;
+            frame(&mut app, width, click(pos));
+            let output = frame(&mut app, width, vec![]);
+            let port = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "Device 2" => {
+                        Some(text.pos + text.galley.size() / 2.0)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            frame(&mut app, width, click(port));
+            assert!(app.show_highlight_win);
+            assert_eq!(app.highlight_port, Some(PortId(2)));
+        }
+        app.create_merged_tab(vec![PortId(1), PortId(3)]);
+        frame(&mut app, 256.0, vec![]);
+        let pos = indicator(&frame(&mut app, 256.0, vec![])).unwrap();
+        frame(&mut app, 256.0, click(pos));
+        assert_eq!(app.highlight_port, Some(PortId(1)));
+        app.create_merged_tab(vec![PortId(3)]);
+        assert!(indicator(&frame(&mut app, 256.0, vec![])).is_none());
+    }
 
     #[test]
     fn footer_tooltip_appears_without_delay_and_survives_clicking() {

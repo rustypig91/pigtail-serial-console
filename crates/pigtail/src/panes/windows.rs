@@ -295,17 +295,27 @@ impl App {
         if !self.show_highlight_win {
             return;
         }
+        let Some(index) = self
+            .highlight_port
+            .and_then(|port| self.connections.iter().position(|conn| conn.id == port))
+        else {
+            self.show_highlight_win = false;
+            return;
+        };
+        let conn = &mut self.connections[index];
+        let title = format!("Highlight rules — {}", conn.display_label());
         let mut open = self.show_highlight_win;
         let mut changed = false;
-        egui::Window::new("Highlight rules")
+        egui::Window::new(title)
+            .id(egui::Id::new("Highlight rules"))
             .open(&mut open)
             .default_width(320.0)
             .frame(super::chrome::dialog_frame(ctx))
             .show(ctx, |ui| {
                 super::chrome::dialog_style(ui);
-                ui.weak("First matching rule wins. Applied to every connection.");
+                ui.weak("First matching rule wins. Applies only to this connection.");
                 let mut remove: Option<usize> = None;
-                for (i, rule) in self.config.highlight.iter_mut().enumerate() {
+                for (i, rule) in conn.highlight.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
                         changed |= ui.checkbox(&mut rule.enabled, "").changed();
                         changed |= ui
@@ -343,11 +353,11 @@ impl App {
                     });
                 }
                 if let Some(i) = remove {
-                    self.config.highlight.remove(i);
+                    conn.highlight.remove(i);
                     changed = true;
                 }
                 if ui.button("+ Add highlight").clicked() {
-                    self.config.highlight.push(HighlightRule {
+                    conn.highlight.push(HighlightRule {
                         pattern: "ERROR|FATAL".into(),
                         color: "#ff5555".into(),
                         case_sensitive: false,
@@ -361,8 +371,8 @@ impl App {
             });
         self.show_highlight_win = open;
         if changed {
-            self.highlight_dirty = true;
-            self.write_config();
+            conn.highlight_dirty = true;
+            self.save_session();
         }
     }
 }
@@ -372,10 +382,83 @@ mod tests {
     use crate::app::tests::test_app;
     use crate::test_ui::ContextTestExt as _;
 
+    fn add_highlight_connection(app: &mut crate::app::App) {
+        let id = serialcore::store::PortId(7);
+        app.connections.push(app.make_connection(
+            id,
+            "Device 7".into(),
+            Default::default(),
+            Default::default(),
+            crate::app::tests::inert_handle(id),
+        ));
+        app.highlight_port = Some(id);
+        app.show_highlight_win = true;
+    }
+
+    #[test]
+    fn highlight_editor_keeps_its_connection_when_switching_tabs_and_closes_with_it() {
+        let (mut app, _tx) = test_app("highlight-editor-target");
+        add_highlight_connection(&mut app);
+        let other = serialcore::store::PortId(8);
+        app.connections.push(app.make_connection(
+            other,
+            "Other port".into(),
+            Default::default(),
+            Default::default(),
+            crate::app::tests::inert_handle(other),
+        ));
+        app.active = 1;
+        app.connections[0].name = Some("Sensor".into());
+        let ctx = egui::Context::default();
+        let mut output =
+            ctx.run_test_ui(Default::default(), |ui| app.show_highlight_window(ui.ctx()));
+        for _ in 0..2 {
+            output = ctx.run_test_ui(Default::default(), |ui| app.show_highlight_window(ui.ctx()));
+        }
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "Highlight rules — Sensor")));
+        let add = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "+ Add highlight" => {
+                    Some(text.pos + text.galley.size() / 2.0)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let _ = ctx.run_test_ui(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(add),
+                    egui::Event::PointerButton {
+                        pos: add,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos: add,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ui| app.show_highlight_window(ui.ctx()),
+        );
+        assert_eq!(app.connections[0].highlight.len(), 4);
+        assert_eq!(app.connections[1].highlight.len(), 3);
+        assert_eq!(app.config.last_open[0].highlight.len(), 4);
+        app.connections.remove(0);
+        let _ = ctx.run_test_ui(Default::default(), |ui| app.show_highlight_window(ui.ctx()));
+        assert!(!app.show_highlight_win);
+    }
+
     #[test]
     fn escape_closes_merged_options_above_a_tool_window() {
         let (mut app, _tx) = test_app("escape-merged-options");
-        app.show_highlight_win = true;
+        add_highlight_connection(&mut app);
         app.merged_dialog = Some(crate::app::MergedDialog {
             editing: None,
             name: "Merged".into(),
@@ -518,7 +601,7 @@ mod tests {
         let (mut app, _enum_tx) = test_app("escape-windows");
         let ctx = egui::Context::default();
         app.show_settings = true;
-        app.show_highlight_win = true;
+        add_highlight_connection(&mut app);
         let _ = ctx.run_test_ui(egui::RawInput::default(), |ui| {
             let ctx = &ui.ctx().clone();
             app.show_tool_windows(ctx);
