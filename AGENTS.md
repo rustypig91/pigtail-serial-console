@@ -169,6 +169,18 @@ application.
 - Custom window header with draggable device tabs, status dots, close buttons,
   and minimize/maximize/close controls. Drag empty header space to move the window,
   double-click it to maximize or restore, and drag an edge or corner to resize.
+  Header dragging uses the original primary-press position rather than egui's
+  cached widget ownership. Native move/resize loops can consume releases and
+  leave that ownership stale; batched pointer motion can also target a different
+  widget before the press is processed. Dragging works before the first resize
+  in single and split workspaces. Resize borders and overlaid windows retain
+  priority; disabled headers and already released clicks never start a drag.
+  Issue #157 regressions cover startup, stale ownership, batched motion, both
+  split orientations, resize priority, overlays and double-click maximize.
+  The 2026-10-21 fix passed formatting, workspace tests and all-target Clippy
+  with default/all features, and the demo check on stable Rust 1.98. Native
+  inspection was unavailable because the display server could not be reached;
+  Windows dragging still needs a native smoke test.
   View controls, search, clear, export, and the app menu sit above the console;
   ANSI/VT sits beside Hex; highlights are in the overflow menu. A thin footer shows
   one combined connection/error status at the bottom left, line counts and port

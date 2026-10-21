@@ -246,11 +246,46 @@ pub(super) fn drag_window(ui: &mut Ui) {
     let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
     let press_id = response.id.with("last_window_press");
     let options = ui.ctx().options(|options| options.input_options);
-    let (time, pos) = ui.input(|input| (input.time, input.pointer.interact_pos()));
+    let time = ui.input(|input| input.time);
+    let target = response.rect.intersect(ui.clip_rect());
+    let press = ui.input(|input| {
+        // Do not start a native drag after a quick click has already ended.
+        if !input.pointer.primary_down() {
+            return None;
+        }
+        input
+            .events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    ..
+                } => Some(*pos),
+                _ => None,
+            })
+            .filter(|pos| target.contains(*pos))
+    });
+    // Native move/resize loops can consume releases, leaving egui's previous
+    // widget holding the interaction. Batched motion can also put its hit test
+    // outside the header. Use the physical press and its original position,
+    // just like edge resizing, rather than requiring widget drag ownership.
+    // Keep floating windows, modal layers and resize edges ahead of the header.
+    let press = press.filter(|pos| {
+        ui.is_enabled()
+            && ui
+                .ctx()
+                .memory(|memory| memory.allows_interaction(ui.layer_id()))
+            && ui.ctx().layer_id_at(*pos) == Some(ui.layer_id())
+            && !window_resize_targets(ui.ctx())
+                .is_some_and(|targets| targets.iter().any(|(rect, _, _)| rect.contains(*pos)))
+    });
     // Native dragging can consume the release event. Detect the second press
     // ourselves, before starting another native drag, so double-click works
     // even when egui never sees a complete first click.
-    if let Some(pos) = pos {
+    if let Some(pos) = press.or_else(|| ui.input(|input| input.pointer.interact_pos())) {
         ui.ctx().data_mut(|data| {
             if data
                 .get_temp::<(f64, Pos2)>(press_id)
@@ -263,20 +298,14 @@ pub(super) fn drag_window(ui: &mut Ui) {
             }
         });
     }
-    // Native window dragging must start on the press, before egui's
-    // click-and-drag motion threshold (and never again while moving).
-    if response.is_pointer_button_down_on()
-        && ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary))
-    {
+    if let Some(pos) = press {
         let double_press = ui.ctx().data_mut(|data| {
             let previous = data.get_temp::<(f64, Pos2)>(press_id);
             data.remove::<(f64, Pos2)>(press_id);
             if previous.is_some() {
                 true
             } else {
-                if let Some(pos) = pos {
-                    data.insert_temp(press_id, (time, pos));
-                }
+                data.insert_temp(press_id, (time, pos));
                 false
             }
         });
@@ -289,84 +318,94 @@ pub(super) fn drag_window(ui: &mut Ui) {
     response.on_hover_text("Drag to move · Double-click to maximize");
 }
 
+/// Geometry is shared by drag exclusion and resize handling, including before
+/// the foreground resize Areas have completed their initial sizing pass.
+fn window_resize_targets(
+    ctx: &egui::Context,
+) -> Option<[(Rect, egui::ResizeDirection, egui::CursorIcon); 8]> {
+    if ctx.input(|i| {
+        i.viewport().maximized.unwrap_or(false) || i.viewport().fullscreen.unwrap_or(false)
+    }) {
+        return None;
+    }
+    let rect = ctx.content_rect();
+    let edge = 8.0;
+    let corner = 20.0;
+    use egui::ResizeDirection::*;
+    Some([
+        (
+            Rect::from_min_max(
+                rect.min,
+                egui::pos2(rect.left() + corner, rect.top() + corner),
+            ),
+            NorthWest,
+            egui::CursorIcon::ResizeNwSe,
+        ),
+        (
+            Rect::from_min_max(
+                egui::pos2(rect.right() - corner, rect.top()),
+                egui::pos2(rect.right(), rect.top() + corner),
+            ),
+            NorthEast,
+            egui::CursorIcon::ResizeNeSw,
+        ),
+        (
+            Rect::from_min_max(
+                egui::pos2(rect.left(), rect.bottom() - corner),
+                egui::pos2(rect.left() + corner, rect.bottom()),
+            ),
+            SouthWest,
+            egui::CursorIcon::ResizeNeSw,
+        ),
+        (
+            Rect::from_min_max(
+                egui::pos2(rect.right() - corner, rect.bottom() - corner),
+                rect.max,
+            ),
+            SouthEast,
+            egui::CursorIcon::ResizeNwSe,
+        ),
+        (
+            Rect::from_min_max(
+                egui::pos2(rect.left() + corner, rect.top()),
+                egui::pos2(rect.right() - corner, rect.top() + edge),
+            ),
+            North,
+            egui::CursorIcon::ResizeVertical,
+        ),
+        (
+            Rect::from_min_max(
+                egui::pos2(rect.left() + corner, rect.bottom() - edge),
+                egui::pos2(rect.right() - corner, rect.bottom()),
+            ),
+            South,
+            egui::CursorIcon::ResizeVertical,
+        ),
+        (
+            Rect::from_min_max(
+                egui::pos2(rect.left(), rect.top() + corner),
+                egui::pos2(rect.left() + edge, rect.bottom() - corner),
+            ),
+            West,
+            egui::CursorIcon::ResizeHorizontal,
+        ),
+        (
+            Rect::from_min_max(
+                egui::pos2(rect.right() - edge, rect.top() + corner),
+                egui::pos2(rect.right(), rect.bottom() - corner),
+            ),
+            East,
+            egui::CursorIcon::ResizeHorizontal,
+        ),
+    ])
+}
+
 impl App {
     /// Frameless windows need explicit resize hit targets, including corners.
     pub(crate) fn show_window_resize(&self, ctx: &egui::Context) {
-        if ctx.input(|i| {
-            i.viewport().maximized.unwrap_or(false) || i.viewport().fullscreen.unwrap_or(false)
-        }) {
+        let Some(targets) = window_resize_targets(ctx) else {
             return;
-        }
-        let rect = ctx.content_rect();
-        let edge = 8.0;
-        let corner = 20.0;
-        use egui::ResizeDirection::*;
-        let targets = [
-            (
-                Rect::from_min_max(
-                    rect.min,
-                    egui::pos2(rect.left() + corner, rect.top() + corner),
-                ),
-                NorthWest,
-                egui::CursorIcon::ResizeNwSe,
-            ),
-            (
-                Rect::from_min_max(
-                    egui::pos2(rect.right() - corner, rect.top()),
-                    egui::pos2(rect.right(), rect.top() + corner),
-                ),
-                NorthEast,
-                egui::CursorIcon::ResizeNeSw,
-            ),
-            (
-                Rect::from_min_max(
-                    egui::pos2(rect.left(), rect.bottom() - corner),
-                    egui::pos2(rect.left() + corner, rect.bottom()),
-                ),
-                SouthWest,
-                egui::CursorIcon::ResizeNeSw,
-            ),
-            (
-                Rect::from_min_max(
-                    egui::pos2(rect.right() - corner, rect.bottom() - corner),
-                    rect.max,
-                ),
-                SouthEast,
-                egui::CursorIcon::ResizeNwSe,
-            ),
-            (
-                Rect::from_min_max(
-                    egui::pos2(rect.left() + corner, rect.top()),
-                    egui::pos2(rect.right() - corner, rect.top() + edge),
-                ),
-                North,
-                egui::CursorIcon::ResizeVertical,
-            ),
-            (
-                Rect::from_min_max(
-                    egui::pos2(rect.left() + corner, rect.bottom() - edge),
-                    egui::pos2(rect.right() - corner, rect.bottom()),
-                ),
-                South,
-                egui::CursorIcon::ResizeVertical,
-            ),
-            (
-                Rect::from_min_max(
-                    egui::pos2(rect.left(), rect.top() + corner),
-                    egui::pos2(rect.left() + edge, rect.bottom() - corner),
-                ),
-                West,
-                egui::CursorIcon::ResizeHorizontal,
-            ),
-            (
-                Rect::from_min_max(
-                    egui::pos2(rect.right() - edge, rect.top() + corner),
-                    egui::pos2(rect.right(), rect.bottom() - corner),
-                ),
-                East,
-                egui::CursorIcon::ResizeHorizontal,
-            ),
-        ];
+        };
         let hovered_target = ctx
             .input(|input| input.pointer.hover_pos())
             .and_then(|pos| {
@@ -1576,6 +1615,187 @@ mod tests {
                 .commands
                 .iter()
                 .any(|cmd| matches!(cmd, egui::ViewportCommand::BeginResize(_))));
+        }
+    }
+
+    #[test]
+    fn window_drag_respects_overlays_disabled_headers_and_completed_clicks() {
+        for (enabled, overlay, released, button) in [
+            (false, false, false, egui::PointerButton::Primary),
+            (true, true, false, egui::PointerButton::Primary),
+            (true, false, true, egui::PointerButton::Primary),
+            (true, false, false, egui::PointerButton::Secondary),
+        ] {
+            let ctx = egui::Context::default();
+            let render = |events| {
+                ctx.run_test_ui(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::Panel::top("drag_header").show(ui, |ui| {
+                            ui.add_enabled_ui(enabled, drag_window);
+                        });
+                        if overlay {
+                            egui::Area::new(egui::Id::new("overlay"))
+                                .fixed_pos(Pos2::ZERO)
+                                .show(ui.ctx(), |ui| {
+                                    ui.allocate_exact_size(Vec2::new(200.0, 100.0), Sense::click());
+                                });
+                        }
+                    },
+                )
+            };
+            render(vec![]);
+            render(vec![]);
+            let pos = egui::pos2(100.0, 15.0);
+            let event = |pressed| egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let mut events = vec![egui::Event::PointerMoved(pos), event(true)];
+            if released {
+                events.push(event(false));
+            }
+            let output = render(events);
+            assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|command| matches!(
+                    command,
+                    egui::ViewportCommand::StartDrag | egui::ViewportCommand::Maximized(_)
+                )));
+        }
+    }
+
+    #[test]
+    fn header_resize_edges_take_priority_before_resize_areas_are_initialized() {
+        for (pos, expected) in [
+            (egui::pos2(350.0, 6.0), egui::ResizeDirection::North),
+            (egui::pos2(15.0, 15.0), egui::ResizeDirection::NorthWest),
+        ] {
+            let (app, _tx) = crate::app::tests::test_app("header-resize-priority");
+            let ctx = egui::Context::default();
+            let output = ctx.run_test_ui(
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::Panel::top("drag_header").show(ui, drag_window);
+                    app.show_window_resize(ui.ctx());
+                },
+            );
+            let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+            assert!(commands.contains(&egui::ViewportCommand::BeginResize(expected)));
+            assert!(!commands.contains(&egui::ViewportCommand::StartDrag));
+        }
+    }
+
+    #[test]
+    fn window_drag_recovers_when_a_previous_native_operation_consumed_the_release() {
+        let ctx = egui::Context::default();
+        let render = |events| {
+            ctx.run_test_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::Panel::top("drag_header").show(ui, drag_window);
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+                    });
+                },
+            )
+        };
+        render(vec![]);
+        let press = |pos| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        render(press(egui::pos2(100.0, 100.0)));
+        // A native move/resize loop can consume a release before egui sees it.
+        // The next physical press must still be able to start a window drag.
+        let output = render(press(egui::pos2(100.0, 15.0)));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::StartDrag));
+    }
+
+    #[test]
+    fn window_drag_uses_header_press_before_batched_motion() {
+        let header = egui::pos2(100.0, 15.0);
+        let content = egui::pos2(100.0, 100.0);
+        for (press, motion, completed_header_click, expected) in [
+            (header, content, false, true),
+            (content, header, false, false),
+            (content, header, true, false),
+        ] {
+            let ctx = egui::Context::default();
+            let render = |events| {
+                ctx.run_test_ui(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::Panel::top("drag_header").show(ui, drag_window);
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+                        });
+                    },
+                )
+            };
+            render(vec![]);
+            let mut events = Vec::new();
+            if completed_header_click {
+                // Only the final held press may initiate a native operation.
+                for pressed in [true, false] {
+                    events.push(egui::Event::PointerButton {
+                        pos: header,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+            }
+            events.extend([
+                egui::Event::PointerMoved(press),
+                egui::Event::PointerButton {
+                    pos: press,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerMoved(motion),
+            ]);
+            let output = render(events);
+            assert_eq!(
+                output.viewport_output[&egui::ViewportId::ROOT]
+                    .commands
+                    .contains(&egui::ViewportCommand::StartDrag),
+                expected,
+                "press={press:?}, motion={motion:?}"
+            );
         }
     }
 
