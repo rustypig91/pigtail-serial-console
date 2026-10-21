@@ -189,6 +189,18 @@ application.
   double-clicks before the fixes. The review passed formatting, workspace tests
   and all-target Clippy with default/all features, plus the demo feature check
   on stable Rust 1.98.
+  Further PR #158 review covers motion and release positions between batched
+  clicks. Moving beyond the click tolerance cancels the pending double-click,
+  even when the pointer returns before painting or a release arrives without
+  a motion event. Rendered-frame regressions cover same-frame and separate-frame
+  presses and reproduce unwanted maximize before the correction.
+  Formatting, workspace tests and all-target Clippy with default/all features,
+  plus the demo check/build, passed on stable Rust 1.98. The initial default
+  run hit an updater-test `Text file busy` error; both its isolated rerun and
+  the complete workspace rerun passed. Native software-Vulkan/X11 demo inspection
+  verified the header and double-click maximize/restore. Synthetic dragging did
+  not move the window under Xwayland, so native move/resize still needs a manual
+  smoke test, including on Windows.
   View controls, search, clear, export, and the app menu sit above the console;
   ANSI/VT sits beside Hex; highlights are in the overflow menu. A thin footer shows
   one combined connection/error status at the bottom left, line counts and port
