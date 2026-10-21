@@ -844,6 +844,67 @@ mod tests {
     }
 
     #[test]
+    fn header_drag_works_before_resizing_single_and_split_workspaces() {
+        for split in [
+            None,
+            Some(SplitDirection::Right),
+            Some(SplitDirection::Below),
+        ] {
+            for warmup_frames in [0, 2] {
+                let (mut app, _tx) = test_app("header-drag-before-resize");
+                add_connection(&mut app, 1);
+                add_connection(&mut app, 2);
+                if let Some(split) = split {
+                    app.apply_layout_action(LayoutAction::Split(
+                        TabId::Connection(PortId(2)),
+                        split,
+                    ));
+                }
+                let ctx = egui::Context::default();
+                let mut render = |events| {
+                    ctx.run_test_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(1100.0, 720.0),
+                            )),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            app.prepare_workspace(&ctx);
+                            app.show_workspace(ui, false);
+                            app.show_window_resize(&ctx);
+                        },
+                    )
+                };
+                for _ in 0..warmup_frames {
+                    render(vec![]);
+                }
+                let pos = egui::pos2(650.0, 18.0);
+                let output = render(vec![egui::Event::PointerMoved(pos), pointer(pos, true)]);
+                let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+                assert_eq!(
+                    commands
+                        .iter()
+                        .filter(|command| **command == egui::ViewportCommand::StartDrag)
+                        .count(),
+                    1,
+                    "split={split:?}, warmup_frames={warmup_frames}, commands={commands:?}"
+                );
+                assert!(!commands.iter().any(|command| matches!(
+                    command,
+                    egui::ViewportCommand::BeginResize(_) | egui::ViewportCommand::Maximized(_)
+                )));
+                let output = render(vec![egui::Event::PointerMoved(egui::pos2(650.0, 70.0))]);
+                assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+                    .commands
+                    .contains(&egui::ViewportCommand::StartDrag));
+            }
+        }
+    }
+
+    #[test]
     fn splitting_a_background_tab_preserves_the_original_selection() {
         let (mut app, _tx) = test_app("split-background-tab");
         for id in 1..=3 {
