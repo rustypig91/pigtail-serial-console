@@ -238,6 +238,18 @@ pub(super) fn window_controls(ui: &mut Ui) -> [Response; 3] {
     })
 }
 
+fn primary_press_positions(input: &egui::InputState) -> impl DoubleEndedIterator<Item = Pos2> + '_ {
+    input.events.iter().filter_map(|event| match event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            ..
+        } => Some(*pos),
+        _ => None,
+    })
+}
+
 pub(super) fn drag_window(ui: &mut Ui) {
     let (_, response) = ui.allocate_exact_size(
         Vec2::new(ui.available_width().max(0.0), HEADER_HEIGHT),
@@ -246,46 +258,29 @@ pub(super) fn drag_window(ui: &mut Ui) {
     let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
     let press_id = response.id.with("last_window_press");
     let options = ui.ctx().options(|options| options.input_options);
-    let time = ui.input(|input| input.time);
-    let target = response.rect.intersect(ui.clip_rect());
-    let press = ui.input(|input| {
-        // Do not start a native drag after a quick click has already ended.
-        if !input.pointer.primary_down() {
-            return None;
-        }
-        input
-            .events
-            .iter()
-            .rev()
-            .find_map(|event| match event {
-                egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    ..
-                } => Some(*pos),
-                _ => None,
-            })
-            .filter(|pos| target.contains(*pos))
+    let (time, held, pointer_pos, presses) = ui.input(|input| {
+        (
+            input.time,
+            input.pointer.primary_down(),
+            input.pointer.interact_pos(),
+            primary_press_positions(input).collect::<Vec<_>>(),
+        )
     });
+    let target = response.rect.intersect(ui.clip_rect());
     // Native move/resize loops can consume releases, leaving egui's previous
     // widget holding the interaction. Batched motion can also put its hit test
     // outside the header. Use the physical press and its original position,
     // just like edge resizing, rather than requiring widget drag ownership.
     // Keep floating windows, modal layers and resize edges ahead of the header.
-    let press = press.filter(|pos| {
-        ui.is_enabled()
-            && ui
-                .ctx()
-                .memory(|memory| memory.allows_interaction(ui.layer_id()))
-            && ui.ctx().layer_id_at(*pos) == Some(ui.layer_id())
-            && !window_resize_targets(ui.ctx())
-                .is_some_and(|targets| targets.iter().any(|(rect, _, _)| rect.contains(*pos)))
-    });
+    let enabled = ui.is_enabled()
+        && ui
+            .ctx()
+            .memory(|memory| memory.allows_interaction(ui.layer_id()));
+    let resize_targets = window_resize_targets(ui.ctx());
     // Native dragging can consume the release event. Detect the second press
     // ourselves, before starting another native drag, so double-click works
     // even when egui never sees a complete first click.
-    if let Some(pos) = press.or_else(|| ui.input(|input| input.pointer.interact_pos())) {
+    if let Some(pos) = pointer_pos.filter(|_| presses.is_empty()) {
         ui.ctx().data_mut(|data| {
             if data
                 .get_temp::<(f64, Pos2)>(press_id)
@@ -298,22 +293,41 @@ pub(super) fn drag_window(ui: &mut Ui) {
             }
         });
     }
-    if let Some(pos) = press {
+    let mut command = None;
+    for pos in presses {
+        // Each later physical press supersedes the previous operation. Keep
+        // completed header clicks for double-click detection, but never begin
+        // a native move for a click whose release was already processed.
+        command = None;
+        let allowed = enabled
+            && target.contains(pos)
+            && ui.ctx().layer_id_at(pos) == Some(ui.layer_id())
+            && !resize_targets
+                .is_some_and(|targets| targets.iter().any(|(rect, _, _)| rect.contains(pos)));
         let double_press = ui.ctx().data_mut(|data| {
             let previous = data.get_temp::<(f64, Pos2)>(press_id);
             data.remove::<(f64, Pos2)>(press_id);
-            if previous.is_some() {
+            if !allowed {
+                return false;
+            }
+            if previous.is_some_and(|(last_time, last_pos)| {
+                time - last_time <= options.max_double_click_delay
+                    && pos.distance(last_pos) <= options.max_click_dist
+            }) {
                 true
             } else {
                 data.insert_temp(press_id, (time, pos));
                 false
             }
         });
-        ui.ctx().send_viewport_cmd(if double_press {
-            egui::ViewportCommand::Maximized(!maximized)
-        } else {
-            egui::ViewportCommand::StartDrag
-        });
+        if double_press {
+            command = Some(egui::ViewportCommand::Maximized(!maximized));
+        } else if allowed && held {
+            command = Some(egui::ViewportCommand::StartDrag);
+        }
+    }
+    if let Some(command) = command {
+        ui.ctx().send_viewport_cmd(command);
     }
     response.on_hover_text("Drag to move · Double-click to maximize");
 }
@@ -437,20 +451,20 @@ impl App {
         // Use the press event's position: subsequent motion in the same frame
         // can move the pointer into or out of an edge. Hit-test current bounds
         // so presses also work immediately after a window size change.
-        let pressed_target = ctx.input(|input| {
-            input.events.iter().find_map(|event| match event {
-                egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    ..
-                } => targets
-                    .iter()
-                    .find(|(target, _, _)| target.contains(*pos))
-                    .map(|(_, direction, _)| *direction),
-                _ => None,
+        let pressed_target = ctx
+            .input(|input| {
+                input
+                    .pointer
+                    .primary_down()
+                    .then(|| primary_press_positions(input).next_back())
+                    .flatten()
             })
-        });
+            .and_then(|pos| {
+                targets
+                    .iter()
+                    .find(|(target, _, _)| target.contains(pos))
+                    .map(|(_, direction, _)| *direction)
+            });
         if let Some(direction) = pressed_target {
             ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
         }
@@ -1615,6 +1629,104 @@ mod tests {
                 .commands
                 .iter()
                 .any(|cmd| matches!(cmd, egui::ViewportCommand::BeginResize(_))));
+        }
+    }
+
+    #[test]
+    fn window_operations_use_only_the_final_held_press() {
+        let edge = egui::pos2(6.0, 100.0);
+        let header = egui::pos2(100.0, 15.0);
+        for (first, last, held, expected) in [
+            (edge, header, true, Some(egui::ViewportCommand::StartDrag)),
+            (
+                header,
+                edge,
+                true,
+                Some(egui::ViewportCommand::BeginResize(
+                    egui::ResizeDirection::West,
+                )),
+            ),
+            (edge, edge, false, None),
+        ] {
+            let (app, _tx) = crate::app::tests::test_app("window-batched-presses");
+            let ctx = egui::Context::default();
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let mut events = vec![
+                egui::Event::PointerMoved(first),
+                button(first, true),
+                button(first, false),
+                egui::Event::PointerMoved(last),
+                button(last, true),
+            ];
+            if !held {
+                events.push(button(last, false));
+            }
+            let output = ctx.run_test_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::Panel::top("drag_header").show(ui, drag_window);
+                    app.show_window_resize(ui.ctx());
+                },
+            );
+            let operations: Vec<_> = output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .filter(|command| {
+                    matches!(
+                        command,
+                        egui::ViewportCommand::StartDrag | egui::ViewportCommand::BeginResize(_)
+                    )
+                })
+                .cloned()
+                .collect();
+            assert_eq!(operations, expected.into_iter().collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn header_double_click_survives_batched_releases() {
+        for same_frame in [false, true] {
+            let ctx = egui::Context::default();
+            let render = |time, events| {
+                ctx.run_test_ui(
+                    egui::RawInput {
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::Panel::top("drag_header").show(ui, drag_window);
+                    },
+                )
+            };
+            render(0.0, vec![]);
+            let pos = egui::pos2(100.0, 15.0);
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let mut events = vec![egui::Event::PointerMoved(pos), button(true), button(false)];
+            if !same_frame {
+                let output = render(0.1, std::mem::take(&mut events));
+                assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+                    .commands
+                    .contains(&egui::ViewportCommand::StartDrag));
+            }
+            events.extend([button(true), button(false)]);
+            let output = render(0.2, events);
+            let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+            assert!(commands.contains(&egui::ViewportCommand::Maximized(true)));
+            assert!(!commands.contains(&egui::ViewportCommand::StartDrag));
         }
     }
 

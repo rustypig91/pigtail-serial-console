@@ -181,6 +181,14 @@ application.
   with default/all features, and the demo check on stable Rust 1.98. Native
   inspection was unavailable because the display server could not be reached;
   Windows dragging still needs a native smoke test.
+  PR #158 review also covers several mouse presses/releases arriving in one
+  frame. Move and resize use only the final press, and completed clicks never
+  start either native operation. Completed header clicks still contribute to
+  double-click maximize/restore, including when both clicks arrive in one frame.
+  Regression frames reproduce conflicting move/resize commands and lost
+  double-clicks before the fixes. The review passed formatting, workspace tests
+  and all-target Clippy with default/all features, plus the demo feature check
+  on stable Rust 1.98.
   View controls, search, clear, export, and the app menu sit above the console;
   ANSI/VT sits beside Hex; highlights are in the overflow menu. A thin footer shows
   one combined connection/error status at the bottom left, line counts and port
