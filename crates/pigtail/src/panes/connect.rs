@@ -384,7 +384,7 @@ impl App {
                                                 // `on_hover_text` only fires on an *enabled* widget,
                                                 // so a disabled tab needs its own tooltip to keep the
                                                 // detected device name and port available.
-                                                let (resp, close, (shape_rect, rect)) = super::chrome::device_tab(ui, display_label, selected, state_color(conn.state), self.config.settings.header_opacity);
+                                                let (resp, close, (shape_rect, rect)) = super::chrome::device_tab(ui, display_label, selected, super::chrome::TabMenuIcon::Connection, state_color(conn.state), self.config.settings.header_opacity);
                                                 if selected { active_tab_rect = rect; active_tab_shape_rect = shape_rect; }
                                                 let resp = resp.on_hover_text(&tooltip).on_disabled_hover_text(format!("{tooltip}\n(finish or cancel the open dialog first)"));
                                                 if close { to_close = Some(i); }
@@ -422,7 +422,7 @@ impl App {
                                             TabId::Plot(id) => {
                                                 let tab = self.plot_tabs.iter().find(|t| t.saved.id == id).unwrap();
                                                 let selected = self.active_plot == Some(id);
-                                                let (resp, close, (shape_rect, rect)) = super::chrome::device_tab(ui, &tab.saved.name, selected, egui::Color32::from_rgb(141, 219, 140), self.config.settings.header_opacity);
+                                                let (resp, close, (shape_rect, rect)) = super::chrome::device_tab(ui, &tab.saved.name, selected, super::chrome::TabMenuIcon::Plot, egui::Color32::from_rgb(141, 219, 140), self.config.settings.header_opacity);
                                                 if selected { active_tab_rect = rect; active_tab_shape_rect = shape_rect; }
                                                 if close || resp.middle_clicked() { close_plot = Some(id); }
                                                 if !modal_open { reorder = tab_drag(ui, ctx, &resp, tab_id, position).or(reorder); }
@@ -443,7 +443,7 @@ impl App {
                                                     .unwrap();
                                                 let tab = &self.merged_tabs[i];
                                                 let selected = self.merged_selected && self.loaded_merged_tab == Some(i);
-                                                let (resp, close, (shape_rect, rect)) = super::chrome::device_tab(ui, &tab.name, selected, egui::Color32::from_rgb(120, 145, 180), self.config.settings.header_opacity);
+                                                let (resp, close, (shape_rect, rect)) = super::chrome::device_tab(ui, &tab.name, selected, super::chrome::TabMenuIcon::Merged, egui::Color32::from_rgb(120, 145, 180), self.config.settings.header_opacity);
                                                 if selected { active_tab_rect = rect; active_tab_shape_rect = shape_rect; }
                                                 let resp = resp.on_hover_text(&tab.name);
                                                 if close { close_merged = Some(i); }
@@ -2363,7 +2363,7 @@ mod tests {
         fn check_corners(shape: &egui::Shape, tab: egui::Rect) -> usize {
             match shape {
                 egui::Shape::Vec(shapes) => shapes.iter().map(|s| check_corners(s, tab)).sum(),
-                egui::Shape::Path(path) if path.points.len() == 3 => {
+                egui::Shape::Path(path) if path.closed && path.points.len() == 3 => {
                     assert!(
                         path.points[0] == tab.left_top() || path.points[0] == tab.right_top(),
                         "rounded corner moved to a scroll clipping edge: {:?}",
