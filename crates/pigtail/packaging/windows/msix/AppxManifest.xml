@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap10 rescap">
+  <Identity Name="rustypig91.RustysPigtailSerialTerminal"
+    Publisher="CN=B41BE868-9458-4B44-AE02-EA569AC9D53B"
+    Version="@VERSION@" ProcessorArchitecture="x64" />
+  <Properties>
+    <DisplayName>Rusty’s Pigtail – Serial Terminal</DisplayName>
+    <PublisherDisplayName>rustypig91</PublisherDisplayName>
+    <Description>A serial terminal with raw capture, search, plots and transmit macros.</Description>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+  <Applications>
+    <Application Id="Pigtail" Executable="pigtail.exe"
+      uap10:RuntimeBehavior="packagedClassicApp" uap10:TrustLevel="mediumIL">
+      <uap:VisualElements DisplayName="Rusty’s Pigtail – Serial Terminal"
+        Description="A serial terminal with raw capture, search, plots and transmit macros."
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png" BackgroundColor="transparent" />
+    </Application>
+  </Applications>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>

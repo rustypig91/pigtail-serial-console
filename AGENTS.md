@@ -900,6 +900,129 @@ crates/pigtail/packaging/linux/build-appimage.sh \
     target/release/pigtail 0.2.0 .                      # .AppImage
 ```
 
+### Microsoft Store MSIX
+
+The Microsoft Store edition is built separately with the `microsoft-store`
+feature. Direct-download builds must omit that feature. It replaces the app
+menu's **Check for updates** with **Open in Microsoft Store**, opening product
+`9P5WS4PFD96H`. Settings explains that Microsoft Store manages updates and has
+no GitHub startup-check control. Both startup/manual GitHub checks and download
+entry points reject Store builds even if old update settings are present.
+Pigtail never requests Store installation, termination or restart itself;
+Windows, Store settings and enterprise policies control external updates.
+The GitHub and Store channels can publish at different times. Store builds do
+not use GitHub availability as an update signal.
+
+Store configuration, captures and diagnostic logs use the application directory
+name `pigtail-store` instead of `pigtail`, with the existing `directories`
+platform conventions. Nothing is imported automatically. On Windows the
+requested paths are `%APPDATA%\pigtail\pigtail-store\config\pigtail.toml` and
+`%APPDATA%\pigtail\pigtail-store\data\`; Windows package virtualization may
+redirect these within the package's per-user storage. **Settings → Folders**
+opens the locations visible to that edition. Both editions can coexist without
+writing the same live files, but a serial device may only allow one process to
+open its port at a time. To copy settings or history manually, first launch and
+close the Store edition to create its folders, close both editions, back up the
+destination, then copy the direct edition's `pigtail.toml` and (optionally) the
+whole `sessions` directory to the corresponding Store locations. Never merge
+live session files. This is a manual migration procedure, not an import UI.
+Do not promise capture retention across Store uninstallation; back up/export
+important data first. Demo builds still use temporary directories.
+
+The registered product is **Rusty’s Pigtail – Serial Terminal**:
+
+| Manifest field | Value |
+| --- | --- |
+| Identity Name | `rustypig91.RustysPigtailSerialTerminal` |
+| Identity Publisher | `CN=B41BE868-9458-4B44-AE02-EA569AC9D53B` |
+| PublisherDisplayName | `rustypig91` |
+
+`crates/pigtail/packaging/windows/msix/AppxManifest.xml` packages the existing
+Win32 application at medium integrity with `runFullTrust`; it is not a UWP
+AppContainer conversion. That capability is needed for existing native serial
+access and desktop file dialogs. No driver, service, administrator elevation or
+separate updater is installed. The initial package supports x64 Windows 10
+2004 (build 19041) or newer. ARM64 and x86 packages are not produced.
+
+From Windows with Rust, Visual Studio C++ Build Tools and the Windows SDK:
+
+```powershell
+./scripts/build-msix.ps1
+# Only when a packaging revision needs a higher Store version:
+./scripts/build-msix.ps1 -PackageVersion 1.4.1.0
+```
+
+The script builds only the Store feature (never demo) with a static MSVC CRT,
+in `target/store`, independently of existing release binaries. It generates
+50/44/150-pixel logos and 200% variants from the existing 512-pixel icon, fills
+the manifest version, indexes the scaled assets with the SDK's MakePri into
+one `resources.pri`, and calls MakeAppx with validation enabled.
+The default package version maps workspace `major.minor.patch` to
+`major.minor.patch.0`; prerelease versions need an explicit numeric override.
+Store versions must increase, each component is at most 65535, the first is
+nonzero, and the fourth is zero (reserved for Microsoft). An override affects
+only package versioning; the app's displayed version remains the workspace
+version. Staging is temporary and cleaned even on failure; Cargo environment
+overrides are restored. The unsigned output is
+`target/release-assets/store/pigtail-store-<four-part-version>-x64.msix`.
+It is for Partner Center ingestion, not public unsigned sideloading. Microsoft
+signs the package during Store publication; no certificate secret is needed.
+
+The separate **Microsoft Store MSIX** workflow tests the Store edition and
+builds on relevant PRs, main pushes, version tags and manual dispatch. Download
+its `pigtail-store-msix-<run-id>` artifact for submission. It does not add an
+unsigned MSIX to GitHub Releases or publish to Partner Center automatically.
+Tag runs require the tag to match the workspace version. Existing EXE/MSI,
+portable and Linux packaging remains in the `build` workflow.
+
+Before the first submission, test on Windows with a real serial device. From
+a Windows SDK Developer PowerShell, unpack a built package into a persistent
+test directory, then register its manifest for local development:
+
+```powershell
+MakeAppx.exe unpack /p <path-to.msix> /d <test-directory>
+Add-AppxPackage -Register <test-directory>\AppxManifest.xml
+```
+
+Local registration may require Windows Developer Mode. Keep the test directory
+while registered and launch the Start menu entry rather than the bare EXE.
+This tests package identity; test the final Store installation separately.
+Verify launch/icons, enumerate/connect/reconnect, receive/capture/send, modem
+controls, file dialogs/export, macro and plot persistence, and independent
+folders with the direct edition installed. Check that the Store menu opens
+the right product and no GitHub update notice appears. Test an upgrade from an
+older package through the Store with captures/settings present, including an
+active serial session; do not assume external updates can never interrupt it.
+Local development registration does not test Store signing or update delivery.
+
+In Partner Center, create a submission, upload the `.msix` under **Packages**,
+complete availability/pricing, age ratings, properties and English listing
+(description, screenshots, support/privacy URLs as required). Explain
+`runFullTrust` in certification notes: the Rust desktop serial terminal uses
+native Windows serial APIs, file dialogs and local capture/export; it installs
+no drivers/services and leaves updates to the Store. Mention that live serial
+I/O needs a Windows-supported serial adapter/device, and supply concrete
+reviewer test steps. Do not submit a demo-feature binary. Review all submission
+sections before publishing; the code/workflow does not publish a listing.
+
+The initial 2026-10-24 implementation passed formatting, workspace tests with
+default/all features, all-target workspace Clippy with default/all features,
+and the demo feature check on stable Rust 1.98. Final app reruns after UI
+adjustments passed with default/all features. Rendered frames cover the menu
+action and scroll-reachable update settings in both themes; regressions also
+cover Store check/download rejection and independent config/data/log paths.
+PowerShell parsing and invalid-version/environment-restoration checks passed
+using portable PowerShell on Linux; manifest XML/identity and workflow YAML
+were checked. No Windows SDK or connected native GUI was available here, so
+MakePri/MakeAppx, actual MSIX installation, serial I/O, Store delivery and
+upgrade preservation still require the Windows workflow and native testing.
+
+References: [manual desktop packaging](https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-manual-conversion),
+[local package testing](https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-debug),
+[Store signing](https://learn.microsoft.com/en-in/windows/apps/publish/faq/get-started-with-the-microsoft-store),
+[version rules](https://learn.microsoft.com/en-us/windows/apps/publish/publish-your-app/package-version-numbering),
+and [Store links](https://learn.microsoft.com/en-us/windows/apps/develop/launch/launch-store-app).
+
 ## APT distribution
 
 Install through APT (Ubuntu 22.04 or newer, amd64)
