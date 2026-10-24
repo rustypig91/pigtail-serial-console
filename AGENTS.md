@@ -970,8 +970,8 @@ PowerShell's current location, independently of the host process directory.
 Cargo overrides and the caller's location are restored even if staging cleanup
 fails; the cleanup failure remains an error.
 Plain `RUSTFLAGS` are split on whitespace without producing empty compiler
-arguments; existing `CARGO_ENCODED_RUSTFLAGS` take precedence and are preserved
-when appending the static CRT option.
+arguments; existing `CARGO_ENCODED_RUSTFLAGS`, including an explicitly empty
+value, take precedence when appending the static CRT option.
 It is for Partner Center ingestion, not public unsigned sideloading. Microsoft
 signs the package during Store publication; no certificate secret is needed.
 
@@ -1043,6 +1043,15 @@ checks encoded-flag precedence, whitespace-only/unset flags, and restoration
 after build and cleanup failures. These checks, Store-feature app tests,
 all-feature workspace tests, all-target all-feature Clippy, and formatting
 passed on stable Rust 1.98. Native Windows package testing remains outstanding.
+
+A subsequent PR #160 review fixed an explicitly empty
+`CARGO_ENCODED_RUSTFLAGS` falling back to plain `RUSTFLAGS`. A minimal Cargo
+probe confirmed empty encoded flags suppress plain flags; the packaging
+regression reproduced the incorrect fallback before the fix and passed after
+it, including caller-state restoration after build and cleanup failures.
+The empty-value case runs on PowerShell 7.5+, which preserves empty environment
+variables. PowerShell regressions, Store-feature app tests (341 passed),
+formatting and diff checks passed on stable Rust 1.98.
 
 References: [manual desktop packaging](https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-manual-conversion),
 [local package testing](https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-debug),

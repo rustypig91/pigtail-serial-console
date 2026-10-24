@@ -55,6 +55,11 @@ try {
         @{ Encoded = $null; Plain = " `t "; Expected = '' },
         @{ Encoded = $null; Plain = $null; Expected = '' }
     )
+    # PowerShell 7.5+ preserves empty environment variables. Cargo treats an
+    # explicitly empty encoded variable as overriding nonempty plain flags.
+    if ($PSVersionTable.PSVersion -ge [version]'7.5') {
+        $flagCases += @{ Encoded = ''; Plain = '--cfg=ignored'; Expected = '' }
+    }
     foreach ($flagCase in $flagCases) {
         foreach ($failCleanup in @($false, $true)) {
             $env:CARGO_TARGET_DIR = 'original-target'

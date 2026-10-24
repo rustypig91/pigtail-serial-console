@@ -40,9 +40,11 @@ $work = $null
 Push-Location $root
 try {
     $env:CARGO_TARGET_DIR = Join-Path $root 'target/store'
-    $flags = if ($previousFlags) { $previousFlags } else { $env:RUSTFLAGS }
+    $hasEncodedFlags = $null -ne $previousFlags
+    $flags = if ($hasEncodedFlags) { $previousFlags } else { $env:RUSTFLAGS }
     # Plain RUSTFLAGS are whitespace separated; encoded flags use unit separators.
-    if (-not $previousFlags -and $flags) {
+    # An explicitly empty encoded variable still takes precedence over RUSTFLAGS.
+    if (-not $hasEncodedFlags -and $flags) {
         $flags = (($flags -split '\s+') | Where-Object { $_.Length -gt 0 }) -join [char]31
     }
     $staticCrt = '-Ctarget-feature=+crt-static'
