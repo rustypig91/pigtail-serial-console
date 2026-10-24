@@ -182,11 +182,14 @@ impl App {
         for (i, line) in lines.iter().enumerate() {
             let bytes = format!("{line}\r\n");
             conn.push_raw_bytes(bytes.as_bytes());
+            let wall = start_wall + chrono::Duration::seconds(i as i64);
             framer.push(
                 bytes.as_bytes(),
                 Timestamp {
-                    wall: start_wall + chrono::Duration::seconds(i as i64),
-                    micros: i as i64 * 1_000_000,
+                    wall,
+                    // Captures have different lengths but share an end time.
+                    // Keep merged ordering and plot axes on that same timeline.
+                    micros: self.clock.micros_at(wall),
                 },
                 &mut framed,
             );
@@ -288,6 +291,49 @@ mod tests {
     }
 
     #[test]
+    fn demo_merged_history_uses_a_shared_timeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_file: dir.path().join("pigtail.toml"),
+            sessions: dir.path().join("sessions"),
+            crash_log: dir.path().join("crash.log"),
+        };
+        let (_, rx) = crossbeam_channel::unbounded();
+        let mut app = App::assemble(Config::default(), paths, Wake::new(|| {}), rx);
+        app.seed_demo().unwrap();
+        app.select_workspace_tab(TabId::Merged(app.merged_tabs[0].id));
+
+        let timestamps: Vec<_> = app
+            .merged
+            .iter()
+            .map(|entry| {
+                app.connections
+                    .iter()
+                    .find(|conn| conn.id == entry.port)
+                    .unwrap()
+                    .store
+                    .get(entry.abs)
+                    .unwrap()
+                    .meta
+                    .ts
+            })
+            .collect();
+        assert_eq!(
+            timestamps.len(),
+            app.connections
+                .iter()
+                .map(|conn| conn.store.len())
+                .sum::<usize>()
+        );
+        assert!(timestamps
+            .windows(2)
+            .all(|pair| pair[0].wall <= pair[1].wall));
+        assert!(timestamps
+            .iter()
+            .all(|ts| ts.micros == app.clock.micros_at(ts.wall)));
+    }
+
+    #[test]
     fn scene_has_colored_history_plots_and_never_persists_config() {
         let dir = tempfile::tempdir().unwrap();
         let paths = AppPaths {
@@ -325,7 +371,8 @@ mod tests {
         assert!(app.plot_tabs[0]
             .charts
             .iter()
-            .all(|chart| chart.series.len() == 2 && chart.series[0].series.len() == 90));
+            .all(|chart| chart.series.len() == 2
+                && chart.series.iter().all(|series| series.series.len() == 90)));
         assert!(conn
             .store
             .get(6)

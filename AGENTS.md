@@ -793,6 +793,15 @@ and humidity charts in an **Environment plot** tab. A
 share the main pane without a split, with device 1 selected at startup.
 Both devices provide 90 temperature/humidity readings with distinct curves,
 so each chart shows two lines rather than a line and a single sample dot.
+Demo timestamps use the shared app clock, keeping merged rows chronological
+and plot samples aligned with their displayed times despite different capture
+lengths. Regression coverage checks merged ordering and all four series' sample
+counts.
+The PR #159 review passed formatting, workspace tests with all features,
+default-feature app tests, all-target Clippy with all features, and VS Code task
+JSON validation on stable Rust 1.98. The new merged chronology regression failed
+before the clock correction. Native inspection was unavailable because the
+display server could not be reached.
 The sample output stays still while you arrange the window and take screenshots.
 Log, ANSI, and hex views use the same sample bytes; switching tabs and exploring
 the display controls works as usual. The connections are simulated and do not
