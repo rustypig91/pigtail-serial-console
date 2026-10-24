@@ -965,6 +965,10 @@ only package versioning; the app's displayed version remains the workspace
 version. Staging is temporary and cleaned even on failure; Cargo environment
 overrides are restored. The unsigned output is
 `target/release-assets/store/pigtail-store-<four-part-version>-x64.msix`.
+Relative `-OutputDirectory` paths resolve from the repository root using
+PowerShell's current location, independently of the host process directory.
+Cargo overrides and the caller's location are restored even if staging cleanup
+fails; the cleanup failure remains an error.
 It is for Partner Center ingestion, not public unsigned sideloading. Microsoft
 signs the package during Store publication; no certificate secret is needed.
 
@@ -972,6 +976,10 @@ The separate **Microsoft Store MSIX** workflow tests the Store edition and
 builds on relevant PRs, main pushes, version tags and manual dispatch. Download
 its `pigtail-store-msix-<run-id>` artifact for submission. It does not add an
 unsigned MSIX to GitHub Releases or publish to Partner Center automatically.
+Rerunning the job replaces that run's artifact. The workflow also runs
+`scripts/tests/build-msix.Tests.ps1`, which simulates build and cleanup failures
+without Rust builds or SDK tools and checks relative output paths and caller
+environment/location restoration.
 Tag runs require the tag to match the workspace version. Existing EXE/MSI,
 portable and Linux packaging remains in the `build` workflow.
 
@@ -1016,6 +1024,13 @@ using portable PowerShell on Linux; manifest XML/identity and workflow YAML
 were checked. No Windows SDK or connected native GUI was available here, so
 MakePri/MakeAppx, actual MSIX installation, serial I/O, Store delivery and
 upgrade preservation still require the Windows workflow and native testing.
+
+The PR #160 review fixed relative output resolution, caller-state restoration
+after staging cleanup failures, and artifact replacement on workflow reruns.
+Both PowerShell failure regressions reproduced before their fixes and passed
+afterwards. Store-feature app tests (341 passed), all-feature workspace tests,
+all-target all-feature Clippy, formatting, the demo check and workflow YAML
+validation passed on stable Rust 1.98. Native Windows validation remains required.
 
 References: [manual desktop packaging](https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-manual-conversion),
 [local package testing](https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-debug),

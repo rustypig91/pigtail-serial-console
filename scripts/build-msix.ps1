@@ -65,7 +65,7 @@ try {
     $makePriPath = Find-SdkTool 'MakePri.exe'
 
     if (-not $OutputDirectory) { $OutputDirectory = Join-Path $root 'target/release-assets/store' }
-    $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
+    $OutputDirectory = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDirectory)
     New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
     # An isolated staging directory cannot accidentally retain old binaries.
     $work = Join-Path $root "target/store/staging-$([guid]::NewGuid().ToString('N'))"
@@ -117,8 +117,11 @@ try {
     Write-Host "Store submission package (unsigned): $package"
     Write-Host 'Upload this MSIX to Partner Center. Microsoft signs it after certification.'
 } finally {
-    if ($work -and (Test-Path -LiteralPath $work)) { Remove-Item -LiteralPath $work -Recurse -Force }
-    $env:CARGO_TARGET_DIR = $previousTargetDir
-    $env:CARGO_ENCODED_RUSTFLAGS = $previousFlags
-    Pop-Location
+    try {
+        if ($work -and (Test-Path -LiteralPath $work)) { Remove-Item -LiteralPath $work -Recurse -Force }
+    } finally {
+        $env:CARGO_TARGET_DIR = $previousTargetDir
+        $env:CARGO_ENCODED_RUSTFLAGS = $previousFlags
+        Pop-Location
+    }
 }

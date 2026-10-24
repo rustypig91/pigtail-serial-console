@@ -7,6 +7,7 @@ on:
       - 'crates/**'
       - 'Cargo.*'
       - 'scripts/build-msix.ps1'
+      - 'scripts/tests/build-msix.Tests.ps1'
       - '.github/workflows/store.yml'
   push:
     branches: [main]
@@ -33,6 +34,9 @@ jobs:
           key: microsoft-store
       - name: Test Store edition
         run: cargo test -p pigtail --features microsoft-store --locked
+      - name: Test MSIX build script
+        shell: pwsh
+        run: ./scripts/tests/build-msix.Tests.ps1
       - name: Verify release tag
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
@@ -47,5 +51,6 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: pigtail-store-msix-${{ github.run_id }}
+          overwrite: true
           if-no-files-found: error
           path: target/release-assets/store/*.msix
