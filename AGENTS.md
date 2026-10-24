@@ -902,6 +902,52 @@ crates/pigtail/packaging/linux/build-appimage.sh \
 
 ### Microsoft Store MSIX
 
+#### Privacy policy publication
+
+`docs/site/privacy/index.html` is the public policy for both distribution
+channels. Keep it aligned with local captures/configuration/diagnostics, device
+identifiers, file and clipboard access, retention/deletion, support submissions,
+and network activity. Store builds do not contact the GitHub updater;
+direct-download builds have opt-out startup checks and user-requested downloads.
+Update the policy's visible date when its content changes. Its contact address
+matches the package maintainer in `crates/pigtail/Cargo.toml`.
+
+`.github/workflows/privacy-policy.yml` uploads only `docs/site` and deploys it
+to GitHub Pages. The default policy URL for Partner Center is
+`https://rustypig91.github.io/pigtail-serial-console/privacy/`. It becomes live
+only after a successful deployment. In repository **Settings → Pages**, select
+**GitHub Actions** as the build source. The `github-pages` environment must allow
+release tags (`v*`) and the branch used for manual publication (normally `main`);
+a branch-only deployment restriction will block tag builds. No custom token or
+domain is required. Pages deployment replaces this repository's entire Pages
+site, so keep any future public pages under `docs/site` too.
+
+The existing build workflow calls the reusable policy workflow after its
+`release` job succeeds, alongside APT publication. It publishes the policy from
+the released commit, and does not deploy on PRs, ordinary branch builds, or
+failed releases. This explicit call avoids relying on a `release` event, which
+is not emitted to other workflows when the release is created with
+`GITHUB_TOKEN`. Use **Actions → Publish privacy policy → Run workflow** from
+`main` for first publication or a policy-only update without releasing the app.
+The workflow reports the deployed policy URL in its job summary. Deployment
+runs serialize without cancelling an in-progress Pages publication.
+Artifacts are named by run/attempt; deployment uses the build job's recorded
+name so full reruns avoid upload collisions and deploy-only retries reuse the
+successful build artifact (within its retention period).
+
+Setup references: [GitHub Pages custom workflows](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages)
+and [publishing source settings](https://docs.github.com/en/pages/getting-started-with-github-pages/configuring-a-publishing-source-for-your-github-pages-site).
+
+Partner Center listing PNGs live in
+`crates/pigtail/packaging/windows/store-listing/`: app tiles at 71, 150 and
+300 pixels square, box art at 1080 and 2160 pixels square, and poster art at
+720 × 1080 and 1440 × 2160. Regenerate with
+`python3 scripts/generate-store-images.py` (requires Pillow). These use the
+original `crates/pigtail/src/icon.png`, preserve its proportions, and center it
+on transparent app tiles or dark, padded box/poster backgrounds. They are listing
+uploads, separate from the MSIX manifest assets generated during packaging.
+The poster exports follow the explicit pixel sizes shown in Partner Center.
+
 The Microsoft Store edition is built separately with the `microsoft-store`
 feature. Direct-download builds must omit that feature. It replaces the app
 menu's **Check for updates** with **Open in Microsoft Store**, opening product

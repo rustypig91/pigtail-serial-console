@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="How Rusty's Pigtail handles serial data, local files, diagnostics, and updates.">
+    <meta name="color-scheme" content="light dark">
+    <title>Privacy policy — Rusty's Pigtail</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+        line-height: 1.65;
+        background: #f7f8fa;
+        color: #202630;
+      }
+      * { box-sizing: border-box; }
+      body { max-width: 48rem; margin: 0 auto; padding: 3rem 1.25rem; }
+      h1, h2 { line-height: 1.25; }
+      h1 { margin: 0.5rem 0; font-size: clamp(2rem, 6vw, 2.75rem); }
+      h2 { margin-top: 2rem; font-size: 1.25rem; }
+      a { color: #17569b; overflow-wrap: anywhere; }
+      a:focus-visible { outline: 3px solid currentColor; outline-offset: 3px; }
+      li + li { margin-top: 0.6rem; }
+      .product, .updated { color: #536070; }
+      .product { margin: 0; font-weight: 600; }
+      .summary {
+        padding: 1rem 1.25rem;
+        margin-top: 2rem;
+        border-left: 4px solid #32844d;
+        background: #eaf3ec;
+      }
+      footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #c5cdd6; }
+      @media (prefers-color-scheme: dark) {
+        :root { background: #14181f; color: #e3e8ef; }
+        a { color: #94c6ff; }
+        .product, .updated { color: #acb9c8; }
+        .summary { background: #1b2b23; border-color: #70c28c; }
+        footer { border-color: #3c4755; }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <p class="product">Rusty's Pigtail – Serial Terminal</p>
+      <h1>Privacy policy</h1>
+      <p class="updated">Last updated: <time datetime="2026-10-24">24 October 2026</time></p>
+    </header>
+    <main>
+      <p>This policy covers Rusty's Pigtail – Serial Terminal, developed by
+        Christoffer Zakrisson (rustypig91), including the Microsoft Store and
+        direct-download editions.</p>
+      <p class="summary">Pigtail processes serial data on your computer. The app
+        does not upload your serial captures, commands, settings, or diagnostic
+        logs to the developer, and does not include advertising, usage analytics,
+        or automatic crash-report uploads. No Pigtail account is required.</p>
+
+      <h2>Data the app uses</h2>
+      <ul>
+        <li><strong>Serial communication:</strong> Pigtail reads data from the
+          serial devices you connect and sends commands or file contents you
+          choose to transmit. Received bytes are automatically saved in local
+          session captures, independently of search filters and display mode.
+          Device output may contain personal or sensitive information.</li>
+        <li><strong>Device information:</strong> Serial port paths, USB vendor
+          and product IDs, device serial numbers, manufacturer and product names,
+          connection names, timestamps, and port settings are used to identify
+          devices, reconnect them, and restore sessions. This information can be
+          saved with settings and captures.</li>
+        <li><strong>Preferences and saved work:</strong> The app stores settings,
+          connections, workspace layouts, macros and their command text,
+          highlight rules, and plot definitions locally to restore your work.</li>
+        <li><strong>Files and clipboard:</strong> The app reads files you select
+          for transmission and writes exports to destinations you choose. Copy
+          and paste actions use your system clipboard.</li>
+        <li><strong>Diagnostics:</strong> Local application and crash logs can
+          include the app version, graphics hardware and driver information,
+          file paths, error details, and crash backtraces. These help investigate
+          failures and are not automatically sent to the developer.</li>
+      </ul>
+
+      <h2>Storage, security, and deletion</h2>
+      <p>Settings, captures, and diagnostic logs are stored in your user profile.
+        The Microsoft Store edition uses separate application folders from the
+        direct-download edition. Use <strong>Settings → Folders</strong> to find
+        the locations used by your installation.</p>
+      <p>Pigtail does not add encryption to these local files or to serial
+        communication. File access is governed by your operating system and
+        filesystem permissions. Backups, synced folders, and the connected
+        device may retain their own copies outside Pigtail's control.</p>
+      <p>Saved captures have no fixed expiry date. The configured log-history
+        limit controls cleanup of older, inactive captures; active captures
+        remain complete. Clear console discards the selected connection's
+        history and requests capture cleanup. It does not delete exports,
+        settings, or diagnostic logs, and is not secure erasure.</p>
+      <p>To remove all locally stored Pigtail data, find its folders, close the
+        app, and delete its configuration and data files. Delete exports and
+        backups separately. Uninstallation may leave files behind. The developer
+        cannot access or delete files held only on your computer.</p>
+
+      <h2>Network access and third-party services</h2>
+      <p><strong>Microsoft Store edition:</strong> The app does not use the
+        GitHub updater. Microsoft Store and Windows manage distribution and
+        updates and may process store, installation, and diagnostic information
+        under the <a href="https://www.microsoft.com/en-us/privacy/privacystatement">Microsoft Privacy Statement</a>.
+        These services operate independently of Pigtail's local data handling.</p>
+      <p><strong>Direct-download editions:</strong> Startup update checks contact
+        GitHub by default and can be disabled in Settings. Manual update checks
+        also contact GitHub; choosing Update downloads release files from GitHub
+        and its download infrastructure. Requests expose your IP address and
+        request details, including the app version in its user-agent, to those
+        services. They do not include serial captures, device identities,
+        command text, or local logs. See the
+        <a href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement">GitHub Privacy Statement</a>.</p>
+      <p>Opening project, support, donation, or Store links uses your browser or
+        the corresponding system app. Information you provide to those services
+        is handled under their policies. Commands and file transfers are sent
+        to the serial device you select; any further processing by that device
+        is outside Pigtail's control.</p>
+
+      <h2>Information you choose to share</h2>
+      <p>If you email the developer or submit an issue, the developer receives
+        the contact information, message, and attachments you provide and uses
+        them to respond and investigate the report. Support correspondence may
+        be retained while needed to resolve and follow up on the request. You
+        can request deletion of correspondence held by the developer using the
+        contact address below, subject to applicable legal obligations.</p>
+      <p>GitHub issues are public. Remove personal data, passwords, tokens, and
+        sensitive device output before sharing logs or captures. The app does
+        not sell personal information or share local app data with advertisers.</p>
+
+      <h2>This policy page</h2>
+      <p>This page is hosted on GitHub Pages. It contains no analytics, tracking
+        scripts, third-party fonts, or embedded third-party content. GitHub may
+        process your IP address and ordinary web-request information when you
+        visit, as described in its privacy statement linked above.</p>
+
+      <h2>Changes and contact</h2>
+      <p>Policy updates will be published at this address with a revised date.</p>
+      <p>For privacy questions or requests, contact Christoffer Zakrisson
+        (rustypig91) at <a href="mailto:rustypig91@gmail.com">rustypig91@gmail.com</a>.</p>
+    </main>
+    <footer>
+      <a href="https://github.com/rustypig91/pigtail-serial-console">Project source and support</a>
+    </footer>
+  </body>
+</html>
