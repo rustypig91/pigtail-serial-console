@@ -41,6 +41,88 @@
       "group": "build"
     },
     {
+      "label": "Run Pigtail Demo (Debug)",
+      "type": "process",
+      "command": "cargo",
+      "args": [
+        "run",
+        "-p",
+        "pigtail",
+        "--features",
+        "demo",
+        "--locked"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$rustc"
+      ],
+      "group": "build"
+    },
+    {
+      "label": "Run Pigtail Demo (Release)",
+      "type": "process",
+      "command": "cargo",
+      "args": [
+        "run",
+        "--release",
+        "-p",
+        "pigtail",
+        "--features",
+        "demo",
+        "--locked"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$rustc"
+      ],
+      "group": "build"
+    },
+    {
+      "label": "Build Pigtail Demo (Debug)",
+      "type": "process",
+      "command": "cargo",
+      "args": [
+        "build",
+        "-p",
+        "pigtail",
+        "--features",
+        "demo",
+        "--locked"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$rustc"
+      ],
+      "group": "build"
+    },
+    {
+      "label": "Build Pigtail Demo (Release)",
+      "type": "process",
+      "command": "cargo",
+      "args": [
+        "build",
+        "--release",
+        "-p",
+        "pigtail",
+        "--features",
+        "demo",
+        "--locked"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$rustc"
+      ],
+      "group": "build"
+    },
+    {
       "label": "Build Pigtail (Debug)",
       "type": "process",
       "command": "cargo",

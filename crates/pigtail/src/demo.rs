@@ -46,24 +46,36 @@ impl App {
         samples.push("\x1b[96mdevice 1>\x1b[0m ".into());
         self.add_demo_console("device 1", samples)?;
 
-        self.add_demo_console(
-            "device 2",
+        let mut samples: Vec<String> = [
+            "Device 2 initialized",
+            "[info] Loading configuration",
+            "[info] Configuration loaded",
+            "[info] Communication interface ready",
+            "[info] Self-test complete",
+            "[info] Monitoring enabled",
+            "",
+            "\x1b[96mdevice 2>\x1b[0m device status",
+            "  State: ready",
+            "  Link: connected",
+            "  Samples captured: 90",
+            "  Dropped samples: 0",
+            "",
+            "\x1b[96mdevice 2>\x1b[0m sensor stream 90",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        for i in 0..90 {
+            let t = i as f64;
+            samples.push(format!(
+                "\x1b[92msensor\x1b[0m: temperature={:.2} humidity={:.2}",
+                24.2 + (t / 14.0 + 0.7).sin() * 0.6 + t * 0.006,
+                47.0 + (t / 19.0 + 0.5).cos() * 1.8,
+            ));
+        }
+        samples.extend(
             [
-                "Device 2 initialized",
-                "[info] Loading configuration",
-                "[info] Configuration loaded",
-                "[info] Communication interface ready",
-                "[info] Self-test complete",
-                "[info] Monitoring enabled",
-                "",
-                "\x1b[96mdevice 2>\x1b[0m device status",
-                "  State: ready",
-                "  Link: connected",
-                "  Samples captured: 90",
-                "  Dropped samples: 0",
-                "",
-                "\x1b[96mdevice 2>\x1b[0m sensor read",
-                "\x1b[92msensor\x1b[0m: temperature=24.84 humidity=46.25",
+                "[info] Capture complete: 90 samples",
                 "",
                 "\x1b[96mdevice 2>\x1b[0m link status",
                 "  Peer: device 1",
@@ -72,9 +84,9 @@ impl App {
                 "\x1b[96mdevice 2>\x1b[0m ",
             ]
             .into_iter()
-            .map(str::to_owned)
-            .collect(),
-        )?;
+            .map(str::to_owned),
+        );
+        self.add_demo_console("device 2", samples)?;
         // Two independent charts, comparing both simulated sources.
         let sources: Vec<_> = self
             .connections
@@ -104,7 +116,7 @@ impl App {
             .collect();
         let saved = serialcore::config::SavedPlotTab {
             id: crate::plots::new_id(),
-            name: "Environment".into(),
+            name: "Environment plot".into(),
             charts,
             follow: false,
             ..Default::default()
@@ -113,9 +125,10 @@ impl App {
         self.plot_routes_dirty = true;
         self.resize_plot_history();
         while self.maintain_plots(Duration::from_secs(1)) {}
-        self.active = 0;
+        self.create_merged_tab(self.connections.iter().map(|conn| conn.id).collect());
+        self.merged_tabs[0].name = "Merged device logs".into();
+        self.select_workspace_tab(TabId::Connection(self.connections[0].id));
         self.next_port_id = 2;
-        self.split_demo_plot(self.plot_tabs[0].saved.id);
         Ok(())
     }
 
@@ -169,11 +182,14 @@ impl App {
         for (i, line) in lines.iter().enumerate() {
             let bytes = format!("{line}\r\n");
             conn.push_raw_bytes(bytes.as_bytes());
+            let wall = start_wall + chrono::Duration::seconds(i as i64);
             framer.push(
                 bytes.as_bytes(),
                 Timestamp {
-                    wall: start_wall + chrono::Duration::seconds(i as i64),
-                    micros: i as i64 * 1_000_000,
+                    wall,
+                    // Captures have different lengths but share an end time.
+                    // Keep merged ordering and plot axes on that same timeline.
+                    micros: self.clock.micros_at(wall),
                 },
                 &mut framed,
             );
@@ -275,6 +291,49 @@ mod tests {
     }
 
     #[test]
+    fn demo_merged_history_uses_a_shared_timeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_file: dir.path().join("pigtail.toml"),
+            sessions: dir.path().join("sessions"),
+            crash_log: dir.path().join("crash.log"),
+        };
+        let (_, rx) = crossbeam_channel::unbounded();
+        let mut app = App::assemble(Config::default(), paths, Wake::new(|| {}), rx);
+        app.seed_demo().unwrap();
+        app.select_workspace_tab(TabId::Merged(app.merged_tabs[0].id));
+
+        let timestamps: Vec<_> = app
+            .merged
+            .iter()
+            .map(|entry| {
+                app.connections
+                    .iter()
+                    .find(|conn| conn.id == entry.port)
+                    .unwrap()
+                    .store
+                    .get(entry.abs)
+                    .unwrap()
+                    .meta
+                    .ts
+            })
+            .collect();
+        assert_eq!(
+            timestamps.len(),
+            app.connections
+                .iter()
+                .map(|conn| conn.store.len())
+                .sum::<usize>()
+        );
+        assert!(timestamps
+            .windows(2)
+            .all(|pair| pair[0].wall <= pair[1].wall));
+        assert!(timestamps
+            .iter()
+            .all(|ts| ts.micros == app.clock.micros_at(ts.wall)));
+    }
+
+    #[test]
     fn scene_has_colored_history_plots_and_never_persists_config() {
         let dir = tempfile::tempdir().unwrap();
         let paths = AppPaths {
@@ -293,11 +352,27 @@ mod tests {
         let conn = &app.connections[0];
         assert_eq!(conn.state, ConnState::Connected);
         assert_eq!(app.plot_tabs.len(), 1);
+        assert_eq!(app.plot_tabs[0].saved.name, "Environment plot");
+        assert_eq!(app.merged_tabs.len(), 1);
+        assert_eq!(app.merged_tabs[0].name, "Merged device logs");
+        assert_eq!(app.merged_tabs[0].ports, vec![PortId(0), PortId(1)]);
+        assert!(app.workspace.split.is_none());
+        assert_eq!(app.selected_tab_id(), Some(TabId::Connection(PortId(0))));
+        assert_eq!(
+            app.visible_pane_tabs(),
+            vec![
+                TabId::Connection(PortId(0)),
+                TabId::Connection(PortId(1)),
+                TabId::Plot(app.plot_tabs[0].saved.id),
+                TabId::Merged(app.merged_tabs[0].id),
+            ]
+        );
         assert_eq!(app.plot_tabs[0].charts.len(), 2);
         assert!(app.plot_tabs[0]
             .charts
             .iter()
-            .all(|chart| chart.series.len() == 2 && chart.series[0].series.len() == 90));
+            .all(|chart| chart.series.len() == 2
+                && chart.series.iter().all(|series| series.series.len() == 90)));
         assert!(conn
             .store
             .get(6)

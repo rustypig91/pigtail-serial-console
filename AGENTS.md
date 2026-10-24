@@ -166,8 +166,12 @@ application.
   its scroll offset before painting, keeping matches near the end from briefly
   leaving blank space below the last row. Closing search removes Hex
   highlighting. Raw data remains complete and all retained byte rows stay visible.
-- Custom window header with draggable device tabs, status dots, close buttons,
-  and minimize/maximize/close controls. Drag empty header space to move the window,
+- Custom window header with draggable device tabs, colored type icons, close buttons,
+  and minimize/maximize/close controls. Tabs reuse the connection plug, plot chart,
+  and merged arrows from the + menu. Connection icons retain the existing status
+  colors: green when connected, yellow while connecting/reconnecting or missing,
+  red when lost, and gray when disconnected/closed. Plot icons stay green and
+  merged icons stay blue. Labels remain neutral. Drag empty header space to move the window,
   double-click it to maximize or restore, and drag an edge or corner to resize.
   Header dragging uses the original primary-press position rather than egui's
   cached widget ownership. Native move/resize loops can consume releases and
@@ -784,8 +788,20 @@ cargo run -p pigtail --release --features demo
 
 This special build always opens a 1280 × 900 dark window with generic output
 from “device 1” and “device 2”, colored prompts and sensor labels, and temperature
-and humidity charts in an Environment plot tab in the right pane. The left
-pane contains the simulated connection logs.
+and humidity charts in an **Environment plot** tab. A
+**Merged device logs** tab combines both simulated connections. All four tabs
+share the main pane without a split, with device 1 selected at startup.
+Both devices provide 90 temperature/humidity readings with distinct curves,
+so each chart shows two lines rather than a line and a single sample dot.
+Demo timestamps use the shared app clock, keeping merged rows chronological
+and plot samples aligned with their displayed times despite different capture
+lengths. Regression coverage checks merged ordering and all four series' sample
+counts.
+The PR #159 review passed formatting, workspace tests with all features,
+default-feature app tests, all-target Clippy with all features, and VS Code task
+JSON validation on stable Rust 1.98. The new merged chronology regression failed
+before the clock correction. Native inspection was unavailable because the
+display server could not be reached.
 The sample output stays still while you arrange the window and take screenshots.
 Log, ANSI, and hex views use the same sample bytes; switching tabs and exploring
 the display controls works as usual. The connections are simulated and do not

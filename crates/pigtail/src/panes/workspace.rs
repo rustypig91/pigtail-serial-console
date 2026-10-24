@@ -87,13 +87,6 @@ impl App {
             .then_some(TabId::Connection(conn.id))
     }
 
-    #[cfg(feature = "demo")]
-    pub(crate) fn split_demo_plot(&mut self, id: u64) {
-        self.apply_layout_action(LayoutAction::Split(TabId::Plot(id), SplitDirection::Right));
-        self.workspace.focused = 0;
-        self.load_pane(0);
-    }
-
     fn saved_workspace_tab(&self, tab: TabId) -> Option<SavedTab> {
         match tab {
             TabId::Connection(id) => self

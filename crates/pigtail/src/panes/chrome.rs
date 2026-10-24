@@ -69,12 +69,13 @@ pub(super) fn surface(ui: &Ui, raised: bool) -> Color32 {
     }
 }
 
-/// Draw tabs ourselves so the status dot and close affordance have their own
+/// Draw tabs ourselves so the status icon and close affordance have their own
 /// space and the label remains neutral regardless of the connection state.
 pub(super) fn device_tab(
     ui: &mut Ui,
     label: &str,
     selected: bool,
+    icon: TabMenuIcon,
     status: Color32,
     opacity: u8,
 ) -> (Response, bool, (Rect, Rect)) {
@@ -137,8 +138,12 @@ pub(super) fn device_tab(
         },
         fill,
     );
-    ui.painter()
-        .circle_filled(Pos2::new(rect.left() + 17.0, rect.center().y), 4.5, status);
+    paint_tab_icon(
+        ui,
+        Pos2::new(rect.left() + 17.0, rect.center().y),
+        icon,
+        status,
+    );
     ui.painter().galley(
         Pos2::new(rect.left() + 31.0, rect.center().y - galley.size().y / 2.0),
         galley,
@@ -1113,6 +1118,7 @@ pub(super) fn popup_style(ui: &mut Ui) {
     ui.spacing_mut().item_spacing = Vec2::new(14.0, 4.0);
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum TabMenuIcon {
     Connection,
     Plot,
@@ -1131,50 +1137,53 @@ pub(super) fn tab_menu_item(
             egui::Button::new((egui::Atom::custom(icon_id, Vec2::splat(18.0)), label)).atom_ui(ui);
         if let Some(rect) = button.rect(icon_id) {
             let color = ui.style().interact(&button.response).fg_stroke.color;
-            let stroke = Stroke::new(1.3_f32, color);
-            let c = rect.center();
-            let point = |x, y| c + Vec2::new(x, y);
-            match icon {
-                TabMenuIcon::Connection => {
-                    ui.painter().rect_stroke(
-                        Rect::from_min_max(point(-4.0, -4.0), point(4.0, 3.0)),
-                        2.0,
-                        stroke,
-                        egui::StrokeKind::Middle,
-                    );
-                    for x in [-2.0, 2.0] {
-                        ui.painter()
-                            .line_segment([point(x, -7.0), point(x, -4.0)], stroke);
-                    }
-                    ui.painter()
-                        .line_segment([point(0.0, 3.0), point(0.0, 7.0)], stroke);
-                }
-                TabMenuIcon::Plot => paint_view_content(
-                    ui,
-                    Rect::from_center_size(c, Vec2::new(30.0, 18.0)),
-                    ViewIcon::Plot,
-                    "",
-                    color,
-                ),
-                TabMenuIcon::Merged => {
-                    for y in [-5.0, 5.0] {
-                        ui.painter().add(egui::Shape::line(
-                            vec![point(-7.0, y), point(-3.0, y), point(2.0, 0.0)],
-                            stroke,
-                        ));
-                    }
-                    ui.painter()
-                        .line_segment([point(2.0, 0.0), point(7.0, 0.0)], stroke);
-                    ui.painter().add(egui::Shape::line(
-                        vec![point(4.0, -3.0), point(7.0, 0.0), point(4.0, 3.0)],
-                        stroke,
-                    ));
-                }
-            }
+            paint_tab_icon(ui, rect.center(), icon, color);
         }
         button.response
     })
     .inner
+}
+
+fn paint_tab_icon(ui: &Ui, c: Pos2, icon: TabMenuIcon, color: Color32) {
+    let stroke = Stroke::new(1.3_f32, color);
+    let point = |x, y| c + Vec2::new(x, y);
+    match icon {
+        TabMenuIcon::Connection => {
+            ui.painter().rect_stroke(
+                Rect::from_min_max(point(-4.0, -4.0), point(4.0, 3.0)),
+                2.0,
+                stroke,
+                egui::StrokeKind::Middle,
+            );
+            for x in [-2.0, 2.0] {
+                ui.painter()
+                    .line_segment([point(x, -7.0), point(x, -4.0)], stroke);
+            }
+            ui.painter()
+                .line_segment([point(0.0, 3.0), point(0.0, 7.0)], stroke);
+        }
+        TabMenuIcon::Plot => paint_view_content(
+            ui,
+            Rect::from_center_size(c, Vec2::new(30.0, 18.0)),
+            ViewIcon::Plot,
+            "",
+            color,
+        ),
+        TabMenuIcon::Merged => {
+            for y in [-5.0, 5.0] {
+                ui.painter().add(egui::Shape::line(
+                    vec![point(-7.0, y), point(-3.0, y), point(2.0, 0.0)],
+                    stroke,
+                ));
+            }
+            ui.painter()
+                .line_segment([point(2.0, 0.0), point(7.0, 0.0)], stroke);
+            ui.painter().add(egui::Shape::line(
+                vec![point(4.0, -3.0), point(7.0, 0.0), point(4.0, 3.0)],
+                stroke,
+            ));
+        }
+    }
 }
 
 pub(super) fn menu_item(ui: &mut Ui, label: &str, shortcut: &str) -> Response {
@@ -1226,6 +1235,53 @@ pub(super) fn modal_header(ui: &mut Ui, title: &str, open: &mut bool) {
 mod tests {
     use super::*;
     use crate::test_ui::ContextTestExt as _;
+
+    #[test]
+    fn tab_type_icons_use_status_colors_without_coloring_labels() {
+        for dark in [false, true] {
+            for selected in [false, true] {
+                for status in [Color32::GREEN, Color32::YELLOW, Color32::RED, Color32::GRAY] {
+                    for icon in [
+                        TabMenuIcon::Connection,
+                        TabMenuIcon::Plot,
+                        TabMenuIcon::Merged,
+                    ] {
+                        let ctx = egui::Context::default();
+                        ctx.set_visuals(app_visuals(dark));
+                        let mut bounds = Rect::NOTHING;
+                        let output = ctx.run_test_ui(egui::RawInput::default(), |ui| {
+                            let (_, _, (rect, _)) =
+                                device_tab(ui, "Device", selected, icon, status, 255);
+                            bounds = rect;
+                        });
+                        let icon_bounds = Rect::from_center_size(
+                            Pos2::new(bounds.left() + 17.0, bounds.center().y),
+                            Vec2::splat(18.0),
+                        );
+                        assert!(output.shapes.iter().any(|shape| {
+                            let colored = match &shape.shape {
+                                egui::Shape::LineSegment { stroke, .. } => stroke.color == status,
+                                egui::Shape::Rect(rect) => rect.stroke.color == status,
+                                egui::Shape::Path(path) => matches!(
+                                    path.stroke.color,
+                                    egui::epaint::ColorMode::Solid(color) if color == status
+                                ),
+                                _ => false,
+                            };
+                            colored && icon_bounds.contains_rect(shape.shape.visual_bounding_rect())
+                        }));
+                        assert!(!output.shapes.iter().any(|shape| {
+                            matches!(&shape.shape, egui::Shape::Circle(circle) if circle.fill == status)
+                        }));
+                        assert!(output.shapes.iter().any(|shape| {
+                            matches!(&shape.shape, egui::Shape::Text(text)
+                                if text.galley.text() == "Device" && text.fallback_color != status)
+                        }));
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn clear_button_click_pulses_then_fades_and_can_restart() {
