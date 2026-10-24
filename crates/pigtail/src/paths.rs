@@ -34,11 +34,20 @@ impl AppPaths {
     }
 }
 
-#[cfg(not(feature = "demo"))]
 impl AppPaths {
+    #[cfg(not(feature = "demo"))]
     pub fn resolve() -> anyhow::Result<AppPaths> {
-        let dirs = directories::ProjectDirs::from("dev", "pigtail", "pigtail")
-            .context("no valid home directory for config")?;
+        Self::for_distribution(crate::distribution::MICROSOFT_STORE)
+    }
+
+    #[cfg(any(not(feature = "demo"), test))]
+    fn for_distribution(store: bool) -> anyhow::Result<AppPaths> {
+        let dirs = directories::ProjectDirs::from(
+            "dev",
+            "pigtail",
+            crate::distribution::application_directory(store),
+        )
+        .context("no valid home directory for config")?;
         let config_file = dirs.config_dir().join("pigtail.toml");
         let sessions = dirs.data_dir().join("sessions");
         let crash_log = dirs.data_dir().join("crash.log");
@@ -47,6 +56,22 @@ impl AppPaths {
             sessions,
             crash_log,
         })
+    }
+}
+
+#[cfg(test)]
+mod distribution_tests {
+    use super::*;
+
+    #[test]
+    fn store_and_direct_installations_never_share_live_files() {
+        let direct = AppPaths::for_distribution(false).unwrap();
+        let store = AppPaths::for_distribution(true).unwrap();
+        assert_ne!(direct.config_file.parent(), store.config_file.parent());
+        assert_ne!(direct.sessions.parent(), store.sessions.parent());
+        assert_ne!(direct.crash_log.parent(), store.crash_log.parent());
+        assert_eq!(direct.config_file.file_name().unwrap(), "pigtail.toml");
+        assert_eq!(store.config_file.file_name().unwrap(), "pigtail.toml");
     }
 }
 

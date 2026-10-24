@@ -12,6 +12,8 @@ workspace = true
 [features]
 # A hardware-free, repeatable scene for promotional demos.
 demo = ["dep:tempfile"]
+# Microsoft Store distribution: Store updates and independent user data.
+microsoft-store = []
 
 [dependencies]
 anyhow = "1.0.104"

@@ -784,7 +784,17 @@ impl App {
                 } else {
                     "An update check or installation is in progress"
                 };
-                if ui
+                if crate::distribution::MICROSOFT_STORE {
+                    if ui.button("Open in Microsoft Store").clicked() {
+                        if let Err(error) = open::that(crate::distribution::STORE_URI) {
+                            self.record_connect_error(
+                                "Couldn't open Microsoft Store",
+                                error.to_string(),
+                            );
+                        }
+                        ui.close();
+                    }
+                } else if ui
                     .add_enabled(
                         !self.demo_mode && !updating,
                         egui::Button::new("Check for updates"),
@@ -1881,6 +1891,52 @@ mod tests {
     use egui::{Event, Key};
     use serialcore::config::TransmitMacro;
     use serialcore::store::PortId;
+
+    #[test]
+    fn app_menu_offers_the_distributions_update_action() {
+        let (mut app, _tx) = test_app("distribution-menu");
+        let ctx = egui::Context::default();
+        let mut draw = |events| {
+            ctx.run_test_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    app.show_app_menu(ui);
+                },
+            )
+        };
+        let _ = draw(vec![]);
+        // The menu is the first control; leave its item unclicked so this test
+        // cannot launch a browser or contact either update provider.
+        let pos = egui::pos2(18.0, 18.0);
+        for pressed in [true, false] {
+            let _ = draw(vec![
+                Event::PointerMoved(pos),
+                Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ]);
+        }
+        let output = draw(vec![]);
+        let contains = |label: &str| {
+            output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == label)
+            })
+        };
+        assert_eq!(
+            contains("Open in Microsoft Store"),
+            crate::distribution::MICROSOFT_STORE
+        );
+        assert_eq!(
+            contains("Check for updates"),
+            !crate::distribution::MICROSOFT_STORE
+        );
+    }
 
     #[test]
     fn footer_highlight_indicator_opens_only_the_displayed_connections_rules() {

@@ -2595,8 +2595,12 @@ impl App {
     /// Menu → "Check for updates" action, which reports a result either way;
     /// the startup check only speaks up when there is a new version.
     pub fn start_update_check(&mut self, manual: bool) {
-        if self.demo_mode || self.update_rx.is_some() || self.install_rx.is_some() {
-            return; // demo builds cannot update; otherwise, one is already in flight
+        if crate::distribution::MICROSOFT_STORE
+            || self.demo_mode
+            || self.update_rx.is_some()
+            || self.install_rx.is_some()
+        {
+            return; // Store/demo builds cannot self-update; otherwise, one is in flight.
         }
         self.update_manual = manual;
         match update::spawn_check(self.wake.clone()) {
@@ -2662,7 +2666,11 @@ impl App {
     }
 
     pub(crate) fn start_update_download(&mut self, version: String) {
-        if self.demo_mode || self.install_rx.is_some() || self.update_rx.is_some() {
+        if crate::distribution::MICROSOFT_STORE
+            || self.demo_mode
+            || self.install_rx.is_some()
+            || self.update_rx.is_some()
+        {
             return;
         }
         match update::spawn_download(version, self.wake.clone()) {
@@ -4371,6 +4379,22 @@ pub(crate) mod tests {
         app.start_update_check(true);
         assert!(app.install_rx.as_ref().unwrap().same_channel(&original));
         assert!(app.update_rx.is_none());
+    }
+
+    #[cfg(feature = "microsoft-store")]
+    #[test]
+    fn store_edition_never_starts_github_checks_or_downloads() {
+        let (mut app, _tx) = test_app("store-updates");
+        app.demo_mode = false;
+        app.config.settings.check_updates = true;
+        for manual in [false, true] {
+            app.start_update_check(manual);
+            assert!(app.update_rx.is_none());
+        }
+        app.start_update_download("v9.9.9".into());
+        assert!(app.install_rx.is_none());
+        assert!(app.update_progress.is_none());
+        assert!(app.update_dialog.is_none());
     }
 
     #[test]

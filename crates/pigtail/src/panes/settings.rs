@@ -163,6 +163,11 @@ impl App {
                         });
                         ui.add_space(10.0);
                         settings_section(ui, "Updates", "Keep the application up to date.", |ui| {
+                        if crate::distribution::MICROSOFT_STORE {
+                            ui.label("Updates");
+                            ui.add(egui::Label::new("Updates are managed by Microsoft Store.").wrap());
+                            ui.end_row();
+                        } else {
                         changed |= reset_setting(ui, "Updates", "Check GitHub for a newer release when the application starts. Downloads begin only when you choose Update.", &mut self.config.settings.check_updates, defaults.check_updates);
                         changed |= ui
                             .checkbox(&mut self.config.settings.check_updates, "Check at startup")
@@ -172,6 +177,7 @@ impl App {
                             )
                             .changed();
                         ui.end_row();
+                        }
                         });
                         ui.add_space(10.0);
                         egui::Frame::NONE
@@ -405,6 +411,76 @@ fn format_bytes(bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use crate::app::tests::test_app;
+
+    #[test]
+    fn update_settings_match_the_distribution() {
+        use crate::test_ui::ContextTestExt as _;
+        for dark in [false, true] {
+            let (mut app, _tx) = test_app("distribution-settings");
+            app.show_settings = true;
+            let ctx = egui::Context::default();
+            ctx.set_visuals(crate::panes::chrome::app_visuals(dark));
+            let mut output = egui::FullOutput::default();
+            for _ in 0..2 {
+                output = ctx.run_test_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1200.0, 2200.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| app.show_settings_window(ui.ctx()),
+                );
+            }
+            let visible = |output: &egui::FullOutput, label: &str| {
+                output.shapes.iter().any(|shape| {
+                    matches!(&shape.shape, egui::Shape::Text(text)
+                        if text.galley.text() == label
+                        && shape.clip_rect.contains_rect(egui::Rect::from_min_size(text.pos, text.galley.size())))
+                })
+            };
+            let scroll_pos = output
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        (text.galley.text() == "Appearance")
+                            .then_some(text.pos + egui::vec2(150.0, 50.0))
+                    } else {
+                        None
+                    }
+                })
+                .expect("appearance section");
+            let mut store_message = false;
+            let mut startup_checkbox = false;
+            for _ in 0..10 {
+                store_message |= visible(&output, "Updates are managed by Microsoft Store.");
+                startup_checkbox |= visible(&output, "Check at startup");
+                output = ctx.run_test_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1200.0, 2200.0),
+                        )),
+                        events: vec![
+                            egui::Event::PointerMoved(scroll_pos),
+                            egui::Event::MouseWheel {
+                                phase: egui::TouchPhase::Move,
+                                unit: egui::MouseWheelUnit::Point,
+                                delta: egui::vec2(0.0, -150.0),
+                                modifiers: Default::default(),
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |ui| app.show_settings_window(ui.ctx()),
+                );
+            }
+            assert_eq!(store_message, crate::distribution::MICROSOFT_STORE);
+            assert_eq!(startup_checkbox, !crate::distribution::MICROSOFT_STORE);
+        }
+    }
 
     #[test]
     fn font_picker_applies_and_saves_the_selected_typeface() {
