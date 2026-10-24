@@ -969,6 +969,9 @@ Relative `-OutputDirectory` paths resolve from the repository root using
 PowerShell's current location, independently of the host process directory.
 Cargo overrides and the caller's location are restored even if staging cleanup
 fails; the cleanup failure remains an error.
+Plain `RUSTFLAGS` are split on whitespace without producing empty compiler
+arguments; existing `CARGO_ENCODED_RUSTFLAGS` take precedence and are preserved
+when appending the static CRT option.
 It is for Partner Center ingestion, not public unsigned sideloading. Microsoft
 signs the package during Store publication; no certificate secret is needed.
 
@@ -1031,6 +1034,15 @@ Both PowerShell failure regressions reproduced before their fixes and passed
 afterwards. Store-feature app tests (341 passed), all-feature workspace tests,
 all-target all-feature Clippy, formatting, the demo check and workflow YAML
 validation passed on stable Rust 1.98. Native Windows validation remains required.
+
+A further PR #160 review fixed leading/trailing whitespace in plain `RUSTFLAGS`
+creating empty encoded arguments and preventing Cargo from probing rustc.
+The regression failed before the fix; a minimal Cargo build also reproduced
+the compiler failure and passed with the corrected flags. PowerShell coverage
+checks encoded-flag precedence, whitespace-only/unset flags, and restoration
+after build and cleanup failures. These checks, Store-feature app tests,
+all-feature workspace tests, all-target all-feature Clippy, and formatting
+passed on stable Rust 1.98. Native Windows package testing remains outstanding.
 
 References: [manual desktop packaging](https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-manual-conversion),
 [local package testing](https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-debug),

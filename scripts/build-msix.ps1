@@ -42,7 +42,9 @@ try {
     $env:CARGO_TARGET_DIR = Join-Path $root 'target/store'
     $flags = if ($previousFlags) { $previousFlags } else { $env:RUSTFLAGS }
     # Plain RUSTFLAGS are whitespace separated; encoded flags use unit separators.
-    if (-not $previousFlags -and $flags) { $flags = ($flags -split '\s+') -join [char]31 }
+    if (-not $previousFlags -and $flags) {
+        $flags = (($flags -split '\s+') | Where-Object { $_.Length -gt 0 }) -join [char]31
+    }
     $staticCrt = '-Ctarget-feature=+crt-static'
     $env:CARGO_ENCODED_RUSTFLAGS = if ($flags) { "$flags$([char]31)$staticCrt" } else { $staticCrt }
 
