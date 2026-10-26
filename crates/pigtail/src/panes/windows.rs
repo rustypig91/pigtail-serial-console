@@ -351,6 +351,12 @@ impl App {
                             remove = Some(i);
                         }
                     });
+                    if crate::app::parse_hex_color(&rule.color).is_none() {
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            "Color must contain six hexadecimal digits (#rrggbb).",
+                        );
+                    }
                 }
                 if let Some(i) = remove {
                     conn.highlight.remove(i);
@@ -393,6 +399,42 @@ mod tests {
         ));
         app.highlight_port = Some(id);
         app.show_highlight_win = true;
+    }
+
+    #[test]
+    fn highlight_editor_reports_invalid_colors_for_enabled_and_disabled_rules() {
+        for dark in [false, true] {
+            for enabled in [false, true] {
+                let (mut app, _tx) = test_app("highlight-editor-invalid-color");
+                add_highlight_connection(&mut app);
+                app.connections[0].highlight.truncate(1);
+                app.connections[0].highlight[0].enabled = enabled;
+                let ctx = egui::Context::default();
+                ctx.set_visuals(if dark {
+                    egui::Visuals::dark()
+                } else {
+                    egui::Visuals::light()
+                });
+                for color in ["#aé000", "#12g456", "#12345", "#112233"] {
+                    app.connections[0].highlight[0].color = color.into();
+                    for _ in 0..3 {
+                        let _ = ctx.run_test_ui(Default::default(), |ui| {
+                            app.show_highlight_window(ui.ctx());
+                        });
+                    }
+                    let output = ctx.run_test_ui(Default::default(), |ui| {
+                        app.show_highlight_window(ui.ctx());
+                    });
+                    let warning = output.shapes.iter().any(|shape| {
+                        matches!(&shape.shape, egui::Shape::Text(text)
+                            if text.galley.text() == "Color must contain six hexadecimal digits (#rrggbb).")
+                    });
+                    assert_eq!(warning, color != "#112233", "{color}, enabled={enabled}");
+                    assert_eq!(app.connections[0].highlight[0].color, color);
+                    assert!(app.show_highlight_win);
+                }
+            }
+        }
     }
 
     #[test]

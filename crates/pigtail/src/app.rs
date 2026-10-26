@@ -3685,7 +3685,8 @@ fn merged_entry_searches(
 /// Parse `#rrggbb` into a colour.
 pub fn parse_hex_color(s: &str) -> Option<egui::Color32> {
     let s = s.trim().trim_start_matches('#');
-    if s.len() != 6 {
+    // The slices below are safe only after every byte is known to be ASCII.
+    if s.len() != 6 || !s.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     let r = u8::from_str_radix(&s[0..2], 16).ok()?;
@@ -4902,6 +4903,45 @@ pub(crate) mod tests {
         let sensitive = compile_search("[A", true, false).unwrap();
         assert!(sensitive.is_match("prefix [A suffix"));
         assert!(!sensitive.is_match("prefix [a suffix"));
+    }
+
+    #[test]
+    fn hex_colors_accept_six_ascii_hex_digits() {
+        for (input, rgb) in [
+            ("#112233", [0x11, 0x22, 0x33]),
+            ("aBcDeF", [0xab, 0xcd, 0xef]),
+            (" \t#00fF80\n", [0x00, 0xff, 0x80]),
+            ("#000000", [0, 0, 0]),
+            ("#FFFFFF", [255, 255, 255]),
+        ] {
+            assert_eq!(
+                parse_hex_color(input),
+                Some(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2])),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hex_colors_reject_malformed_ascii_and_unicode() {
+        for input in [
+            "#aé000",
+            "",
+            "#",
+            "#12345",
+            "#1234567",
+            "#gg0000",
+            "#12 456",
+            "#+12345",
+            "#00aé0",
+            "#000aé",
+            "#€000",
+            "#ééé",
+            "#💩00",
+            "#１２３４５６",
+        ] {
+            assert_eq!(parse_hex_color(input), None, "{input:?}");
+        }
     }
 
     #[test]
