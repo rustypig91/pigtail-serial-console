@@ -655,8 +655,46 @@ Windows setup installations use the setup installer and may show a Windows
 permission prompt. Portable Windows/Linux builds and writable AppImages update
 in place. Installations managed by MSI or a Linux package manager should be
 updated with that installer/package manager, especially in protected folders.
-Debian package installations still check for updates and show release notices, but disable in-app installation.
+MSI and Debian package installations still check for updates and show release
+notices with **Downloads page**, **Skip this version** and **Later**, but omit
+the in-app **Update** action and explain which installer/package to use.
+MSI ownership is queried with Windows Installer's related-product and component
+path APIs, matching the running executable's canonical path rather than its
+folder, filename or permissions. A separate portable or Inno copy remains
+independent of an MSI elsewhere. The x64 executable component GUID in
+`wix/main.wxs` preserves the original WiX-generated GUID used by older releases;
+keep it and the updater's ownership constants in sync. No MSI installation or
+repair is triggered by detection. UI policy is cached; download and install
+workers query ownership again before network access or replacement, including
+when a stale Inno uninstaller is adjacent. Ownership-query/path-resolution
+failures block in-app installation rather than guessing portable ownership.
 To update, download the latest `.deb` and install it with `sudo apt install ./pigtail_<version>-1_amd64.deb`.
+
+`scripts/tests/msi-update-smoke.ps1` runs the native MSI regression without
+elevation. Build the serialcore test executable with
+`cargo test -p serialcore --no-run --locked`, then pass the reported
+`target/debug/deps/serialcore-<hash>.exe` path as `-CoreTestExe`. WiX defaults to
+`target/release-tools/wix-3.14.1`; override with `-WixDirectory` if needed.
+Run from the repository root in a clean user/VM with no Pigtail MSI registered.
+The script refuses elevated tokens and existing related products. It installs
+two temporary per-user MSI versions containing the test executable, verifies
+ownership and download/install refusal (including a writable folder and stale
+Inno marker), tests portable replacement alongside MSI, and checks the MSI
+upgrade's version and single product registration. It uninstalls its packages
+in `finally` and retains build artifacts/logs under `target/msi-update-smoke`.
+Its per-user fixture retains production's executable key path, so ICE38/ICE64
+are suppressed only for that fixture. This does not replace a production MSI
+smoke test in Program Files or a visual check of the installed app's notice.
+
+The issue #166 fix passed formatting, workspace tests and all-target Clippy
+with default/all features, and the demo check on Windows with stable Rust
+1.98.1. Rendered frames check automatic/MSI/Debian notices in both themes.
+The native non-elevated per-user MSI fixture passed ownership, worker refusal,
+stale-Inno precedence, portable coexistence, upgrade metadata and uninstall
+cleanup checks. GUIDs were also checked against existing 0.11.0 and 0.12.1
+release MSIs. Native visual inspection was unavailable because the computer-use
+native pipe could not be reached; production Program Files/UAC testing remains
+outstanding.
 
 Automatic updates require the matching release asset and its GitHub SHA-256
 digest; older releases without these assets cannot be installed automatically.
