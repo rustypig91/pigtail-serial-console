@@ -136,6 +136,17 @@ application.
   stale selection targets, and migration/persistence of empty and malformed lists.
   Footer frame coverage checks both themes, narrow/wide layouts, visibility
   switches and display modes, and direct/merged editor targets.
+  Highlight colors require six ASCII hexadecimal digits, with an optional `#`
+  and surrounding whitespace. Invalid input, including six-byte Unicode values,
+  returns a validation failure without slicing inside UTF-8 characters. The
+  editor shows an inline six-digit format message for enabled and disabled rules;
+  correcting the value clears it. Issue #164 regressions cover valid colors,
+  malformed lengths/ASCII/Unicode, and editor rendering in both themes.
+  The 2026-10-26 fix reproduced the panic in parser and editor-frame tests before
+  the correction. Formatting, workspace tests and all-target Clippy with
+  default/all features, and the demo feature check passed on stable Rust 1.98.1.
+  Native inspection was unavailable because the computer-use native pipe could
+  not be reached.
   The 2026-10-17 revision passed formatting, app tests and all-target Clippy with
   default/all features, and the demo check. Workspace runs hit the known core
   receive-overload timeout; isolated reruns passed with both feature selections,
