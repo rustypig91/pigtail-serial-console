@@ -709,7 +709,7 @@ Dependencies were checked against the registry and updated to current stable ver
 on 2026-10-11. The GUI uses eframe/egui 0.36.2, egui_plot 0.37.0 and wgpu 30.0.1.
 This includes the upstream fix for DX12 diagnostic hooks being initialized when
 DX12 is disabled, which caused AMD Vulkan presentation to flood Windows logs.
-Automatic backend selection and environment overrides remain available.
+Environment overrides remain available; the Windows default is described below.
 The migration uses parent-UI panels, output hooks for clipboard selection capture,
 and fractional font advances for console wrapping. Headless UI tests explicitly
 discard texture uploads because they have no GPU consumer.
@@ -720,11 +720,37 @@ resource-state diagnostics. This machine still logs a missing Rockstar Social
 Club Vulkan layer manifest registered by another application. Linux runtime and
 Windows sleep/resume validation remain necessary on the affected hardware.
 
-The application uses eframe's wgpu renderer with standard wgpu backend and adapter
-selection, including its `WGPU_BACKEND` and `WGPU_POWER_PREF` environment overrides.
+The application uses eframe's wgpu renderer. Windows defaults to Direct3D 12
+only, excluding Vulkan from instance creation and adapter enumeration. Store
+certification of package 1.4.0.0 on a Surface Laptop Go reported a launch-time
+access violation (`0xc0000005`) in Intel's `igvk64.dll` 31.0.101.2125 at offset
+`0x64ea82`. This matches the class of older Intel Vulkan startup crashes in
+[wgpu #10124](https://github.com/gfx-rs/wgpu/pull/10124); the locked wgpu 30.0.1
+does not include that fix. The event log has no stack, so the exact Vulkan call
+is unconfirmed. Preferring DX12 while leaving Vulkan enabled is insufficient
+because startup enumerates enabled backends before choosing an adapter.
+The Windows default applies to direct, Store and demo builds. Explicit
+`WGPU_BACKEND` overrides remain available for diagnostics and can opt back into
+Vulkan; `WGPU_POWER_PREF` and other upstream settings are preserved. Other
+platforms retain upstream backend selection. There is no automatic Vulkan
+fallback on Windows. Regression tests check the default instance backend mask
+and explicit single/multiple-backend overrides without loading GPU drivers.
 The direct wgpu dependency enables its standard backend features (eframe disables
-wgpu's defaults). No platform-specific backend is forced. This replaces the
-glow/glutin renderer involved in the AMD `atio6axx.dll` crash on Windows resume.
+wgpu's defaults). This renderer replaces the glow/glutin renderer involved in
+the AMD `atio6axx.dll` crash on Windows resume.
+
+The 2026-10-26 Windows backend revision passed formatting, workspace tests and
+all-target Clippy with default/all features, Store-feature graphics tests, and
+the demo feature check/build on stable Rust 1.98.1. The default-backend
+regression failed with the old backend selection and passed with the fix.
+A Windows demo launch with `WGPU_BACKEND` unset selected the AMD Radeon RX
+6800 XT via DX12, enumerated only DX12 adapters, and loaded Direct3D 12 modules
+without a Vulkan loader/driver. The Windows SDK MakePri/MakeAppx build succeeded
+for the unsigned `pigtail-store-1.6.0.0-x64.msix`. Native visual inspection was
+unavailable because the computer-use native pipe could not be reached. Testing
+the installed package on the certification Surface/Intel driver, real serial
+I/O and Store certification remain outstanding.
+
 Linux uses `AutoNoVsync` presentation: wgpu chooses Immediate, then Mailbox,
 then FIFO according to surface support. This avoids the repeated frame-acquisition
 timeouts observed with default FIFO presentation on Intel Iris Xe/Mesa 26.0.8
