@@ -3,8 +3,20 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use eframe::egui_wgpu::{SurfaceErrorAction, WgpuConfiguration};
-use eframe::wgpu::CurrentSurfaceTexture;
+use eframe::egui_wgpu::{SurfaceErrorAction, WgpuConfiguration, WgpuSetup, WgpuSetupCreateNew};
+use eframe::wgpu::{Backends, CurrentSurfaceTexture};
+
+fn wgpu_setup(backend_override: Option<Backends>) -> WgpuSetup {
+    let mut setup = WgpuSetupCreateNew::without_display_handle();
+    // Loading/enumerating Vulkan can crash inside older Intel Windows drivers,
+    // before a usable adapter is selected. Exclude it from normal startup,
+    // rather than just preferring DX12. Keep explicit WGPU_BACKEND overrides.
+    let backends = backend_override.or(cfg!(target_os = "windows").then_some(Backends::DX12));
+    if let Some(backends) = backends {
+        setup.instance_descriptor.backends = backends;
+    }
+    setup.into()
+}
 
 /// Pace our animations without relying on the surface's presentation mode.
 /// Input and reader wakes can still request an earlier frame.
@@ -52,6 +64,7 @@ pub fn configuration(context: Arc<OnceLock<egui::Context>>) -> WgpuConfiguration
         }
     });
     WgpuConfiguration {
+        wgpu_setup: wgpu_setup(Backends::from_env()),
         // FIFO presentation stalls on the affected Mesa/Wayland system. Let
         // wgpu select Immediate or Mailbox when available, with a safe fallback
         // on surfaces that only support FIFO. Forcing Mailbox would instead
@@ -71,6 +84,38 @@ mod tests {
     use super::*;
     use crate::test_ui::ContextTestExt as _;
     use std::sync::Mutex;
+
+    #[test]
+    fn default_setup_excludes_vulkan_on_windows() {
+        let WgpuSetup::CreateNew(setup) = wgpu_setup(None) else {
+            panic!("startup must create a new graphics instance");
+        };
+        if cfg!(target_os = "windows") {
+            // A preference/adapter selector alone still enumerates Vulkan.
+            assert_eq!(setup.instance_descriptor.backends, Backends::DX12);
+        } else {
+            assert_eq!(
+                setup.instance_descriptor.backends,
+                WgpuSetupCreateNew::without_display_handle()
+                    .instance_descriptor
+                    .backends
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_backend_overrides_reach_the_instance_descriptor() {
+        for backends in [
+            Backends::DX12,
+            Backends::VULKAN,
+            Backends::GL | Backends::VULKAN,
+        ] {
+            let WgpuSetup::CreateNew(setup) = wgpu_setup(Some(backends)) else {
+                panic!("startup must create a new graphics instance");
+            };
+            assert_eq!(setup.instance_descriptor.backends, backends);
+        }
+    }
 
     #[test]
     fn short_deadline_repaints_wait_and_due_deadlines_remain_immediate() {
