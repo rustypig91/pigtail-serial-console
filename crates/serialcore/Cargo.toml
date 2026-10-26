@@ -27,5 +27,8 @@ toml = "1.1.8"
 tracing = "0.1.44"
 ureq = "3.4.2"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_ApplicationInstallationAndServicing"] }
+
 [dev-dependencies]
 proptest = "1.12.0"

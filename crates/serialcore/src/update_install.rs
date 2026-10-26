@@ -65,10 +65,12 @@ fn asset_name(version: &str, os: &str, arch: &str, format: Format) -> Result<Str
 }
 
 fn destination() -> Result<(PathBuf, Format), String> {
-    if super::is_debian_installation() {
-        return Err(super::PACKAGE_UPDATE_MESSAGE.into());
-    }
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    destination_for(executable)
+}
+
+fn destination_for(executable: PathBuf) -> Result<(PathBuf, Format), String> {
+    super::ensure_self_update_allowed(&executable)?;
     if cfg!(target_os = "linux") {
         if let Some(appimage) = std::env::var_os("APPIMAGE") {
             let path = PathBuf::from(appimage);
@@ -237,9 +239,10 @@ pub fn spawn_download(version: String, wake: Wake) -> std::io::Result<Receiver<I
 
 impl PreparedUpdate {
     fn install(self) -> Result<InstallOutcome, String> {
-        if super::is_debian_installation() {
-            return Err(super::PACKAGE_UPDATE_MESSAGE.into());
-        }
+        // Never trust the earlier destination decision: installer ownership can
+        // change while a download is in progress. Check before any side effect.
+        super::ensure_self_update_allowed(&std::env::current_exe().map_err(|e| e.to_string())?)?;
+        super::ensure_self_update_allowed(&self.target)?;
         if self.format == Format::WindowsSetup {
             return self.launch_setup();
         }
@@ -412,6 +415,75 @@ pub fn spawn_install(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_inno_and_portable_destinations_remain_distinct() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("pigtail.exe");
+        std::fs::write(&executable, b"portable").unwrap();
+        assert_eq!(
+            destination_for(executable.clone()).unwrap(),
+            (executable.clone(), Format::Binary)
+        );
+        std::fs::write(directory.path().join("unins000.exe"), b"Inno Setup").unwrap();
+        assert_eq!(
+            destination_for(executable.clone()).unwrap(),
+            (executable, Format::WindowsSetup)
+        );
+    }
+
+    // Run by scripts/tests/msi-update-smoke.ps1 from a real, isolated MSI
+    // installation. No update download, installer launch or replacement may run.
+    #[cfg(windows)]
+    #[test]
+    fn msi_owned_update_probe() {
+        let Some(expected) = std::env::var_os("PIGTAIL_MSI_UPDATE_PROBE") else {
+            return;
+        };
+        let target = std::env::current_exe().unwrap();
+        assert_eq!(
+            target.canonicalize().unwrap(),
+            PathBuf::from(expected).canonicalize().unwrap()
+        );
+        assert!(super::super::msi::owns(&target).unwrap());
+        assert_eq!(
+            super::super::manual_install_message(),
+            Some(super::super::MSI_UPDATE_MESSAGE)
+        );
+        assert_eq!(destination().unwrap_err(), super::super::MSI_UPDATE_MESSAGE);
+        let (tx, _) = crossbeam_channel::unbounded();
+        assert_eq!(
+            download("invalid/version", &tx, &Wake::none()).unwrap_err(),
+            super::super::MSI_UPDATE_MESSAGE
+        );
+
+        let original = std::fs::read(&target).unwrap();
+        for format in [Format::Binary, Format::WindowsSetup] {
+            let directory = tempfile::tempdir().unwrap();
+            let file = directory.path().join("replacement.exe");
+            std::fs::write(&file, b"must not install").unwrap();
+            let staging = directory.path().to_owned();
+            let prepared = PreparedUpdate {
+                directory,
+                file,
+                target: target.clone(),
+                format,
+            };
+            assert_eq!(
+                prepared.install().unwrap_err(),
+                super::super::MSI_UPDATE_MESSAGE
+            );
+            assert_eq!(std::fs::read(&target).unwrap(), original);
+            assert!(!staging.exists());
+        }
+        // MSI takes priority even when a stale Inno uninstaller is adjacent.
+        let uninstaller = target.parent().unwrap().join("unins000.exe");
+        std::fs::write(&uninstaller, b"stale Inno marker").unwrap();
+        let result = destination();
+        std::fs::remove_file(uninstaller).unwrap();
+        assert_eq!(result.unwrap_err(), super::super::MSI_UPDATE_MESSAGE);
+    }
 
     #[test]
     fn portable_replacement_probe() {

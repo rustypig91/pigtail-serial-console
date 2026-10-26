@@ -50,7 +50,9 @@
             <Directory Id="$(var.PlatformProgramFilesFolder)" Name="PFiles">
                 <Directory Id="APPLICATIONFOLDER" Name="Rusty's Pigtail - Serial Terminal">
 
-                    <Component Id="MainExecutable" Guid="*">
+                    <!-- Preserve the original WiX-generated x64 component identity.
+                         serialcore's updater queries this registered key path. -->
+                    <Component Id="MainExecutable" Guid="{545A7A2D-8DBD-5B22-AD6C-E11BD0B0C13C}">
                         <File
                             Id="PigtailExe"
                             Name="pigtail.exe"

@@ -3,6 +3,9 @@
 
 #[path = "update_install.rs"]
 mod install;
+#[cfg(windows)]
+#[path = "update_msi.rs"]
+mod msi;
 pub use install::{spawn_download, spawn_install, InstallEvent, InstallOutcome};
 
 use crate::wake::Wake;
@@ -12,6 +15,52 @@ use std::time::Duration;
 /// Package installations must be updated through their package manager.
 pub const PACKAGE_UPDATE_MESSAGE: &str =
     "In-app installation is disabled for Debian package installations. Install the latest .deb package using your package manager.";
+
+pub const MSI_UPDATE_MESSAGE: &str =
+    "In-app installation is disabled for MSI installations. Download the latest .msi from the downloads page and install it using Windows Installer.";
+
+#[cfg(windows)]
+const MSI_QUERY_FAILED_MESSAGE: &str =
+    "Windows Installer ownership could not be determined. In-app installation is disabled; update using the installer for this installation.";
+
+/// Manual update guidance, cached so painting never repeatedly queries ownership.
+pub fn manual_install_message() -> Option<&'static str> {
+    if is_debian_installation() {
+        return Some(PACKAGE_UPDATE_MESSAGE);
+    }
+    #[cfg(windows)]
+    {
+        static MESSAGE: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+        *MESSAGE.get_or_init(|| {
+            match std::env::current_exe()
+                .map_err(|e| e.to_string())
+                .and_then(|path| msi::owns(&path))
+            {
+                Ok(true) => Some(MSI_UPDATE_MESSAGE),
+                Ok(false) => None,
+                Err(error) => {
+                    tracing::warn!("update ownership: {error}");
+                    Some(MSI_QUERY_FAILED_MESSAGE)
+                }
+            }
+        })
+    }
+    #[cfg(not(windows))]
+    None
+}
+
+/// Recheck ownership on the worker before downloading and again before installing.
+fn ensure_self_update_allowed(executable: &std::path::Path) -> Result<(), String> {
+    if is_debian_installation() {
+        return Err(PACKAGE_UPDATE_MESSAGE.into());
+    }
+    #[cfg(windows)]
+    if msi::owns(executable)? {
+        return Err(MSI_UPDATE_MESSAGE.into());
+    }
+    let _ = executable;
+    Ok(())
+}
 
 /// Cache package ownership so drawing the UI never repeatedly reads the disk.
 pub fn is_debian_installation() -> bool {

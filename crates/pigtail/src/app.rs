@@ -1187,6 +1187,25 @@ pub struct UpdateDialog {
     pub skip_version: Option<String>,
 }
 
+impl UpdateDialog {
+    pub(crate) fn available(version: String, url: String, manual_message: Option<&str>) -> Self {
+        let current = env!("CARGO_PKG_VERSION");
+        let guidance = manual_message.unwrap_or(
+            "Update will download, install, and restart Rusty's Pigtail - Serial Terminal. Active connections will close.",
+        );
+        Self {
+            title: "Update available".into(),
+            message: format!(
+                "v{} is available. You are on v{current}.\n{guidance}",
+                version.trim_start_matches('v')
+            ),
+            update_version: manual_message.is_none().then(|| version.clone()),
+            download_url: Some(url),
+            skip_version: Some(version),
+        }
+    }
+}
+
 /// Confirmation and preparation state for one dropped file.
 pub struct FileTransferDialog {
     pub port: PortId,
@@ -2631,23 +2650,9 @@ impl App {
         );
 
         self.update_dialog = notice.map(|notice| match notice {
-            update::Notice::Available { version, url } => UpdateDialog {
-                title: "Update available".into(),
-                message: if update::is_debian_installation() {
-                    format!(
-                        "v{} is available. You are on v{current}.\nThis installation is managed by Debian. Download the latest .deb from the downloads page and install it using your package manager.",
-                        version.trim_start_matches('v')
-                    )
-                } else {
-                    format!(
-                        "v{} is available. You are on v{current}.\nUpdate will download, install, and restart Rusty's Pigtail - Serial Terminal. Active connections will close.",
-                        version.trim_start_matches('v')
-                    )
-                },
-                update_version: (!update::is_debian_installation()).then(|| version.clone()),
-                download_url: Some(url),
-                skip_version: Some(version),
-            },
+            update::Notice::Available { version, url } => {
+                UpdateDialog::available(version, url, update::manual_install_message())
+            }
             update::Notice::UpToDate => UpdateDialog {
                 title: "Up to date".into(),
                 message: format!("You're running the latest version (v{current})."),

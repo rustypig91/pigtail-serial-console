@@ -130,6 +130,59 @@ mod tests {
     use crate::test_ui::ContextTestExt as _;
 
     #[test]
+    fn managed_update_notices_keep_downloads_and_skip_without_install_action() {
+        use serialcore::update::{MSI_UPDATE_MESSAGE, PACKAGE_UPDATE_MESSAGE};
+        for dark in [false, true] {
+            for guidance in [None, Some(MSI_UPDATE_MESSAGE), Some(PACKAGE_UPDATE_MESSAGE)] {
+                let (mut app, _tx) = test_app("managed-update-notice");
+                app.update_dialog = Some(UpdateDialog::available(
+                    "v9.9.9".into(),
+                    "https://example.invalid/release".into(),
+                    guidance,
+                ));
+                let dialog = app.update_dialog.as_ref().unwrap();
+                assert_eq!(dialog.update_version.is_some(), guidance.is_none());
+                assert_eq!(dialog.skip_version.as_deref(), Some("v9.9.9"));
+                assert_eq!(
+                    dialog.download_url.as_deref(),
+                    Some("https://example.invalid/release")
+                );
+                if let Some(guidance) = guidance {
+                    assert!(dialog.message.contains(guidance));
+                    assert!(!dialog.message.contains("Active connections will close"));
+                }
+                let ctx = egui::Context::default();
+                ctx.set_visuals(if dark {
+                    egui::Visuals::dark()
+                } else {
+                    egui::Visuals::light()
+                });
+                for _ in 0..3 {
+                    let _ =
+                        ctx.run_test_ui(Default::default(), |ui| app.show_update_dialog(ui.ctx()));
+                }
+                let output =
+                    ctx.run_test_ui(Default::default(), |ui| app.show_update_dialog(ui.ctx()));
+                let labels: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some(text.galley.text()),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(labels.contains(&"Downloads page"), "{labels:?}");
+                assert!(labels.contains(&"Skip this version"));
+                assert!(labels.contains(&"Later"));
+                assert_eq!(labels.contains(&"Update"), guidance.is_none());
+                if let Some(guidance) = guidance {
+                    assert!(labels.iter().any(|label| label.contains(guidance)));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn escape_dismisses_update_notice_but_keeps_installation_progress_open() {
         for installing in [false, true] {
             let (mut app, _enum_tx) = test_app(if installing {
